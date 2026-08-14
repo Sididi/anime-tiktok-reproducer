@@ -50,6 +50,17 @@ TRACK_RESIDUAL_SECONDS = 0.75
 VARIANT_EMBED_FRACTION = 0.25
 VERIFY_FPS = 6.0
 MAX_ALTERNATIVES = 7
+# A detector-sized micro-fragment may be an unreliable island between longer
+# tracks.  Do not redefine ordinary short scenes: this wider absorption range
+# is used only when the fragment is weak and either its retrieval evidence or
+# two continuous flanking tracks disprove the selected island.
+WEAK_MICRO_MIN_SECONDS = 0.35
+WEAK_MICRO_MAX_SECONDS = 0.65
+WEAK_MICRO_MAX_CONFIDENCE = 0.38
+WEAK_MICRO_NEIGHBOR_MIN_CONFIDENCE = 0.50
+WEAK_MICRO_PROPOSAL_MIN_CONFIDENCE = 0.40
+WEAK_MICRO_PROPOSAL_MARGIN = 0.07
+WEAK_MICRO_CLEAR_CUT_RATIO = 0.75
 # How much a manual-merge prior tilts the episode vote. Big enough to break a
 # near-tie toward the fragment the owner said this span continues, small enough
 # that a clear body of fresh retrieval still overrules it.
@@ -315,6 +326,17 @@ class HierarchicalMatcherService:
         )
         segments = cls._merge_continuous_segments(segments)
         segments = cls._absorb_tiny_segments(segments)
+        before_weak_micro = len(segments)
+        segments = cls._absorb_weak_micro_segments(
+            segments,
+            candidates,
+            samples,
+            diff_times,
+            diffs,
+        )
+        diagnostics.counters["weak_micro_absorptions"] = float(
+            max(0, before_weak_micro - len(segments))
+        )
         diagnostics.phase_timings["v2_assemble_tracks"] = time.perf_counter() - started
 
         started = time.perf_counter()
@@ -1820,6 +1842,255 @@ class HierarchicalMatcherService:
             )
             result.pop(index)
             index = max(0, index - 1)
+        return result
+
+    @staticmethod
+    def _boundary_diff_strength(
+        timestamp: float,
+        diff_times: list[float],
+        diffs: list[float],
+    ) -> float:
+        """Return the strongest native-frame change immediately at a boundary."""
+        if not diff_times or len(diff_times) != len(diffs):
+            return 0.0
+        nearby = [
+            float(value)
+            for time_value, value in zip(diff_times, diffs, strict=False)
+            if abs(float(time_value) - timestamp) <= 0.08
+        ]
+        if nearby:
+            return max(nearby)
+        nearest = min(
+            range(len(diff_times)),
+            key=lambda value: abs(float(diff_times[value]) - timestamp),
+        )
+        if abs(float(diff_times[nearest]) - timestamp) <= 0.15:
+            return float(diffs[nearest])
+        return 0.0
+
+    @classmethod
+    def _absorb_weak_micro_segments(
+        cls,
+        segments: list[TrackSegment],
+        candidates: list[list[RetrievalCandidate]],
+        samples: list[QueryFrame],
+        diff_times: list[float],
+        diffs: list[float],
+    ) -> list[TrackSegment]:
+        """Absorb only retrieval-disproved micro-fragments into a neighbour.
+
+        The ordinary sliver absorber intentionally stops at 0.35s.  Slightly
+        longer false fragments need a stronger certificate: their selected
+        track must be weak, while an adjacent track must have a supported
+        proposal *inside the micro-fragment* that meets its affine source line
+        at the shared boundary.  A sampling hole is accepted only between two
+        strong, same-episode, affine-continuous flanks.  This preserves genuine
+        confident 0.5s edits.
+
+        If both sides qualify, a clearly weaker visual cut is removed.  With
+        comparable cuts, the better-supported affine continuation wins.
+        """
+        result = list(segments)
+        index = 0
+        while len(result) > 1 and index < len(result):
+            micro = result[index]
+            duration = micro.q_end - micro.q_start
+            if (
+                not WEAK_MICRO_MIN_SECONDS <= duration <= WEAK_MICRO_MAX_SECONDS
+                or micro.episode is None
+                or micro.confidence > WEAK_MICRO_MAX_CONFIDENCE
+                or "weak_similarity" not in micro.doubt_reasons
+            ):
+                index += 1
+                continue
+
+            proposals = cls._line_proposals(micro, candidates, samples)
+            required_support = max(
+                1,
+                int(math.ceil(duration * BASE_SAMPLE_FPS * 0.50)),
+            )
+            choices: list[
+                tuple[str, float, TrackSegment, LineProposal]
+            ] = []
+            for side, neighbor in (
+                ("left", result[index - 1] if index > 0 else None),
+                ("right", result[index + 1] if index + 1 < len(result) else None),
+            ):
+                if (
+                    neighbor is None
+                    or neighbor.episode is None
+                    or neighbor.episode == micro.episode
+                    or neighbor.confidence < WEAK_MICRO_NEIGHBOR_MIN_CONFIDENCE
+                    or neighbor.q_end - neighbor.q_start < 1.0
+                ):
+                    continue
+                boundary = micro.q_start if side == "left" else micro.q_end
+                supported = [
+                    proposal
+                    for proposal in proposals
+                    if proposal.episode == neighbor.episode
+                    and proposal.support >= required_support
+                    and proposal.confidence
+                    >= max(
+                        WEAK_MICRO_PROPOSAL_MIN_CONFIDENCE,
+                        micro.confidence + WEAK_MICRO_PROPOSAL_MARGIN,
+                    )
+                    and abs(
+                        proposal.source_at(boundary)
+                        - neighbor.source_at(boundary)
+                    )
+                    <= TRACK_RESIDUAL_SECONDS
+                ]
+                if not supported:
+                    continue
+                proposal = max(
+                    supported,
+                    key=lambda value: (
+                        value.confidence,
+                        value.support,
+                    ),
+                )
+                gap = abs(
+                    proposal.source_at(boundary) - neighbor.source_at(boundary)
+                )
+                score = (
+                    proposal.confidence
+                    + 0.04 * min(proposal.support, 4)
+                    + 0.15 * neighbor.confidence
+                    - 0.12 * gap
+                )
+                choices.append((side, score, neighbor, proposal))
+
+            # A short fragment can fall between useful retrieval probes.  In
+            # that specific hole, two strong flanking tracks are an equivalent
+            # certificate when they name the same episode and their affine
+            # mappings agree over the whole fragment.  Do not use this for a
+            # one-sided guess.
+            left_neighbor = result[index - 1] if index > 0 else None
+            right_neighbor = (
+                result[index + 1] if index + 1 < len(result) else None
+            )
+            bridge_neighbors = (left_neighbor, right_neighbor)
+            bridge_is_supported = (
+                all(
+                    neighbor is not None
+                    and neighbor.episode is not None
+                    and neighbor.episode != micro.episode
+                    and neighbor.confidence >= WEAK_MICRO_NEIGHBOR_MIN_CONFIDENCE
+                    and neighbor.q_end - neighbor.q_start >= 1.0
+                    for neighbor in bridge_neighbors
+                )
+                and left_neighbor is not None
+                and right_neighbor is not None
+                and left_neighbor.episode == right_neighbor.episode
+                and max(
+                    abs(
+                        left_neighbor.source_at(timestamp)
+                        - right_neighbor.source_at(timestamp)
+                    )
+                    for timestamp in (micro.q_start, micro.q_end)
+                )
+                <= TRACK_RESIDUAL_SECONDS
+            )
+            if bridge_is_supported:
+                existing_sides = {choice[0] for choice in choices}
+                bridge_confidence = min(
+                    left_neighbor.confidence,
+                    right_neighbor.confidence,
+                )
+                for side, neighbor in (
+                    ("left", left_neighbor),
+                    ("right", right_neighbor),
+                ):
+                    if side in existing_sides:
+                        continue
+                    proposal = LineProposal(
+                        episode=neighbor.episode,
+                        a=neighbor.a,
+                        b=neighbor.b,
+                        confidence=bridge_confidence,
+                        support=0,
+                        algorithm="continuous_bridge",
+                    )
+                    score = bridge_confidence + 0.15 * neighbor.confidence
+                    choices.append((side, score, neighbor, proposal))
+
+            if not choices:
+                index += 1
+                continue
+
+            by_side = {choice[0]: choice for choice in choices}
+            chosen: tuple[str, float, TrackSegment, LineProposal]
+            left_strength = cls._boundary_diff_strength(
+                micro.q_start, diff_times, diffs
+            )
+            right_strength = cls._boundary_diff_strength(
+                micro.q_end, diff_times, diffs
+            )
+            if (
+                "right" in by_side
+                and left_strength > 0.0
+                and right_strength
+                <= WEAK_MICRO_CLEAR_CUT_RATIO * left_strength
+            ):
+                chosen = by_side["right"]
+            elif (
+                "left" in by_side
+                and right_strength > 0.0
+                and left_strength
+                <= WEAK_MICRO_CLEAR_CUT_RATIO * right_strength
+            ):
+                chosen = by_side["left"]
+            else:
+                chosen = max(choices, key=lambda value: value[1])
+
+            side, _, neighbor, proposal = chosen
+            evidence = cls._segment_from_proposal(
+                micro,
+                micro.q_start,
+                micro.q_end,
+                proposal,
+                candidates,
+                samples,
+            )
+            points = sorted(
+                neighbor.points + evidence.points,
+                key=lambda value: value.t_query,
+            )
+            if points:
+                a, b, residual = cls._fit_points(points)
+                confidence = float(
+                    np.median([point.similarity for point in points])
+                )
+            else:  # Defensive: the proposal support certificate normally prevents this.
+                a, b, residual = neighbor.a, neighbor.b, neighbor.residual
+                confidence = neighbor.confidence
+            reasons = sorted(
+                set(neighbor.doubt_reasons + ["weak_micro_absorbed"])
+            )
+            uncertain = neighbor.uncertain
+            if residual > 0.45:
+                reasons = sorted(set(reasons + ["timing_residual"]))
+                uncertain = True
+            extended = TrackSegment(
+                q_start=micro.q_start if side == "right" else neighbor.q_start,
+                q_end=micro.q_end if side == "left" else neighbor.q_end,
+                episode=neighbor.episode,
+                a=a,
+                b=b,
+                points=points,
+                confidence=confidence,
+                residual=residual,
+                uncertain=uncertain,
+                doubt_reasons=reasons,
+            )
+            if side == "left":
+                result[index - 1] = extended
+                result.pop(index)
+                index = max(0, index - 1)
+            else:
+                result[index + 1] = extended
+                result.pop(index)
         return result
 
     @classmethod

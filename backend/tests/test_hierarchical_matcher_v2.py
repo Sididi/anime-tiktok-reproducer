@@ -223,6 +223,204 @@ def test_continuous_adjacent_segments_merge_but_discontinuous_do_not():
     assert merged[0].q_end == 2.0
 
 
+def test_weak_micro_fragment_merges_right_when_its_trailing_cut_is_weaker():
+    samples = [_sample(value) for value in (1.0, 1.25, 1.5)]
+    candidates = [
+        [
+            _candidate(
+                index,
+                sample.t_query,
+                20.0 + sample.t_query,
+                episode="correct",
+                similarity=0.50,
+            )
+        ]
+        for index, sample in enumerate(samples)
+    ]
+    segments = [
+        TrackSegment(0.0, 1.0, "correct", 1.0, 20.0, confidence=0.70),
+        TrackSegment(
+            1.0,
+            1.55,
+            "wrong",
+            1.0,
+            90.0,
+            confidence=0.34,
+            uncertain=True,
+            doubt_reasons=["weak_similarity"],
+        ),
+        TrackSegment(1.55, 3.0, "correct", 1.0, 20.0, confidence=0.64),
+    ]
+
+    merged = HierarchicalMatcherService._absorb_weak_micro_segments(
+        segments,
+        candidates,
+        samples,
+        [1.0, 1.55],
+        [100.0, 30.0],
+    )
+
+    assert len(merged) == 2
+    assert merged[0].q_end == 1.0
+    assert merged[1].q_start == 1.0
+    assert merged[1].episode == "correct"
+    assert "weak_micro_absorbed" in merged[1].doubt_reasons
+
+
+def test_weak_micro_fragment_bridges_continuous_flanks_without_inner_evidence():
+    samples = [_sample(value) for value in (2.0, 2.2)]
+    candidates = [
+        [
+            _candidate(
+                index,
+                sample.t_query,
+                150.0 + sample.t_query,
+                episode="unrelated",
+                similarity=0.70,
+            )
+        ]
+        for index, sample in enumerate(samples)
+    ]
+    segments = [
+        TrackSegment(0.0, 2.0, "correct", 1.0, 50.0, confidence=0.70),
+        TrackSegment(
+            2.0,
+            2.4,
+            "wrong",
+            1.0,
+            90.0,
+            confidence=0.34,
+            uncertain=True,
+            doubt_reasons=["weak_similarity"],
+        ),
+        TrackSegment(2.4, 4.0, "correct", 1.0, 50.4, confidence=0.51),
+    ]
+
+    merged = HierarchicalMatcherService._absorb_weak_micro_segments(
+        segments,
+        candidates,
+        samples,
+        [2.0, 2.4],
+        [60.0, 58.0],
+    )
+
+    assert len(merged) == 2
+    assert merged[0].q_end == 2.4
+    assert merged[0].episode == "correct"
+    assert merged[1].q_start == 2.4
+
+
+def test_weak_micro_fragment_preserves_a_confident_half_second_edit():
+    samples = [_sample(value) for value in (1.0, 1.25, 1.5)]
+    candidates = [
+        [
+            _candidate(
+                index,
+                sample.t_query,
+                20.0 + sample.t_query,
+                episode="neighbor",
+                similarity=0.70,
+            )
+        ]
+        for index, sample in enumerate(samples)
+    ]
+    segments = [
+        TrackSegment(0.0, 1.0, "neighbor", 1.0, 20.0, confidence=0.70),
+        TrackSegment(1.0, 1.5, "real-edit", 1.0, 80.0, confidence=0.70),
+        TrackSegment(1.5, 3.0, "neighbor", 1.0, 20.0, confidence=0.70),
+    ]
+
+    merged = HierarchicalMatcherService._absorb_weak_micro_segments(
+        segments,
+        candidates,
+        samples,
+        [1.0, 1.5],
+        [100.0, 30.0],
+    )
+
+    assert merged == segments
+
+
+def test_weak_micro_fragment_requires_neighbor_evidence_inside_the_fragment():
+    samples = [_sample(value) for value in (1.0, 1.25, 1.5)]
+    candidates = [
+        [
+            _candidate(
+                index,
+                sample.t_query,
+                200.0 + sample.t_query,
+                episode="unrelated",
+                similarity=0.70,
+            )
+        ]
+        for index, sample in enumerate(samples)
+    ]
+    segments = [
+        TrackSegment(0.0, 1.0, "left-neighbor", 1.0, 20.0, confidence=0.70),
+        TrackSegment(
+            1.0,
+            1.5,
+            "wrong",
+            1.0,
+            80.0,
+            confidence=0.34,
+            uncertain=True,
+            doubt_reasons=["weak_similarity"],
+        ),
+        TrackSegment(1.5, 3.0, "right-neighbor", 1.0, 20.0, confidence=0.70),
+    ]
+
+    merged = HierarchicalMatcherService._absorb_weak_micro_segments(
+        segments,
+        candidates,
+        samples,
+        [1.0, 1.5],
+        [100.0, 30.0],
+    )
+
+    assert merged == segments
+
+
+def test_weak_micro_fragment_does_not_bridge_discontinuous_flanks():
+    samples = [_sample(value) for value in (1.0, 1.25)]
+    candidates = [
+        [
+            _candidate(
+                index,
+                sample.t_query,
+                200.0 + sample.t_query,
+                episode="unrelated",
+                similarity=0.70,
+            )
+        ]
+        for index, sample in enumerate(samples)
+    ]
+    segments = [
+        TrackSegment(0.0, 1.0, "neighbor", 1.0, 20.0, confidence=0.70),
+        TrackSegment(
+            1.0,
+            1.4,
+            "wrong",
+            1.0,
+            80.0,
+            confidence=0.34,
+            uncertain=True,
+            doubt_reasons=["weak_similarity"],
+        ),
+        TrackSegment(1.4, 3.0, "neighbor", 1.0, 30.0, confidence=0.70),
+    ]
+
+    merged = HierarchicalMatcherService._absorb_weak_micro_segments(
+        segments,
+        candidates,
+        samples,
+        [1.0, 1.4],
+        [60.0, 58.0],
+    )
+
+    assert merged == segments
+
+
 def test_detector_boundary_splits_only_with_supported_source_jump():
     samples = [_sample(value) for value in np.arange(0.0, 2.0, 0.25)]
     candidates = []
