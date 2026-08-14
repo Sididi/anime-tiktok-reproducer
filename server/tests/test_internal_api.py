@@ -765,3 +765,74 @@ def test_upsert_does_not_cancel_published_post(
         )
         assert r.status_code == 200
     deleted.assert_not_awaited()
+
+
+def test_list_job_statuses_returns_projection_without_payloads(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    import app.api.internal as internal_module
+
+    # Reset the module-level snapshot cache so this test is isolated.
+    internal_module._status_snapshot = {}
+    internal_module._status_snapshot_at = 0.0
+
+    app, _discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    payload = dict(JOB_PAYLOAD)
+    payload["tiktok"] = {"social_account_id": "pfm_1", "caption": "cap"}
+
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
+        assert r.status_code == 200
+        r = client.post(
+            "/api/internal/jobs/p1/platform-status",
+            json={"platform": "tiktok", "status": "uploaded", "url": "https://tiktok.com/@a/video/1"},
+            headers=INTERNAL_AUTH,
+        )
+        assert r.status_code == 200
+
+        # Cache still holds the pre-update snapshot? No: first GET builds it now.
+        r = client.get("/api/internal/jobs", headers=INTERNAL_AUTH)
+        assert r.status_code == 200
+        jobs = r.json()["jobs"]
+        assert "p1" in jobs
+        entry = jobs["p1"]
+        assert entry["platform_statuses"]["tiktok"]["status"] == "uploaded"
+        assert entry["platform_statuses"]["tiktok"]["url"] == "https://tiktok.com/@a/video/1"
+        # Secrets/payloads must never be exposed.
+        assert "tiktok_payload" not in entry
+        assert "instagram_payload" not in entry
+
+        # Unauthenticated is rejected.
+        r = client.get("/api/internal/jobs")
+        assert r.status_code in (401, 403)
+
+
+def test_list_job_statuses_is_throttled(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    import app.api.internal as internal_module
+
+    internal_module._status_snapshot = {}
+    internal_module._status_snapshot_at = 0.0
+
+    app, _discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        assert r.status_code == 200
+        r = client.get("/api/internal/jobs", headers=INTERNAL_AUTH)
+        assert r.status_code == 200
+        assert "p1" in r.json()["jobs"]
+
+        # A job created inside the TTL window is not visible until it expires:
+        # the snapshot is served from cache (max one store read per window).
+        payload2 = dict(JOB_PAYLOAD)
+        payload2["project_id"] = "p2"
+        r = client.post("/api/internal/jobs", json=payload2, headers=INTERNAL_AUTH)
+        assert r.status_code == 200
+        r = client.get("/api/internal/jobs", headers=INTERNAL_AUTH)
+        assert "p2" not in r.json()["jobs"]
+
+        # After the TTL the snapshot refreshes.
+        internal_module._status_snapshot_at = 0.0
+        r = client.get("/api/internal/jobs", headers=INTERNAL_AUTH)
+        assert "p2" in r.json()["jobs"]

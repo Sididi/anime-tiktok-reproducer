@@ -7,3 +7,4 @@ export { RawSceneValidationPage } from "./RawSceneValidationPage";
 export { ScriptRestructurePage } from "./ScriptRestructurePage";
 export { ProcessingPage } from "./ProcessingPage";
 export { GapResolutionPage } from "./GapResolutionPage";
+export { PlanningPage } from "./PlanningPage";

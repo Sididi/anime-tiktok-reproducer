@@ -91,6 +91,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     throw new Error("Request failed");
   }
 
+  // 204 No Content (e.g. scheduling DELETE routes) has no body to parse.
+  if (res.status === 204 || res.headers.get("content-length") === "0") {
+    return undefined as T;
+  }
   return res.json();
 }
 
@@ -1322,6 +1326,24 @@ export const api = {
     return request(`/scheduling/free-slots?${usp.toString()}`);
   },
 
+  async listFreeSlotRange(params: {
+    account_id: string;
+    range_start: string;
+    range_end: string;
+    platforms?: import("@/types").Platform[];
+  }): Promise<{
+    slots: Partial<Record<import("@/types").Platform, import("@/types").FreeSlot[]>>;
+  }> {
+    const usp = new URLSearchParams({
+      account_id: params.account_id,
+      range_start: params.range_start,
+      range_end: params.range_end,
+    });
+    if (params.platforms?.length)
+      usp.set("platforms", params.platforms.join(","));
+    return request(`/scheduling/free-slots-range?${usp.toString()}`);
+  },
+
   async resolveAnchor(payload: {
     project_id: string;
     account_id: string;
@@ -1390,16 +1412,13 @@ export const api = {
     project_id: string,
     platform: import("@/types").Platform,
   ): Promise<void> {
-    await fetch(
-      `${API_BASE}/scheduling/projects/${project_id}/platforms/${platform}`,
-      {
-        method: "DELETE",
-      },
-    );
+    await request(`/scheduling/projects/${project_id}/platforms/${platform}`, {
+      method: "DELETE",
+    });
   },
 
   async cancelAllSlots(project_id: string): Promise<void> {
-    await fetch(`${API_BASE}/scheduling/projects/${project_id}/all`, {
+    await request(`/scheduling/projects/${project_id}/all`, {
       method: "DELETE",
     });
   },

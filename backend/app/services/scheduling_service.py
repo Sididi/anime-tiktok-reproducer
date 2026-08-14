@@ -3,12 +3,40 @@ from __future__ import annotations
 import hashlib
 import random
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from threading import Lock
+from zoneinfo import ZoneInfo
 
 from ..models import PlatformSchedule, Project
 from .account_service import AccountService
 from .project_service import ProjectService
+from .scheduling_errors import (
+    SchedulingConflictError,
+    SchedulingError,
+    SchedulingLockedError,
+    SchedulingNotFoundError,
+)
+
+# Configured slot "HH:MM" strings are Paris wall-clock times; every instant
+# stored or compared is UTC.
+SLOT_TZ = ZoneInfo("Europe/Paris")
+
+
+def platform_upload_result_entry(project: "Project", platform: str) -> dict | None:
+    """The upload_last_result entry for `platform`, or None.
+
+    Handles both historical shapes: a list of {"platform": ..., ...} entries
+    (what the uploader writes today) and a {platform: entry} dict."""
+    result = project.upload_last_result or {}
+    platforms = result.get("platforms") if isinstance(result, dict) else None
+    if isinstance(platforms, dict):
+        entry = platforms.get(platform)
+        return entry if isinstance(entry, dict) else None
+    if isinstance(platforms, list):
+        for entry in platforms:
+            if isinstance(entry, dict) and entry.get("platform") == platform:
+                return entry
+    return None
 
 
 @dataclass
@@ -120,6 +148,18 @@ class SchedulingService:
     @classmethod
     def _earliest_allowed_publish_time(cls) -> datetime:
         return datetime.now(timezone.utc) + timedelta(minutes=cls._MIN_LEAD_MINUTES)
+
+    @classmethod
+    def _slot_instant(cls, day: date, hour: int, minute: int) -> datetime:
+        """UTC instant of a configured slot ("HH:MM" Paris wall time) on a
+        Paris calendar day. DST gaps/overlaps resolve via zoneinfo fold=0."""
+        local = datetime(day.year, day.month, day.day, hour, minute, tzinfo=SLOT_TZ)
+        return local.astimezone(timezone.utc)
+
+    @classmethod
+    def _slot_day(cls, instant: datetime) -> date:
+        """Paris calendar day containing the instant."""
+        return cls._normalize_utc_datetime(instant).astimezone(SLOT_TZ).date()
 
     @classmethod
     def _normalize_utc_datetime(cls, value: datetime) -> datetime:
@@ -295,12 +335,24 @@ class SchedulingService:
         return warnings
 
     @classmethod
+    def _raise_blocked(cls, prefix: str, blockers: list[CascadeBlocker]) -> None:
+        """Raise for a blocked cascade/switch plan. pool_busy is a transient
+        conflict (409); everything else is a plain 422."""
+        summary = ", ".join(f"{b.platform}:{b.reason}" for b in blockers)
+        exc_cls = (
+            SchedulingConflictError
+            if any(b.reason == "pool_busy" for b in blockers)
+            else SchedulingError
+        )
+        raise exc_cls(f"{prefix}: {summary}")
+
+    @classmethod
     def _raise_if_displaced_precedence_broken(
         cls, warnings: list[DisplacedPrecedenceWarning]
     ) -> None:
         if warnings:
             titles = ", ".join(w.anime_title for w in warnings)
-            raise ValueError(f"tiktok_precedence_displaced:{titles}")
+            raise SchedulingConflictError(f"tiktok_precedence_displaced:{titles}")
 
     # ------------------------------------------------------------------- lookup
 
@@ -319,11 +371,11 @@ class SchedulingService:
         """
         account = AccountService.get_account(account_id)
         if not account:
-            raise ValueError(f"Account {account_id} not found")
+            raise SchedulingNotFoundError(f"Account {account_id} not found")
 
         slot_strings = account.slots_for(platform)
         if not slot_strings:
-            raise ValueError(
+            raise SchedulingError(
                 f"Account {account_id} has no slots configured for platform {platform}"
             )
 
@@ -344,16 +396,12 @@ class SchedulingService:
             not_before = cls._normalize_utc_datetime(not_before)
             earliest_allowed = max(earliest_allowed, not_before)
 
-        current_date = now_utc.date()
+        current_date = cls._slot_day(now_utc)
         end_date = current_date + timedelta(days=cls._MAX_LOOKAHEAD_DAYS)
 
         while current_date <= end_date:
             for hour, minute in slot_times:
-                slot_dt = datetime(
-                    current_date.year, current_date.month, current_date.day,
-                    hour, minute, 0,
-                    tzinfo=timezone.utc,
-                )
+                slot_dt = cls._slot_instant(current_date, hour, minute)
                 if slot_dt < earliest_allowed:
                     continue
                 if slot_dt.isoformat() in reserved_slots:
@@ -385,7 +433,7 @@ class SchedulingService:
 
         account = AccountService.get_account(account_id)
         if not account:
-            raise ValueError(f"Account {account_id} not found")
+            raise SchedulingNotFoundError(f"Account {account_id} not found")
 
         slot_strings = account.slots_for(platform)
         if not slot_strings:
@@ -403,14 +451,10 @@ class SchedulingService:
         after_utc = cls._normalize_utc_datetime(after)
         results: list[FreeSlot] = []
 
-        current_date = after_utc.date()
+        current_date = cls._slot_day(after_utc)
         for _ in range(cls._MAX_LOOKAHEAD_DAYS + 1):
             for hour, minute in slot_times:
-                slot_dt = datetime(
-                    current_date.year, current_date.month, current_date.day,
-                    hour, minute, 0,
-                    tzinfo=timezone.utc,
-                )
+                slot_dt = cls._slot_instant(current_date, hour, minute)
                 if slot_dt <= after_utc:
                     continue
                 slot_iso = slot_dt.isoformat()
@@ -428,6 +472,50 @@ class SchedulingService:
             current_date += timedelta(days=1)
         return results
 
+    @classmethod
+    def find_slots_in_range(
+        cls,
+        account_id: str,
+        platform: str,
+        range_start: datetime,
+        range_end: datetime,
+    ) -> list[FreeSlot]:
+        """All configured slots with `range_start <= slot < range_end` for
+        (account, platform), flagged free/taken against the shared pool."""
+        account = AccountService.get_account(account_id)
+        if not account:
+            raise SchedulingNotFoundError(f"Account {account_id} not found")
+
+        slot_times = cls._slot_times_sorted(account_id, platform)
+        if not slot_times:
+            return []
+
+        pool_key = cls._resolve_pool_key(account_id, platform)
+        reservations = cls._collect_pool_reservations(pool_key, platform)
+
+        start_utc = cls._normalize_utc_datetime(range_start)
+        end_utc = cls._normalize_utc_datetime(range_end)
+        results: list[FreeSlot] = []
+
+        current_date = cls._slot_day(start_utc)
+        last_date = cls._slot_day(end_utc)
+        while current_date <= last_date:
+            for hour, minute in slot_times:
+                slot_dt = cls._slot_instant(current_date, hour, minute)
+                if slot_dt < start_utc or slot_dt >= end_utc:
+                    continue
+                taker = reservations.get(slot_dt.isoformat())
+                results.append(
+                    FreeSlot(
+                        slot=slot_dt,
+                        available=taker is None,
+                        taken_by_project_id=taker.id if taker else None,
+                        taken_by_title=(taker.anime_name or taker.id) if taker else None,
+                    )
+                )
+            current_date += timedelta(days=1)
+        return results
+
     # ---------------------------------------------------------------- anchoring
 
     _OTHER_PLATFORMS_FOR_ANCHOR: tuple[str, ...] = ("youtube", "facebook", "instagram")
@@ -440,7 +528,8 @@ class SchedulingService:
         if not account:
             return False
         slot_strings = account.slots_for(platform)
-        wanted = (slot.hour, slot.minute)
+        local = cls._normalize_utc_datetime(slot).astimezone(SLOT_TZ)
+        wanted = (local.hour, local.minute)
         for slot_str in slot_strings:
             parts = slot_str.strip().split(":")
             hour = int(parts[0])
@@ -586,7 +675,7 @@ class SchedulingService:
             and existing.manual
             and project.scheduled_account_id == account_id
         ):
-            raise ValueError(f"manual_schedule_expired:{platform}")
+            raise SchedulingError(f"manual_schedule_expired:{platform}")
 
         slot_dt, scheduled_at = cls.find_next_slot_for_platform(
             account_id, platform, project_id=project.id, not_before=not_before
@@ -617,7 +706,7 @@ class SchedulingService:
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
             if project is None:
-                raise ValueError("Project not found")
+                raise SchedulingNotFoundError("Project not found")
 
             not_before = (
                 cls._tiktok_anchor_for(project, account_id)
@@ -653,7 +742,7 @@ class SchedulingService:
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
             if project is None:
-                raise ValueError("Project not found")
+                raise SchedulingNotFoundError("Project not found")
 
             # If the stored reservation belongs to a different account, drop it
             # before reserving under the new account.
@@ -703,7 +792,7 @@ class SchedulingService:
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
             if project is None:
-                raise ValueError("Project not found")
+                raise SchedulingNotFoundError("Project not found")
 
             # Reuse path: same account, same anchor TT slot already stored.
             existing_tt = (project.platform_schedules or {}).get("tiktok")
@@ -726,14 +815,13 @@ class SchedulingService:
             for platform, spec in (steals or {}).items():
                 steal_slot = anchor if platform == "tiktok" else (overrides or {}).get(platform)
                 if steal_slot is None:
-                    raise ValueError(f"steal for {platform} requires an override slot")
+                    raise SchedulingError(f"steal for {platform} requires an override slot")
                 result = cls.compute_switch(project_id, account_id, platform, steal_slot)
                 if (result.occupant_project_id or None) != (spec.expected_occupant_id or None):
-                    raise ValueError("slot_state_changed")
+                    raise SchedulingConflictError("slot_state_changed")
                 plan = result.cascade if spec.mode == "cascade" else result.next_free
                 if plan.blockers:
-                    summary = ", ".join(f"{b.platform}:{b.reason}" for b in plan.blockers)
-                    raise ValueError(f"Switch blocked: {summary}")
+                    cls._raise_blocked("Switch blocked", plan.blockers)
                 if not allow_before_tiktok:
                     cls._raise_if_displaced_precedence_broken(plan.precedence_warnings)
                 steal_plans.append((platform, plan))
@@ -768,10 +856,18 @@ class SchedulingService:
                     account_id, anchor, overrides, project_id=project_id
                 )
                 if resolution.conflicts:
+                    # Wire codes matched by the frontend: keep them stable.
+                    if any(
+                        c.platform == "tiktok" and c.reason == "slot_taken"
+                        for c in resolution.conflicts
+                    ):
+                        raise SchedulingConflictError("tiktok_slot_taken")
+                    if any(c.reason == "slot_not_configured" for c in resolution.conflicts):
+                        raise SchedulingError("invalid_slot")
                     conflict_summary = ", ".join(
                         f"{c.platform}:{c.reason}" for c in resolution.conflicts
                     )
-                    raise ValueError(f"Anchor conflicts: {conflict_summary}")
+                    raise SchedulingError(f"Anchor conflicts: {conflict_summary}")
                 cls._validate_duplication_restrictions(
                     project,
                     account_id,
@@ -821,12 +917,12 @@ class SchedulingService:
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
             if project is None:
-                raise ValueError("Project not found")
+                raise SchedulingNotFoundError("Project not found")
             if cls.tiktok_timing_locked(project):
-                raise ValueError("timing_locked")
+                raise SchedulingLockedError("timing_locked")
             at_utc = cls._normalize_utc_datetime(at)
             if at_utc < cls._earliest_allowed_publish_time():
-                raise ValueError("slot_too_close")
+                raise SchedulingError("slot_too_close")
             cls._validate_duplication_restrictions(project, account_id, [at_utc])
             if project.scheduled_account_id and project.scheduled_account_id != account_id:
                 project.platform_schedules = {}
@@ -854,12 +950,12 @@ class SchedulingService:
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
             if project is None:
-                raise ValueError("Project not found")
+                raise SchedulingNotFoundError("Project not found")
             account_id = project.scheduled_account_id
             if not account_id:
-                raise ValueError("Project has no scheduled account")
+                raise SchedulingError("Project has no scheduled account")
             if cls.tiktok_timing_locked(project):
-                raise ValueError("timing_locked")
+                raise SchedulingLockedError("timing_locked")
             # Drop existing per-platform reservations so resolve_anchor sees
             # the slots as free in this pool.
             project.platform_schedules = {}
@@ -886,19 +982,19 @@ class SchedulingService:
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
             if project is None:
-                raise ValueError("Project not found")
+                raise SchedulingNotFoundError("Project not found")
             account_id = project.scheduled_account_id
             if not account_id:
-                raise ValueError("Project has no scheduled account")
+                raise SchedulingError("Project has no scheduled account")
             if cls.tiktok_timing_locked(project):
-                raise ValueError("timing_locked")
+                raise SchedulingLockedError("timing_locked")
             slot = cls._normalize_utc_datetime(new_slot)
             if not cls._is_slot_in_account_config(account_id, platform, slot):
-                raise ValueError(f"Slot {slot.isoformat()} not configured for {platform}")
+                raise SchedulingError(f"Slot {slot.isoformat()} not configured for {platform}")
             if not allow_before_tiktok and cls._breaks_tiktok_precedence(
                 project, platform, slot
             ):
-                raise ValueError("tiktok_precedence")
+                raise SchedulingConflictError("tiktok_precedence")
 
             # Free old slot before checking pool: must NOT see ourselves as taking it.
             schedules = dict(project.platform_schedules or {})
@@ -910,11 +1006,11 @@ class SchedulingService:
                 pool_key = cls._resolve_pool_key(account_id, platform)
                 taken = cls._collect_reserved_slots_for_pool(pool_key, platform)
                 if slot.isoformat() in taken:
-                    raise ValueError(f"Slot {slot.isoformat()} already taken in {platform} pool")
+                    raise SchedulingError(f"Slot {slot.isoformat()} already taken in {platform} pool")
 
                 now_utc = datetime.now(timezone.utc)
                 if slot < now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES):
-                    raise ValueError("slot_too_close")
+                    raise SchedulingError("slot_too_close")
 
                 new_sched = PlatformSchedule(
                     slot=slot,
@@ -1000,21 +1096,16 @@ class SchedulingService:
         if not slot_times:
             return None
         cap = datetime.now(timezone.utc) + timedelta(days=cls._MAX_LOOKAHEAD_DAYS)
-        current_date = after_slot.date()
-        seen_after = False
+        current_date = cls._slot_day(after_slot)
         for _ in range(cls._MAX_LOOKAHEAD_DAYS + 1):
             for hour, minute in slot_times:
-                candidate = datetime(
-                    current_date.year, current_date.month, current_date.day,
-                    hour, minute, 0, tzinfo=timezone.utc,
-                )
+                candidate = cls._slot_instant(current_date, hour, minute)
                 if candidate <= after_slot:
                     continue
                 if candidate > cap:
                     return None
                 return candidate
             current_date += timedelta(days=1)
-            del seen_after
         return None
 
     @classmethod
@@ -1025,13 +1116,10 @@ class SchedulingService:
         if not slot_times:
             return None
         cap = lower_bound + timedelta(days=cls._MAX_LOOKAHEAD_DAYS)
-        current_date = lower_bound.date()
+        current_date = cls._slot_day(lower_bound)
         for _ in range(cls._MAX_LOOKAHEAD_DAYS + 1):
             for hour, minute in slot_times:
-                candidate = datetime(
-                    current_date.year, current_date.month, current_date.day,
-                    hour, minute, 0, tzinfo=timezone.utc,
-                )
+                candidate = cls._slot_instant(current_date, hour, minute)
                 if candidate < lower_bound:
                     continue
                 if candidate > cap:
@@ -1044,14 +1132,8 @@ class SchedulingService:
     def _project_requires_platform_notification(
         cls, project: Project, platform: str
     ) -> bool:
-        result = project.upload_last_result or {}
-        platforms = result.get("platforms") if isinstance(result, dict) else None
-        if not isinstance(platforms, dict):
-            return False
-        entry = platforms.get(platform)
-        if not isinstance(entry, dict):
-            return False
-        return bool(entry.get("url"))
+        entry = platform_upload_result_entry(project, platform)
+        return bool(entry and entry.get("url"))
 
     @classmethod
     def _pool_is_busy_uploading(cls, account_id: str, platform: str) -> tuple[bool, str | None]:
@@ -1294,11 +1376,10 @@ class SchedulingService:
         with cls._reservation_lock:
             result = cls.compute_switch(project_id, account_id, platform, slot)
             if (result.occupant_project_id or None) != (expected_occupant_id or None):
-                raise ValueError("slot_state_changed")
+                raise SchedulingConflictError("slot_state_changed")
             plan = result.cascade if mode == "cascade" else result.next_free
             if plan.blockers:
-                summary = ", ".join(f"{b.platform}:{b.reason}" for b in plan.blockers)
-                raise ValueError(f"Switch blocked: {summary}")
+                cls._raise_blocked("Switch blocked", plan.blockers)
             if not allow_before_tiktok:
                 cls._raise_if_displaced_precedence_broken(plan.precedence_warnings)
 
@@ -1306,16 +1387,16 @@ class SchedulingService:
             # rejection leaves zero side effects.
             switcher = ProjectService.load(project_id)
             if switcher is None:
-                raise ValueError("Project not found")
+                raise SchedulingNotFoundError("Project not found")
             if cls.tiktok_timing_locked(switcher):
-                raise ValueError("timing_locked")
+                raise SchedulingLockedError("timing_locked")
             slot_utc = cls._normalize_utc_datetime(slot)
             if (
                 not allow_before_tiktok
                 and switcher.scheduled_account_id == account_id
                 and cls._breaks_tiktok_precedence(switcher, platform, slot_utc)
             ):
-                raise ValueError("tiktok_precedence")
+                raise SchedulingConflictError("tiktok_precedence")
 
             now_utc = datetime.now(timezone.utc)
             cls._apply_displacements(platform, plan.displaced, now_utc)
@@ -1340,8 +1421,7 @@ class SchedulingService:
         with cls._reservation_lock:
             result = cls.compute_cascade(project_id, account_id)
             if result.blockers:
-                summary = ", ".join(f"{b.platform}:{b.reason}" for b in result.blockers)
-                raise ValueError(f"Cascade blocked: {summary}")
+                cls._raise_blocked("Cascade blocked", result.blockers)
             if not allow_before_tiktok:
                 cls._raise_if_displaced_precedence_broken(
                     [w for plat in result.per_platform for w in plat.precedence_warnings]
@@ -1349,7 +1429,7 @@ class SchedulingService:
 
             urgent = ProjectService.load(project_id)
             if urgent is None:
-                raise ValueError("Urgent project not found")
+                raise SchedulingNotFoundError("Urgent project not found")
 
             now_utc = datetime.now(timezone.utc)
 

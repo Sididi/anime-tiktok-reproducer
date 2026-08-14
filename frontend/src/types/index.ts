@@ -220,7 +220,8 @@ export interface ProjectManagerRow {
   language: string | null;
   local_size_bytes: number;
   uploaded: boolean;
-  uploaded_status: "green" | "orange" | "red";
+  uploaded_status: "green" | "orange" | "red" | "publish_error";
+  publish_error_detail?: string | null;
   can_upload_status: "green" | "orange" | "red";
   can_upload_reasons: string[];
   has_metadata: boolean;
@@ -501,7 +502,9 @@ export interface PlanningEvent {
   slot: string;            // ISO; clean time (no jitter), shown to user
   scheduled_at: string;    // ISO with jitter; hidden from UI
   drive_folder_url: string | null;
-  status: "scheduled" | "running" | "complete";
+  /** "dispatched" = handed to the VPS scheduler (IG/TT), awaiting publish. */
+  status: "scheduled" | "dispatched" | "running" | "complete" | "failed";
+  posted_url?: string | null;
   manual: boolean;
   timing_locked: boolean;
 }

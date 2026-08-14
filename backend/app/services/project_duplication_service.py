@@ -291,7 +291,9 @@ class UploadRestrictionService:
         if account_id:
             blocked_accounts = cls.blocked_account_ids(project, members)
             if account_id in blocked_accounts:
-                raise ValueError(
+                from .scheduling_errors import SchedulingError  # noqa: PLC0415
+
+                raise SchedulingError(
                     f"Account '{account_id}' already uploaded linked duplicated "
                     f"project '{blocked_accounts[account_id]}' — an account can "
                     "never upload two projects from the same duplication family"
@@ -302,7 +304,9 @@ class UploadRestrictionService:
             candidate_utc = cls._as_utc(candidate)
             for start, end, member_id in windows:
                 if start <= candidate_utc <= end:
-                    raise ValueError(
+                    from .scheduling_errors import SchedulingError  # noqa: PLC0415
+
+                    raise SchedulingError(
                         f"Publish time {candidate_utc.isoformat()} is within "
                         f"{cls.MIN_SPACING_DAYS} days of linked duplicated project "
                         f"'{member_id}' ({project.output_language}) — same-language "

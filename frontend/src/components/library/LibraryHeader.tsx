@@ -1,3 +1,4 @@
+import { useNavigate } from "react-router-dom";
 import { CalendarDays, FolderKanban, Eraser } from "lucide-react";
 import type { LibraryType } from "@/types";
 import { LIBRARY_TYPE_OPTIONS } from "@/utils/libraryTypes";
@@ -6,7 +7,6 @@ interface LibraryHeaderProps {
   selectedType: LibraryType;
   onTypeChange: (type: LibraryType) => void;
   onOpenProjectManager: () => void;
-  onOpenPlanning: () => void;
   onOpenPurge: () => void;
 }
 
@@ -14,9 +14,9 @@ export function LibraryHeader({
   selectedType,
   onTypeChange,
   onOpenProjectManager,
-  onOpenPlanning,
   onOpenPurge,
 }: LibraryHeaderProps) {
+  const navigate = useNavigate();
   return (
     <div className="flex items-center gap-3 rounded-lg bg-[hsl(var(--card))] px-4 py-3">
       <span className="font-bold text-lg text-[hsl(var(--primary))]">
@@ -48,7 +48,7 @@ export function LibraryHeader({
       </button>
 
       <button
-        onClick={onOpenPlanning}
+        onClick={() => navigate("/planning")}
         className="flex items-center gap-1.5 bg-[hsl(var(--secondary))] rounded px-3 py-1.5 text-sm hover:bg-[hsl(var(--secondary))]/80 transition-colors"
       >
         <CalendarDays className="h-4 w-4" />

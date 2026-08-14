@@ -755,8 +755,8 @@ export function ProjectManagerModal({
   }, [rows, selectedAccount]);
 
   const sortedRows = useMemo(() => {
-    const statusWeight = (value: "green" | "orange" | "red") =>
-      value === "green" ? 2 : value === "orange" ? 1 : 0;
+    const statusWeight = (value: "green" | "orange" | "red" | "publish_error") =>
+      value === "green" ? 2 : value === "orange" ? 1 : value === "publish_error" ? -1 : 0;
     const direction = sortDirection === "asc" ? 1 : -1;
     return [...filteredRows].sort((a, b) => {
       let aVal: string | number = "";

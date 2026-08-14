@@ -9,6 +9,7 @@ import {
   ScriptRestructurePage,
   ProcessingPage,
   GapResolutionPage,
+  PlanningPage,
 } from "@/pages";
 import { DownloadProgressCard } from "@/components/DownloadProgressCard";
 
@@ -18,6 +19,7 @@ function App() {
       <DownloadProgressCard />
       <Routes>
         <Route path="/" element={<ProjectSetup />} />
+        <Route path="/planning" element={<PlanningPage />} />
         <Route
           path="/project/:projectId/cleanup"
           element={<CleanupPage />}

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -38,7 +38,9 @@ class PlanningEvent(BaseModel):
     slot: datetime
     scheduled_at: datetime
     drive_folder_url: str | None
-    status: Literal["scheduled", "running", "complete"]
+    # "dispatched" = handed to the VPS scheduler (IG/TT), not yet confirmed.
+    status: Literal["scheduled", "dispatched", "running", "complete", "failed"]
+    posted_url: str | None = None
     manual: bool = False
     timing_locked: bool = False
 
@@ -50,15 +52,107 @@ class FreeSlotResponse(BaseModel):
     taken_by_title: str | None = None
 
 
-def _project_event_status(project: Project, platform: str) -> str:
+def _platform_posted_url_exists(project: Project, platform: str) -> bool:
+    from ...services.scheduling_service import platform_upload_result_entry  # noqa: PLC0415
+
+    entry = platform_upload_result_entry(project, platform)
+    return bool(entry and entry.get("url"))
+
+
+def _local_job_running(project: Project) -> bool:
     from ...services.project_upload_service import project_upload_queue  # noqa: PLC0415
-    for job in project_upload_queue.list_jobs():
-        if job.project_id == project.id:
-            if job.status == "running":
-                return "running"
-            if job.status == "complete":
-                return "complete"
-    return "scheduled"
+
+    return any(
+        j.project_id == project.id and j.status == "running"
+        for j in project_upload_queue.list_jobs()
+    )
+
+
+def _vps_event_status(project: Project, platform: str) -> tuple[str, str | None]:
+    """Status for VPS-published platforms (instagram/tiktok).
+
+    The VPS owns publication; locally we know: the live/synced VPS status,
+    persisted terminal outcomes, and whether the job was dispatched at all.
+    With no contrary information a past slot is presumed published (the VPS
+    pings Discord and its failures get synced back on the next planning
+    open)."""
+    from ...services.scheduling_service import platform_upload_result_entry  # noqa: PLC0415
+    from ...services.vps_status_sync_service import VpsStatusSyncService  # noqa: PLC0415
+
+    source = VpsStatusSyncService.cached_status(
+        project.id, platform
+    ) or platform_upload_result_entry(project, platform)
+    if source:
+        status = source.get("status")
+        url = source.get("url")
+        if status == "uploaded":
+            return "complete", url
+        if status == "failed":
+            return "failed", None
+        if status == "uploading":
+            return "running", None
+        if status == "pending":
+            return "dispatched", None
+        # "skipped": locally skipped during prep — nothing will publish.
+        return "scheduled", None
+
+    if _local_job_running(project):
+        return "running", None
+
+    if project.final_upload_discord_message_id:
+        # Dispatched to the VPS, no news: presumed on track / published.
+        sched = (project.platform_schedules or {}).get(platform)
+        if sched is not None:
+            sched_at = sched.scheduled_at
+            if sched_at.tzinfo is None:
+                sched_at = sched_at.replace(tzinfo=timezone.utc)
+            if sched_at <= datetime.now(timezone.utc):
+                return "complete", None
+        return "dispatched", None
+
+    return "scheduled", None
+
+
+def _project_event_status(project: Project, platform: str) -> tuple[str, str | None]:
+    """Per-platform (status, posted_url).
+
+    YT/FB publish locally: derive from the latest upload job's incremental
+    platform_results, falling back to the persisted upload_last_result.
+    IG/TT publish on the VPS: see _vps_event_status."""
+    from ...services.project_upload_service import project_upload_queue  # noqa: PLC0415
+    from ...services.scheduling_service import platform_upload_result_entry  # noqa: PLC0415
+
+    if platform in ("instagram", "tiktok"):
+        return _vps_event_status(project, platform)
+
+    jobs = [j for j in project_upload_queue.list_jobs() if j.project_id == project.id]
+    persisted = platform_upload_result_entry(project, platform)
+    persisted_url = persisted.get("url") if persisted else None
+    if not jobs:
+        return ("complete", persisted_url) if persisted_url else ("scheduled", None)
+    job = max(jobs, key=lambda j: j.updated_at)
+    entry = next(
+        (r for r in (job.platform_results or []) if str(r.get("platform")) == platform),
+        None,
+    )
+    if entry is not None:
+        result_status = entry.get("status")
+        if result_status == "uploaded":
+            return "complete", entry.get("url")
+        if result_status == "failed":
+            return "failed", None
+        if result_status == "skipped":
+            return "scheduled", None
+    if job.status == "running":
+        return "running", None
+    if persisted_url:
+        return "complete", persisted_url
+    if job.status == "error":
+        return "failed", None
+    if job.status == "complete":
+        # Legacy jobs without platform_results.
+        return "complete", None
+    return "scheduled", None
 
 
 def _build_planning_event(
@@ -70,6 +164,7 @@ def _build_planning_event(
     account = accounts.get(project.scheduled_account_id)
     if account is None:
         return None
+    status, posted_url = _project_event_status(project, platform)
     return PlanningEvent(
         project_id=project.id,
         anime_title=project.anime_name or project.id,
@@ -80,7 +175,8 @@ def _build_planning_event(
         slot=sched.slot,
         scheduled_at=sched.scheduled_at,
         drive_folder_url=project.drive_folder_url,
-        status=_project_event_status(project, platform),  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
+        posted_url=posted_url,
         manual=sched.manual,
         timing_locked=SchedulingService.tiktok_timing_locked(project),
     )
@@ -111,6 +207,13 @@ async def list_events(
     range_start: datetime | None = None,
     range_end: datetime | None = None,
 ):
+    from ...services.vps_status_sync_service import VpsStatusSyncService  # noqa: PLC0415
+
+    # Fire-and-forget: pull IG/TT publish outcomes from the VPS job store
+    # (throttled internally; results land in cache + project.json for the
+    # next refetch).
+    VpsStatusSyncService.request_sync()
+
     accounts = AccountService.all_accounts()
     wanted_platforms = (
         [p.strip() for p in platforms.split(",") if p.strip()]
@@ -141,13 +244,10 @@ async def free_slots(
     after: datetime,
     limit: int = Query(default=20, ge=1, le=200),
 ):
-    try:
-        slots = await asyncio.to_thread(
-            SchedulingService.find_free_slots_after,
-            account_id, platform, after, limit,
-        )
-    except ValueError as exc:
-        raise HTTPException(404, str(exc))
+    slots = await asyncio.to_thread(
+        SchedulingService.find_free_slots_after,
+        account_id, platform, after, limit,
+    )
     return {
         "slots": [
             FreeSlotResponse(
@@ -159,6 +259,49 @@ async def free_slots(
             for s in slots
         ]
     }
+
+
+_FREE_SLOTS_RANGE_MAX_DAYS = 62
+
+
+@router.get("/free-slots-range")
+async def free_slots_range(
+    account_id: str,
+    range_start: datetime,
+    range_end: datetime,
+    platforms: str | None = None,  # CSV; defaults to all four
+):
+    """Configured slots (free or taken) per platform inside a date range.
+
+    Powers the planning board's ghost slots. Platforms without configured
+    slots return an empty list."""
+    if range_end <= range_start:
+        raise HTTPException(422, "invalid_range")
+    if range_end - range_start > timedelta(days=_FREE_SLOTS_RANGE_MAX_DAYS):
+        raise HTTPException(422, "range_too_large")
+    wanted_platforms = (
+        [p.strip() for p in platforms.split(",") if p.strip()]
+        if platforms else ["youtube", "facebook", "instagram", "tiktok"]
+    )
+
+    def _collect() -> dict[str, list[dict]]:
+        out: dict[str, list[dict]] = {}
+        for platform in wanted_platforms:
+            slots = SchedulingService.find_slots_in_range(
+                account_id, platform, range_start, range_end
+            )
+            out[platform] = [
+                FreeSlotResponse(
+                    slot=s.slot,
+                    available=s.available,
+                    taken_by_project_id=s.taken_by_project_id,
+                    taken_by_title=s.taken_by_title,
+                ).model_dump(mode="json")
+                for s in slots
+            ]
+        return out
+
+    return {"slots": await asyncio.to_thread(_collect)}
 
 
 class ResolveAnchorRequest(BaseModel):
@@ -274,25 +417,11 @@ async def _notify_switch_displacements(switches, steals) -> dict[str, dict[str, 
 @router.post("/projects/{project_id}/reserve-anchor")
 async def reserve_anchor(project_id: str, req: ReserveAnchorRequest):
     steals = _steals_to_specs(req.steals)
-    try:
-        schedules, switches = await asyncio.to_thread(
-            SchedulingService.reserve_anchor,
-            project_id, req.account_id, req.tiktok_slot, req.overrides, steals,
-            req.confirm_before_tiktok,
-        )
-    except ValueError as exc:
-        msg = str(exc)
-        if msg.startswith("tiktok_precedence"):
-            raise HTTPException(409, msg)
-        if "slot_state_changed" in msg or "pool_busy" in msg:
-            raise HTTPException(409, msg)
-        if "tiktok" in msg and "slot_taken" in msg:
-            raise HTTPException(409, "tiktok_slot_taken")
-        if "slot_not_configured" in msg:
-            raise HTTPException(422, "invalid_slot")
-        if "Project not found" in msg:
-            raise HTTPException(404, msg)
-        raise HTTPException(422, msg)
+    schedules, switches = await asyncio.to_thread(
+        SchedulingService.reserve_anchor,
+        project_id, req.account_id, req.tiktok_slot, req.overrides, steals,
+        req.confirm_before_tiktok,
+    )
 
     notification_status = await _notify_switch_displacements(switches, req.steals or {})
     return {
@@ -316,20 +445,10 @@ async def reserve_manual(project_id: str, req: ReserveManualRequest):
         if account is None:
             raise HTTPException(404, "Account not found")
         platforms = _platforms_to_reserve(account, requested_platforms=None)
-    try:
-        schedules = await asyncio.to_thread(
-            SchedulingService.reserve_manual,
-            project_id, req.account_id, req.at, platforms,
-        )
-    except ValueError as exc:
-        msg = str(exc)
-        if "timing_locked" in msg:
-            raise HTTPException(423, "timing_locked")
-        if "slot_too_close" in msg:
-            raise HTTPException(422, "slot_too_close")
-        if "Project not found" in msg:
-            raise HTTPException(404, msg)
-        raise HTTPException(422, msg)
+    schedules = await asyncio.to_thread(
+        SchedulingService.reserve_manual,
+        project_id, req.account_id, req.at, platforms,
+    )
 
     # Editing an already-uploaded manual schedule must reach the platforms
     # (YT publishAt, FB scheduled_publish_time, VPS reminder). For not-yet
@@ -347,17 +466,10 @@ async def reserve_manual(project_id: str, req: ReserveManualRequest):
 
 @router.patch("/projects/{project_id}/platforms/{platform}")
 async def patch_platform(project_id: str, platform: str, req: PatchPlatformRequest):
-    try:
-        sched = await asyncio.to_thread(
-            SchedulingService.reschedule_platform,
-            project_id, platform, req.new_slot, req.confirm_before_tiktok,
-        )
-    except ValueError as exc:
-        if str(exc) == "timing_locked":
-            raise HTTPException(423, "timing_locked")
-        if str(exc) == "tiktok_precedence":
-            raise HTTPException(409, "tiktok_precedence")
-        raise HTTPException(422, str(exc))
+    sched = await asyncio.to_thread(
+        SchedulingService.reschedule_platform,
+        project_id, platform, req.new_slot, req.confirm_before_tiktok,
+    )
     notif_status = await asyncio.to_thread(
         _notify_displaced, project_id, platform, sched.scheduled_at
     )
@@ -371,21 +483,11 @@ async def patch_platform(project_id: str, platform: str, req: PatchPlatformReque
 @router.patch("/projects/{project_id}/anchor")
 async def patch_anchor(project_id: str, req: PatchAnchorRequest):
     steals = _steals_to_specs(req.steals)
-    try:
-        schedules, switches = await asyncio.to_thread(
-            SchedulingService.reschedule_anchor,
-            project_id, req.tiktok_slot, req.overrides, steals,
-            req.confirm_before_tiktok,
-        )
-    except ValueError as exc:
-        msg = str(exc)
-        if msg == "timing_locked":
-            raise HTTPException(423, "timing_locked")
-        if msg.startswith("tiktok_precedence"):
-            raise HTTPException(409, msg)
-        if "slot_state_changed" in msg or "pool_busy" in msg:
-            raise HTTPException(409, msg)
-        raise HTTPException(422, msg)
+    schedules, switches = await asyncio.to_thread(
+        SchedulingService.reschedule_anchor,
+        project_id, req.tiktok_slot, req.overrides, steals,
+        req.confirm_before_tiktok,
+    )
 
     # Notify the rescheduled project's own platforms (its slots moved).
     statuses: dict[str, str] = {}
@@ -477,20 +579,10 @@ async def cascade_preview(project_id: str, req: CascadeRequest):
 
 @router.post("/projects/{project_id}/cascade-apply")
 async def cascade_apply(project_id: str, req: CascadeRequest):
-    try:
-        result = await asyncio.to_thread(
-            SchedulingService.apply_cascade,
-            project_id, req.account_id, req.confirm_before_tiktok,
-        )
-    except ValueError as exc:
-        msg = str(exc)
-        if msg.startswith("tiktok_precedence"):
-            raise HTTPException(409, msg)
-        if "pool_busy" in msg:
-            raise HTTPException(409, msg)
-        if "facebook_horizon_exceeded" in msg or "pool_full" in msg:
-            raise HTTPException(422, msg)
-        raise HTTPException(422, msg)
+    result = await asyncio.to_thread(
+        SchedulingService.apply_cascade,
+        project_id, req.account_id, req.confirm_before_tiktok,
+    )
 
     notification_status: dict[str, dict[str, str]] = {}
     for plat in result.per_platform:
@@ -564,21 +656,11 @@ async def switch_preview(project_id: str, req: SwitchPreviewRequest):
 
 @router.post("/projects/{project_id}/switch-apply")
 async def switch_apply(project_id: str, req: SwitchApplyRequest):
-    try:
-        result = await asyncio.to_thread(
-            SchedulingService.apply_switch,
-            project_id, req.account_id, req.platform, req.slot,
-            req.mode, req.expected_occupant_id, req.confirm_before_tiktok,
-        )
-    except ValueError as exc:
-        msg = str(exc)
-        if msg == "timing_locked":
-            raise HTTPException(423, "timing_locked")
-        if msg.startswith("tiktok_precedence"):
-            raise HTTPException(409, msg)
-        if "slot_state_changed" in msg or "pool_busy" in msg:
-            raise HTTPException(409, msg)
-        raise HTTPException(422, msg)
+    result = await asyncio.to_thread(
+        SchedulingService.apply_switch,
+        project_id, req.account_id, req.platform, req.slot,
+        req.mode, req.expected_occupant_id, req.confirm_before_tiktok,
+    )
 
     plan = result.cascade if req.mode == "cascade" else result.next_free
     notification_status: dict[str, str] = {}

@@ -63,8 +63,30 @@ class UploadReadiness:
     local_video_name: str | None = None
 
 
+def _vps_publish_errors(project: "Project") -> list[str]:
+    """VPS-synced terminal publish failures (IG/TT), as display strings."""
+    result = project.upload_last_result
+    platforms = result.get("platforms") if isinstance(result, dict) else None
+    if not isinstance(platforms, list):
+        return []
+    errors: list[str] = []
+    for entry in platforms:
+        if (
+            isinstance(entry, dict)
+            and entry.get("source") == "vps"
+            and entry.get("status") == "failed"
+        ):
+            detail = entry.get("detail") or "publication échouée"
+            errors.append(f"{entry.get('platform')}: {detail}")
+    return errors
+
+
 def _uploaded_fields(project: "Project") -> dict[str, Any]:
-    """Return uploaded + uploaded_status based on scheduled_at vs now."""
+    """Return uploaded + uploaded_status based on scheduled_at vs now.
+
+    A VPS-reported publish failure (IG/TT gave up after all retries)
+    overrides the clock-based status with "publish_error"."""
+    publish_errors = _vps_publish_errors(project)
     has_discord = bool(project.final_upload_discord_message_id)
     scheduled_at = project.scheduled_at
     if scheduled_at is not None:
@@ -76,11 +98,21 @@ def _uploaded_fields(project: "Project") -> dict[str, Any]:
             status = "orange"  # scheduled, not yet published
         else:
             status = "red"
-        return {"uploaded": is_live, "uploaded_status": status}
+        if publish_errors:
+            status = "publish_error"
+        return {
+            "uploaded": is_live,
+            "uploaded_status": status,
+            "publish_error_detail": "; ".join(publish_errors) or None,
+        }
     # No scheduling: rely on discord message presence (immediate publish)
+    status = "green" if has_discord else "red"
+    if publish_errors:
+        status = "publish_error"
     return {
         "uploaded": has_discord,
-        "uploaded_status": "green" if has_discord else "red",
+        "uploaded_status": status,
+        "publish_error_detail": "; ".join(publish_errors) or None,
     }
 
 

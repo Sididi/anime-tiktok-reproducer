@@ -19,7 +19,17 @@ from app.services.account_service import AccountService
 from app.services.project_service import ProjectService
 from app.services.scheduling_service import SchedulingService
 
-_NOW = datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc)
+from zoneinfo import ZoneInfo
+
+PARIS = ZoneInfo("Europe/Paris")
+
+
+def paris(y, m, d, h, mi=0):
+    """UTC instant of a Paris wall-clock time (slot semantics)."""
+    return datetime(y, m, d, h, mi, tzinfo=PARIS).astimezone(timezone.utc)
+
+
+_NOW = paris(2026, 7, 21, 12, 0)
 
 
 class _FixedDateTime(datetime):
@@ -69,9 +79,9 @@ def _make_project(pid: str, **kwargs) -> Project:
     return project
 
 
-TT_SLOT = datetime(2026, 7, 21, 20, 0, tzinfo=timezone.utc)
-YT_SLOT_TODAY = datetime(2026, 7, 21, 14, 0, tzinfo=timezone.utc)
-YT_SLOT_TOMORROW = datetime(2026, 7, 22, 14, 0, tzinfo=timezone.utc)
+TT_SLOT = paris(2026, 7, 21, 20, 0)
+YT_SLOT_TODAY = paris(2026, 7, 21, 14, 0)
+YT_SLOT_TOMORROW = paris(2026, 7, 22, 14, 0)
 
 
 # ------------------------------------------------- reserve_all_platform_slots
@@ -203,7 +213,7 @@ def test_reschedule_platform_allows_with_user_confirmation(scheduler):
 
 def test_reschedule_tiktok_after_other_platform_warns(scheduler):
     _reserved_project(scheduler)
-    late_tt = datetime(2026, 7, 23, 20, 0, tzinfo=timezone.utc)  # after youtube
+    late_tt = paris(2026, 7, 23, 20, 0)  # after youtube
     with pytest.raises(ValueError, match="tiktok_precedence"):
         SchedulingService.reschedule_platform("p1", "tiktok", late_tt)
 
@@ -229,7 +239,7 @@ def test_apply_switch_warns_when_moving_before_tiktok(scheduler, monkeypatch):
 
 # ------------------------------------------- displaced projects (steal/cascade)
 
-TT_SLOT_TOMORROW = datetime(2026, 7, 22, 20, 0, tzinfo=timezone.utc)
+TT_SLOT_TOMORROW = paris(2026, 7, 22, 20, 0)
 
 
 def _victim_project(scheduler) -> Project:

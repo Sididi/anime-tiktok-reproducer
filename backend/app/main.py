@@ -23,6 +23,7 @@ os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "131072")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .config import settings
 from .api import api_router
@@ -36,6 +37,7 @@ from .services.project_service import ProjectService
 from .services.project_startup_service import project_startup_queue
 from .services.project_upload_service import project_upload_queue
 from .services.reschedule_retry_service import RescheduleRetryService
+from .services.scheduling_errors import SchedulingError
 from .services.google_drive_service import GoogleDriveService
 from .services.storage_box_rclone import StorageBoxRclone
 from .services.storage_box_sftp_client import StorageBoxSftpClient
@@ -223,6 +225,11 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(SchedulingError)
+async def _scheduling_error_handler(request, exc: SchedulingError):
+    return JSONResponse(status_code=exc.http_status, content={"detail": str(exc)})
 
 # CORS middleware for frontend
 app.add_middleware(

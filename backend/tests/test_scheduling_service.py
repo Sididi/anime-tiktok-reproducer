@@ -13,6 +13,15 @@ from app.services.account_service import AccountService
 from app.services.project_service import ProjectService
 from app.services.scheduling_service import SchedulingService
 
+from zoneinfo import ZoneInfo
+
+PARIS = ZoneInfo("Europe/Paris")
+
+
+def paris(y, m, d, h, mi=0):
+    """UTC instant of a Paris wall-clock time (slot semantics)."""
+    return datetime(y, m, d, h, mi, tzinfo=PARIS).astimezone(timezone.utc)
+
 
 def test_instagram_shared_pool_uses_canonical_slot_not_jitter(
     tmp_path: Path, monkeypatch,
@@ -71,8 +80,8 @@ accounts:
         "p2", "anime_fr_4", ["instagram"]
     )
 
-    assert first["instagram"][0] == datetime(2026, 4, 29, 22, 0, tzinfo=timezone.utc)
-    assert second["instagram"][0] == datetime(2026, 4, 30, 22, 0, tzinfo=timezone.utc)
+    assert first["instagram"][0] == paris(2026, 4, 29, 22, 0)
+    assert second["instagram"][0] == paris(2026, 4, 30, 22, 0)
     assert first["instagram"][1].minute != second["instagram"][1].minute or (
         first["instagram"][1].date() != second["instagram"][1].date()
     )
@@ -127,9 +136,8 @@ def _save_scheduled_project(pid, account_id, platform, slot_dt, manual=False, ti
 def test_manual_entries_do_not_block_slots(tmp_path, monkeypatch):
     from datetime import timedelta
     acc = _setup_single_account(tmp_path, monkeypatch)
-    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
-        hour=10, minute=0, second=0, microsecond=0
-    )
+    d = (datetime.now(PARIS) + timedelta(days=1)).date()
+    tomorrow = paris(d.year, d.month, d.day, 10)
     _save_scheduled_project("manualproj", acc, "tiktok", tomorrow, manual=True)
 
     slots = SchedulingService.find_free_slots_after(
@@ -143,9 +151,8 @@ def test_manual_entries_do_not_block_slots(tmp_path, monkeypatch):
 def test_taken_slot_reports_project_and_title(tmp_path, monkeypatch):
     from datetime import timedelta
     acc = _setup_single_account(tmp_path, monkeypatch)
-    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
-        hour=10, minute=0, second=0, microsecond=0
-    )
+    d = (datetime.now(PARIS) + timedelta(days=1)).date()
+    tomorrow = paris(d.year, d.month, d.day, 10)
     _save_scheduled_project("slotproj", acc, "tiktok", tomorrow, title="Naruto")
 
     slots = SchedulingService.find_free_slots_after(
@@ -252,9 +259,8 @@ def test_reserve_manual_not_blocked_for_fresh_project(tmp_path, monkeypatch):
 
 def _future_slot(days, hour):
     from datetime import timedelta
-    return (datetime.now(timezone.utc) + timedelta(days=days)).replace(
-        hour=hour, minute=0, second=0, microsecond=0
-    )
+    d = (datetime.now(PARIS) + timedelta(days=days)).date()
+    return paris(d.year, d.month, d.day, hour)
 
 
 def _patch_pool_not_busy(monkeypatch):

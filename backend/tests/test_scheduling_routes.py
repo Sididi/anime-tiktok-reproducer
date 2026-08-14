@@ -14,8 +14,17 @@ from app.services.account_service import AccountService
 from app.services.project_service import ProjectService
 from app.services.scheduling_service import SchedulingService
 
+from zoneinfo import ZoneInfo
 
-_NOW = datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
+PARIS = ZoneInfo("Europe/Paris")
+
+
+def paris(y, m, d, h, mi=0):
+    """UTC instant of a Paris wall-clock time (slot semantics)."""
+    return datetime(y, m, d, h, mi, tzinfo=PARIS).astimezone(timezone.utc)
+
+
+_NOW = paris(2026, 5, 7, 12, 0)
 
 
 class _FixedDateTime(datetime):
@@ -57,8 +66,8 @@ def test_list_events_returns_filtered_events(client):
         scheduled_account_id="acc_a",
         platform_schedules={
             "tiktok": PlatformSchedule(
-                slot=datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc),
-                scheduled_at=datetime(2026, 5, 7, 18, 5, tzinfo=timezone.utc),
+                slot=paris(2026, 5, 7, 18, 0),
+                scheduled_at=paris(2026, 5, 7, 18, 5),
             )
         }
     )
@@ -88,7 +97,7 @@ def test_resolve_anchor_endpoint(client):
     r = client.post("/api/scheduling/resolve-anchor", json={
         "project_id": "p1",
         "account_id": "acc_a",
-        "tiktok_slot": datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc).isoformat(),
+        "tiktok_slot": paris(2026, 5, 7, 14, 0).isoformat(),
     })
     assert r.status_code == 200
     body = r.json()
@@ -102,7 +111,7 @@ def test_reserve_anchor_endpoint(client):
     ProjectService.save(p)
     r = client.post("/api/scheduling/projects/p1/reserve-anchor", json={
         "account_id": "acc_a",
-        "tiktok_slot": datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc).isoformat(),
+        "tiktok_slot": paris(2026, 5, 7, 14, 0).isoformat(),
     })
     assert r.status_code == 200
     schedules = r.json()["platform_schedules"]
@@ -114,15 +123,15 @@ def test_patch_platform_endpoint(client):
     ProjectService.get_project_dir(p.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(p)
     SchedulingService.reserve_anchor(
-        "p1", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+        "p1", "acc_a", paris(2026, 5, 7, 14, 0)
     )
     r = client.patch(
         "/api/scheduling/projects/p1/platforms/youtube",
-        json={"new_slot": datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc).isoformat()},
+        json={"new_slot": paris(2026, 5, 8, 14, 0).isoformat()},
     )
     assert r.status_code == 200
     body = r.json()
-    assert body["slot"].startswith("2026-05-08T14:00:00")
+    assert body["slot"].startswith(paris(2026, 5, 8, 14, 0).isoformat()[:19])
 
 
 def test_delete_platform_endpoint(client):
@@ -130,7 +139,7 @@ def test_delete_platform_endpoint(client):
     ProjectService.get_project_dir(p.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(p)
     SchedulingService.reserve_anchor(
-        "p1", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+        "p1", "acc_a", paris(2026, 5, 7, 14, 0)
     )
     r = client.delete("/api/scheduling/projects/p1/platforms/youtube")
     assert r.status_code == 204
@@ -143,7 +152,7 @@ def test_delete_all_endpoint(client):
     ProjectService.get_project_dir(p.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(p)
     SchedulingService.reserve_anchor(
-        "p1", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+        "p1", "acc_a", paris(2026, 5, 7, 14, 0)
     )
     r = client.delete("/api/scheduling/projects/p1/all")
     assert r.status_code == 204
@@ -156,8 +165,8 @@ def test_cascade_preview_endpoint(client):
         anime_name="Other",
         platform_schedules={
             "tiktok": PlatformSchedule(
-                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-                scheduled_at=datetime(2026, 5, 7, 14, 6, tzinfo=timezone.utc),
+                slot=paris(2026, 5, 7, 14, 0),
+                scheduled_at=paris(2026, 5, 7, 14, 6),
             )
         }
     )
@@ -180,8 +189,8 @@ def test_cascade_apply_endpoint(client):
         anime_name="Other",
         platform_schedules={
             "tiktok": PlatformSchedule(
-                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-                scheduled_at=datetime(2026, 5, 7, 14, 6, tzinfo=timezone.utc),
+                slot=paris(2026, 5, 7, 14, 0),
+                scheduled_at=paris(2026, 5, 7, 14, 6),
             )
         }
     )
@@ -195,9 +204,7 @@ def test_cascade_apply_endpoint(client):
                     json={"account_id": "acc_a"})
     assert r.status_code == 200
     other = ProjectService.load("other")
-    assert other.platform_schedules["tiktok"].slot == datetime(
-        2026, 5, 7, 18, 0, tzinfo=timezone.utc
-    )
+    assert other.platform_schedules["tiktok"].slot == paris(2026, 5, 7, 18, 0)
 
 
 def test_reschedule_pending_endpoint(client):
@@ -269,8 +276,8 @@ def test_reserve_manual_route_rejects_too_close(client):
 
 def _seed_pool_b_c():
     """projB @ 2026-05-08 12:00, projC @ 14:00, 18:00 free, plus 'me'."""
-    slot1 = datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
-    slot2 = datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc)
+    slot1 = paris(2026, 5, 8, 12, 0)
+    slot2 = paris(2026, 5, 8, 14, 0)
     _mk_project("projB", anime_name="B", scheduled_account_id="acc_a",
         platform_schedules={"tiktok": PlatformSchedule(slot=slot1, scheduled_at=slot1)})
     _mk_project("projC", anime_name="C", scheduled_account_id="acc_a",
@@ -357,29 +364,29 @@ def _save_project_with_tiktok(pid, scheduled_at):
 
 def test_patch_platform_locked_returns_423(client):
     # tiktok at _NOW + 5min → lock window opened at _NOW - 5min → locked now
-    locked_at = datetime(2026, 5, 7, 12, 5, tzinfo=timezone.utc)
+    locked_at = paris(2026, 5, 7, 12, 5)
     _save_project_with_tiktok("plock", locked_at)
     r = client.patch(
         "/api/scheduling/projects/plock/platforms/tiktok",
-        json={"new_slot": datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc).isoformat()},
+        json={"new_slot": paris(2026, 5, 7, 18, 0).isoformat()},
     )
     assert r.status_code == 423
     assert "timing_locked" in r.text
 
 
 def test_patch_anchor_locked_returns_423(client):
-    locked_at = datetime(2026, 5, 7, 12, 5, tzinfo=timezone.utc)
+    locked_at = paris(2026, 5, 7, 12, 5)
     _save_project_with_tiktok("plock2", locked_at)
     r = client.patch(
         "/api/scheduling/projects/plock2/anchor",
-        json={"tiktok_slot": datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc).isoformat()},
+        json={"tiktok_slot": paris(2026, 5, 7, 18, 0).isoformat()},
     )
     assert r.status_code == 423
 
 
 def test_events_include_timing_locked_flag(client):
-    _save_project_with_tiktok("plocked", datetime(2026, 5, 7, 12, 5, tzinfo=timezone.utc))
-    _save_project_with_tiktok("pfree", datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc))
+    _save_project_with_tiktok("plocked", paris(2026, 5, 7, 12, 5))
+    _save_project_with_tiktok("pfree", paris(2026, 5, 7, 18, 0))
     r = client.get("/api/scheduling/events", params={"range_start": _NOW.isoformat()})
     assert r.status_code == 200
     events = {e["project_id"]: e for e in r.json()["events"]}

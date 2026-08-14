@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
+import { nowParis } from "@/utils/parisTime";
 
 interface SlotPickerCalendarProps {
   monthAnchor: Date;       // any day inside the displayed month
@@ -28,12 +29,6 @@ function ymd(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-function startOfDay(d: Date): Date {
-  const out = new Date(d);
-  out.setHours(0, 0, 0, 0);
-  return out;
-}
-
 export function SlotPickerCalendar({
   monthAnchor,
   onPrevMonth,
@@ -56,11 +51,13 @@ export function SlotPickerCalendar({
     });
   }, [monthAnchor]);
 
-  const today = startOfDay(new Date());
+  // Grid cells are "digit dates" (their Y/M/D digits mean Paris calendar
+  // days), so "today" must be compared by Paris digits too.
+  const todayKey = ymd(nowParis());
   const inMonth = (d: Date) => d.getMonth() === monthAnchor.getMonth();
   const isSelected = (d: Date) =>
     !!selectedDate && ymd(d) === ymd(selectedDate);
-  const isPast = (d: Date) => startOfDay(d).getTime() < today.getTime();
+  const isPast = (d: Date) => ymd(d) < todayKey;
   // A day is "full" only when slots ARE configured for it AND every one is
   // already taken. Days where the account has no slot configured are NOT
   // crossed — clicking them just shows an empty slot list. This matches the

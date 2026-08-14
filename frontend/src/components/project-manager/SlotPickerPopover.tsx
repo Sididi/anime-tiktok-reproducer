@@ -4,12 +4,25 @@ import { Button } from "@/components/ui";
 import { api } from "@/api/client";
 import type { FreeSlot, Platform, ResolveAnchorResult, StealSpec, SwitchMode, SwitchPreview, UploadRestrictions } from "@/types";
 import { PLATFORM_SHORT } from "@/components/planning/platformColors";
+import { parisDayKey, parisWallTimeToUtcIso, toParis } from "@/utils/parisTime";
 import { SlotPickerCalendar } from "./SlotPickerCalendar";
 import { SlotChips } from "./SlotChips";
 import { PerPlatformOverride } from "./PerPlatformOverride";
 import { SwitchSlotConfirmModal } from "./SwitchSlotConfirmModal";
 
 type SlotPickerMode = "anchor" | "single-platform";
+
+/** Local Date whose Y/M/D digits are the Paris calendar day of `instant`
+ *  (noon-anchored to dodge DST edges). */
+function parisDigitDate(instant: Date): Date {
+  const p = toParis(instant);
+  return new Date(p.getFullYear(), p.getMonth(), p.getDate(), 12);
+}
+
+/** "yyyy-MM-dd" from a digit date's own digits. */
+function digitDayKey(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 
 type SlotPickerConfirmPayload =
   | {
@@ -40,7 +53,9 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
     initialIso, platformsForAnchor, onConfirm,
   } = props;
 
-  const initial = initialIso ? new Date(initialIso) : new Date();
+  // Calendar dates are "digit dates": local Date objects whose Y/M/D digits
+  // mean Paris calendar days. Instants only exist at the API boundary.
+  const initial = parisDigitDate(initialIso ? new Date(initialIso) : new Date());
   const [monthAnchor, setMonthAnchor] = useState(initial);
   const [selectedDate, setSelectedDate] = useState<Date | null>(initial);
   const [selectedSlotIso, setSelectedSlotIso] = useState<string | null>(initialIso ?? null);
@@ -60,20 +75,17 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
   useEffect(() => {
     if (!open || !selectedDate) return;
     let cancelled = false;
-    const dayStart = new Date(selectedDate);
-    dayStart.setHours(0, 0, 0, 0);
-    const dayEnd = new Date(selectedDate);
-    dayEnd.setHours(23, 59, 59, 0);
+    const dayKey = digitDayKey(selectedDate);
     (async () => {
       try {
         const r = await api.listFreeSlots({
           account_id: accountId,
           platform: platformForFetch,
-          after: dayStart.toISOString(),
+          after: parisWallTimeToUtcIso(dayKey, "00:00"),
           limit: 50,
         });
         if (cancelled) return;
-        const sameDay = r.slots.filter((s) => new Date(s.slot) <= dayEnd);
+        const sameDay = r.slots.filter((s) => parisDayKey(s.slot) === dayKey);
         setSlotsForDay(sameDay);
       } catch (err) {
         if (!cancelled) setError((err as Error).message);
@@ -88,12 +100,7 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    const monthStart = new Date(
-      monthAnchor.getFullYear(),
-      monthAnchor.getMonth(),
-      1,
-    );
-    monthStart.setHours(0, 0, 0, 0);
+    const monthStartKey = `${monthAnchor.getFullYear()}-${String(monthAnchor.getMonth() + 1).padStart(2, "0")}-01`;
     (async () => {
       try {
         // Backend caps `limit` at 200. Even a 1-slot/day platform (YT) gets
@@ -101,7 +108,7 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
         const r = await api.listFreeSlots({
           account_id: accountId,
           platform: platformForFetch,
-          after: monthStart.toISOString(),
+          after: parisWallTimeToUtcIso(monthStartKey, "00:00"),
           limit: 200,
         });
         if (cancelled) return;
@@ -129,25 +136,19 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
     const days = new Set<string>();
     if (!restrictions?.blocked_windows.length) return days;
     // Cover the whole 42-cell grid: first of month minus 7d to end plus 14d.
-    const rangeStart = new Date(monthAnchor.getFullYear(), monthAnchor.getMonth(), 1);
-    rangeStart.setDate(rangeStart.getDate() - 7);
-    rangeStart.setHours(0, 0, 0, 0);
-    const rangeEnd = new Date(monthAnchor.getFullYear(), monthAnchor.getMonth() + 1, 0);
-    rangeEnd.setDate(rangeEnd.getDate() + 14);
-    rangeEnd.setHours(23, 59, 59, 999);
+    // Digit dates → Paris instants at the boundaries only.
+    const firstOfMonth = new Date(monthAnchor.getFullYear(), monthAnchor.getMonth(), 1 - 7, 12);
+    const endOfGrid = new Date(monthAnchor.getFullYear(), monthAnchor.getMonth() + 1, 14, 12);
+    const rangeStartMs = new Date(parisWallTimeToUtcIso(digitDayKey(firstOfMonth), "00:00")).getTime();
+    const rangeEndMs = new Date(parisWallTimeToUtcIso(digitDayKey(endOfGrid), "23:59")).getTime();
     for (const window of restrictions.blocked_windows) {
-      const start = new Date(window.start);
-      const end = new Date(window.end);
-      // Grey out every day the window touches, even partially.
-      const cursor = new Date(Math.max(start.getTime(), rangeStart.getTime()));
-      cursor.setHours(0, 0, 0, 0);
-      const stop = Math.min(end.getTime(), rangeEnd.getTime());
-      while (cursor.getTime() <= stop) {
-        days.add(
-          `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, "0")}-${String(cursor.getDate()).padStart(2, "0")}`,
-        );
-        cursor.setDate(cursor.getDate() + 1);
+      const startMs = Math.max(new Date(window.start).getTime(), rangeStartMs);
+      const stopMs = Math.min(new Date(window.end).getTime(), rangeEndMs);
+      // Grey out every Paris day the window touches, even partially.
+      for (let t = startMs; t <= stopMs; t += 24 * 3600 * 1000) {
+        days.add(parisDayKey(new Date(t)));
       }
+      if (startMs <= stopMs) days.add(parisDayKey(new Date(stopMs)));
     }
     return days;
   }, [restrictions, monthAnchor]);
@@ -156,8 +157,7 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
     const all = new Set<string>();
     const free = new Set<string>();
     for (const s of monthSlots) {
-      const d = new Date(s.slot);
-      const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      const ymd = parisDayKey(s.slot);
       all.add(ymd);
       if (s.available) free.add(ymd);
     }
@@ -189,10 +189,8 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
 
   const customIso = useMemo(() => {
     if (!customActive || !selectedDate || !/^\d{2}:\d{2}$/.test(customTime)) return null;
-    const [h, m] = customTime.split(":").map(Number);
-    const d = new Date(selectedDate);
-    d.setHours(h, m, 0, 0);
-    return d.toISOString();
+    // The typed time is a Paris wall time on the selected Paris day.
+    return parisWallTimeToUtcIso(digitDayKey(selectedDate), customTime);
   }, [customActive, selectedDate, customTime]);
 
   const customTooClose =

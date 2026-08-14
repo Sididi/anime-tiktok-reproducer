@@ -457,3 +457,50 @@ async def delete_discord_message(
     target_channel = channel_id or settings.discord.upload_channel_id
     await discord.delete_message(target_channel, message_id)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Stored publish-status read (planning sync).
+#
+# Returns ONLY what the job store already holds — never calls Post for Me or
+# Instagram, and never exposes payloads (they contain access tokens).
+# Snapshot rebuilds are throttled: at most one store read per
+# _STATUS_SNAPSHOT_TTL_SECONDS; callers inside the window get the cached copy.
+_STATUS_SNAPSHOT_TTL_SECONDS = 10.0
+_status_snapshot: dict = {}
+_status_snapshot_at: float = 0.0
+
+
+def _job_status_projection(job: Job) -> dict:
+    return {
+        "project_id": job.project_id,
+        "slot_time": job.slot_time.isoformat(),
+        "platform_scheduled_at": {
+            platform: scheduled_at.isoformat()
+            for platform, scheduled_at in job.platform_scheduled_at.items()
+        },
+        "platforms_requested": list(job.platforms_requested),
+        "platform_statuses": {
+            p: ps.to_dict() for p, ps in job.platform_statuses.items()
+        },
+        "reminder_cancelled": job.reminder_cancelled,
+        "updated_at": job.updated_at.isoformat(),
+    }
+
+
+@router.get("/jobs")
+async def list_job_statuses(request: Request) -> dict:
+    global _status_snapshot, _status_snapshot_at
+    import time
+
+    now = time.monotonic()
+    if _status_snapshot and now - _status_snapshot_at < _STATUS_SNAPSHOT_TTL_SECONDS:
+        return _status_snapshot
+
+    store = request.app.state.job_store
+    jobs = await store.list_all()
+    _status_snapshot = {
+        "jobs": {job.project_id: _job_status_projection(job) for job in jobs}
+    }
+    _status_snapshot_at = now
+    return _status_snapshot

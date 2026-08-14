@@ -13,8 +13,17 @@ from app.services.account_service import AccountService
 from app.services.project_service import ProjectService
 from app.services.scheduling_service import SchedulingService
 
+from zoneinfo import ZoneInfo
 
-_NOW = datetime(2026, 5, 7, 12, 0, tzinfo=timezone.utc)
+PARIS = ZoneInfo("Europe/Paris")
+
+
+def paris(y, m, d, h, mi=0):
+    """UTC instant of a Paris wall-clock time (slot semantics)."""
+    return datetime(y, m, d, h, mi, tzinfo=PARIS).astimezone(timezone.utc)
+
+
+_NOW = paris(2026, 5, 7, 12, 0)
 
 
 class _FixedDateTime(datetime):
@@ -76,15 +85,15 @@ def test_find_free_slots_after_returns_chronological_chips(isolated_scheduler):
     )
     assert len(slots) == 5
     assert all(s.available for s in slots)
-    assert [s.slot.hour for s in slots[:4]] == [14, 18, 21, 12]
+    assert [s.slot.astimezone(PARIS).hour for s in slots[:4]] == [14, 18, 21, 12]
 
 
 def test_find_free_slots_after_marks_taken_slots(isolated_scheduler):
     project = Project(id="p1", scheduled_account_id="acc_a")
     project.platform_schedules = {
         "tiktok": __import__("app").models.PlatformSchedule(
-            slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-            scheduled_at=datetime(2026, 5, 7, 14, 11, tzinfo=timezone.utc),
+            slot=paris(2026, 5, 7, 14, 0),
+            scheduled_at=paris(2026, 5, 7, 14, 11),
         )
     }
     ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
@@ -98,18 +107,18 @@ def test_find_free_slots_after_marks_taken_slots(isolated_scheduler):
     )
     taken = [s for s in slots if not s.available]
     assert len(taken) == 1
-    assert taken[0].slot == datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    assert taken[0].slot == paris(2026, 5, 7, 14, 0)
     assert taken[0].taken_by_project_id == "p1"
 
 
 def test_resolve_anchor_resolves_each_platform_to_first_free_slot(isolated_scheduler):
     result = SchedulingService.resolve_anchor(
         account_id="acc_a",
-        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        tiktok_slot=paris(2026, 5, 7, 14, 0),
         overrides=None,
     )
     yt = result.resolved["youtube"]
-    assert yt.slot == datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    assert yt.slot == paris(2026, 5, 7, 14, 0)
     assert yt.available is True
     assert result.conflicts == []
 
@@ -118,8 +127,8 @@ def test_resolve_anchor_falls_back_to_next_slot_when_taken(isolated_scheduler):
     other = Project(id="other", scheduled_account_id="acc_a")
     other.platform_schedules = {
         "youtube": __import__("app").models.PlatformSchedule(
-            slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-            scheduled_at=datetime(2026, 5, 7, 14, 7, tzinfo=timezone.utc),
+            slot=paris(2026, 5, 7, 14, 0),
+            scheduled_at=paris(2026, 5, 7, 14, 7),
         )
     }
     ProjectService.get_project_dir(other.id).mkdir(parents=True, exist_ok=True)
@@ -127,29 +136,29 @@ def test_resolve_anchor_falls_back_to_next_slot_when_taken(isolated_scheduler):
 
     result = SchedulingService.resolve_anchor(
         account_id="acc_a",
-        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        tiktok_slot=paris(2026, 5, 7, 14, 0),
         overrides=None,
     )
     yt = result.resolved["youtube"]
-    assert yt.slot == datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc)
+    assert yt.slot == paris(2026, 5, 7, 18, 0)
     assert yt.available is True
 
 
 def test_resolve_anchor_uses_overrides(isolated_scheduler):
     result = SchedulingService.resolve_anchor(
         account_id="acc_a",
-        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-        overrides={"youtube": datetime(2026, 5, 8, 18, 0, tzinfo=timezone.utc)},
+        tiktok_slot=paris(2026, 5, 7, 14, 0),
+        overrides={"youtube": paris(2026, 5, 8, 18, 0)},
     )
     yt = result.resolved["youtube"]
-    assert yt.slot == datetime(2026, 5, 8, 18, 0, tzinfo=timezone.utc)
+    assert yt.slot == paris(2026, 5, 8, 18, 0)
 
 
 def test_resolve_anchor_invalid_override_returns_conflict(isolated_scheduler):
     result = SchedulingService.resolve_anchor(
         account_id="acc_a",
-        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-        overrides={"youtube": datetime(2026, 5, 7, 9, 0, tzinfo=timezone.utc)},
+        tiktok_slot=paris(2026, 5, 7, 14, 0),
+        overrides={"youtube": paris(2026, 5, 7, 9, 0)},
     )
     assert any(c.platform == "youtube" for c in result.conflicts)
 
@@ -161,7 +170,7 @@ def test_reserve_anchor_persists_platform_schedules(isolated_scheduler):
     result, _ = SchedulingService.reserve_anchor(
         project_id="proj",
         account_id="acc_a",
-        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        tiktok_slot=paris(2026, 5, 7, 14, 0),
     )
     assert "tiktok" in result
     assert "youtube" in result
@@ -177,12 +186,12 @@ def test_reserve_anchor_idempotent_when_called_twice(isolated_scheduler):
     first, _ = SchedulingService.reserve_anchor(
         project_id="proj",
         account_id="acc_a",
-        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        tiktok_slot=paris(2026, 5, 7, 14, 0),
     )
     second, _ = SchedulingService.reserve_anchor(
         project_id="proj",
         account_id="acc_a",
-        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        tiktok_slot=paris(2026, 5, 7, 14, 0),
     )
     assert first["tiktok"].slot == second["tiktok"].slot
     assert first["tiktok"].scheduled_at == second["tiktok"].scheduled_at
@@ -194,8 +203,8 @@ def test_reserve_anchor_raises_on_conflict(isolated_scheduler):
         scheduled_account_id="acc_a",
         platform_schedules={
             "tiktok": __import__("app").models.PlatformSchedule(
-                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-                scheduled_at=datetime(2026, 5, 7, 14, 8, tzinfo=timezone.utc),
+                slot=paris(2026, 5, 7, 14, 0),
+                scheduled_at=paris(2026, 5, 7, 14, 8),
             )
         },
     )
@@ -208,7 +217,7 @@ def test_reserve_anchor_raises_on_conflict(isolated_scheduler):
         SchedulingService.reserve_anchor(
             project_id="proj",
             account_id="acc_a",
-            tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+            tiktok_slot=paris(2026, 5, 7, 14, 0),
         )
     assert "tiktok" in str(exc.value)
 
@@ -220,9 +229,9 @@ def test_reschedule_anchor_swaps_existing_reservations(isolated_scheduler):
     SchedulingService.reserve_anchor(
         project_id="proj",
         account_id="acc_a",
-        tiktok_slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
+        tiktok_slot=paris(2026, 5, 7, 14, 0),
     )
-    new_anchor = datetime(2026, 5, 8, 18, 0, tzinfo=timezone.utc)
+    new_anchor = paris(2026, 5, 8, 18, 0)
     SchedulingService.reschedule_anchor(
         project_id="proj",
         tiktok_slot=new_anchor,
@@ -236,18 +245,16 @@ def test_reschedule_platform_replaces_single_platform_slot(isolated_scheduler):
     ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(project)
     SchedulingService.reserve_anchor(
-        "proj", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+        "proj", "acc_a", paris(2026, 5, 7, 14, 0)
     )
-    new_yt = datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc)
+    new_yt = paris(2026, 5, 8, 14, 0)
     sched = SchedulingService.reschedule_platform("proj", "youtube", new_yt)
     assert sched.slot == new_yt
 
     reloaded = ProjectService.load("proj")
     assert reloaded.platform_schedules["youtube"].slot == new_yt
     # tiktok unchanged
-    assert reloaded.platform_schedules["tiktok"].slot == datetime(
-        2026, 5, 7, 14, 0, tzinfo=timezone.utc
-    )
+    assert reloaded.platform_schedules["tiktok"].slot == paris(2026, 5, 7, 14, 0)
 
 
 def test_reschedule_platform_rejects_taken_slot(isolated_scheduler):
@@ -256,8 +263,8 @@ def test_reschedule_platform_rejects_taken_slot(isolated_scheduler):
         scheduled_account_id="acc_a",
         platform_schedules={
             "youtube": __import__("app").models.PlatformSchedule(
-                slot=datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc),
-                scheduled_at=datetime(2026, 5, 8, 14, 5, tzinfo=timezone.utc),
+                slot=paris(2026, 5, 8, 14, 0),
+                scheduled_at=paris(2026, 5, 8, 14, 5),
             )
         },
     )
@@ -267,11 +274,11 @@ def test_reschedule_platform_rejects_taken_slot(isolated_scheduler):
     ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(project)
     SchedulingService.reserve_anchor(
-        "proj", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+        "proj", "acc_a", paris(2026, 5, 7, 14, 0)
     )
     with pytest.raises(ValueError):
         SchedulingService.reschedule_platform(
-            "proj", "youtube", datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc)
+            "proj", "youtube", paris(2026, 5, 8, 14, 0)
         )
 
 
@@ -280,7 +287,7 @@ def test_cancel_platform_slot_removes_only_one_platform(isolated_scheduler):
     ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(project)
     SchedulingService.reserve_anchor(
-        "proj", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+        "proj", "acc_a", paris(2026, 5, 7, 14, 0)
     )
     SchedulingService.cancel_platform_slot("proj", "youtube")
     reloaded = ProjectService.load("proj")
@@ -293,7 +300,7 @@ def test_cancel_all_slots_clears_everything(isolated_scheduler):
     ProjectService.get_project_dir(project.id).mkdir(parents=True, exist_ok=True)
     ProjectService.save(project)
     SchedulingService.reserve_anchor(
-        "proj", "acc_a", datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+        "proj", "acc_a", paris(2026, 5, 7, 14, 0)
     )
     SchedulingService.cancel_all_slots("proj")
     reloaded = ProjectService.load("proj")
@@ -305,8 +312,8 @@ def test_compute_cascade_simple_one_displaced(isolated_scheduler):
     other = Project(id="other", scheduled_account_id="acc_a",
         platform_schedules={
             "tiktok": __import__("app").models.PlatformSchedule(
-                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-                scheduled_at=datetime(2026, 5, 7, 14, 5, tzinfo=timezone.utc),
+                slot=paris(2026, 5, 7, 14, 0),
+                scheduled_at=paris(2026, 5, 7, 14, 5),
             )
         }
     )
@@ -318,11 +325,11 @@ def test_compute_cascade_simple_one_displaced(isolated_scheduler):
 
     result = SchedulingService.compute_cascade("urgent", "acc_a")
     tt = next(p for p in result.per_platform if p.platform == "tiktok")
-    assert tt.target_slot == datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    assert tt.target_slot == paris(2026, 5, 7, 14, 0)
     assert len(tt.displaced) == 1
     assert tt.displaced[0].project_id == "other"
-    assert tt.displaced[0].from_slot == datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
-    assert tt.displaced[0].to_slot == datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc)
+    assert tt.displaced[0].from_slot == paris(2026, 5, 7, 14, 0)
+    assert tt.displaced[0].to_slot == paris(2026, 5, 7, 18, 0)
 
 
 def test_compute_cascade_chain_three_displaced(isolated_scheduler):
@@ -330,8 +337,8 @@ def test_compute_cascade_chain_three_displaced(isolated_scheduler):
         proj = Project(id=pid, scheduled_account_id="acc_a",
             platform_schedules={
                 "tiktok": __import__("app").models.PlatformSchedule(
-                    slot=datetime(2026, 5, 7, hour, 0, tzinfo=timezone.utc),
-                    scheduled_at=datetime(2026, 5, 7, hour, 5, tzinfo=timezone.utc),
+                    slot=paris(2026, 5, 7, hour, 0),
+                    scheduled_at=paris(2026, 5, 7, hour, 5),
                 )
             }
         )
@@ -346,11 +353,11 @@ def test_compute_cascade_chain_three_displaced(isolated_scheduler):
     assert len(tt.displaced) == 3
     # cascade order: a -> 18, b -> 21, c -> next day 12
     assert tt.displaced[0].project_id == "a"
-    assert tt.displaced[0].to_slot == datetime(2026, 5, 7, 18, 0, tzinfo=timezone.utc)
+    assert tt.displaced[0].to_slot == paris(2026, 5, 7, 18, 0)
     assert tt.displaced[1].project_id == "b"
-    assert tt.displaced[1].to_slot == datetime(2026, 5, 7, 21, 0, tzinfo=timezone.utc)
+    assert tt.displaced[1].to_slot == paris(2026, 5, 7, 21, 0)
     assert tt.displaced[2].project_id == "c"
-    assert tt.displaced[2].to_slot == datetime(2026, 5, 8, 12, 0, tzinfo=timezone.utc)
+    assert tt.displaced[2].to_slot == paris(2026, 5, 8, 12, 0)
 
 
 def test_compute_cascade_blocks_when_pool_busy(isolated_scheduler, monkeypatch):
@@ -358,8 +365,8 @@ def test_compute_cascade_blocks_when_pool_busy(isolated_scheduler, monkeypatch):
     active = Project(id="active", scheduled_account_id="acc_a",
         platform_schedules={
             "tiktok": __import__("app").models.PlatformSchedule(
-                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-                scheduled_at=datetime(2026, 5, 7, 14, 3, tzinfo=timezone.utc),
+                slot=paris(2026, 5, 7, 14, 0),
+                scheduled_at=paris(2026, 5, 7, 14, 3),
             )
         }
     )
@@ -387,8 +394,8 @@ def test_apply_cascade_persists_displacements_and_reserves_urgent(isolated_sched
         anime_name="Other Anime",
         platform_schedules={
             "tiktok": __import__("app").models.PlatformSchedule(
-                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-                scheduled_at=datetime(2026, 5, 7, 14, 4, tzinfo=timezone.utc),
+                slot=paris(2026, 5, 7, 14, 0),
+                scheduled_at=paris(2026, 5, 7, 14, 4),
             )
         }
     )
@@ -403,12 +410,8 @@ def test_apply_cascade_persists_displacements_and_reserves_urgent(isolated_sched
 
     other = ProjectService.load("other")
     urgent = ProjectService.load("urgent")
-    assert other.platform_schedules["tiktok"].slot == datetime(
-        2026, 5, 7, 18, 0, tzinfo=timezone.utc
-    )
-    assert urgent.platform_schedules["tiktok"].slot == datetime(
-        2026, 5, 7, 14, 0, tzinfo=timezone.utc
-    )
+    assert other.platform_schedules["tiktok"].slot == paris(2026, 5, 7, 18, 0)
+    assert urgent.platform_schedules["tiktok"].slot == paris(2026, 5, 7, 14, 0)
     assert urgent.scheduled_account_id == "acc_a"
 
 
@@ -420,8 +423,8 @@ def test_apply_cascade_aborts_with_blockers(isolated_scheduler, monkeypatch):
     blocker = Project(id="blocker", scheduled_account_id="acc_a",
         platform_schedules={
             "tiktok": __import__("app").models.PlatformSchedule(
-                slot=datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc),
-                scheduled_at=datetime(2026, 5, 7, 14, 5, tzinfo=timezone.utc),
+                slot=paris(2026, 5, 7, 14, 0),
+                scheduled_at=paris(2026, 5, 7, 14, 5),
             )
         }
     )
@@ -437,6 +440,4 @@ def test_apply_cascade_aborts_with_blockers(isolated_scheduler, monkeypatch):
 
     # Ensure no partial state was persisted.
     blocker = ProjectService.load("blocker")
-    assert blocker.platform_schedules["tiktok"].slot == datetime(
-        2026, 5, 7, 14, 0, tzinfo=timezone.utc
-    )
+    assert blocker.platform_schedules["tiktok"].slot == paris(2026, 5, 7, 14, 0)

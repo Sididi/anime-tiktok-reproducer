@@ -100,11 +100,13 @@ export function ProjectRow({
         <span
           className={statusCircleClasses(row.uploaded_status)}
           title={
-            row.uploaded
-              ? "Uploaded"
-              : row.uploaded_status === "orange"
-                ? "Scheduled"
-                : "Not uploaded"
+            row.uploaded_status === "publish_error"
+              ? `Échec de publication — ${row.publish_error_detail ?? "voir Discord"}`
+              : row.uploaded
+                ? "Uploaded"
+                : row.uploaded_status === "orange"
+                  ? "Scheduled"
+                  : "Not uploaded"
           }
         />
       </td>

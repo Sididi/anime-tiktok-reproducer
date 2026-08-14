@@ -25,10 +25,13 @@ export function formatScheduledAt(isoString: string | null): string {
   return `${day} ${month} ${hours}:${minutes}`;
 }
 
-export function statusCircleClasses(color: "green" | "orange" | "red"): string {
+export function statusCircleClasses(
+  color: "green" | "orange" | "red" | "publish_error",
+): string {
   const base = "h-3 w-3 rounded-full inline-block";
   if (color === "green") return `${base} bg-green-500 shadow-[0_0_6px_rgba(34,197,94,0.5)]`;
   if (color === "orange") return `${base} bg-amber-500 shadow-[0_0_6px_rgba(245,158,11,0.5)]`;
+  if (color === "publish_error") return `${base} bg-red-500 publish-error-glow`;
   return `${base} bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.5)]`;
 }
 

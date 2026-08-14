@@ -163,3 +163,16 @@ class DiscordService:
             r = c.delete(f"/api/internal/jobs/{project_id}")
             r.raise_for_status()
             return None
+
+    @classmethod
+    @_swallow("VPS fetch_job_statuses")
+    def fetch_job_statuses(cls) -> dict | None:
+        """Stored per-platform publish statuses for every VPS job.
+
+        Read-only snapshot of the VPS job store (throttled server-side);
+        never triggers Post for Me / Instagram calls. None when the VPS is
+        unreachable or unconfigured."""
+        with _client() as c:
+            r = c.get("/api/internal/jobs")
+            r.raise_for_status()
+            return r.json()
