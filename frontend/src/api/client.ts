@@ -297,6 +297,8 @@ export const api = {
       state: "ready" | "in_progress" | "error" | "missing";
       detail?: string;
       version?: string;
+      bytes_done?: number;
+      bytes_total?: number;
     }>(
       `/project-manager/projects/${projectId}/upload-source-status`,
     ),

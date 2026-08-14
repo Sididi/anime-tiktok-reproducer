@@ -42,7 +42,7 @@ export function FacebookDurationModal({
   stacked = false,
 }: FacebookDurationModalProps) {
   const maxDuration = maxDurationSeconds;
-  const preview = useUploadSourcePreview(projectId, open);
+  const preview = useUploadSourcePreview(projectId, open, projectTitle);
 
   useEffect(() => {
     if (!open || stacked) return;

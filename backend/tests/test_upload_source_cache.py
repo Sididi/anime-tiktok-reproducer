@@ -147,3 +147,22 @@ def test_start_download_short_circuits_when_ready(source_cache):
     (cache_dir / "final.mp4").write_bytes(b"x")
     status = UploadPhaseService.start_source_video_download("p1", _readiness())
     assert status["state"] == "ready"
+
+
+def test_source_status_reports_bytes_progress(tmp_path, monkeypatch):
+    monkeypatch.setattr(UploadPhaseService, "_SOURCE_CACHE_DIR", tmp_path)
+    cache_dir = tmp_path / "p1"
+    cache_dir.mkdir()
+    (cache_dir / "video.mp4.part").write_bytes(b"\x00" * 1234)
+    with UploadPhaseService._source_download_guard:
+        UploadPhaseService._source_downloads_in_flight.add("p1")
+        UploadPhaseService._source_download_totals["p1"] = 10000
+    try:
+        status = UploadPhaseService.source_video_status("p1")
+    finally:
+        with UploadPhaseService._source_download_guard:
+            UploadPhaseService._source_downloads_in_flight.discard("p1")
+            UploadPhaseService._source_download_totals.pop("p1", None)
+    assert status["state"] == "in_progress"
+    assert status["bytes_done"] == 1234
+    assert status["bytes_total"] == 10000

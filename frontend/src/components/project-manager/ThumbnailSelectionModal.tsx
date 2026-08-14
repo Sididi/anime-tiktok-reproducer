@@ -21,7 +21,11 @@ export function ThumbnailSelectionModal({
   onChoice,
   stacked = false,
 }: ThumbnailSelectionModalProps) {
-  const { status, candidates, detail } = useThumbnailCandidates(projectId, open);
+  const { status, candidates, detail } = useThumbnailCandidates(
+    projectId,
+    open,
+    projectTitle,
+  );
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
 
   const isReady = (c: ThumbnailCandidate) => c.source !== "pending";

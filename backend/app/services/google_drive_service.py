@@ -1182,6 +1182,20 @@ class GoogleDriveService:
         return seconds if seconds > 0 else None
 
     @classmethod
+    def get_file_size(cls, file_id: str) -> int | None:
+        """Return the file's byte size, or ``None`` when unavailable."""
+        try:
+            drive = cls._client()
+            info = drive.files().get(
+                fileId=file_id,
+                fields="size",
+                supportsAllDrives=True,
+            ).execute()
+            return int(info["size"])
+        except Exception:
+            return None
+
+    @classmethod
     def download_file(cls, file_id: str, destination: Path) -> None:
         drive = cls._client()
         request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)

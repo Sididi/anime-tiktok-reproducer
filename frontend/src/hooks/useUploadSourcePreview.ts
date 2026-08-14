@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "@/api/client";
+import { useDownloadProgressStore } from "@/stores/downloadProgressStore";
 
 type UploadSourcePreviewStatus = "loading" | "ready" | "error";
 
@@ -8,9 +9,15 @@ type UploadSourcePreviewStatus = "loading" | "ready" | "error";
  * The backend warms the cache on the first status call, so mounting this
  * hook is enough to trigger the download.
  */
-export function useUploadSourcePreview(projectId: string, active: boolean) {
+export function useUploadSourcePreview(
+  projectId: string,
+  active: boolean,
+  projectTitle?: string | null,
+) {
   const [status, setStatus] = useState<UploadSourcePreviewStatus>("loading");
   const [version, setVersion] = useState<string>();
+  const report = useDownloadProgressStore((s) => s.report);
+  const clear = useDownloadProgressStore((s) => s.clear);
 
   useEffect(() => {
     if (!active) return;
@@ -27,11 +34,21 @@ export function useUploadSourcePreview(projectId: string, active: boolean) {
           // file was being prepared.
           setVersion(result.version || String(Date.now()));
           setStatus("ready");
+          clear(projectId);
           return;
         }
         if (result.state === "error") {
           setStatus("error");
+          clear(projectId);
           return;
+        }
+        if (result.state === "in_progress") {
+          report(projectId, {
+            state: "in_progress",
+            bytesDone: result.bytes_done,
+            bytesTotal: result.bytes_total,
+            title: projectTitle,
+          });
         }
       } catch {
         // transient network error: keep polling
@@ -45,8 +62,9 @@ export function useUploadSourcePreview(projectId: string, active: boolean) {
     return () => {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
+      clear(projectId);
     };
-  }, [projectId, active]);
+  }, [projectId, active, projectTitle, report, clear]);
 
   return {
     status,

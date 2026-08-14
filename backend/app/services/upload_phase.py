@@ -1465,6 +1465,7 @@ class UploadPhaseService:
     _source_download_guard = threading.Lock()
     _source_downloads_in_flight: set[str] = set()
     _source_download_errors: dict[str, str] = {}
+    _source_download_totals: dict[str, int] = {}
     _source_locks: dict[str, threading.Lock] = {}
 
     @classmethod
@@ -1521,6 +1522,30 @@ class UploadPhaseService:
             return cls._source_locks.setdefault(project_id, threading.Lock())
 
     @classmethod
+    def _source_download_bytes_done(cls, project_id: str) -> int:
+        cache_dir = cls._source_cache_dir(project_id)
+        if not cache_dir.exists():
+            return 0
+        newest: Path | None = None
+        newest_mtime = -1.0
+        for f in cache_dir.iterdir():
+            if not f.is_file() or f.suffix != ".part":
+                continue
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest_mtime = mtime
+                newest = f
+        if newest is None:
+            return 0
+        try:
+            return newest.stat().st_size
+        except OSError:
+            return 0
+
+    @classmethod
     def cached_source_video(cls, project_id: str) -> Path | None:
         cache_dir = cls._source_cache_dir(project_id)
         if not cache_dir.exists():
@@ -1554,6 +1579,10 @@ class UploadPhaseService:
                 if readiness.local_video_path and Path(readiness.local_video_path).exists():
                     shutil.copy2(readiness.local_video_path, partial)
                 elif readiness.drive_video_id:
+                    total = GoogleDriveService.get_file_size(readiness.drive_video_id)
+                    if total is not None:
+                        with cls._source_download_guard:
+                            cls._source_download_totals[project_id] = total
                     GoogleDriveService.download_file(readiness.drive_video_id, partial)
                 else:
                     raise ValueError(
@@ -1600,6 +1629,7 @@ class UploadPhaseService:
             finally:
                 with cls._source_download_guard:
                     cls._source_downloads_in_flight.discard(project_id)
+                    cls._source_download_totals.pop(project_id, None)
 
         threading.Thread(
             target=_worker, name=f"source-video-{project_id}", daemon=True
@@ -1620,9 +1650,17 @@ class UploadPhaseService:
                     "version": f"{stat.st_mtime_ns}-{stat.st_size}",
                 }
         with cls._source_download_guard:
-            if project_id in cls._source_downloads_in_flight:
-                return {"state": "in_progress"}
+            in_progress = project_id in cls._source_downloads_in_flight
+            total = cls._source_download_totals.get(project_id)
             error = cls._source_download_errors.get(project_id)
+        if in_progress:
+            result: dict[str, Any] = {
+                "state": "in_progress",
+                "bytes_done": cls._source_download_bytes_done(project_id),
+            }
+            if total is not None:
+                result["bytes_total"] = total
+            return result
         if error:
             return {"state": "error", "detail": error}
         return {"state": "missing"}

@@ -10,10 +10,12 @@ import {
   ProcessingPage,
   GapResolutionPage,
 } from "@/pages";
+import { DownloadProgressCard } from "@/components/DownloadProgressCard";
 
 function App() {
   return (
     <BrowserRouter>
+      <DownloadProgressCard />
       <Routes>
         <Route path="/" element={<ProjectSetup />} />
         <Route

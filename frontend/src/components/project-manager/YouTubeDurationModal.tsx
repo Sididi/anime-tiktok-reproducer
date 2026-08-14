@@ -36,7 +36,7 @@ export function YouTubeDurationModal({
   stacked = false,
 }: YouTubeDurationModalProps) {
   const maxDuration = 180;
-  const preview = useUploadSourcePreview(projectId, open);
+  const preview = useUploadSourcePreview(projectId, open, projectTitle);
 
   useEffect(() => {
     if (!open || stacked) return;
