@@ -261,6 +261,23 @@ async def test_create_post_includes_thumbnail_timestamp(fake, tmp_path):
     ]
 
 
+async def test_create_post_includes_thumbnail_url(fake, tmp_path):
+    state = TikTokPublishState(media_url="https://media.example/abc.mp4",
+                               stage="media_uploaded")
+    result = await create_tiktok_post(
+        api_key="key", social_account_id="spc_1", caption="cap",
+        post_for_me_platform="tiktok_business",
+        thumbnail_url="https://drive.example/cover.jpg",
+        thumbnail_timestamp_ms=500, publish_state=state,
+    )
+    assert result.success is True
+    assert fake.created_posts[0]["media"] == [{
+        "url": "https://media.example/abc.mp4",
+        "thumbnail_timestamp_ms": 500,
+        "thumbnail_url": "https://drive.example/cover.jpg",
+    }]
+
+
 async def test_create_post_omits_thumbnail_when_none(fake, tmp_path):
     state = TikTokPublishState(media_url="https://media.example/abc.mp4",
                                stage="media_uploaded")

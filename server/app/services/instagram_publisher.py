@@ -413,6 +413,7 @@ async def _create_instagram_container(
     thumb_offset: int | None,
     upload_method: str,
     video_url: str | None = None,
+    cover_url: str | None = None,
 ) -> tuple[str, str | None]:
     create_data = {
         "media_type": "REELS",
@@ -422,6 +423,8 @@ async def _create_instagram_container(
     }
     if thumb_offset is not None:
         create_data["thumb_offset"] = str(thumb_offset)
+    if cover_url is not None:
+        create_data["cover_url"] = cover_url
     if upload_method == "rupload":
         create_data["upload_type"] = "resumable"
     elif upload_method == "video_url":
@@ -1224,6 +1227,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
     poll_timeout: float = _DEFAULT_POLL_TIMEOUT_SECONDS,
     share_to_feed: bool = True,
     thumb_offset: int | None = None,
+    cover_url: str | None = None,
     publish_state: InstagramPublishState | dict[str, Any] | None = None,
     progress_callback: InstagramProgressCallback | None = None,
     project_id: str | None = None,
@@ -1428,6 +1432,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     thumb_offset=thumb_offset,
                     upload_method=upload_method,
                     video_url=prepared_video_url if upload_method == "video_url" else None,
+                    cover_url=cover_url,
                 )
                 created_at = _utc_now()
                 expires_at = created_at + timedelta(
@@ -1468,67 +1473,136 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     if isinstance(e, httpx.HTTPStatusError)
                     else f"{type(e).__name__}: {e}"
                 )
-                if upload_method == "video_url" and video_path is not None:
+                cover_retry_succeeded = False
+                if isinstance(e, httpx.HTTPStatusError) and cover_url is not None:
                     logger.warning(
-                        "Instagram video_url container creation failed; falling back "
-                        "to rupload ig_user_id=%s detail=%s",
+                        "Instagram container creation failed with cover_url set; "
+                        "retrying once without cover_url ig_user_id=%s detail=%s",
                         ig_user_id,
                         first_detail,
                     )
                     try:
-                        container_id, upload_uri, state = (
-                            await _create_rupload_fallback_container(
-                                client,
-                                base=base,
-                                ig_user_id=ig_user_id,
-                                ig_access_token=ig_access_token,
-                                caption=caption,
-                                share_to_feed=share_to_feed,
-                                thumb_offset=thumb_offset,
-                                graph_api_version=graph_api_version,
-                                first_detail=first_detail,
-                                force_video_url_reason=force_video_url_reason,
-                                prepared_metadata=prepared_metadata,
-                                progress_callback=progress_callback,
+                        container_id, upload_uri = await _create_instagram_container(
+                            client,
+                            base=base,
+                            ig_user_id=ig_user_id,
+                            ig_access_token=ig_access_token,
+                            caption=caption,
+                            share_to_feed=share_to_feed,
+                            thumb_offset=thumb_offset,
+                            upload_method=upload_method,
+                            video_url=(
+                                prepared_video_url if upload_method == "video_url" else None
+                            ),
+                            cover_url=None,
+                        )
+                    except (
+                        httpx.HTTPStatusError, httpx.HTTPError, KeyError, ValueError,
+                    ) as retry_e:
+                        first_detail = (
+                            _response_detail(retry_e.response)
+                            if isinstance(retry_e, httpx.HTTPStatusError)
+                            else f"{type(retry_e).__name__}: {retry_e}"
+                        )
+                    else:
+                        created_at = _utc_now()
+                        expires_at = created_at + timedelta(
+                            seconds=_INSTAGRAM_CONTAINER_TTL_SECONDS
+                        )
+                        state = InstagramPublishState(
+                            container_id=container_id,
+                            upload_uri=upload_uri,
+                            stage="uploaded" if upload_method == "video_url" else "created",
+                            created_at=created_at,
+                            expires_at=expires_at,
+                            upload_completed_at=(
+                                created_at if upload_method == "video_url" else None
+                            ),
+                            upload_method=upload_method,
+                            fallback_reason=force_video_url_reason,
+                            **prepared_metadata,
+                        )
+                        await _emit_progress(progress_callback, state)
+                        logger.info(
+                            "Instagram container created without cover_url after retry "
+                            "ig_user_id=%s graph_api_version=%s container_id=%s "
+                            "upload_method=%s",
+                            ig_user_id,
+                            graph_api_version,
+                            container_id,
+                            upload_method,
+                        )
+                        needs_upload = upload_method == "rupload"
+                        if (
+                            upload_method == "video_url"
+                            and video_path is not None
+                            and not prepared_metadata
+                        ):
+                            video_path.unlink(missing_ok=True)
+                            video_path = None
+                        cover_retry_succeeded = True
+                if not cover_retry_succeeded:
+                    if upload_method == "video_url" and video_path is not None:
+                        logger.warning(
+                            "Instagram video_url container creation failed; falling back "
+                            "to rupload ig_user_id=%s detail=%s",
+                            ig_user_id,
+                            first_detail,
+                        )
+                        try:
+                            container_id, upload_uri, state = (
+                                await _create_rupload_fallback_container(
+                                    client,
+                                    base=base,
+                                    ig_user_id=ig_user_id,
+                                    ig_access_token=ig_access_token,
+                                    caption=caption,
+                                    share_to_feed=share_to_feed,
+                                    thumb_offset=thumb_offset,
+                                    graph_api_version=graph_api_version,
+                                    first_detail=first_detail,
+                                    force_video_url_reason=force_video_url_reason,
+                                    prepared_metadata=prepared_metadata,
+                                    progress_callback=progress_callback,
+                                )
                             )
-                        )
-                        needs_upload = True
-                    except httpx.HTTPStatusError as fallback_e:
+                            needs_upload = True
+                        except httpx.HTTPStatusError as fallback_e:
+                            if video_path is not None:
+                                video_path.unlink(missing_ok=True)
+                            return InstagramPublishResult(
+                                success=False,
+                                detail=(
+                                    f"create_container: {first_detail}; "
+                                    "fallback_rupload: "
+                                    f"{_response_detail(fallback_e.response)}"
+                                ),
+                                publish_state=state,
+                            )
+                        except (httpx.HTTPError, KeyError, ValueError) as fallback_e:
+                            if video_path is not None:
+                                video_path.unlink(missing_ok=True)
+                            fallback_detail = (
+                                _response_detail(fallback_e.response)
+                                if isinstance(fallback_e, httpx.HTTPStatusError)
+                                else f"{type(fallback_e).__name__}: {fallback_e}"
+                            )
+                            return InstagramPublishResult(
+                                success=False,
+                                detail=(
+                                    f"create_container: {first_detail}; "
+                                    f"fallback_rupload: {fallback_detail}"
+                                ),
+                                publish_state=state,
+                            )
+                    else:
                         if video_path is not None:
                             video_path.unlink(missing_ok=True)
                         return InstagramPublishResult(
                             success=False,
-                            detail=(
-                                f"create_container: {first_detail}; "
-                                "fallback_rupload: "
-                                f"{_response_detail(fallback_e.response)}"
-                            ),
+                            detail=_stage_detail("create_container", first_detail),
                             publish_state=state,
                         )
-                    except (httpx.HTTPError, KeyError, ValueError) as fallback_e:
-                        if video_path is not None:
-                            video_path.unlink(missing_ok=True)
-                        fallback_detail = (
-                            _response_detail(fallback_e.response)
-                            if isinstance(fallback_e, httpx.HTTPStatusError)
-                            else f"{type(fallback_e).__name__}: {fallback_e}"
-                        )
-                        return InstagramPublishResult(
-                            success=False,
-                            detail=(
-                                f"create_container: {first_detail}; "
-                                f"fallback_rupload: {fallback_detail}"
-                            ),
-                            publish_state=state,
-                        )
-                else:
-                    if video_path is not None:
-                        video_path.unlink(missing_ok=True)
-                    return InstagramPublishResult(
-                        success=False,
-                        detail=_stage_detail("create_container", first_detail),
-                        publish_state=state,
-                    )
         elif needs_upload:
             video_path = _state_prepared_media_path(state, prepared_media_dir)
             if video_path is None:
@@ -1778,6 +1852,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     poll_timeout=poll_timeout,
                     share_to_feed=share_to_feed,
                     thumb_offset=thumb_offset,
+                    cover_url=cover_url,
                     publish_state=state,
                     progress_callback=progress_callback,
                     project_id=project_id,

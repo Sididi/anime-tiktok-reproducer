@@ -219,6 +219,23 @@ async def test_dispatch_tiktok_passes_thumbnail_timestamp(
     assert calls["create"][0]["thumbnail_timestamp_ms"] == 2350
 
 
+async def test_dispatch_tiktok_passes_thumbnail_url(
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
+):
+    settings = replace(
+        _settings_for(example_yaml, tmp_server_dir / "avatars"), pfm_api_key="key"
+    )
+    store = JobStore(tmp_path / "jobs.json")
+    discord = AsyncMock()
+    calls = _patch_phases(monkeypatch)
+    job = _tiktok_job()
+    job.tiktok_payload["thumbnail_url"] = "https://drive.example/cover.jpg"
+    await store.create(job)
+    await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
+    assert calls["create"][0]["thumbnail_url"] == "https://drive.example/cover.jpg"
+
+
 async def test_dispatch_tiktok_missing_payload_skips(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, caplog
 ):
@@ -446,6 +463,7 @@ async def test_dispatch_instagram_happy_path(
         "poll_timeout_seconds": 600,
         "share_to_feed": False,
         "thumb_offset": 250,
+        "cover_url": "https://drive.example/cover.jpg",
     }
     job.platform_statuses = {"instagram": PlatformStatus(status="pending")}
     await store.create(job)
@@ -482,6 +500,7 @@ async def test_dispatch_instagram_happy_path(
     assert publish_mock.await_args.kwargs["poll_timeout"] == 600
     assert publish_mock.await_args.kwargs["share_to_feed"] is False
     assert publish_mock.await_args.kwargs["thumb_offset"] == 250
+    assert publish_mock.await_args.kwargs["cover_url"] == "https://drive.example/cover.jpg"
     assert publish_mock.await_args.kwargs["project_id"] == "ig-job"
     assert "prepared_media_dir" not in publish_mock.await_args.kwargs
     assert "public_base_url" not in publish_mock.await_args.kwargs

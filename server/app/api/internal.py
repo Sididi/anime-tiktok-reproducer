@@ -33,6 +33,7 @@ class InstagramPayload(BaseModel):
     share_to_feed: bool | None = None
     thumb_offset: int | None = None
     max_duration_seconds: float | None = None
+    cover_url: str | None = None
 
 
 class TikTokPayload(BaseModel):
@@ -44,6 +45,7 @@ class TikTokPayload(BaseModel):
     allow_duet: bool = True
     allow_stitch: bool = True
     thumbnail_timestamp_ms: int | None = None
+    thumbnail_url: str | None = None
 
 
 class InitialPlatformStatus(BaseModel):

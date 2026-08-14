@@ -314,6 +314,61 @@ async def test_container_creation_fails_http_400():
 
 
 @respx.mock
+async def test_container_creation_includes_cover_url_when_set():
+    """cover_url, when passed, reaches the container-creation POST body."""
+    _mock_video_download()
+    create_route = _mock_resumable_create()
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON, poll_interval=0.01, poll_timeout=1.0,
+        cover_url="https://cdn.example.com/cover.jpg",
+    )
+
+    assert result.success is True
+    assert _form_call(create_route)["cover_url"] == ["https://cdn.example.com/cover.jpg"]
+
+
+@respx.mock
+async def test_container_creation_retries_without_cover_url_on_failure():
+    """A bad cover_url must never kill the publish: one retry without it."""
+    _mock_video_download()
+    create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
+        side_effect=[
+            httpx.Response(400, json={"error": {"message": "Invalid cover_url"}}),
+            httpx.Response(200, json={"id": CONTAINER_ID, "uri": UPLOAD_URI}),
+        ]
+    )
+    respx.get(f"{BASE}/{CONTAINER_ID}").mock(
+        return_value=httpx.Response(200, json={"status_code": "FINISHED", "id": CONTAINER_ID})
+    )
+    respx.post(f"{BASE}/{IG_USER_ID}/media_publish").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID})
+    )
+    respx.get(f"{BASE}/{MEDIA_ID}").mock(
+        return_value=httpx.Response(200, json={"id": MEDIA_ID, "permalink": PERMALINK_URL})
+    )
+
+    result = await publish_to_instagram(
+        **_COMMON, poll_interval=0.01, poll_timeout=1.0,
+        cover_url="https://cdn.example.com/bad-cover.jpg",
+    )
+
+    assert result.success is True
+    assert create_route.call_count == 2
+    assert "cover_url" in _form_call(create_route, 0)
+    assert "cover_url" not in _form_call(create_route, 1)
+
+
+@respx.mock
 async def test_polling_sees_error_status():
     """Container status returns ERROR → success=False."""
     _mock_video_download()
