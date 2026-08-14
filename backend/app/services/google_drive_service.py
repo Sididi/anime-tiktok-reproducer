@@ -742,6 +742,16 @@ class GoogleDriveService:
         return response
 
     @classmethod
+    def find_subfolder(cls, parent_id: str, name: str, *, drive=None) -> str | None:
+        """Return the id of an existing subfolder by exact name, else None."""
+        q = (
+            f"mimeType='{FOLDER_MIME}' and trashed=false and "
+            f"name='{_escape_query_value(name)}' and '{_escape_query_value(parent_id)}' in parents"
+        )
+        found = cls._query_files(q, fields="files(id,name)", drive=drive)
+        return str(found[0]["id"]) if found else None
+
+    @classmethod
     def ensure_subfolder(cls, parent_id: str, name: str, *, drive=None) -> str:
         drive = drive or cls._client()
         q = (

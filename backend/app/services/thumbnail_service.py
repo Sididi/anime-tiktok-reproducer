@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import subprocess
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,9 +21,11 @@ from PIL import Image
 from ..config import settings
 from ..models.match import MatchList, SceneMatch
 from ..models.transcription import Transcription
+from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
 from .export_service import ExportService
+from .google_drive_service import GoogleDriveService
 from .project_service import ProjectService
 
 logger = logging.getLogger(__name__)
@@ -302,5 +306,71 @@ class ThumbnailService:
             logger.warning(
                 "Local clean-frame extraction failed: %s t=%.3f",
                 path, candidate.source_timestamp_seconds, exc_info=True,
+            )
+            return None
+
+    _DRIVE_FETCH_TIMEOUT_SECONDS = 90
+
+    @classmethod
+    def _extract_drive_clean_frame(
+        cls, candidate: ThumbnailCandidate, drive_folder_id: str
+    ) -> Image.Image | None:
+        """Single-frame ffmpeg range-fetch from the project's Drive sources/ bundle.
+
+        ffmpeg seeks over HTTPS with Range requests: it reads the mp4 index
+        then only the GOP around the target — a few MB, never the full file.
+        """
+        if not candidate.episode or candidate.source_timestamp_seconds is None:
+            return None
+        try:
+            sources_id = GoogleDriveService.find_subfolder(drive_folder_id, "sources")
+            if not sources_id:
+                return None
+            basename = Path(candidate.episode).name
+            entries = GoogleDriveService.list_children_named(sources_id, basename)
+            if not entries:
+                return None
+            file_id = str(entries[0]["id"])
+            token = GoogleDriveService.credentials().token
+            url = (
+                "https://www.googleapis.com/drive/v3/files/"
+                f"{file_id}?alt=media&supportsAllDrives=true"
+            )
+            with tempfile.TemporaryDirectory(prefix="atr-thumb-drive-") as tmp:
+                out = Path(tmp) / "frame.jpg"
+                cmd = [
+                    "ffmpeg", "-y", "-v", "error",
+                    "-headers", f"Authorization: Bearer {token}\r\n",
+                    "-ss", f"{candidate.source_timestamp_seconds:.3f}",
+                    "-i", url,
+                    "-frames:v", "1", "-q:v", "2",
+                    str(out),
+                ]
+                # Same synchronous-ffmpeg idiom as match_playback_service._probe_clip_sync /
+                # video_cleanup_service._spawn_crop_reader / video_color.py: this classmethod
+                # is plain sync (no event loop involved), so we use subprocess.run directly
+                # (binary resolution + sanitized env via media_binaries, same as run_command)
+                # instead of the async run_command used elsewhere in the codebase.
+                cmd = rewrite_media_command(cmd)
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    check=False,
+                    timeout=cls._DRIVE_FETCH_TIMEOUT_SECONDS,
+                    env=get_media_subprocess_env(cmd),
+                )
+                if result.returncode != 0 or not out.exists():
+                    logger.warning(
+                        "Drive frame range-fetch failed: episode=%s t=%.3f rc=%s",
+                        basename, candidate.source_timestamp_seconds,
+                        result.returncode,
+                    )
+                    return None
+                with Image.open(out) as img:
+                    return img.convert("RGB").copy()
+        except Exception:
+            logger.warning(
+                "Drive clean-frame extraction failed for %s", candidate.episode,
+                exc_info=True,
             )
             return None

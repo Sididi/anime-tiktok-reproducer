@@ -400,3 +400,100 @@ def test_extract_local_clean_frame_none_without_source_or_file(monkeypatch):
         episode="gone.mkv", source_timestamp_seconds=1.0,
     )
     assert ThumbnailService._extract_local_clean_frame(with_source, None) is None
+
+
+def test_drive_clean_frame_builds_range_fetch_command(monkeypatch, tmp_path):
+    from app.services.thumbnail_service import ThumbnailService
+
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.GoogleDriveService.find_subfolder",
+        classmethod(lambda cls, parent, name: "srcfolder" if name == "sources" else None),
+    )
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.GoogleDriveService.list_children_named",
+        classmethod(lambda cls, folder_id, filename, drive=None: [{"id": "fid123"}]),
+    )
+
+    class _Creds:
+        token = "tok-abc"
+
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.GoogleDriveService.credentials",
+        classmethod(lambda cls: _Creds()),
+    )
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        # produce the output file the command would have written
+        out = Path(cmd[-1])
+        Image.new("RGB", (1920, 1080), (1, 2, 3)).save(out, "JPEG")
+        return _Result()
+
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.rewrite_media_command", lambda cmd: list(cmd)
+    )
+    monkeypatch.setattr("app.services.thumbnail_service.subprocess.run", fake_run)
+    cand = ThumbnailCandidate(
+        index=0, label="x", timestamp_seconds=0.05, scene_index=0, position="start",
+        episode="/library/Anime/ep1.mkv", source_timestamp_seconds=63.25,
+    )
+    frame = ThumbnailService._extract_drive_clean_frame(cand, "folder-1")
+    assert frame is not None and frame.size == (1920, 1080)
+    cmd = captured["cmd"]
+    assert cmd[0] == "ffmpeg"
+    assert "-ss" in cmd and cmd[cmd.index("-ss") + 1] == "63.250"
+    assert any("fid123" in part and "alt=media" in part for part in cmd)
+    assert any("Bearer tok-abc" in part for part in cmd)
+    assert "-frames:v" in cmd
+    # episode ref reduced to basename for the Drive lookup
+    # (list_children_named stub above only matches; assert via captured lookup is implicit)
+
+
+def test_drive_clean_frame_none_when_missing(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.GoogleDriveService.find_subfolder",
+        classmethod(lambda cls, parent, name: None),
+    )
+    cand = ThumbnailCandidate(
+        index=0, label="x", timestamp_seconds=0.05, scene_index=0, position="start",
+        episode="ep1.mkv", source_timestamp_seconds=1.0,
+    )
+    assert ThumbnailService._extract_drive_clean_frame(cand, "folder-1") is None
+
+
+def test_drive_clean_frame_none_on_ffmpeg_failure(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.GoogleDriveService.find_subfolder",
+        classmethod(lambda cls, parent, name: "srcfolder"),
+    )
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.GoogleDriveService.list_children_named",
+        classmethod(lambda cls, folder_id, filename, drive=None: [{"id": "fid123"}]),
+    )
+
+    class _Creds:
+        token = "tok"
+
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.GoogleDriveService.credentials",
+        classmethod(lambda cls: _Creds()),
+    )
+
+    class _Fail:
+        returncode = 1
+
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.rewrite_media_command", lambda cmd: list(cmd)
+    )
+    monkeypatch.setattr(
+        "app.services.thumbnail_service.subprocess.run", lambda cmd, **kw: _Fail()
+    )
+    cand = ThumbnailCandidate(
+        index=0, label="x", timestamp_seconds=0.05, scene_index=0, position="start",
+        episode="ep1.mkv", source_timestamp_seconds=1.0,
+    )
+    assert ThumbnailService._extract_drive_clean_frame(cand, "folder-1") is None
