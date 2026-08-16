@@ -350,6 +350,17 @@ class AnimeLibraryService:
         """Get the anime_searcher module path."""
         return settings.anime_searcher_path
 
+    # ext4 caps one path component at 255 bytes. The stem is not the whole
+    # component: the importer appends ".mp4", the sidecar writers append
+    # ".mp4.atr_source.json" (20 bytes, the longest suffix) and
+    # ".atr_subtitles" (14), and same-folder collisions append "__" plus an
+    # 8-hex hash (10). 180 + 10 + 20 = 210 keeps every derived name safely
+    # under the limit. Source releases that embed a full light-novel title in
+    # every episode filename (~200+ chars) previously sailed through
+    # normalization untouched and died much later with a raw OSError
+    # "File name too long" at whatever touched the path first.
+    MAX_EPISODE_STEM_CHARS = 180
+
     @classmethod
     def normalize_indexed_episode_stem(cls, raw_stem: str) -> str:
         """Normalize an indexed episode stem to a Premiere-safe ASCII filename."""
@@ -368,6 +379,11 @@ class AnimeLibraryService:
         normalized = re.sub(r"(?<=[A-Za-z0-9])([\[\(])", r" \1", normalized)
         normalized = cls._SAFE_EPISODE_FILENAME_INVALID_RE.sub(" ", normalized)
         normalized = re.sub(r"\s+", " ", normalized).strip(" ._")
+        if len(normalized) > cls.MAX_EPISODE_STEM_CHARS:
+            # Post-normalization the stem is pure ASCII, so chars == bytes.
+            # Two long titles that collide after truncation are disambiguated
+            # by the existing collision suffix, which hashes the *raw* stem.
+            normalized = normalized[: cls.MAX_EPISODE_STEM_CHARS].strip(" ._")
         return normalized or "episode"
 
     @staticmethod
