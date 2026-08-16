@@ -202,6 +202,7 @@ async def test_dispatch_tiktok_happy_path(
     assert len(calls["poll"]) == 1
 
 
+@pytest.mark.skip(reason="Thumbnail feature disabled 2026-08-16 (owner request); re-enable with the feature")
 async def test_dispatch_tiktok_passes_thumbnail_timestamp(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -219,6 +220,7 @@ async def test_dispatch_tiktok_passes_thumbnail_timestamp(
     assert calls["create"][0]["thumbnail_timestamp_ms"] == 2350
 
 
+@pytest.mark.skip(reason="Thumbnail feature disabled 2026-08-16 (owner request); re-enable with the feature")
 async def test_dispatch_tiktok_passes_thumbnail_url(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -499,8 +501,12 @@ async def test_dispatch_instagram_happy_path(
     assert publish_mock.await_args.kwargs["poll_interval"] == 7
     assert publish_mock.await_args.kwargs["poll_timeout"] == 600
     assert publish_mock.await_args.kwargs["share_to_feed"] is False
-    assert publish_mock.await_args.kwargs["thumb_offset"] == 250
-    assert publish_mock.await_args.kwargs["cover_url"] == "https://drive.example/cover.jpg"
+    # THUMBNAIL FEATURE DISABLED (2026-08-16, owner request): covers are not
+    # forwarded. Restore the equality assertions when re-enabling.
+    assert "thumb_offset" not in publish_mock.await_args.kwargs
+    assert "cover_url" not in publish_mock.await_args.kwargs
+    # assert publish_mock.await_args.kwargs["thumb_offset"] == 250
+    # assert publish_mock.await_args.kwargs["cover_url"] == "https://drive.example/cover.jpg"
     assert publish_mock.await_args.kwargs["project_id"] == "ig-job"
     assert "prepared_media_dir" not in publish_mock.await_args.kwargs
     assert "public_base_url" not in publish_mock.await_args.kwargs

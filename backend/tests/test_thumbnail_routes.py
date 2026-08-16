@@ -24,6 +24,7 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
+@pytest.mark.skip(reason="Thumbnail feature disabled 2026-08-16 (owner request); re-enable with the feature")
 def test_candidates_delegates_to_start_candidates_build(client, monkeypatch):
     monkeypatch.setattr(
         UploadPhaseService, "start_source_video_download",
@@ -51,6 +52,7 @@ def test_candidates_delegates_to_start_candidates_build(client, monkeypatch):
     assert resp.json() == snapshot
 
 
+@pytest.mark.skip(reason="Thumbnail feature disabled 2026-08-16 (owner request); re-enable with the feature")
 def test_candidates_404_when_project_missing(client, monkeypatch):
     def raise_missing(cls, pid, readiness=None):
         raise ValueError("Project not found")
@@ -62,6 +64,7 @@ def test_candidates_404_when_project_missing(client, monkeypatch):
     assert resp.status_code == 404
 
 
+@pytest.mark.skip(reason="Thumbnail feature disabled 2026-08-16 (owner request); re-enable with the feature")
 def test_candidates_warm_failure_is_best_effort(client, monkeypatch):
     """A non-ValueError warm failure must not 500 — the builder still runs
     off the clean-frame path, which doesn't need the source cache."""

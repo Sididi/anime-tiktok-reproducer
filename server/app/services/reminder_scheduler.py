@@ -328,8 +328,10 @@ async def _dispatch_tiktok_publish(  # noqa: PLR0911, PLR0912, PLR0915
                 allow_comment=bool(payload.get("allow_comment", True)),
                 allow_duet=bool(payload.get("allow_duet", True)),
                 allow_stitch=bool(payload.get("allow_stitch", True)),
-                thumbnail_timestamp_ms=payload.get("thumbnail_timestamp_ms"),
-                thumbnail_url=payload.get("thumbnail_url"),
+                # THUMBNAIL FEATURE DISABLED (2026-08-16, owner request):
+                # covers are not forwarded to PFM. Uncomment to re-enable.
+                # thumbnail_timestamp_ms=payload.get("thumbnail_timestamp_ms"),
+                # thumbnail_url=payload.get("thumbnail_url"),
                 scheduled_at=None if instant else sched,
                 publish_state=state,
             )
@@ -435,8 +437,10 @@ async def _dispatch_instagram_publish(
         share_to_feed=(
             True if payload.get("share_to_feed") is None else bool(payload["share_to_feed"])
         ),
-        thumb_offset=payload.get("thumb_offset"),
-        cover_url=payload.get("cover_url"),
+        # THUMBNAIL FEATURE DISABLED (2026-08-16, owner request):
+        # covers are not forwarded to the Graph container. Uncomment to re-enable.
+        # thumb_offset=payload.get("thumb_offset"),
+        # cover_url=payload.get("cover_url"),
         publish_state=job.instagram_publish_state,
         progress_callback=persist_instagram_state,
         project_id=job.project_id,

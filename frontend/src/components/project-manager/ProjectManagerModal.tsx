@@ -483,16 +483,21 @@ export function ProjectManagerModal({
     [isSessionCurrent, patchUploadSession, removeUploadSession, upsertUploadJob],
   );
 
+  // THUMBNAIL FEATURE DISABLED (2026-08-16, owner request): the selection
+  // modal is skipped and uploads enqueue directly, so no candidate extraction
+  // or preview preparation is triggered. To re-enable, restore the
+  // patchUploadSession block below and remove the enqueueUpload call.
   const continueUploadToThumbnail = useCallback(
     (context: PendingUploadContext, token: string) => {
-      patchUploadSession(context.projectId, token, {
-        context,
-        status: "awaiting_thumbnail_choice",
-        message: null,
-        youtubeResult: undefined,
-      });
+      void enqueueUpload(context, token);
+      // patchUploadSession(context.projectId, token, {
+      //   context,
+      //   status: "awaiting_thumbnail_choice",
+      //   message: null,
+      //   youtubeResult: undefined,
+      // });
     },
-    [patchUploadSession],
+    [enqueueUpload],
   );
 
   const continueUploadAfterFacebook = useCallback(

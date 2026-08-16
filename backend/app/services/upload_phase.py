@@ -911,6 +911,14 @@ class UploadPhaseService:
         progress_callback: Callable[[float, str, str], None] | None = None,
         platform_result_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
+        # THUMBNAIL FEATURE DISABLED (2026-08-16, owner request): force-clear
+        # both request fields so every downstream cover path (frame extraction,
+        # Drive hosting, YouTube thumbnails.set, Facebook thumb, Instagram
+        # cover_url/thumb_offset, TikTok thumbnail fields) stays inert.
+        # To re-enable, delete these two lines.
+        thumbnail_timestamp_ms = None
+        thumbnail_candidate_index = None
+
         def emit_progress(progress: float, phase: str, message: str) -> None:
             if progress_callback is None:
                 return
