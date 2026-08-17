@@ -599,7 +599,7 @@ class TranscriberService:
 
                 # wav2vec2 forced alignment: unchanged — this is what makes
                 # the word timings frame-precise.
-                segments, _model_a, _metadata, _align_device = cls._align_segments(
+                segments, model_a, align_metadata, align_device = cls._align_segments(
                     segments=segments,
                     audio=audio,
                     detected_language=detected_language,
@@ -610,9 +610,29 @@ class TranscriberService:
 
                 words = cls._extract_words_from_segments(segments)
                 words.sort(key=lambda word: (word["start"], word["end"]))
-                # Observational only: makes any future coverage regression
-                # loud in the logs instead of silently emptying scenes.
-                asr_engine.log_residual_coverage(words, speech_regions)
+                residual = asr_engine.log_residual_coverage(words, speech_regions)
+                if residual:
+                    # Token-cap truncation leaves a segment whose span claims
+                    # coverage while its text stops mid-word (token-dense
+                    # scripts, e.g. Hindi), so the batched coverage check
+                    # can't see it — the wordless tail only surfaces here,
+                    # after alignment. Re-decode those spans sequentially and
+                    # merge the aligned words.
+                    repairs = asr_engine.redecode_spans(
+                        model, audio, residual, language=detected_language
+                    )
+                    if repairs:
+                        repairs, _model_a, _metadata, _device = cls._align_segments(
+                            segments=repairs,
+                            audio=audio,
+                            detected_language=detected_language,
+                            align_device=align_device,
+                            alignment_model=model_a,
+                            alignment_metadata=align_metadata,
+                        )
+                        words.extend(cls._extract_words_from_segments(repairs))
+                        words.sort(key=lambda word: (word["start"], word["end"]))
+                        asr_engine.log_residual_coverage(words, speech_regions)
                 return words, detected_language
 
             if last_exc is not None:

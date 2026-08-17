@@ -18,7 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services import asr_engine
 from app.services.asr_engine import (
+    CHUNK_LENGTH_SECONDS,
     COVERAGE_GAP_MIN_SECONDS,
+    TOKEN_DENSE_CHUNK_LENGTH_SECONDS,
+    chunk_length_for,
+    redecode_spans,
     uncovered_speech_spans,
 )
 from app.services.transcriber import TranscriberService
@@ -106,6 +110,61 @@ class TestSequentialSpanClamping:
         assert asr_engine._sequential_decode_span(
             _BrokenModel(), audio, 10.0, 14.0, language="hi",
         ) == []
+
+
+class TestTokenCapResidualRepair:
+    """2026-08-17 signature (project eabe25d9b2f4, Hindi): a 15s chunk hit
+    the ~448-token decoder cap; the segment's text was truncated mid-word
+    (even mid-byte -> U+FFFD) while its span still claimed coverage to the
+    chunk end. The batched coverage check trusts spans, so the loss only
+    surfaces post-alignment as speech spans without words — those must be
+    fed back through the sequential decode path."""
+
+    def test_token_dense_language_gets_shorter_chunks(self):
+        assert chunk_length_for("hi") == TOKEN_DENSE_CHUNK_LENGTH_SECONDS
+        assert TOKEN_DENSE_CHUNK_LENGTH_SECONDS < CHUNK_LENGTH_SECONDS
+
+    def test_latin_and_auto_keep_default_chunks(self):
+        assert chunk_length_for("fr") == CHUNK_LENGTH_SECONDS
+        assert chunk_length_for("en") == CHUNK_LENGTH_SECONDS
+        assert chunk_length_for(None) == CHUNK_LENGTH_SECONDS
+
+    def test_redecode_spans_covers_every_span(self):
+        class _FakeSeg:
+            def __init__(self, start, end, text):
+                self.start, self.end, self.text = start, end, text
+
+        class _FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def transcribe(self, clip, **kwargs):
+                self.calls.append(len(clip))
+                # One segment spanning the whole clip (padding included);
+                # redecode_spans must clamp it back inside each gap.
+                return iter([_FakeSeg(0.0, len(clip) / 16000, "recovered")]), None
+
+        import numpy as np
+
+        audio = np.zeros(16000 * 340, dtype=np.float32)
+        spans = [(24.01, 26.15), (314.87, 317.63)]
+        segments = redecode_spans(_FakeModel(), audio, spans, language="hi")
+
+        assert len(segments) == 2
+        for seg, (gap_start, gap_end) in zip(segments, spans):
+            assert seg["text"] == "recovered"
+            assert seg["start"] >= gap_start
+            assert seg["end"] <= gap_end
+
+    def test_redecode_spans_empty_input(self):
+        class _NeverCalledModel:
+            def transcribe(self, clip, **kwargs):
+                raise AssertionError("must not decode when there are no spans")
+
+        import numpy as np
+
+        audio = np.zeros(16000, dtype=np.float32)
+        assert redecode_spans(_NeverCalledModel(), audio, [], language="hi") == []
 
 
 class TestNormalizeToken:

@@ -13,6 +13,11 @@ defenses. The new core:
 3. **Sequential re-decode of only the uncovered spans** — a genuinely
    different decode path that does not reproduce the batched dropout.
    On healthy media this never fires and costs nothing.
+4. **Post-alignment residual repair** (driven by the transcriber via
+   ``log_residual_coverage`` + ``redecode_spans``): token-cap-truncated
+   segments claim spans their text doesn't cover, which step 2 cannot see;
+   after wav2vec2 alignment the wordless tails become visible and are
+   re-decoded sequentially too.
 
 Word-level timing precision is unaffected: wav2vec2 forced alignment
 (whisperx.align, driven by the transcriber) runs on the merged segments
@@ -38,6 +43,18 @@ COVERAGE_GAP_MIN_SECONDS = 2.0
 # language comfortably under the cap (verified 2026-08-13: 30s chunks lost
 # ~60% of a dense Hindi narration).
 CHUNK_LENGTH_SECONDS = 15
+# 15s is still not always enough for scripts that Whisper's BPE encodes at
+# ~1+ token per character: a fast Hindi narration (~4.4 words/s, project
+# eabe25d9b2f4) overflowed the cap inside 15s chunks, truncating segment
+# text mid-word (even mid-byte, U+FFFD) while the segment span still claimed
+# coverage. Only applies when the language is known up front (no auto).
+TOKEN_DENSE_CHUNK_LENGTH_SECONDS = 10
+TOKEN_DENSE_LANGUAGES = {
+    # Indic scripts
+    "hi", "mr", "ne", "bn", "as", "gu", "pa", "or", "ta", "te", "kn", "ml", "si",
+    # Other BPE-dense scripts
+    "th", "lo", "km", "my", "ka", "am", "ur",
+}
 # Padding around a re-decoded gap so the decoder gets acoustic context.
 GAP_DECODE_PADDING_SECONDS = 0.35
 # A re-decoded segment must overlap its gap by this much to be kept
@@ -81,7 +98,7 @@ def decode_with_coverage(
         vad_filter=True,
         word_timestamps=False,
         without_timestamps=False,
-        chunk_length=CHUNK_LENGTH_SECONDS,
+        chunk_length=chunk_length_for(language),
     )
     segments = [
         {"start": float(seg.start), "end": float(seg.end), "text": seg.text or ""}
@@ -111,6 +128,36 @@ def decode_with_coverage(
         segments.sort(key=lambda seg: (seg["start"], seg["end"]))
 
     return segments, detected_language, speech_regions
+
+
+def chunk_length_for(language: str | None) -> int:
+    """Batched-decode chunk length in seconds, shrunk for token-dense scripts."""
+    if language in TOKEN_DENSE_LANGUAGES:
+        return TOKEN_DENSE_CHUNK_LENGTH_SECONDS
+    return CHUNK_LENGTH_SECONDS
+
+
+def redecode_spans(
+    model: Any,
+    audio: Any,
+    spans: list[tuple[float, float]],
+    *,
+    language: str,
+) -> list[dict]:
+    """Sequentially re-decode the given speech spans (repair path).
+
+    Same decode path as the in-``decode_with_coverage`` safety net, exposed
+    for the post-alignment residual repair: token-cap-truncated segments
+    claim coverage the batched check trusts, so their wordless tails only
+    become visible once alignment has run.
+    """
+    segments: list[dict] = []
+    for span_start, span_end in spans:
+        segments.extend(
+            _sequential_decode_span(model, audio, span_start, span_end, language=language)
+        )
+    segments.sort(key=lambda seg: (seg["start"], seg["end"]))
+    return segments
 
 
 def uncovered_speech_spans(
@@ -211,10 +258,11 @@ def log_residual_coverage(
     words: list[dict],
     speech_regions: list[tuple[float, float]],
 ) -> list[tuple[float, float]]:
-    """Final sanity check after alignment: speech spans still without words.
+    """Coverage check after alignment: speech spans still without words.
 
-    Purely observational (returns and logs); regressions become visible in
-    the logs instead of silently producing empty scenes.
+    Logs and returns the gaps; the transcriber feeds them back through
+    ``redecode_spans`` so token-cap truncation doesn't silently produce
+    empty scenes.
     """
     pseudo_segments = [
         {"start": word["start"], "end": word["end"], "text": word.get("text") or "w"}
