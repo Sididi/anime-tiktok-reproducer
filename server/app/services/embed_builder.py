@@ -1,7 +1,7 @@
 """Pure function: build a Discord embed dict from a Job + config."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -32,14 +32,22 @@ _STATUS_EMOJI = {
 
 
 
-def format_french_datetime(dt: datetime, *, tz: str = "UTC") -> str:
-    """Render `dt` in French. `tz` is the IANA timezone to display in."""
-    target = ZoneInfo(tz)
-    local = dt.astimezone(target)
-    label = "UTC" if tz == "UTC" else (local.tzname() or tz)
+_DISPLAY_TZ = ZoneInfo("Europe/Paris")
+
+
+def _as_local(dt: datetime) -> datetime:
+    # Naive datetimes are stored as UTC; anchor them before converting.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(_DISPLAY_TZ)
+
+
+def format_french_datetime(dt: datetime) -> str:
+    """Render `dt` in French, as Europe/Paris wall time (no timezone label)."""
+    local = _as_local(dt)
     return (
         f"{_FR_DAYS[local.weekday()]} {local.day} {_FR_MONTHS[local.month - 1]} "
-        f"{local.year} à {local.strftime('%H:%M')} {label}"
+        f"{local.year} à {local.strftime('%H:%M')}"
     )
 
 
@@ -94,7 +102,7 @@ def build_embed(
     footer_bits = [account.name]
     if job.device_id:
         footer_bits.append(job.device_id)
-    footer_bits.append(f"{job.slot_time.strftime('%H:%M')} UTC")
+    footer_bits.append(_as_local(job.slot_time).strftime("%H:%M"))
 
     return {
         "author": {"name": account.name, "icon_url": avatar_url},

@@ -156,48 +156,42 @@ export function ProjectRow({
         </span>
       </td>
 
-      {/* LLM preset */}
-      <td className="py-3 pr-3">
-        <span
-          className={`text-xs ${
-            row.llm_preset_is_default
-              ? "italic text-[hsl(var(--muted-foreground))]"
-              : "text-[hsl(var(--foreground))]"
-          }`}
-          title={row.llm_preset_is_default ? "Default" : "Project override"}
-        >
-          {row.llm_preset_resolved}
-        </span>
-      </td>
-
-      {/* Min playback speed */}
-      <td className="py-3 pr-3">
-        <span
-          className={`text-xs font-mono ${
-            row.min_playback_speed_is_default
-              ? "italic text-[hsl(var(--muted-foreground))]"
-              : "text-[hsl(var(--foreground))]"
-          }`}
-          title={
-            row.min_playback_speed_is_default ? "Default" : "Project override"
-          }
-        >
-          {row.min_playback_speed_resolved.toFixed(2)}
-        </span>
-      </td>
-
-      {/* Template */}
-      <td className="py-3 pr-3">
-        <span
-          className={`text-xs ${
-            row.template_is_default
-              ? "italic text-[hsl(var(--muted-foreground))]"
-              : "text-[hsl(var(--foreground))]"
-          }`}
-          title={row.template_is_default ? "Default" : "Project override"}
-        >
-          {row.template_resolved}
-        </span>
+      {/* Config: LLM • Speed • Template */}
+      <td className="py-3 pr-3 overflow-hidden">
+        <div className="text-xs whitespace-nowrap truncate">
+          <span
+            className={
+              row.llm_preset_is_default
+                ? "italic text-[hsl(var(--muted-foreground))]"
+                : "text-[hsl(var(--foreground))]"
+            }
+            title={`LLM — ${row.llm_preset_is_default ? "Default" : "Project override"}`}
+          >
+            {row.llm_preset_resolved}
+          </span>
+          <span className="text-[hsl(var(--muted-foreground))]"> • </span>
+          <span
+            className={`font-mono ${
+              row.min_playback_speed_is_default
+                ? "italic text-[hsl(var(--muted-foreground))]"
+                : "text-[hsl(var(--foreground))]"
+            }`}
+            title={`Speed — ${row.min_playback_speed_is_default ? "Default" : "Project override"}`}
+          >
+            {row.min_playback_speed_resolved.toFixed(2)}
+          </span>
+          <span className="text-[hsl(var(--muted-foreground))]"> • </span>
+          <span
+            className={
+              row.template_is_default
+                ? "italic text-[hsl(var(--muted-foreground))]"
+                : "text-[hsl(var(--foreground))]"
+            }
+            title={`Template — ${row.template_is_default ? "Default" : "Project override"}`}
+          >
+            {row.template_resolved}
+          </span>
+        </div>
       </td>
 
       {/* Scheduled At */}
