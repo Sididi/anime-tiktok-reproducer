@@ -30,6 +30,24 @@ def _scheduled_project() -> Project:
     )
 
 
+def _posted_project_with_pending_platforms() -> Project:
+    """Posted on TikTok already, still scheduled on the other platforms."""
+    past = datetime.now(timezone.utc) - timedelta(days=1)
+    future = datetime.now(timezone.utc) + timedelta(days=1)
+    return Project(
+        id="project1",
+        drive_folder_id="drive-project",
+        upload_completed_at=past,
+        platform_schedules={
+            "tiktok": PlatformSchedule(slot=past, scheduled_at=past),
+            **{
+                platform: PlatformSchedule(slot=future, scheduled_at=future)
+                for platform in ("youtube", "facebook", "instagram")
+            },
+        },
+    )
+
+
 def test_managed_delete_rejects_unconfirmed_scheduled_project(monkeypatch):
     project = _scheduled_project()
     monkeypatch.setattr("app.services.upload_phase.ProjectService.load", lambda _id: project)
@@ -66,7 +84,7 @@ def test_legacy_aggregate_schedule_still_requires_confirmation(monkeypatch):
 
 
 def test_confirmed_managed_delete_archives_unschedules_then_deletes(monkeypatch):
-    project = _scheduled_project()
+    project = _posted_project_with_pending_platforms()
     calls: list[str] = []
     monkeypatch.setattr("app.services.upload_phase.ProjectService.load", lambda _id: project)
     monkeypatch.setattr(
@@ -107,13 +125,12 @@ def test_confirmed_managed_delete_archives_unschedules_then_deletes(monkeypatch)
     assert result["unscheduled"] == {
         "facebook": "ok",
         "instagram": "ok",
-        "tiktok": "ok",
         "youtube": "ok",
     }
 
 
 def test_archive_failure_preserves_original_and_local_project(monkeypatch):
-    project = _scheduled_project()
+    project = _posted_project_with_pending_platforms()
     monkeypatch.setattr("app.services.upload_phase.ProjectService.load", lambda _id: project)
     monkeypatch.setattr(
         "app.services.upload_phase.GoogleDriveService.is_configured", lambda: True
@@ -134,6 +151,113 @@ def test_archive_failure_preserves_original_and_local_project(monkeypatch):
 
     drive_delete.assert_not_called()
     local_delete.assert_not_called()
+
+
+def _mock_delete_collaborators(monkeypatch, calls: list[str]) -> None:
+    monkeypatch.setattr(
+        "app.services.upload_phase.GoogleDriveService.is_configured", lambda: True
+    )
+    monkeypatch.setattr(
+        "app.services.upload_phase.PlatformRescheduleService.delete_server_job",
+        lambda _project: calls.append("server") or NotificationResult(status="ok"),
+    )
+    monkeypatch.setattr(
+        "app.services.upload_phase.PlatformRescheduleService.cancel",
+        lambda _project, platform: calls.append(f"cancel:{platform}")
+        or NotificationResult(status="ok"),
+    )
+    monkeypatch.setattr(
+        "app.services.upload_phase.GoogleDriveService.delete_folder",
+        lambda _id: calls.append("drive-delete"),
+    )
+    monkeypatch.setattr(
+        "app.services.upload_phase.ProjectService.delete",
+        lambda _id: calls.append("local-delete") or True,
+    )
+
+
+def test_scheduled_only_project_deletes_without_archive(monkeypatch):
+    project = _scheduled_project()
+    calls: list[str] = []
+    monkeypatch.setattr("app.services.upload_phase.ProjectService.load", lambda _id: project)
+    archive = MagicMock()
+    monkeypatch.setattr(
+        "app.services.upload_phase.GoogleDriveService.archive_project_folder", archive
+    )
+    _mock_delete_collaborators(monkeypatch, calls)
+
+    result = UploadPhaseService.managed_delete(project.id, confirmed=True)
+
+    archive.assert_not_called()
+    assert result["archive"] is None
+    assert result["status"] == "deleted"
+    assert "drive-delete" in calls and "local-delete" in calls
+
+
+def test_dispatched_but_all_future_deletes_without_archive(monkeypatch):
+    # Uploaded to the schedulers but nothing has gone live yet: still only
+    # scheduled, so no archive copy is kept.
+    project = _scheduled_project()
+    project.upload_last_result = {"platforms": [{"platform": "tiktok", "status": "pending"}]}
+    calls: list[str] = []
+    monkeypatch.setattr("app.services.upload_phase.ProjectService.load", lambda _id: project)
+    archive = MagicMock()
+    monkeypatch.setattr(
+        "app.services.upload_phase.GoogleDriveService.archive_project_folder", archive
+    )
+    _mock_delete_collaborators(monkeypatch, calls)
+
+    result = UploadPhaseService.managed_delete(project.id, confirmed=True)
+
+    archive.assert_not_called()
+    assert result["archive"] is None
+    assert result["status"] == "deleted"
+
+
+def test_never_uploaded_project_deletes_without_archive(monkeypatch):
+    project = Project(id="project1", drive_folder_id="drive-project")
+    calls: list[str] = []
+    monkeypatch.setattr("app.services.upload_phase.ProjectService.load", lambda _id: project)
+    archive = MagicMock()
+    monkeypatch.setattr(
+        "app.services.upload_phase.GoogleDriveService.archive_project_folder", archive
+    )
+    _mock_delete_collaborators(monkeypatch, calls)
+
+    # No pending platforms: no confirmation required.
+    result = UploadPhaseService.managed_delete(project.id)
+
+    archive.assert_not_called()
+    assert result["archive"] is None
+    assert result["status"] == "deleted"
+    assert calls == ["drive-delete", "local-delete"]
+
+
+def test_posted_project_with_past_schedules_archives(monkeypatch):
+    past = datetime.now(timezone.utc) - timedelta(days=1)
+    project = Project(
+        id="project1",
+        drive_folder_id="drive-project",
+        upload_completed_at=past,
+        upload_last_result={
+            "platforms": [{"platform": "youtube", "url": "https://youtu.be/abc12345"}]
+        },
+        platform_schedules={
+            "youtube": PlatformSchedule(slot=past, scheduled_at=past),
+        },
+    )
+    calls: list[str] = []
+    monkeypatch.setattr("app.services.upload_phase.ProjectService.load", lambda _id: project)
+    monkeypatch.setattr(
+        "app.services.upload_phase.GoogleDriveService.archive_project_folder",
+        lambda _id: calls.append("archive") or {"folder_id": "archive1", "files_copied": 7},
+    )
+    _mock_delete_collaborators(monkeypatch, calls)
+
+    result = UploadPhaseService.managed_delete(project.id)
+
+    assert calls == ["archive", "drive-delete", "local-delete"]
+    assert result["archive"] == {"folder_id": "archive1", "files_copied": 7}
 
 
 def test_drive_archive_copies_only_reconstructable_files(monkeypatch):

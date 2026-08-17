@@ -2145,8 +2145,31 @@ class UploadPhaseService:
             )
             drive_folder_id = found["id"] if found else None
 
+        # Archive is reserved for projects that actually went live: emergency
+        # re-access only matters for published videos. Scheduled-only or
+        # never-posted projects are deleted outright, without an archive copy.
+        has_upload_activity = bool(
+            project.upload_completed_at
+            or project.upload_last_result
+            or project.final_upload_discord_message_id
+        )
+        live_platforms = {
+            platform
+            for platform, schedule in (project.platform_schedules or {}).items()
+            if (
+                schedule.scheduled_at.replace(tzinfo=timezone.utc)
+                if schedule.scheduled_at.tzinfo is None
+                else schedule.scheduled_at.astimezone(timezone.utc)
+            )
+            <= now
+        }
+        everything_still_pending = bool(pending_platform_set) or aggregate_is_future
+        was_posted = has_upload_activity and (
+            bool(live_platforms) or not everything_still_pending
+        )
+
         # Archive must finish before any destructive Drive or local operation.
-        if drive_folder_id and GoogleDriveService.is_configured():
+        if was_posted and drive_folder_id and GoogleDriveService.is_configured():
             archive_result = GoogleDriveService.archive_project_folder(drive_folder_id)
 
         cancellation_status: dict[str, str] = {}

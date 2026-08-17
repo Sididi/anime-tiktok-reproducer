@@ -45,8 +45,9 @@ export function ScheduledDeleteConfirm({ open, projectTitle, scheduledAt, onConf
                   Delete <strong>{projectTitle}</strong>?
                 </>
               )}
-              {" "}The reconstructable Drive files, when present, will first be
-              copied to Archive Projets.
+              {" "}Already-posted projects first have their reconstructable
+              Drive files copied to Archive Projets; scheduled-only or unposted
+              projects are deleted entirely.
             </p>
             <div className="flex justify-end gap-2">
               <Button variant="ghost" size="sm" onClick={onCancel}>

@@ -1331,8 +1331,9 @@ export function ProjectManagerModal({
                     {selectedProjectIds.size !== 1 ? "s" : ""}?
                   </h3>
                   <p className="text-sm text-[hsl(var(--muted-foreground))] mb-4">
-                    Reconstructable Drive files, when present, will be copied to
-                    Archive Projets before the selected projects are deleted.
+                    Already-posted projects have their reconstructable Drive
+                    files copied to Archive Projets first; scheduled-only or
+                    unposted projects are deleted entirely.
                   </p>
                   {selectedPendingRows.length > 0 && (
                     <div className="mb-4 rounded-md border border-[hsl(var(--destructive))]/50 bg-[hsl(var(--destructive))]/10 p-3">
