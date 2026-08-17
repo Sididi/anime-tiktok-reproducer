@@ -88,10 +88,28 @@ CLIP_CONTEXT_FRAMES = 10
 CLIP_MAX_FRAMES = 240
 CLIP_CHUNK_OVERLAP = 10
 
-# Inpaint mask dilation inside the rect (pixels ~ iterations).
-MASK_DILATE_ITERATIONS = 9
-# Feather (Gaussian sigma in px) when compositing back.
-COMPOSITE_FEATHER_SIGMA = 1.5
+# Inpaint mask dilation inside the rect (pixels ~ iterations). Must leave
+# enough margin past the text's dark outline (~3px, plus 2px of half-res
+# quantization) for the eroded+feathered composite alpha: with erode 2 and
+# sigma 2.5, original pixels show through up to ~6px inside the mask edge —
+# 12px of dilation keeps the outline at >=7px depth (<=2% show-through;
+# 9px left visible outline traces on bright backgrounds).
+MASK_DILATE_ITERATIONS = 12
+# Per-frame subtitle masks: each active frame's mask is the union of the raw
+# text masks over a ±window. Tight per-frame holes let the model propagate the
+# real background revealed when the text changes (the per-clip union mask made
+# every fill a hallucination and the composite a visible band).
+TEXT_MASK_WINDOW_FRAMES = 5
+# Feather (Gaussian sigma in px) when compositing back; the alpha is eroded
+# first so the blend band sits inside the repaired margin.
+COMPOSITE_FEATHER_SIGMA = 2.5
+COMPOSITE_ALPHA_ERODE_PX = 2
+# Optional unsharp on the upscaled fill, applied inside the mask only
+# (env PURE_CLEANUP_FILL_UNSHARP overrides; 0 disables).
+FILL_UNSHARP_AMOUNT = 0.0
+# Bumped whenever the npz clip-cache content semantics change (masks moved
+# from per-clip union to per-frame in v2); stale versions are ignored.
+CLIP_CACHE_VERSION = 2
 
 # Temporal stride: the model processes every Nth frame; skipped frames get
 # their mask region filled by blending the two neighbouring fills. The mask
@@ -102,6 +120,15 @@ COMPOSITE_FEATHER_SIGMA = 1.5
 # window (2026-08-14) — visually indistinguishable from stride 2.
 TEMPORAL_STRIDE = 3
 TEMPORAL_STRIDE_SMALL_CROP = 4
+
+# A skipped (strided) frame's fill is blended from the two neighbouring model
+# frames; its true text pixels are only guaranteed covered by those frames'
+# masks when the window is at least the stride.
+assert TEXT_MASK_WINDOW_FRAMES >= TEMPORAL_STRIDE_SMALL_CROP
+# Mid-span chunk boundaries only carry CLIP_CHUNK_OVERLAP frames of shared
+# context; a wider window would truncate at the seam and masks would differ
+# between the two chunks for the same output frame.
+assert TEXT_MASK_WINDOW_FRAMES <= CLIP_CHUNK_OVERLAP
 
 # OOM ladder for ProPainter subvideo length.
 SUBVIDEO_LADDER = (80, 40, 24)
@@ -139,7 +166,10 @@ class _Clip:
     @property
     def cache_name(self) -> str:
         z = self.zone_plan.zone
-        return f"{z.kind}_{z.id}_{self.out_start:06d}_{self.out_end:06d}.npz"
+        return (
+            f"{z.kind}_{z.id}_{self.out_start:06d}_{self.out_end:06d}"
+            f"_v{CLIP_CACHE_VERSION}.npz"
+        )
 
 
 class CleanupCancelled(Exception):
@@ -600,17 +630,48 @@ class VideoCleanupService:
         return np.stack(frames), current_pos
 
     @classmethod
+    def _per_frame_text_masks(
+        cls, clip: _Clip, crop_frames_bgr: np.ndarray
+    ) -> list[np.ndarray | None]:
+        """Half-resolution raw text mask per frame (None on context frames).
+
+        Mirrors exactly what the decode thread accumulates during the full
+        run, so the preview path (which recomputes here) cannot diverge.
+        """
+        plan = clip.zone_plan
+        cx, cy, _, _ = plan.crop
+        x, y, w, h = plan.rect
+        rx, ry = x - cx, y - cy
+        mh, mw = max(1, h // 2), max(1, w // 2)
+        out: list[np.ndarray | None] = []
+        for i in range(crop_frames_bgr.shape[0]):
+            absolute = clip.frame_start + i
+            if not (clip.mask_start <= absolute < clip.mask_end):
+                out.append(None)
+                continue
+            rect_crop = crop_frames_bgr[i][ry : ry + h, rx : rx + w]
+            if (mh, mw) != (h, w):
+                rect_crop = cv2.resize(
+                    rect_crop, (mw, mh), interpolation=cv2.INTER_AREA
+                )
+            out.append(cls._text_mask(rect_crop))
+        return out
+
+    @classmethod
     def _build_clip_masks(
         cls,
         clip: _Clip,
         crop_frames_bgr: np.ndarray,
-        text_union: np.ndarray | None = None,
+        text_masks: list[np.ndarray | None] | None = None,
     ) -> np.ndarray:
         """Per-frame uint8 masks (255 = inpaint) in crop coords.
 
-        ``text_union`` is the incrementally accumulated per-frame text-mask
-        union (rect coords) computed on the decode thread; when None it is
-        recomputed here from the frames (preview path).
+        ``text_masks`` is the per-frame half-resolution raw text mask list
+        (rect coords, None on context frames) accumulated on the decode
+        thread; when None it is recomputed here from the frames (preview
+        path). Each active frame's mask is the union of the raw masks over
+        a ±TEXT_MASK_WINDOW_FRAMES window, dilated — tight per-frame holes
+        instead of the former per-clip union band.
         """
         plan = clip.zone_plan
         cx, cy, cw, ch = plan.crop
@@ -620,46 +681,80 @@ class VideoCleanupService:
         length = crop_frames_bgr.shape[0]
         masks = np.zeros((length, ch, cw), dtype=np.uint8)
 
-        if plan.zone.kind == "watermark":
+        def _active(i: int) -> bool:
+            absolute = clip.frame_start + i
+            return clip.mask_start <= absolute < clip.mask_end
+
+        def _fill_full_rect() -> np.ndarray:
             rect_mask = np.zeros((ch, cw), dtype=np.uint8)
             rect_mask[ry : ry + h, rx : rx + w] = 255
-        else:
-            if os.environ.get("PURE_CLEANUP_FULL_RECT_MASK"):
-                rect_mask = np.zeros((ch, cw), dtype=np.uint8)
-                rect_mask[ry : ry + h, rx : rx + w] = 255
-            else:
-                # Static-per-span mask: union of per-frame text masks over the
-                # ACTIVE frames of this clip, dilated, clipped to the rect.
-                if text_union is not None:
-                    if text_union.shape != (h, w):
-                        union = cv2.resize(
-                            text_union.astype(np.uint8), (w, h),
-                            interpolation=cv2.INTER_NEAREST,
-                        ) > 0
-                    else:
-                        union = text_union.copy()
-                else:
-                    union = np.zeros((h, w), dtype=bool)
-                    for i in range(length):
-                        absolute = clip.frame_start + i
-                        if clip.mask_start <= absolute < clip.mask_end:
-                            crop = crop_frames_bgr[i]
-                            union |= cls._text_mask(crop[ry : ry + h, rx : rx + w])
-                if not union.any():
-                    # Detection said text is here; fall back to the full rect.
-                    union[:] = True
-                kernel = np.ones((3, 3), np.uint8)
-                dilated = cv2.dilate(
-                    union.astype(np.uint8), kernel,
-                    iterations=MASK_DILATE_ITERATIONS,
-                )
-                rect_mask = np.zeros((ch, cw), dtype=np.uint8)
-                rect_mask[ry : ry + h, rx : rx + w] = dilated * 255
+            for i in range(length):
+                if _active(i):
+                    masks[i] = rect_mask
+            return masks
 
+        if plan.zone.kind == "watermark" or os.environ.get(
+            "PURE_CLEANUP_FULL_RECT_MASK"
+        ):
+            return _fill_full_rect()
+
+        if text_masks is None:
+            text_masks = cls._per_frame_text_masks(clip, crop_frames_bgr)
+
+        raw = [m for m in text_masks if m is not None]
+        if not raw or not any(m.any() for m in raw):
+            # Detection said text is here yet no strokes were found on any
+            # frame; fall back to the full rect (rare — the warning feeds
+            # the verification stats).
+            logger.warning(
+                "Cleanup clip %s: empty text-mask union, falling back to "
+                "the full rect", clip.cache_name,
+            )
+            return _fill_full_rect()
+
+        dilate_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * MASK_DILATE_ITERATIONS + 1, 2 * MASK_DILATE_ITERATIONS + 1),
+        )
+        window = TEXT_MASK_WINDOW_FRAMES
+        # Sliding ±window union via an incremental count array (2 updates per
+        # frame instead of re-OR-ing the whole window).
+        count = np.zeros(raw[0].shape, dtype=np.uint16)
+        added_hi = -1
+        removed_lo = 0
+        empty_active = 0
         for i in range(length):
-            absolute = clip.frame_start + i
-            if clip.mask_start <= absolute < clip.mask_end:
-                masks[i] = rect_mask
+            while added_hi < min(length - 1, i + window):
+                added_hi += 1
+                m = text_masks[added_hi]
+                if m is not None:
+                    count += (m > 0).astype(np.uint16)
+            while removed_lo < i - window:
+                m = text_masks[removed_lo]
+                if m is not None:
+                    count -= (m > 0).astype(np.uint16)
+                removed_lo += 1
+            if not _active(i):
+                continue
+            base = (count > 0).astype(np.uint8)
+            if not base.any():
+                # Window sees no candidate pixels at all: nothing visible to
+                # remove on this frame — leave it untouched (falling back to
+                # a wider union would resurrect the band on hysteresis
+                # tails).
+                empty_active += 1
+                continue
+            if base.shape != (h, w):
+                base = cv2.resize(
+                    base, (w, h), interpolation=cv2.INTER_NEAREST
+                )
+            dilated = cv2.dilate(base, dilate_kernel)
+            masks[i, ry : ry + h, rx : rx + w] = dilated * 255
+        if empty_active:
+            logger.debug(
+                "Cleanup clip %s: %d active frame(s) with empty window mask",
+                clip.cache_name, empty_active,
+            )
         return masks
 
     @staticmethod
@@ -786,21 +881,97 @@ class VideoCleanupService:
         for orig, fill in fill_by_index.items():
             region = masks[orig] > 0
             result[orig][region] = fill[region]
-        kept_sorted = keep
-        for j in range(length):
-            if j in fill_by_index:
-                continue
-            prev_i = max(i for i in kept_sorted if i < j)
-            next_i = min(i for i in kept_sorted if i > j)
-            region = masks[j] > 0
-            if not region.any():
-                continue
-            blended = (
-                fill_by_index[prev_i].astype(np.uint16)
-                + fill_by_index[next_i].astype(np.uint16)
-            ) // 2
-            result[j][region] = blended.astype(np.uint8)[region]
+        # A neighbour's fill outside its OWN mask is that neighbour's
+        # original pixels — subtitle strokes included. With per-frame masks
+        # the blend must therefore be restricted per pixel to where each
+        # neighbour actually repaired; masks are ±window unions with
+        # window >= stride, so every true text pixel of a skipped frame is
+        # covered by both neighbours. (Static masks: both == region,
+        # identical to the former 50/50 blend.)
+        for prev_i, next_i in zip(keep, keep[1:]):
+            blended = None
+            fill_p = fill_by_index[prev_i]
+            fill_n = fill_by_index[next_i]
+            mask_p = masks[prev_i] > 0
+            mask_n = masks[next_i] > 0
+            for j in range(prev_i + 1, next_i):
+                region = masks[j] > 0
+                if not region.any():
+                    continue
+                both = region & mask_p & mask_n
+                only_p = region & mask_p & ~mask_n
+                only_n = region & mask_n & ~mask_p
+                if both.any():
+                    if blended is None:
+                        blended = (
+                            (fill_p.astype(np.uint16) + fill_n.astype(np.uint16))
+                            // 2
+                        ).astype(np.uint8)
+                    result[j][both] = blended[both]
+                if only_p.any():
+                    result[j][only_p] = fill_p[only_p]
+                if only_n.any():
+                    result[j][only_n] = fill_n[only_n]
+                # region pixels covered by neither neighbour are window
+                # bleed, not text at frame j — the original stays.
         return result
+
+    @staticmethod
+    def _fill_is_near_black(
+        result_bgr: np.ndarray, masks: np.ndarray, original_bgr: np.ndarray
+    ) -> bool:
+        """Canary: a mostly-black mid-frame fill means upstream flow/feature
+        corruption (e.g. the RAFT sub-128px NaN pathology) — but only when
+        the surrounding original content is NOT black itself. With per-frame
+        stroke masks a black fill is the correct answer on fades/dark scenes
+        (measured: every black fill on the reference project sat in >80%
+        black surroundings)."""
+        mid = result_bgr.shape[0] // 2
+        region = masks[mid] > 0
+        mid_region = result_bgr[mid][region]
+        if not mid_region.size:
+            return False
+        if float((mid_region.max(axis=1) < 8).mean()) <= 0.9:
+            return False
+        surroundings = original_bgr[mid][~region]
+        if not surroundings.size:
+            return True
+        return float((surroundings.max(axis=1) < 8).mean()) < 0.5
+
+    @classmethod
+    def _canary_retry_fp32(
+        cls,
+        frames_bgr: np.ndarray,
+        masks: np.ndarray,
+        *,
+        status_cb: Callable[[str], None] | None = None,
+    ) -> np.ndarray | None:
+        """One bounded fp32 retry of a clip whose fill tripped the canary.
+        Returns None (keep the suspect fill) if the retry fails or trips
+        the canary again — never fail the whole job over it."""
+        from .propainter_adapter import ProPainterEngine
+
+        try:
+            ProPainterEngine.load(fp16=False)
+            retry = cls._inpaint_ladder_inner(
+                frames_bgr,
+                masks,
+                status_cb=status_cb,
+                allow_canary_retry=False,
+                _attempts_override=[
+                    (SUBVIDEO_LADDER[-1], 1.0),
+                    (SUBVIDEO_LADDER[-1], OOM_DOWNSCALE_FACTOR),
+                ],
+            )
+        except Exception:
+            logger.exception("Canary fp32 retry failed; keeping the suspect fill")
+            return None
+        finally:
+            # MUST restore, else every later clip runs fp32.
+            ProPainterEngine.load(fp16=True)
+        if cls._fill_is_near_black(retry, masks, frames_bgr):
+            return None
+        return retry
 
     @classmethod
     def _inpaint_ladder_inner(
@@ -809,6 +980,8 @@ class VideoCleanupService:
         masks: np.ndarray,
         *,
         status_cb: Callable[[str], None] | None = None,
+        allow_canary_retry: bool = True,
+        _attempts_override: list[tuple[int, float]] | None = None,
     ) -> np.ndarray:
         import torch
 
@@ -821,13 +994,19 @@ class VideoCleanupService:
         if long_side > MODEL_MAX_LONG_SIDE:
             scale = MODEL_MAX_LONG_SIDE / long_side
 
-        attempts: list[tuple[int, float]] = []
-        for subvideo in SUBVIDEO_LADDER:
-            attempts.append((subvideo, scale))
-        attempts.append((SUBVIDEO_LADDER[-1], scale * OOM_DOWNSCALE_FACTOR))
-        attempts.append(
-            (SUBVIDEO_LADDER[-1], scale * OOM_DOWNSCALE_FACTOR * OOM_DOWNSCALE_FACTOR)
-        )
+        if _attempts_override is not None:
+            attempts = list(_attempts_override)
+        else:
+            attempts = []
+            for subvideo in SUBVIDEO_LADDER:
+                attempts.append((subvideo, scale))
+            attempts.append((SUBVIDEO_LADDER[-1], scale * OOM_DOWNSCALE_FACTOR))
+            attempts.append(
+                (
+                    SUBVIDEO_LADDER[-1],
+                    scale * OOM_DOWNSCALE_FACTOR * OOM_DOWNSCALE_FACTOR,
+                )
+            )
 
         last_error: Exception | None = None
         for attempt_index, (subvideo, attempt_scale) in enumerate(attempts):
@@ -882,19 +1061,43 @@ class VideoCleanupService:
                             for f in result_bgr
                         ]
                     )
+                    unsharp = FILL_UNSHARP_AMOUNT
+                    env_unsharp = os.environ.get("PURE_CLEANUP_FILL_UNSHARP")
+                    if env_unsharp:
+                        try:
+                            unsharp = float(env_unsharp)
+                        except ValueError:
+                            logger.warning(
+                                "Ignoring invalid PURE_CLEANUP_FILL_UNSHARP=%r",
+                                env_unsharp,
+                            )
+                    if unsharp > 0:
+                        # The upscaled fill is softer than the native-res
+                        # surroundings; sharpen inside the mask only.
+                        for i in range(length):
+                            region = masks[i] > 0
+                            if not region.any():
+                                continue
+                            f = result_bgr[i]
+                            sharp = cv2.addWeighted(
+                                f, 1.0 + unsharp,
+                                cv2.GaussianBlur(f, (0, 0), 1.0), -unsharp,
+                                0,
+                            )
+                            f[region] = sharp[region]
 
-                mid = length // 2
-                mid_region = result_bgr[mid][masks[mid] > 0]
-                if mid_region.size and float(
-                    (mid_region.max(axis=1) < 8).mean()
-                ) > 0.9:
-                    # Canary: a mostly-black fill means upstream flow/feature
-                    # corruption (e.g. the RAFT sub-128px NaN pathology).
+                if cls._fill_is_near_black(result_bgr, masks, frames_bgr):
                     logger.error(
                         "Inpaint produced a near-black fill (%dx%d model "
                         "input) — output is likely corrupted",
                         model_frames.shape[2], model_frames.shape[1],
                     )
+                    if allow_canary_retry:
+                        retried = cls._canary_retry_fp32(
+                            frames_bgr, masks, status_cb=status_cb
+                        )
+                        if retried is not None:
+                            return np.ascontiguousarray(retried)
                 return np.ascontiguousarray(result_bgr)
             except torch.cuda.OutOfMemoryError as exc:  # type: ignore[attr-defined]
                 last_error = exc
@@ -912,11 +1115,26 @@ class VideoCleanupService:
 
     @classmethod
     def _composite_alpha(cls, masks: np.ndarray) -> np.ndarray:
-        """Feathered float alpha [T, H, W, 1] from uint8 masks."""
+        """Feathered float alpha [T, H, W, 1] from uint8 masks.
+
+        The binary mask is eroded before blurring so the blend band sits
+        entirely inside the repaired margin (>= 9px of dilation) instead of
+        straddling the seam."""
+        erode_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * COMPOSITE_ALPHA_ERODE_PX + 1, 2 * COMPOSITE_ALPHA_ERODE_PX + 1),
+        )
         alphas = []
         for mask in masks:
-            alpha = (mask.astype(np.float32)) / 255.0
-            alpha = cv2.GaussianBlur(alpha, (0, 0), COMPOSITE_FEATHER_SIGMA)
+            binary = (mask > 0).astype(np.uint8)
+            if COMPOSITE_ALPHA_ERODE_PX > 0 and binary.any():
+                eroded = cv2.erode(binary, erode_kernel)
+                if eroded.any():
+                    # Guard: never erase a mask too thin to survive erosion.
+                    binary = eroded
+            alpha = cv2.GaussianBlur(
+                binary.astype(np.float32), (0, 0), COMPOSITE_FEATHER_SIGMA
+            )
             alphas.append(alpha)
         return np.stack(alphas)[..., None]
 
@@ -952,10 +1170,10 @@ class VideoCleanupService:
             nonlocal done_count
             clip = entry["clip"]
             frames_bgr = np.stack(entry["frames"])
-            # The text-mask union was accumulated per frame on the decode
-            # thread; building masks here is now just dilation + broadcast.
+            # Per-frame text masks were computed on the decode thread;
+            # building masks here is the windowed union + dilation.
             masks = cls._build_clip_masks(
-                clip, frames_bgr, text_union=entry.get("union")
+                clip, frames_bgr, text_masks=entry.get("text_masks")
             )
             progress = 0.15 + 0.65 * (done_count / max(1, len(clips)))
             set_progress(
@@ -1037,13 +1255,10 @@ class VideoCleanupService:
                     new_clip = todo[next_index]
                     entry: dict = {"clip": new_clip, "frames": []}
                     if new_clip.zone_plan.zone.kind == "subtitle":
-                        _, _, rw, rh = new_clip.zone_plan.rect
-                        # Accumulated at half resolution: 4x less per-frame
-                        # CPU on this (GIL-sharing) decode thread; the mask
-                        # dilation swallows the 2px quantization.
-                        entry["union"] = np.zeros(
-                            (max(1, rh // 2), max(1, rw // 2)), dtype=bool
-                        )
+                        # Per-frame masks at half resolution: 4x less
+                        # per-frame CPU on this (GIL-sharing) decode thread;
+                        # the mask dilation swallows the 2px quantization.
+                        entry["text_masks"] = []
                     active.append(entry)
                     next_index += 1
                 for entry in list(active):
@@ -1051,21 +1266,23 @@ class VideoCleanupService:
                     if clip.frame_start <= frame_index < clip.frame_end:
                         crop_frame = crops[id(clip.zone_plan)]
                         entry["frames"].append(crop_frame.copy())
-                        if (
-                            "union" in entry
-                            and clip.mask_start <= frame_index < clip.mask_end
-                        ):
-                            cx, cy, _, _ = clip.zone_plan.crop
-                            x, y, w, h = clip.zone_plan.rect
-                            rx, ry = x - cx, y - cy
-                            rect_crop = crop_frame[ry : ry + h, rx : rx + w]
-                            uh, uw = entry["union"].shape
-                            if (uh, uw) != (h, w):
-                                rect_crop = cv2.resize(
-                                    rect_crop, (uw, uh),
-                                    interpolation=cv2.INTER_AREA,
+                        if "text_masks" in entry:
+                            if clip.mask_start <= frame_index < clip.mask_end:
+                                cx, cy, _, _ = clip.zone_plan.crop
+                                x, y, w, h = clip.zone_plan.rect
+                                rx, ry = x - cx, y - cy
+                                rect_crop = crop_frame[ry : ry + h, rx : rx + w]
+                                mh, mw = max(1, h // 2), max(1, w // 2)
+                                if (mh, mw) != (h, w):
+                                    rect_crop = cv2.resize(
+                                        rect_crop, (mw, mh),
+                                        interpolation=cv2.INTER_AREA,
+                                    )
+                                entry["text_masks"].append(
+                                    cls._text_mask(rect_crop)
                                 )
-                            entry["union"] |= cls._text_mask(rect_crop)
+                            else:
+                                entry["text_masks"].append(None)
                     if frame_index >= clip.frame_end - 1:
                         active.remove(entry)
                         _submit(entry)

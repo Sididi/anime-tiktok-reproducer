@@ -48,7 +48,7 @@ the backend after editing prompt files.
 - The job reserves the **whole heavy-slot budget** (like fast matching): the
   models need the full 8 GB card.
 - VRAM strategy: only a crop around each rect (+margin, ×16-aligned) is fed
-  to the model; crops longer than 640 px are downscaled for the model and the
+  to the model; crops longer than 512 px are downscaled for the model and the
   repair is upscaled back (confined to the mask). OOM ladder:
   `subvideo_length` 80→40→24, then ×0.75 downscale steps, then a hard error.
 - Text-presence detection (subtitle zones): white-text candidate mask
@@ -58,8 +58,17 @@ the backend after editing prompt files.
   `backend/app/services/video_cleanup_service.py`.
   `PURE_CLEANUP_FULL_RECT_MASK=1` switches to full-rect masks per active
   frame if the text-mask union ever misbehaves.
+- Subtitle masks are **per frame**: each active frame's mask is the union of
+  the raw text masks over a ±5-frame window, dilated. Tight per-frame holes
+  let the model propagate the real background revealed when the text changes
+  (a per-clip union mask degenerates into a hallucinated full band). The
+  skipped-frame stride blend is restricted per pixel to where each neighbour
+  model frame was actually repaired; the composite alpha is eroded 2 px then
+  feathered (σ 2.5) so the blend band sits inside the repaired margin.
 - Per-clip results are cached under `{project}/cleanup/spans/` — re-running a
-  failed job resumes from the cached clips.
+  failed job resumes from the cached clips. Cache filenames carry a
+  `_v{CLIP_CACHE_VERSION}` suffix; bump it whenever mask/fill semantics
+  change so stale clips are ignored.
 - Assembly: raw frames piped to ffmpeg (NVENC `constqp 19`, libx264 CRF 16
   fallback), audio stream-copied from the original, BT.709 tags fixed.
 

@@ -13,6 +13,7 @@ from app.models.cleanup import CleanupZone
 from app.services.video_cleanup_service import (
     CLIP_CONTEXT_FRAMES,
     CLIP_MAX_FRAMES,
+    TEXT_MASK_WINDOW_FRAMES,
     TEXT_SCORE_OFF,
     TEXT_SCORE_ON,
     VideoCleanupService,
@@ -219,3 +220,279 @@ def test_build_clip_masks_watermark_uses_full_rect():
     assert (masks[0][ry : ry + h, rx : rx + w] == 255).all()
     # Nothing outside the rect.
     assert masks[0].sum() == 255 * w * h
+
+
+def _subtitle_clip_frames(span=(10, 70), total=200):
+    """Dark frames + clip covering the given span; returns (clip, frames, geo)."""
+    plan = _plan("subtitle", [span])
+    clip = VideoCleanupService._spans_to_clips(plan, total)[0]
+    cx, cy, cw, ch = plan.crop
+    length = clip.frame_end - clip.frame_start
+    frames = np.full((length, ch, cw, 3), 30, dtype=np.uint8)
+    rx, ry = plan.rect[0] - cx, plan.rect[1] - cy
+    return clip, frames, (rx, ry, plan.rect[2], plan.rect[3])
+
+
+def _draw_text(frames, i, x, y):
+    import cv2
+
+    cv2.putText(
+        frames[i], "HELLO", (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3,
+    )
+
+
+def test_build_clip_masks_track_text_position_change():
+    # Text sits in the left half of the rect, then jumps to the right half:
+    # per-frame masks must follow it instead of unioning both positions.
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    switch = clip.mask_start + 30
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if clip.mask_start <= absolute < clip.mask_end:
+            if absolute < switch:
+                _draw_text(frames, i, rx + 10, ry + 60)
+            else:
+                _draw_text(frames, i, rx + w - 300, ry + 60)
+
+    masks = VideoCleanupService._build_clip_masks(clip, frames)
+    margin = 2 * TEXT_MASK_WINDOW_FRAMES
+    early = switch - clip.frame_start - margin - 5  # well before the switch
+    late = switch - clip.frame_start + margin + 5  # well after the switch
+    mid_col = rx + w // 2
+    assert masks[early][:, :mid_col].any(), "early mask should cover left text"
+    assert not masks[early][:, mid_col:].any(), "no right-side mask before switch"
+    assert masks[late][:, mid_col:].any(), "late mask should cover right text"
+    assert not masks[late][:, :mid_col].any(), "left-side mask must decay after switch"
+
+
+def test_build_clip_masks_window_covers_neighbors():
+    # Text on a single active frame: neighbours within the ±window inherit
+    # its mask (stride-blend correctness), frames beyond stay empty.
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    k_abs = clip.mask_start + 25
+    k = k_abs - clip.frame_start
+    _draw_text(frames, k, rx + 10, ry + 60)
+
+    masks = VideoCleanupService._build_clip_masks(clip, frames)
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if not (clip.mask_start <= absolute < clip.mask_end):
+            assert not masks[i].any()
+        elif abs(i - k) <= TEXT_MASK_WINDOW_FRAMES:
+            assert masks[i].any(), f"frame {i} inside the window must be masked"
+        else:
+            assert not masks[i].any(), f"frame {i} outside the window must be empty"
+
+
+def test_build_clip_masks_empty_union_falls_back_full_rect():
+    # Detection fired but no strokes are found anywhere: keep the historical
+    # full-rect fallback rather than leaving the text in place.
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    masks = VideoCleanupService._build_clip_masks(clip, frames)
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if clip.mask_start <= absolute < clip.mask_end:
+            assert (masks[i][ry : ry + h, rx : rx + w] == 255).all()
+            assert masks[i].sum() == 255 * w * h
+        else:
+            assert not masks[i].any()
+
+
+def test_build_clip_masks_halfres_input_matches_recompute():
+    # The decode thread hands half-res per-frame masks; the preview path
+    # recomputes them from frames. Both must produce identical output.
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if clip.mask_start <= absolute < clip.mask_end:
+            _draw_text(frames, i, rx + 10 + (i % 7) * 20, ry + 60)
+
+    recomputed = VideoCleanupService._build_clip_masks(clip, frames)
+    supplied = VideoCleanupService._build_clip_masks(
+        clip, frames,
+        text_masks=VideoCleanupService._per_frame_text_masks(clip, frames),
+    )
+    assert (recomputed == supplied).all()
+
+
+# ---------------------------------------------------------------------------
+# Temporal stride blending
+# ---------------------------------------------------------------------------
+
+def test_temporal_stride_blend_restricted_to_neighbor_masks(monkeypatch):
+    # Fill of a model frame outside its own mask is that frame's ORIGINAL
+    # pixels (subtitle strokes included): the skipped-frame blend must only
+    # use a neighbour's fill where that neighbour was actually repaired.
+    def fake_ladder(cls, frames_sub, masks_sub, **_kwargs):
+        out = np.zeros_like(frames_sub)
+        for k in range(frames_sub.shape[0]):
+            out[k] = 100 + k
+        return out
+
+    monkeypatch.setattr(
+        VideoCleanupService, "_inpaint_ladder_inner", classmethod(fake_ladder)
+    )
+
+    length = 12  # stride 3 (crop >= 320) -> keep = {0, 3, 6, 9, 11}
+    frames = np.full((length, 64, 400, 3), 7, dtype=np.uint8)
+    masks = np.zeros((length, 64, 400), dtype=np.uint8)
+    # Pixel A: skipped frame 1 covered by both neighbours (0 and 3).
+    masks[0][10, 10] = masks[1][10, 10] = masks[3][10, 10] = 255
+    # Pixel B: covered by prev (0) only.
+    masks[0][20, 20] = masks[1][20, 20] = 255
+    # Pixel C: covered by neither neighbour -> original must survive.
+    masks[1][30, 30] = 255
+
+    result = VideoCleanupService._inpaint_temporal_strided(frames, masks)
+    fill_p, fill_n = 100, 101  # fake fills of kept frames 0 and 3
+    assert (result[1][10, 10] == (fill_p + fill_n) // 2).all()
+    assert (result[1][20, 20] == fill_p).all()
+    assert (result[1][30, 30] == 7).all()
+    # Model frames keep their own fill inside their mask.
+    assert (result[0][10, 10] == fill_p).all()
+
+
+def test_temporal_stride_static_masks_match_legacy_blend(monkeypatch):
+    # Static masks (watermarks / full-rect fallback): every skipped pixel is
+    # covered by both neighbours -> behavior identical to the old 50/50.
+    def fake_ladder(cls, frames_sub, masks_sub, **_kwargs):
+        out = np.zeros_like(frames_sub)
+        for k in range(frames_sub.shape[0]):
+            out[k] = 40 + 10 * k
+        return out
+
+    monkeypatch.setattr(
+        VideoCleanupService, "_inpaint_ladder_inner", classmethod(fake_ladder)
+    )
+
+    length = 12
+    frames = np.full((length, 64, 400, 3), 7, dtype=np.uint8)
+    masks = np.zeros((length, 64, 400), dtype=np.uint8)
+    masks[:, 10:30, 10:30] = 255
+
+    result = VideoCleanupService._inpaint_temporal_strided(frames, masks)
+    # Skipped frame 1 between kept 0 (fill 40) and 3 (fill 50).
+    assert (result[1][10:30, 10:30] == (40 + 50) // 2).all()
+    assert (result[1][40, 40] == 7).all()
+
+
+# ---------------------------------------------------------------------------
+# Composite alpha
+# ---------------------------------------------------------------------------
+
+def test_composite_alpha_erode_and_feather():
+    masks = np.zeros((1, 60, 60), dtype=np.uint8)
+    masks[0, 10:50, 10:50] = 255
+    alpha = VideoCleanupService._composite_alpha(masks)
+    assert alpha.shape == (1, 60, 60, 1)
+    assert alpha[0, 30, 30, 0] > 0.99  # fully repaired at the center
+    # The 0.5 crossing sits strictly INSIDE the original mask edge …
+    assert alpha[0, 10, 30, 0] < 0.5
+    assert alpha[0, 14, 30, 0] > 0.5
+    # … and the outside fades to ~0 within a few px.
+    assert alpha[0, 4, 30, 0] < 0.02
+
+
+def test_composite_alpha_thin_mask_survives_erosion():
+    masks = np.zeros((1, 60, 60), dtype=np.uint8)
+    masks[0, 30:32, 10:50] = 255  # thinner than the erosion kernel
+    alpha = VideoCleanupService._composite_alpha(masks)
+    assert alpha.max() > 0.25  # not erased
+
+
+# ---------------------------------------------------------------------------
+# Cache versioning
+# ---------------------------------------------------------------------------
+
+def test_clip_cache_name_versioned():
+    plan = _plan("subtitle", [(100, 160)])
+    clip = VideoCleanupService._spans_to_clips(plan, 1000)[0]
+    assert clip.cache_name.endswith("_v2.npz")
+
+
+# ---------------------------------------------------------------------------
+# Canary retry
+# ---------------------------------------------------------------------------
+
+def test_canary_retry_fp32_and_restore(monkeypatch):
+    from app.services.propainter_adapter import ProPainterEngine
+
+    load_calls: list[bool] = []
+    inpaint_calls: list[int] = []
+
+    def fake_load(cls, *, fp16=True, progress_cb=None):
+        load_calls.append(fp16)
+
+    def fake_inpaint(cls, frames_rgb, masks, **_kwargs):
+        inpaint_calls.append(1)
+        value = 0 if len(inpaint_calls) == 1 else 128  # black, then sane
+        return np.full_like(frames_rgb, value)
+
+    monkeypatch.setattr(ProPainterEngine, "load", classmethod(fake_load))
+    monkeypatch.setattr(ProPainterEngine, "inpaint_clip", classmethod(fake_inpaint))
+
+    frames = np.full((8, 128, 128, 3), 50, dtype=np.uint8)
+    masks = np.zeros((8, 128, 128), dtype=np.uint8)
+    masks[:, 40:90, 40:90] = 255
+
+    result = VideoCleanupService._inpaint_ladder_inner(frames, masks)
+    assert len(inpaint_calls) == 2  # one retry, no more
+    assert (result[4][60, 60] == 128).all()  # the retried fill won
+    assert load_calls == [False, True]  # fp32 retry, then fp16 restored
+
+
+def test_canary_ignores_black_fill_on_black_scene(monkeypatch):
+    # A black fill over black surroundings (fade/dark scene) is CORRECT with
+    # per-frame stroke masks — the canary must not waste an fp32 retry on it.
+    from app.services.propainter_adapter import ProPainterEngine
+
+    load_calls: list[bool] = []
+    inpaint_calls: list[int] = []
+
+    def fake_load(cls, *, fp16=True, progress_cb=None):
+        load_calls.append(fp16)
+
+    def fake_inpaint(cls, frames_rgb, masks, **_kwargs):
+        inpaint_calls.append(1)
+        return np.zeros_like(frames_rgb)
+
+    monkeypatch.setattr(ProPainterEngine, "load", classmethod(fake_load))
+    monkeypatch.setattr(ProPainterEngine, "inpaint_clip", classmethod(fake_inpaint))
+
+    frames = np.zeros((8, 128, 128, 3), dtype=np.uint8)  # black scene
+    masks = np.zeros((8, 128, 128), dtype=np.uint8)
+    masks[:, 40:90, 40:90] = 255
+
+    VideoCleanupService._inpaint_ladder_inner(frames, masks)
+    assert len(inpaint_calls) == 1  # no retry
+    assert load_calls == []  # engine never reloaded
+
+
+def test_canary_retry_failure_keeps_suspect_fill(monkeypatch):
+    from app.services.propainter_adapter import ProPainterEngine
+
+    load_calls: list[bool] = []
+    inpaint_calls: list[int] = []
+
+    def fake_load(cls, *, fp16=True, progress_cb=None):
+        load_calls.append(fp16)
+
+    def fake_inpaint(cls, frames_rgb, masks, **_kwargs):
+        inpaint_calls.append(1)
+        if len(inpaint_calls) > 1:
+            raise RuntimeError("boom")
+        return np.zeros_like(frames_rgb)  # near-black -> canary trips
+
+    monkeypatch.setattr(ProPainterEngine, "load", classmethod(fake_load))
+    monkeypatch.setattr(ProPainterEngine, "inpaint_clip", classmethod(fake_inpaint))
+
+    frames = np.full((8, 128, 128, 3), 50, dtype=np.uint8)
+    masks = np.zeros((8, 128, 128), dtype=np.uint8)
+    masks[:, 40:90, 40:90] = 255
+
+    result = VideoCleanupService._inpaint_ladder_inner(frames, masks)
+    # The suspect (black) fill is returned rather than failing the job …
+    assert (result[4][60, 60] == 0).all()
+    # … and the engine is restored to fp16 even on failure.
+    assert load_calls == [False, True]
