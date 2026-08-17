@@ -8,6 +8,7 @@ from typing import Any
 import yaml
 
 from ..config import settings
+from .audio_speed_service import AudioSpeedService
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,10 @@ class VoiceEntry:
     model_id: str | None = None
     languages: tuple[str, ...] | None = None
     auto_editor_overrides: dict[str, str] | None = None
+    # Post-generation atempo default (the /script speed slider), applied once
+    # when an Automate run finishes generating TTS with this voice. Distinct
+    # from voice_settings.speed, which is the ElevenLabs generation parameter.
+    default_tts_speed: float | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +167,23 @@ class VoiceConfigService:
                         )
                 auto_editor_overrides = {k: str(v).strip() for k, v in ae_raw.items()}
 
+            # default_tts_speed (optional)
+            default_tts_speed: float | None = None
+            dts_raw = value.get("default_tts_speed")
+            if dts_raw is not None:
+                if isinstance(dts_raw, bool) or not isinstance(dts_raw, (int, float)):
+                    raise ValueError(f"Voice '{key}' default_tts_speed must be numeric")
+                default_tts_speed = float(dts_raw)
+                if not (
+                    AudioSpeedService.SPEED_MIN
+                    <= default_tts_speed
+                    <= AudioSpeedService.SPEED_MAX
+                ):
+                    raise ValueError(
+                        f"Voice '{key}' default_tts_speed must be between "
+                        f"{AudioSpeedService.SPEED_MIN} and {AudioSpeedService.SPEED_MAX}"
+                    )
+
             normalized_key = key.strip()
             voices[normalized_key] = VoiceEntry(
                 key=normalized_key,
@@ -171,6 +193,7 @@ class VoiceConfigService:
                 model_id=model_id,
                 languages=languages,
                 auto_editor_overrides=auto_editor_overrides,
+                default_tts_speed=default_tts_speed,
             )
 
         default_key = default_key.strip()

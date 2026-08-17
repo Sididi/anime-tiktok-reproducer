@@ -64,3 +64,41 @@ def test_persist_run_voice_key_missing_project_raises(tmp_path, monkeypatch):
         assert "Project not found" in str(exc)
     else:
         raise AssertionError("expected RuntimeError for unknown project")
+
+
+def _voice(default_tts_speed=None):
+    from app.services.voice_config_service import VoiceEntry
+
+    return VoiceEntry(
+        key="maxime",
+        display_name="Maxime",
+        elevenlabs_voice_id="voice-id",
+        voice_settings={},
+        default_tts_speed=default_tts_speed,
+    )
+
+
+def test_voice_default_tts_speed_applied_after_generation(tmp_path, monkeypatch):
+    project = _setup_project(tmp_path, monkeypatch, tts_speed=1.3)
+
+    applied = ScriptAutomationService._persist_voice_default_tts_speed(
+        project.id, _voice(default_tts_speed=1.1)
+    )
+
+    assert applied == 1.1
+    loaded = ProjectService.load(project.id)
+    assert loaded is not None
+    assert loaded.tts_speed == 1.1
+
+
+def test_voice_without_default_tts_speed_resets_to_neutral(tmp_path, monkeypatch):
+    project = _setup_project(tmp_path, monkeypatch, tts_speed=1.3)
+
+    applied = ScriptAutomationService._persist_voice_default_tts_speed(
+        project.id, _voice(default_tts_speed=None)
+    )
+
+    assert applied == 1.0
+    loaded = ProjectService.load(project.id)
+    assert loaded is not None
+    assert loaded.tts_speed == 1.0

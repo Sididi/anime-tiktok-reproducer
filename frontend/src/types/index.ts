@@ -206,6 +206,7 @@ export interface ScriptAutomationEvent {
   overlay_json?: VideoOverlay;
   overlay_warning?: string | null;
   parts?: ScriptAutomationPart[];
+  tts_speed?: number | null;
   warning?: string;
   part_id?: string;
   part_index?: number;

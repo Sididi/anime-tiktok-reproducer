@@ -48,7 +48,7 @@ templates:
         enabled: false
         style: "minimal"
         prfpset: null
-    voice_key: nicolas_petit
+    voice_key: paul_k
     music_key: montagem_batchi_cut_start_15s
     llm_preset: mistral
     min_playback_speed: 0.5
@@ -77,7 +77,7 @@ templates:
         enabled: true
         style: "minimal"
         prfpset: null
-    voice_key: maxime
+    voice_key: noe
     music_key: credits_song_death
     llm_preset: gemini
     min_playback_speed: 0.8

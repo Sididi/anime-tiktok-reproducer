@@ -1571,6 +1571,12 @@ export function ScriptRestructurePage() {
         throw new Error("Automation response did not include run_id");
       }
 
+      // Voice default speed, already persisted server-side when TTS was
+      // actually generated this run — sync the slider without re-saving.
+      if (typeof finalEvent.tts_speed === "number") {
+        setTtsSpeed(clampPreviewTtsSpeed(finalEvent.tts_speed));
+      }
+
       const parts = finalEvent.parts || [];
       if (parts.length > 0) {
         const files = await hydrateAutomationParts(finalEvent.run_id, parts);
@@ -1733,6 +1739,12 @@ export function ScriptRestructurePage() {
 
         if (finalEvent.overlay_warning) {
           setAutomationOverlayWarning(finalEvent.overlay_warning);
+        }
+
+        // Voice default speed, already persisted server-side when TTS was
+        // actually generated this run — sync the slider without re-saving.
+        if (typeof finalEvent.tts_speed === "number") {
+          setTtsSpeed(clampPreviewTtsSpeed(finalEvent.tts_speed));
         }
 
         const parts = finalEvent.parts || [];

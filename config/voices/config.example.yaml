@@ -15,3 +15,6 @@ voices:
     auto_editor_overrides:                    # optional, overrides production auto-editor profile
       threshold: "0.060"
       margin: "0.04sec,0.20sec"
+    default_tts_speed: 1.1                    # optional, 0.9-1.5; post-generation speed slider default,
+                                              # applied once when Automate finishes generating TTS with
+                                              # this voice (omit = 1.0). NOT the ElevenLabs speed param.

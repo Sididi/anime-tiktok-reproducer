@@ -27,7 +27,7 @@ from .project_service import ProjectService
 from .script_payload_service import ScriptPayloadService
 from .script_phase_prompt_service import ScriptPhasePromptService
 from .tts_text_normalizer import TtsTextNormalizer
-from .voice_config_service import VoiceConfigService
+from .voice_config_service import VoiceConfigService, VoiceEntry
 
 _SENTENCE_END_RE = re.compile(r"[.!?…][\"')\]]*\s*$")
 _SENTENCE_BOUNDARY_RE = re.compile(r"[.!?…][\"')\]]*(?:\s+|$)")
@@ -73,6 +73,23 @@ class ScriptAutomationService:
         if project.voice_key != voice_key:
             project.voice_key = voice_key
             ProjectService.save(project)
+
+    @classmethod
+    def _persist_voice_default_tts_speed(cls, project_id: str, voice: VoiceEntry) -> float:
+        """Reset the post-TTS speed slider to the generated voice's default.
+
+        Applied exactly once per completed TTS generation (1.0 when the voice
+        has no default_tts_speed configured). Manual slider changes and voice
+        re-selection never re-trigger it.
+        """
+        speed = float(voice.default_tts_speed or 1.0)
+        project = ProjectService.load(project_id)
+        if project is None:
+            raise RuntimeError("Project not found while saving the voice default TTS speed")
+        if project.tts_speed != speed:
+            project.tts_speed = speed
+            ProjectService.save(project)
+        return speed
 
     @staticmethod
     def _tts_seed_and_continuity_kwargs(
@@ -1070,6 +1087,7 @@ class ScriptAutomationService:
             metadata_warning: str | None = None
             overlay_json: dict[str, Any] | None = None
             overlay_warning: str | None = None
+            applied_tts_speed: float | None = None
 
             if skip_tts:
                 yield cls._event("tts_generating", message="TTS generation skipped")
@@ -1159,6 +1177,7 @@ class ScriptAutomationService:
 
                 merged_path = run_dir / "merged.wav"
                 await asyncio.to_thread(cls._merge_parts_to_wav, part_paths, merged_path)
+                applied_tts_speed = cls._persist_voice_default_tts_speed(project_id, voice)
 
             # --- Metadata generation ---
             if skip_metadata or not settings.automate_metadata_overlay_enabled:
@@ -1254,6 +1273,7 @@ class ScriptAutomationService:
                 overlay_json=overlay_json,
                 overlay_warning=overlay_warning,
                 parts=parts,
+                tts_speed=applied_tts_speed,
             )
             yield complete_payload
         except Exception as exc:
