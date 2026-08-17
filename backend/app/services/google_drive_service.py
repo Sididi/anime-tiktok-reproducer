@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+import http.client
 import io
 import json
 import logging
 import mimetypes
 from pathlib import Path
 import random
+import socket
+import ssl
 from threading import Lock, local
 import time
 from typing import Callable, Iterable, Any, TypeVar
@@ -34,6 +37,18 @@ RETRYABLE_403_REASONS = {
 logger = logging.getLogger("uvicorn.error")
 _RequestResultT = TypeVar("_RequestResultT")
 _GOOGLE_AUTH_HTTP_TIMEOUT_SECONDS = 10
+# httplib2 keeps one persistent socket per client; Google (or any NAT on the
+# way) drops it after a few idle minutes. Reusing that dead socket surfaces as
+# a broken pipe on write or an unexpected TLS EOF on read - never as an
+# HttpError - so those exceptions mean "reconnect and try again", not "failed".
+TRANSPORT_ERROR_TYPES = (
+    ssl.SSLError,
+    ConnectionError,
+    TimeoutError,
+    socket.gaierror,
+    http.client.HTTPException,
+    httplib2.ServerNotFoundError,
+)
 
 
 class DriveVideoMetadataLookupError(RuntimeError):
@@ -285,6 +300,27 @@ class GoogleDriveService:
                 reasons.add(reason)
         return reasons
 
+    @staticmethod
+    def _is_transport_error(exc: Exception) -> bool:
+        """True when the request died on the wire, before Drive answered."""
+        return isinstance(exc, TRANSPORT_ERROR_TYPES)
+
+    @classmethod
+    def _recycle_connection(cls, drive=None) -> None:
+        """Drop the dead socket so the next request dials a fresh one.
+
+        ``httplib2`` reconnects lazily, so closing the pooled connection of the
+        very client that failed is what makes a retry meaningful - the caller
+        may hold its own ``drive`` handle that ``reset_client`` cannot reach.
+        """
+        http_client = getattr(drive, "_http", None)
+        if http_client is not None and hasattr(http_client, "close"):
+            try:
+                http_client.close()
+            except Exception:
+                pass
+        cls.reset_client()
+
     @classmethod
     def _is_retryable_http_error(cls, exc: Exception) -> bool:
         status_code = cls._http_error_status_code(exc)
@@ -301,7 +337,16 @@ class GoogleDriveService:
         *,
         max_attempts: int = 5,
         operation: str = "drive_request",
+        retry_transport_errors: bool = False,
+        drive=None,
     ) -> _RequestResultT:
+        """Run a Drive request, retrying transient failures.
+
+        ``retry_transport_errors`` additionally retries connection-level
+        failures (stale keep-alive socket, TLS EOF) after recycling the
+        connection. Only opt in for idempotent requests: a transport error can
+        also mean the call reached Drive and only the response was lost.
+        """
         attempt = 1
         while True:
             try:
@@ -315,9 +360,23 @@ class GoogleDriveService:
                 return result
             except Exception as exc:
                 status_code = cls._http_error_status_code(exc)
-                should_retry = cls._is_retryable_http_error(exc)
+                transport_failure = retry_transport_errors and cls._is_transport_error(exc)
+                should_retry = transport_failure or cls._is_retryable_http_error(exc)
                 if not should_retry or attempt >= max_attempts:
                     raise
+                if transport_failure:
+                    cls._recycle_connection(drive)
+                    logger.warning(
+                        "Drive connection lost; reconnecting and retrying request: "
+                        "operation=%s attempt=%d/%d error=%s",
+                        operation,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+                    time.sleep(min(2.0, 0.25 * attempt))
+                    attempt += 1
+                    continue
                 backoff_seconds = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
                 logger.warning(
                     "Transient Drive error; retrying request: operation=%s status=%s reasons=%s attempt=%d/%d backoff_seconds=%.2f",
@@ -343,14 +402,22 @@ class GoogleDriveService:
         items: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:
-            response = drive.files().list(
-                q=q,
-                fields=f"nextPageToken,{fields}",
-                pageSize=1000,
-                pageToken=page_token,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            ).execute()
+            def _list(token: str | None = page_token) -> dict[str, Any]:
+                return drive.files().list(
+                    q=q,
+                    fields=f"nextPageToken,{fields}",
+                    pageSize=1000,
+                    pageToken=token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                ).execute()
+
+            response = cls._execute_with_retries(
+                _list,
+                operation="drive_query_files",
+                retry_transport_errors=True,
+                drive=drive,
+            )
             items.extend(response.get("files", []))
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -969,12 +1036,23 @@ class GoogleDriveService:
     @classmethod
     def set_public_read(cls, file_id: str, *, drive=None) -> None:
         drive = drive or cls._client()
-        drive.permissions().create(
-            fileId=file_id,
-            body={"type": "anyone", "role": "reader"},
-            fields="id",
-            supportsAllDrives=True,
-        ).execute()
+
+        def _share() -> None:
+            drive.permissions().create(
+                fileId=file_id,
+                body={"type": "anyone", "role": "reader"},
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+
+        # Re-sharing an already-public file is a no-op for Drive, so this is
+        # safe to replay after a lost connection.
+        cls._execute_with_retries(
+            _share,
+            operation=f"drive_set_public_read:{file_id}",
+            retry_transport_errors=True,
+            drive=drive,
+        )
 
     @classmethod
     def get_direct_download_url(cls, file_id: str) -> str:
@@ -983,11 +1061,20 @@ class GoogleDriveService:
     @classmethod
     def get_web_view_url(cls, file_id: str) -> str:
         drive = cls._client()
-        info = drive.files().get(
-            fileId=file_id,
-            fields="webViewLink",
-            supportsAllDrives=True,
-        ).execute()
+
+        def _get() -> dict[str, Any]:
+            return drive.files().get(
+                fileId=file_id,
+                fields="webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+
+        info = cls._execute_with_retries(
+            _get,
+            operation=f"drive_web_view_url:{file_id}",
+            retry_transport_errors=True,
+            drive=drive,
+        )
         return info.get("webViewLink", "")
 
     @classmethod
