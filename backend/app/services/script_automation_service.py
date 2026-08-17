@@ -44,6 +44,9 @@ class ScriptAutomationService:
     TTS_MIN = 500
     TTS_SOFT_MAX = 750
     TTS_HARD_MAX = 800
+    # Delivery instruction prepended to every eleven_v3 request. Audio tags in
+    # brackets are interpreted by v3, not spoken, so transcripts stay clean.
+    V3_CONTROL_PREFIX = "[TikTok narrator, energetic, rapid]"
 
     @classmethod
     def _generate_and_store_elevenlabs_seed(cls, project_id: str) -> int:
@@ -1112,7 +1115,9 @@ class ScriptAutomationService:
                         char_count=segment_char_count,
                     )
 
-                    outgoing_text = chunk
+                    outgoing_text = (
+                        f"{cls.V3_CONTROL_PREFIX} {chunk}" if is_v3_model else chunk
+                    )
                     synthesize_kwargs: dict[str, Any] = {
                         "voice_id": voice.elevenlabs_voice_id,
                         "text": outgoing_text,
