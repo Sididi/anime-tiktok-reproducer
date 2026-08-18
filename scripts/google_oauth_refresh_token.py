@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from typing import Any
@@ -17,14 +17,21 @@ from _env import env, load_dotenv
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 YOUTUBE_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 YOUTUBE_FORCE_SSL_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
+YOUTUBE_ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"
+YOUTUBE_ANALYTICS_MONETARY_SCOPE = "https://www.googleapis.com/auth/yt-analytics-monetary.readonly"
 
 DEFAULT_SCOPES_SHARED = [
     DRIVE_SCOPE,
     YOUTUBE_UPLOAD_SCOPE,
     YOUTUBE_FORCE_SSL_SCOPE,
+    YOUTUBE_ANALYTICS_SCOPE,
 ]
 DEFAULT_SCOPES_DRIVE = [DRIVE_SCOPE]
-DEFAULT_SCOPES_YOUTUBE = [YOUTUBE_UPLOAD_SCOPE, YOUTUBE_FORCE_SSL_SCOPE]
+DEFAULT_SCOPES_YOUTUBE = [
+    YOUTUBE_UPLOAD_SCOPE,
+    YOUTUBE_FORCE_SSL_SCOPE,
+    YOUTUBE_ANALYTICS_SCOPE,
+]
 
 DEFAULT_SCOPES_BY_TARGET = {
     "shared": DEFAULT_SCOPES_SHARED,
@@ -56,6 +63,27 @@ def _default_scopes_for_target(target: str) -> list[str]:
 
 def _has_youtube_scope(scopes: list[str]) -> bool:
     return any(scope in YOUTUBE_VERIFICATION_SCOPES for scope in scopes)
+
+
+def _has_analytics_scope(scopes: list[str]) -> bool:
+    return YOUTUBE_ANALYTICS_SCOPE in scopes or YOUTUBE_ANALYTICS_MONETARY_SCOPE in scopes
+
+
+def _resolve_scopes(
+    target: str,
+    *,
+    override: list[str] | None,
+    no_analytics: bool,
+    with_monetary: bool,
+) -> list[str]:
+    if override:
+        return list(override)
+    scopes = _default_scopes_for_target(target)
+    if no_analytics:
+        scopes = [scope for scope in scopes if scope != YOUTUBE_ANALYTICS_SCOPE]
+    if with_monetary and _has_youtube_scope(scopes):
+        scopes.append(YOUTUBE_ANALYTICS_MONETARY_SCOPE)
+    return scopes
 
 
 def _env_template_for_target(target: str, *, client_id: str, client_secret: str, refresh_token: str) -> list[str]:
@@ -130,6 +158,15 @@ def _print_verification(verification: dict[str, Any]) -> list[dict[str, str]]:
             print(f"  - {item.get('id')} ({item.get('title')})")
     elif "youtube_channels" in verification:
         print("- youtube_channels: none")
+
+    if "analytics_probe_error" in verification:
+        print(f"- analytics_probe_error: {verification['analytics_probe_error']}")
+    elif "analytics_probe" in verification:
+        probe = verification["analytics_probe"]
+        print(
+            f"- analytics_probe: OK ({probe['window']}, "
+            f"{probe['days']} days, {probe['views']} views)"
+        )
     return youtube_channels
 
 
@@ -176,6 +213,22 @@ def _parser() -> argparse.ArgumentParser:
         help="OAuth scopes override (default depends on --target)",
     )
     parser.add_argument(
+        "--with-monetary",
+        action="store_true",
+        help=(
+            "Also request yt-analytics-monetary.readonly (estimated revenue, RPM, CPM). "
+            "Opt-in because it exposes earnings data; ignored when --scopes is given."
+        ),
+    )
+    parser.add_argument(
+        "--no-analytics",
+        action="store_true",
+        help=(
+            "Drop yt-analytics.readonly from the default scopes (upload-only token). "
+            "Ignored when --scopes is given."
+        ),
+    )
+    parser.add_argument(
         "--no-open-browser",
         action="store_true",
         help="Do not auto-open browser; copy URL manually",
@@ -206,6 +259,7 @@ def _verify_tokens(
     *,
     verify_drive: bool,
     verify_youtube: bool,
+    verify_analytics: bool = False,
 ) -> dict[str, Any]:
     details: dict[str, Any] = {}
 
@@ -241,6 +295,32 @@ def _verify_tokens(
         except Exception as exc:
             details["youtube_channels_error"] = str(exc)
 
+    if verify_analytics:
+        # Analytics data lags a couple of days, so end the probe window before "today".
+        end = (datetime.now(timezone.utc) - timedelta(days=3)).date()
+        start = end - timedelta(days=27)
+        try:
+            analytics = build("youtubeAnalytics", "v2", credentials=creds, cache_discovery=False)
+            report = (
+                analytics.reports()
+                .query(
+                    ids="channel==MINE",
+                    startDate=start.isoformat(),
+                    endDate=end.isoformat(),
+                    metrics="views,estimatedMinutesWatched",
+                    dimensions="day",
+                )
+                .execute()
+            )
+            rows = report.get("rows", []) or []
+            details["analytics_probe"] = {
+                "window": f"{start.isoformat()} -> {end.isoformat()}",
+                "days": len(rows),
+                "views": sum(int(row[1]) for row in rows),
+            }
+        except Exception as exc:
+            details["analytics_probe_error"] = str(exc)
+
     return details
 
 
@@ -248,7 +328,12 @@ def main() -> None:
     args = _parser().parse_args()
     load_dotenv(args.env_file)
 
-    scopes = args.scopes or _default_scopes_for_target(args.target)
+    scopes = _resolve_scopes(
+        args.target,
+        override=args.scopes,
+        no_analytics=args.no_analytics,
+        with_monetary=args.with_monetary,
+    )
 
     client_id = args.client_id or _resolve_client_id(args.target)
     client_secret = args.client_secret or _resolve_client_secret(args.target)
@@ -304,10 +389,22 @@ def main() -> None:
             "or revoke previous app access in Google account permissions first."
         )
 
+    granted = list(creds.scopes or [])
+    missing = [scope for scope in scopes if scope not in granted] if granted else []
+    if missing:
+        print("\nWARNING: Google granted fewer scopes than requested.")
+        for scope in missing:
+            print(f"- not granted: {scope}")
+        print(
+            "Re-run and keep every permission checked on the consent screen, otherwise the "
+            "token will fail at call time."
+        )
+
     verification = _verify_tokens(
         creds,
         verify_drive=DRIVE_SCOPE in scopes,
         verify_youtube=_has_youtube_scope(scopes),
+        verify_analytics=_has_analytics_scope(scopes),
     )
     expires_at = creds.expiry.astimezone(timezone.utc).isoformat() if creds.expiry else None
 
@@ -345,4 +442,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+    # Google routinely echoes back extra scopes (openid, userinfo) which otherwise makes
+    # oauthlib abort the exchange with "Scope has changed". Shortfalls are reported in main().
+    os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
     main()

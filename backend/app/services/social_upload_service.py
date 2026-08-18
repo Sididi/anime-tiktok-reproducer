@@ -145,6 +145,30 @@ def _is_youtube_quota_error(exc: HttpError) -> bool:
     return any(marker in detail for marker in quota_markers)
 
 
+def _is_youtube_caption_retryable_error(exc: HttpError) -> bool:
+    """captions().insert failures worth another attempt.
+
+    A just-created video id is not immediately resolvable by the captions
+    endpoint, which answers 404 videoNotFound until it propagates.
+    """
+    try:
+        payload = json.loads(exc.content.decode("utf-8"))
+        error = payload.get("error", {})
+        code = int(error.get("code", 0) or 0)
+        reasons = {
+            str(item.get("reason", "")).lower()
+            for item in error.get("errors", [])
+            if isinstance(item, dict)
+        }
+        if "videonotfound" in reasons:
+            return True
+        if code in SocialUploadService._RETRY_STATUS_CODES:
+            return True
+    except Exception:
+        pass
+    return "videonotfound" in _extract_http_error_detail(exc).lower()
+
+
 class SocialUploadService:
     """Uploads to YouTube/Facebook/Instagram with metadata payloads."""
     _RETRY_STATUS_CODES = {408, 429, 500, 502, 503, 504}
@@ -720,6 +744,70 @@ class SocialUploadService:
             time.sleep(poll_seconds)
             waited += poll_seconds
 
+    # captions().insert can answer videoNotFound while a just-created video id
+    # propagates (observed 2026-08-18 on a video that was live and scheduled).
+    _YOUTUBE_CAPTION_RETRY_DELAYS = (5.0, 10.0, 20.0, 30.0, 45.0)
+
+    @classmethod
+    def _insert_youtube_caption(
+        cls,
+        youtube,
+        video_id: str,
+        subtitle_path: Path,
+        language: str,
+        deadline: float | None,
+    ) -> str | None:
+        """Best-effort subtitle track; a failure must not sink the upload.
+
+        The video is already on the channel (and already carries its publishAt)
+        by the time this runs, so raising here would report a live upload as
+        failed and invite a duplicate retry. Degrades to a warning like the
+        thumbnail step. Returns None on success.
+        """
+        detail = "raison inconnue"
+        for delay in (0.0, *cls._YOUTUBE_CAPTION_RETRY_DELAYS):
+            if delay:
+                if deadline is not None and time.monotonic() + delay >= deadline:
+                    break
+                time.sleep(delay)
+            try:
+                cls._execute_google_request(
+                    youtube,
+                    youtube.captions().insert(
+                        part="snippet",
+                        body={
+                            "snippet": {
+                                "videoId": video_id,
+                                "language": language,
+                                "name": language,
+                                "isDraft": False,
+                            }
+                        },
+                        media_body=MediaFileUpload(
+                            str(subtitle_path),
+                            mimetype="application/octet-stream",
+                        ),
+                    ),
+                    deadline=deadline,
+                    platform="YouTube",
+                    operation="caption upload",
+                )
+                return None
+            except HttpError as exc:
+                detail = _extract_http_error_detail(exc)
+                logger.warning(
+                    "YouTube caption insert failed for video=%s: %s", video_id, detail
+                )
+                if not _is_youtube_caption_retryable_error(exc):
+                    break
+            except Exception as exc:
+                detail = str(exc)
+                logger.warning(
+                    "YouTube caption insert failed for video=%s: %s", video_id, detail
+                )
+                break
+        return f"Sous-titres YouTube non ajoutés: {detail}"
+
     @classmethod
     def _set_youtube_thumbnail_after_processing(
         cls,
@@ -800,6 +888,7 @@ class SocialUploadService:
                 status="skipped",
                 detail="Refus volontaire par l'utilisateur: vidéo trop longue pour YouTube.",
             )
+        created_video_id: str | None = None
         try:
             with tempfile.TemporaryDirectory(prefix="atr-yt-upload-") as prep_dir:
                 if strategy == "cut":
@@ -928,6 +1017,7 @@ class SocialUploadService:
                         operation="video upload",
                     )
                 video_id = response["id"]
+                created_video_id = video_id
                 if expected_channel_id:
                     actual_channel_id = cls._uploaded_video_channel_id(
                         youtube,
@@ -954,26 +1044,12 @@ class SocialUploadService:
                             ),
                         )
 
-                cls._execute_google_request(
+                caption_warning = cls._insert_youtube_caption(
                     youtube,
-                    youtube.captions().insert(
-                        part="snippet",
-                        body={
-                            "snippet": {
-                                "videoId": video_id,
-                                "language": youtube_language,
-                                "name": youtube_language,
-                                "isDraft": False,
-                            }
-                        },
-                        media_body=MediaFileUpload(
-                            str(subtitle_path),
-                            mimetype="application/octet-stream",
-                        ),
-                    ),
-                    deadline=deadline,
-                    platform="YouTube",
-                    operation="caption upload",
+                    video_id,
+                    subtitle_path,
+                    youtube_language,
+                    deadline,
                 )
 
                 thumbnail_warning: str | None = None
@@ -987,6 +1063,8 @@ class SocialUploadService:
                     detail_parts.append(
                         f"Programmé le {cls._format_french_datetime(scheduled_at)}"
                     )
+                if caption_warning:
+                    detail_parts.append(caption_warning)
                 if thumbnail_warning:
                     detail_parts.append(thumbnail_warning)
 
@@ -1009,15 +1087,32 @@ class SocialUploadService:
             return PlatformUploadResult(
                 platform="youtube",
                 status="failed",
-                detail=detail,
+                detail=cls._with_orphan_video_hint(detail, created_video_id),
+                resource_id=created_video_id,
                 quota_exceeded=quota_exceeded,
             )
         except Exception as exc:
             return PlatformUploadResult(
                 platform="youtube",
                 status="failed",
-                detail=str(exc),
+                detail=cls._with_orphan_video_hint(str(exc), created_video_id),
+                resource_id=created_video_id,
             )
+
+    @staticmethod
+    def _with_orphan_video_hint(detail: str, video_id: str | None) -> str:
+        """Name the video when the upload itself succeeded before the failure.
+
+        Without this the operator sees only the API message and cannot tell a
+        failed upload apart from a live video whose post-upload step broke —
+        and a blind retry then duplicates it on the channel.
+        """
+        if not video_id:
+            return detail
+        return (
+            f"{detail} | La vidéo est déjà en ligne sur la chaîne: "
+            f"https://youtu.be/{video_id} (ne pas relancer l'upload)"
+        )
 
     @classmethod
     def _probe_media(
