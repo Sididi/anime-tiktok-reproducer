@@ -83,6 +83,10 @@ class TranscriberService:
     _model_lock = threading.RLock()
     _active_transcriptions: int = 0
     _unload_requested: bool = False
+    # Speech spans the last _transcribe_sync run could not recover words for
+    # (post-alignment, post-repair). Safe as a class attribute: transcription
+    # runs are serialized behind the indexation queue's heavy slot.
+    _last_unrecovered_gaps: list[tuple[float, float]] = []
 
     @classmethod
     def _ensure_unsafe_torch_load_env(cls) -> None:
@@ -538,6 +542,7 @@ class TranscriberService:
     ) -> tuple[list[dict], str]:
         cls._ensure_unsafe_torch_load_env()
         cls._start_transcription_session()
+        cls._last_unrecovered_gaps = []
 
         temp_audio_path: Path | None = None
         try:
@@ -616,10 +621,14 @@ class TranscriberService:
                     # coverage while its text stops mid-word (token-dense
                     # scripts, e.g. Hindi), so the batched coverage check
                     # can't see it — the wordless tail only surfaces here,
-                    # after alignment. Re-decode those spans sequentially and
-                    # merge the aligned words.
+                    # after alignment. Re-decode those spans through the
+                    # repair ladder and merge the aligned words.
                     repairs = asr_engine.redecode_spans(
-                        model, audio, residual, language=detected_language
+                        model,
+                        audio,
+                        residual,
+                        language=detected_language,
+                        speech_regions=speech_regions,
                     )
                     if repairs:
                         repairs, _model_a, _metadata, _device = cls._align_segments(
@@ -632,7 +641,12 @@ class TranscriberService:
                         )
                         words.extend(cls._extract_words_from_segments(repairs))
                         words.sort(key=lambda word: (word["start"], word["end"]))
-                        asr_engine.log_residual_coverage(words, speech_regions)
+                        residual = asr_engine.log_residual_coverage(
+                            words, speech_regions
+                        )
+                cls._last_unrecovered_gaps = [
+                    (float(start), float(end)) for start, end in residual
+                ]
                 return words, detected_language
 
             if last_exc is not None:
@@ -1232,6 +1246,7 @@ class TranscriberService:
             transcription = Transcription(
                 language=detected_lang,
                 scenes=scene_transcriptions,
+                unrecovered_gaps=list(cls._last_unrecovered_gaps),
             )
 
             # Save transcription
@@ -1336,6 +1351,16 @@ class TranscriberService:
                         )
 
             completion_message = f"Transcribed {len(words)} words in {detected_lang}"
+            if transcription.unrecovered_gaps:
+                # Loud canary: scenes inside these spans are empty because of
+                # an ASR failure, not because the narrator was silent.
+                gap_list = ", ".join(
+                    f"{start:.1f}-{end:.1f}s"
+                    for start, end in transcription.unrecovered_gaps[:5]
+                )
+                completion_message += (
+                    f" — WARNING: no words recovered for {gap_list}"
+                )
             if detection_result is not None and detection_result.error:
                 # Loud canary: a failed diarization must never read as a
                 # clean "no raw scenes" result.

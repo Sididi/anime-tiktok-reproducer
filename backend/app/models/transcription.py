@@ -30,3 +30,8 @@ class Transcription(BaseModel):
 
     language: str
     scenes: list[SceneTranscription] = []
+    # Speech spans (seconds) the ASR pipeline could not recover words for,
+    # even after the repair ladder. Empty on healthy media. Scenes inside
+    # these spans are empty because of an ASR failure, not because the
+    # narrator was silent.
+    unrecovered_gaps: list[tuple[float, float]] = []
