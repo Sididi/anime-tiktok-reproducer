@@ -3,13 +3,19 @@
 Polls every `interval` seconds; for each job, iterates `platforms_requested`
 and runs due per-platform actions:
 
-- tiktok    → stage media on arrival, create a PFM post with scheduled_at at
-              sched − TIKTOK_SCHEDULE_LEAD_MINUTES, poll results from sched.
+- tiktok    → RETIRED 2026-08: the main backend creates the PFM post directly
+              (native scheduled_at); the dispatcher is kept commented.
 - instagram → call Instagram Graph API to publish the Reel. On success,
               update the embed. On failure, increment attempts; after
               5 attempts give up + ping the reminder channel.
 - youtube   → no-op (main backend schedules natively via publishAt).
-- facebook  → no-op (main backend schedules natively via video_state).
+- facebook  → no-op for jobs without a facebook_payload (main backend
+              schedules natively via video_state within Meta's ~29d window).
+              Jobs WITH a facebook_payload are long-range holds (target beyond
+              the window): at T - FACEBOOK_CONVERT_LEAD_DAYS the server either
+              uploads the prepared video as a native scheduled post (CREATE
+              hold) or pushes an existing post's scheduled_publish_time to the
+              real target (RETIME hold).
 
 Survives VPS restarts: the scheduler is purely state-driven (re-reads
 jobs.json every tick), so a restart simply resumes polling.
@@ -22,12 +28,17 @@ from datetime import UTC, datetime, timedelta
 
 from app.config import Settings
 from app.models.job import (
+    FacebookPublishState,
     InstagramPublishState,
     Job,
     PlatformStatus,
     TikTokPublishState,
 )
 from app.services.embed_builder import build_embed
+from app.services.facebook_publisher import (
+    create_facebook_scheduled_post,
+    retime_facebook_scheduled_post,
+)
 from app.services.instagram_publisher import publish_to_instagram
 from app.services.job_store import JobStore
 from app.services.post_for_me_publisher import (
@@ -40,6 +51,11 @@ logger = logging.getLogger(__name__)
 
 _IG_MAX_ATTEMPTS = 5
 _TT_MAX_ATTEMPTS = 5
+_FB_MAX_ATTEMPTS = 5
+# Long-range Facebook holds convert to a native scheduled post this many days
+# before the target (Meta's scheduled_publish_time window is ~29 days; the
+# 1-day margin absorbs clock drift and slow ticks).
+FACEBOOK_CONVERT_LEAD_DAYS = 28
 # Quota errors (403 reached_active_user_cap) are NOT retried on a long spaced
 # window: the owner prefers a fast terminal failure + Discord ping so the
 # video can be posted manually near its slot, over an hour-long retry window
@@ -80,6 +96,12 @@ def _dispatch_worthwhile(job: Job, platform: str) -> bool:
             )
             return False
         return True
+    if platform == "facebook":
+        # Only long-range holds are server-dispatched; jobs without a
+        # facebook_payload are scheduled natively by the main backend.
+        if not job.facebook_payload:
+            return False
+        return status.status not in ("uploaded", "failed", "skipped")
     # instagram
     if not job.instagram_payload:
         logger.warning(
@@ -126,12 +148,23 @@ async def dispatch_due_actions(
     started = 0
     for job in await store.list_all():
         for platform in job.platforms_requested:
-            if platform == "tiktok":
-                dispatcher = _dispatch_tiktok_publish
-            elif platform == "instagram":
+            # 2026-08 PFM MIGRATION: TikTok is now scheduled by the main
+            # backend directly against Post for Me (native scheduled_at,
+            # backend/app/services/post_for_me_client.py). New jobs no longer
+            # carry "tiktok" in platforms_requested; the dispatcher below is
+            # kept COMMENTED (never delete) in case the relay path is needed
+            # again. Legacy in-flight jobs with a live post_scheduled PFM post
+            # publish server-side via PFM regardless.
+            # if platform == "tiktok":
+            #     dispatcher = _dispatch_tiktok_publish
+            # elif platform == "instagram":
+            if platform == "instagram":
                 dispatcher = _dispatch_instagram_publish
+            elif platform == "facebook" and job.facebook_payload:
+                # Long-range hold (target beyond Meta's ~29d window).
+                dispatcher = _dispatch_facebook_hold
             else:
-                continue  # youtube + facebook: main backend schedules natively
+                continue  # youtube + native facebook + tiktok: scheduled natively/by backend
             key = (job.project_id, platform)
             if key in _IN_FLIGHT:
                 continue
@@ -156,7 +189,11 @@ def _platform_due_time(job: Job, platform: str) -> datetime:
     TikTok runs three phases: media staging is due as soon as the job exists;
     post creation at sched - TIKTOK_SCHEDULE_LEAD_MINUTES (PFM then publishes
     server-side at sched via scheduled_at); result polling from sched.
+    Facebook long-range holds convert at sched - FACEBOOK_CONVERT_LEAD_DAYS.
     The stored times are never mutated."""
+    if platform == "facebook" and job.facebook_payload:
+        sched = _normalize_utc(job.platform_scheduled_at.get(platform) or job.slot_time)
+        return sched - timedelta(days=FACEBOOK_CONVERT_LEAD_DAYS)
     if platform != "tiktok":
         due_time = job.platform_scheduled_at.get(platform) or job.slot_time
         return _normalize_utc(due_time)
@@ -502,6 +539,120 @@ async def _dispatch_instagram_publish(
         logger.info(
             "Instagram publish attempt %d/%d failed for %s: %s — will retry next tick",
             next_attempts, _IG_MAX_ATTEMPTS, job.project_id, result.detail,
+        )
+    return False
+
+
+async def _dispatch_facebook_hold(
+    job: Job, store: JobStore, settings: Settings, discord
+) -> bool:
+    """Convert a long-range Facebook hold once inside Meta's window.
+
+    RETIME hold (payload carries video_id): push the parked native post's
+    scheduled_publish_time to the real target. CREATE hold: upload the
+    backend-prepared video as a native scheduled post."""
+    payload = job.facebook_payload or {}
+    state = job.facebook_publish_state or FacebookPublishState()
+    sched = _normalize_utc(job.platform_scheduled_at.get("facebook") or job.slot_time)
+    next_attempts = state.attempts + 1
+
+    page_id = str(payload.get("page_id") or "")
+    token = str(payload.get("page_access_token") or "")
+    video_id = payload.get("video_id") or state.video_id
+    if not page_id or not token:
+        detail = "facebook hold: missing page_id/page_access_token"
+        await store.merge_platform_status(
+            job.project_id, "facebook",
+            PlatformStatus(status="failed", detail=detail, attempts=next_attempts,
+                           completed_at=datetime.now(tz=UTC)),
+        )
+        await _rerender_embed(job.project_id, store, settings, discord)
+        return False
+
+    if video_id:
+        result = await retime_facebook_scheduled_post(
+            page_id=page_id,
+            page_access_token=token,
+            video_id=str(video_id),
+            scheduled_at=sched,
+            graph_api_version=payload.get("graph_api_version"),
+        )
+        stage_on_success = "retimed"
+    else:
+        result = await create_facebook_scheduled_post(
+            page_id=page_id,
+            page_access_token=token,
+            title=str(payload.get("title") or ""),
+            description=str(payload.get("description") or ""),
+            prepared_video_url=str(payload.get("prepared_video_url") or ""),
+            scheduled_at=sched,
+            graph_api_version=payload.get("graph_api_version"),
+        )
+        stage_on_success = "created"
+
+    if result.success:
+        await store.set_facebook_publish_state(
+            job.project_id,
+            FacebookPublishState(
+                video_id=result.video_id, stage=stage_on_success, attempts=next_attempts
+            ),
+        )
+        await store.merge_platform_status(
+            job.project_id, "facebook",
+            PlatformStatus(
+                status="uploaded",
+                url=result.url,
+                detail=f"Scheduled natively at {sched.isoformat()} ({stage_on_success})",
+                attempts=next_attempts,
+                completed_at=datetime.now(tz=UTC),
+            ),
+        )
+        await _rerender_embed(job.project_id, store, settings, discord)
+        logger.info(
+            "Facebook hold %s for %s (video_id=%s at=%s)",
+            stage_on_success, job.project_id, result.video_id, sched.isoformat(),
+        )
+        return True
+
+    await store.set_facebook_publish_state(
+        job.project_id,
+        FacebookPublishState(
+            video_id=result.video_id or (str(video_id) if video_id else None),
+            stage="failed" if next_attempts >= _FB_MAX_ATTEMPTS else state.stage,
+            attempts=next_attempts,
+            last_error=result.detail,
+        ),
+    )
+    if next_attempts >= _FB_MAX_ATTEMPTS:
+        await store.merge_platform_status(
+            job.project_id, "facebook",
+            PlatformStatus(status="failed", detail=result.detail,
+                           attempts=next_attempts, completed_at=datetime.now(tz=UTC)),
+        )
+        await _rerender_embed(job.project_id, store, settings, discord)
+        await _post_failure_ping(
+            job, settings, discord, result.detail or "hold conversion failed",
+            platform_label="Facebook",
+        )
+        logger.warning(
+            "Facebook hold failed for %s after %d attempts: %s",
+            job.project_id, next_attempts, result.detail,
+        )
+    else:
+        await store.merge_platform_status(
+            job.project_id, "facebook",
+            PlatformStatus(status="pending", detail=result.detail, attempts=next_attempts),
+        )
+        if next_attempts == 1:
+            await _post_failure_ping(
+                job, settings, discord,
+                f"{result.detail or 'hold conversion failed'} "
+                f"(attempt 1/{_FB_MAX_ATTEMPTS}, retrying)",
+                platform_label="Facebook",
+            )
+        logger.info(
+            "Facebook hold attempt %d/%d failed for %s: %s — will retry next tick",
+            next_attempts, _FB_MAX_ATTEMPTS, job.project_id, result.detail,
         )
     return False
 

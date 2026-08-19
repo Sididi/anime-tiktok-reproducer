@@ -113,7 +113,7 @@ def test_shared_jitter_same_offset_for_all_platforms(scheduler):
     tt_offset = results["tiktok"][1] - results["tiktok"][0]
     yt_offset = results["youtube"][1] - results["youtube"][0]
     assert tt_offset == yt_offset
-    assert abs(tt_offset) <= timedelta(minutes=30)
+    assert abs(tt_offset) <= timedelta(minutes=SchedulingService._JITTER_MINUTES)
 
 
 def test_stale_pre_tiktok_reservation_is_realigned(scheduler):

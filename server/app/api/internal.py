@@ -48,6 +48,23 @@ class TikTokPayload(BaseModel):
     thumbnail_url: str | None = None
 
 
+class FacebookPayload(BaseModel):
+    """Long-range Facebook hold (target beyond Meta's ~29d native window).
+
+    CREATE hold: prepared_video_url set, video_id absent — the scheduler
+    uploads it as a native scheduled post at T - FACEBOOK_CONVERT_LEAD_DAYS.
+    RETIME hold: video_id set — the existing native post (parked inside the
+    window by the backend) gets its scheduled_publish_time pushed to T."""
+
+    page_id: str
+    page_access_token: str
+    title: str = ""
+    description: str = ""
+    prepared_video_url: str | None = None
+    video_id: str | None = None
+    graph_api_version: str = "v25.0"
+
+
 class InitialPlatformStatus(BaseModel):
     status: Literal["pending", "uploading", "uploaded", "skipped", "failed"]
     url: str | None = None
@@ -66,6 +83,7 @@ class CreateJobRequest(BaseModel):
     platform_statuses: dict[str, InitialPlatformStatus] | None = None
     instagram: InstagramPayload | None = None
     tiktok: TikTokPayload | None = None
+    facebook: FacebookPayload | None = None
 
 
 class CreateJobResponse(BaseModel):
@@ -126,6 +144,10 @@ def _tiktok_payload(req: CreateJobRequest) -> dict | None:
     return req.tiktok.model_dump(exclude_none=True) if req.tiktok else None
 
 
+def _facebook_payload(req: CreateJobRequest) -> dict | None:
+    return req.facebook.model_dump(exclude_none=True) if req.facebook else None
+
+
 def _normalized_tiktok_payload(payload: dict | None) -> dict | None:
     """Treat legacy payloads without a connector as consumer TikTok payloads."""
     if payload is None:
@@ -150,6 +172,7 @@ def _job_payload_changed(
     req: CreateJobRequest,
     instagram_payload: dict | None,
     tiktok_payload: dict | None,
+    facebook_payload: dict | None = None,
 ) -> bool:
     return (
         job.account_id != req.account_id
@@ -160,6 +183,7 @@ def _job_payload_changed(
         or job.drive_video_url != req.drive_video_url
         or job.platforms_requested != list(req.platforms_requested)
         or job.instagram_payload != instagram_payload
+        or job.facebook_payload != facebook_payload
         or _normalized_tiktok_payload(job.tiktok_payload)
         != _normalized_tiktok_payload(tiktok_payload)
     )
@@ -175,8 +199,14 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         raise HTTPException(400, f"Unknown account {req.account_id!r}")
     account = settings.accounts[req.account_id]
 
+    # 2026-08 PFM MIGRATION: the main backend now creates the TikTok Post for
+    # Me post directly at upload time; new jobs arrive without a tiktok
+    # payload or "tiktok" in platforms_requested. The tiktok handling below
+    # (target lock, PFM cancel on payload change) stays in place for legacy
+    # in-flight jobs and is inert for new ones.
     instagram_payload = _instagram_payload(req)
     tiktok_payload = _tiktok_payload(req)
+    facebook_payload = _facebook_payload(req)
     platform_statuses = _initial_platform_statuses(req)
     updated: Job | None = None
     async with store.tiktok_publish_transition(req.project_id):
@@ -186,7 +216,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         existing = await store.get(req.project_id)
         if existing is not None:
             if not _job_payload_changed(
-                existing, req, instagram_payload, tiktok_payload
+                existing, req, instagram_payload, tiktok_payload, facebook_payload
             ):
                 return CreateJobResponse(
                     job_id=existing.job_id,
@@ -239,6 +269,8 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
                 instagram_publish_state=None,
                 tiktok_payload=tiktok_payload,
                 tiktok_publish_state=None,
+                facebook_payload=facebook_payload,
+                facebook_publish_state=None,
             )
 
     if updated is not None:
@@ -274,6 +306,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         reminder_forward_message_id=None,
         instagram_payload=instagram_payload,
         tiktok_payload=tiktok_payload,
+        facebook_payload=facebook_payload,
         created_at=now,
         updated_at=now,
     )
@@ -328,6 +361,74 @@ async def platform_status(
             logger.warning("Embed edit failed for %s: %s", project_id, e)
 
     return {"ok": True, "noop": False}
+
+
+class FacebookHoldRequest(BaseModel):
+    """Create-or-update a long-range Facebook hold on a project's job.
+
+    Used when a NATIVE post is rescheduled beyond Meta's ~29d window: the
+    backend parks the post at a placeholder inside the window and this hold
+    retimes it to the real target at T - FACEBOOK_CONVERT_LEAD_DAYS."""
+
+    account_id: str
+    scheduled_at: datetime
+    facebook: FacebookPayload
+    anime_title: str | None = None
+
+
+@router.post("/jobs/{project_id}/facebook-hold")
+async def facebook_hold(
+    project_id: str, req: FacebookHoldRequest, request: Request
+) -> dict:
+    settings = request.app.state.settings
+    store = request.app.state.job_store
+
+    if req.account_id not in settings.accounts:
+        raise HTTPException(400, f"Unknown account {req.account_id!r}")
+    account = settings.accounts[req.account_id]
+
+    payload = req.facebook.model_dump(exclude_none=True)
+    job = await store.get(project_id)
+    if job is None:
+        now = datetime.now(tz=UTC)
+        job = Job(
+            project_id=project_id,
+            job_id=f"j_{secrets.token_hex(4)}",
+            account_id=req.account_id,
+            device_id=account.device,
+            anime_title=req.anime_title or project_id,
+            description="",
+            drive_video_url="",
+            slot_time=req.scheduled_at,
+            platform_scheduled_at={"facebook": req.scheduled_at},
+            platforms_requested=["facebook"],
+            platform_statuses={"facebook": PlatformStatus(status="pending")},
+            discord_message_id=None,
+            reminder_message_id=None,
+            reminder_forward_message_id=None,
+            facebook_payload=payload,
+            created_at=now,
+            updated_at=now,
+        )
+        await store.create(job)
+        return {"ok": True, "created": True}
+
+    merged_times = dict(job.platform_scheduled_at or {})
+    merged_times["facebook"] = req.scheduled_at
+    platforms = list(job.platforms_requested)
+    if "facebook" not in platforms:
+        platforms.append("facebook")
+    statuses = dict(job.platform_statuses)
+    statuses["facebook"] = PlatformStatus(status="pending")
+    await store.update(
+        project_id,
+        platform_scheduled_at=merged_times,
+        platforms_requested=platforms,
+        platform_statuses=statuses,
+        facebook_payload=payload,
+        facebook_publish_state=None,
+    )
+    return {"ok": True, "created": False}
 
 
 @router.patch("/jobs/{project_id}/slot")
@@ -484,6 +585,12 @@ def _job_status_projection(job: Job) -> dict:
             p: ps.to_dict() for p, ps in job.platform_statuses.items()
         },
         "reminder_cancelled": job.reminder_cancelled,
+        # Long-range Facebook hold: the native post id once created/known, so
+        # the backend can reschedule with a single Graph call (never expose
+        # the payload itself — it carries the page access token).
+        "facebook_video_id": (
+            job.facebook_publish_state.video_id if job.facebook_publish_state else None
+        ),
         "updated_at": job.updated_at.isoformat(),
     }
 

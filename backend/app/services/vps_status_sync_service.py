@@ -24,7 +24,9 @@ from .project_service import ProjectService
 
 logger = logging.getLogger(__name__)
 
-VPS_PLATFORMS = ("instagram", "tiktok")
+# tiktok kept for legacy pre-PFM-migration jobs; facebook covers the
+# long-range (>29d) server holds (2026-08 redesign).
+VPS_PLATFORMS = ("instagram", "tiktok", "facebook")
 
 _MIN_SYNC_INTERVAL_SECONDS = 60.0
 
@@ -36,10 +38,17 @@ class VpsStatusSyncService:
     # {project_id: {platform: {"status": ..., "url": ..., "detail": ...,
     #               "completed_at": ..., "attempts": ...}}}
     _cache: dict[str, dict[str, dict[str, Any]]] = {}
+    # {project_id: facebook native post id} — reported by the server once a
+    # long-range hold is converted, so reschedules can use one Graph call.
+    _facebook_video_ids: dict[str, str] = {}
 
     @classmethod
     def cached_status(cls, project_id: str, platform: str) -> dict[str, Any] | None:
         return cls._cache.get(project_id, {}).get(platform)
+
+    @classmethod
+    def cached_facebook_video_id(cls, project_id: str) -> str | None:
+        return cls._facebook_video_ids.get(project_id)
 
     @classmethod
     def request_sync(cls) -> None:
@@ -65,9 +74,13 @@ class VpsStatusSyncService:
             if not isinstance(jobs, dict):
                 return
             cache: dict[str, dict[str, dict[str, Any]]] = {}
+            fb_video_ids: dict[str, str] = {}
             for project_id, job in jobs.items():
                 if not isinstance(job, dict):
                     continue
+                fb_video_id = job.get("facebook_video_id")
+                if isinstance(fb_video_id, str) and fb_video_id:
+                    fb_video_ids[project_id] = fb_video_id
                 statuses = job.get("platform_statuses")
                 if not isinstance(statuses, dict):
                     continue
@@ -79,6 +92,7 @@ class VpsStatusSyncService:
                 if entry:
                     cache[project_id] = entry
             cls._cache = cache
+            cls._facebook_video_ids = fb_video_ids
             cls._persist_terminal_outcomes(cache)
         except Exception:  # pragma: no cover - defensive: sync must never crash
             logger.exception("VPS status sync failed")

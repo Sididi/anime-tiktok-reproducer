@@ -177,7 +177,10 @@ def test_cascade_skips_manual_entries(tmp_path, monkeypatch):
     # Place the manual project exactly ON the cascade anchor slot, so the
     # test fails if manual entries are ever visible to the cascade walk.
     anchor = SchedulingService._earliest_slot_at_or_after(
-        acc, "tiktok", datetime.now(timezone.utc) + timedelta(minutes=30)
+        acc,
+        "tiktok",
+        datetime.now(timezone.utc)
+        + timedelta(minutes=SchedulingService._MIN_LEAD_MINUTES),
     )
     _save_scheduled_project("manualproj", acc, "tiktok", anchor, manual=True)
 

@@ -5,6 +5,7 @@ import { api } from "@/api/client";
 import type { FreeSlot, Platform, ResolveAnchorResult, StealSpec, SwitchMode, SwitchPreview, UploadRestrictions } from "@/types";
 import { PLATFORM_SHORT } from "@/components/planning/platformColors";
 import { parisDayKey, parisWallTimeToUtcIso, toParis } from "@/utils/parisTime";
+import { MIN_LEAD_MINUTES, MIN_LEAD_MS } from "@/utils/scheduling";
 import { SlotPickerCalendar } from "./SlotPickerCalendar";
 import { SlotChips } from "./SlotChips";
 import { PerPlatformOverride } from "./PerPlatformOverride";
@@ -44,6 +45,11 @@ interface SlotPickerPopoverProps {
   platformsForAnchor: Platform[]; // anchor mode: which platforms are in scope
   allowManual?: boolean;           // default true in anchor mode
   initialManual?: boolean;         // open with custom time active
+  /** Anchor mode's slot grid platform (default "tiktok"). The urgent
+   * TikTok-only flow anchors the OTHER platforms on a non-TT grid: the live
+   * resolve preview, per-platform overrides and steals are then disabled —
+   * the confirmed slot becomes the "not before" instant for every platform. */
+  anchorPlatform?: Platform;
   onConfirm: (payload: SlotPickerConfirmPayload) => Promise<void>;
 }
 
@@ -69,7 +75,9 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
   const [steals, setSteals] = useState<Partial<Record<Platform, StealSpec>>>({});
   const [switchTarget, setSwitchTarget] = useState<{ platform: Platform; slotIso: string } | null>(null);
 
-  const platformForFetch: Platform = mode === "anchor" ? "tiktok" : platform!;
+  const anchorPlatform: Platform = props.anchorPlatform ?? "tiktok";
+  const tiktokAnchored = mode !== "anchor" || anchorPlatform === "tiktok";
+  const platformForFetch: Platform = mode === "anchor" ? anchorPlatform : platform!;
 
   // Fetch slots for selected day.
   useEffect(() => {
@@ -164,9 +172,9 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
     return { daysWithSlots: all, daysWithFreeSlots: free };
   }, [monthSlots]);
 
-  // Live resolve preview in anchor mode.
+  // Live resolve preview in anchor mode (TikTok-anchored only).
   useEffect(() => {
-    if (!open || mode !== "anchor" || !selectedSlotIso) {
+    if (!open || mode !== "anchor" || !tiktokAnchored || !selectedSlotIso) {
       setResolveResult(null);
       return;
     }
@@ -194,7 +202,7 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
   }, [customActive, selectedDate, customTime]);
 
   const customTooClose =
-    customIso !== null && new Date(customIso).getTime() < Date.now() + 30 * 60 * 1000;
+    customIso !== null && new Date(customIso).getTime() < Date.now() + MIN_LEAD_MS;
 
   const proximityWarning = useMemo(() => {
     if (!customIso) return null;
@@ -260,7 +268,11 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
         onClick={(e) => e.stopPropagation()}
       >
         <h3 className="text-sm font-semibold mb-2">
-          {mode === "anchor" ? "Pick a slot" : `Pick ${PLATFORM_SHORT[platform!]} slot`}
+          {mode === "anchor"
+            ? tiktokAnchored
+              ? "Pick a slot"
+              : "Planifier les autres plateformes"
+            : `Pick ${PLATFORM_SHORT[platform!]} slot`}
         </h3>
         <SlotPickerCalendar
           monthAnchor={monthAnchor}
@@ -281,7 +293,9 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
         />
         <div className="border-t border-[hsl(var(--border))] mt-3 pt-2">
           <div className="text-[11px] text-[hsl(var(--muted-foreground))] mb-1.5">
-            {mode === "anchor" ? "TikTok slots" : `${PLATFORM_SHORT[platform!]} slots`}
+            {mode === "anchor"
+              ? `${PLATFORM_SHORT[platformForFetch]} slots`
+              : `${PLATFORM_SHORT[platform!]} slots`}
             {selectedDate && ` · ${selectedDate.toLocaleDateString("fr-FR")}`}
           </div>
           <SlotChips
@@ -296,8 +310,11 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
                 return next;
               });
             }}
-            onSelectTaken={(s) =>
-              setSwitchTarget({ platform: platformForFetch, slotIso: s.slot })
+            onSelectTaken={
+              tiktokAnchored
+                ? (s) =>
+                    setSwitchTarget({ platform: platformForFetch, slotIso: s.slot })
+                : undefined
             }
             stolenIsos={
               new Set(
@@ -331,7 +348,7 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
                 />
                 {customTooClose && (
                   <div className="text-[11px] text-[hsl(var(--destructive))] mt-1">
-                    Minimum 30 minutes dans le futur.
+                    Minimum {MIN_LEAD_MINUTES} minutes dans le futur.
                   </div>
                 )}
                 {proximityWarning && (

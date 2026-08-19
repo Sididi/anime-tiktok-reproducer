@@ -23,12 +23,18 @@ function fmt(iso: string): string {
   }).format(new Date(iso));
 }
 
+/**
+ * Takeover confirmation: shows the occupant's NEW timings under the single
+ * "relocate" strategy — the occupant is pushed to its nearest free slots,
+ * TikTok-first (1 API call per platform). The old chain-cascade / next-free
+ * choice was removed from the UI (2026-08); backend modes stay available.
+ */
 export function SwitchSlotConfirmModal({
   open, projectId, accountId, platform, slotIso, onClose, onChoose,
 }: SwitchSlotConfirmModalProps) {
   const [preview, setPreview] = useState<SwitchPreview | null>(null);
   const [loading, setLoading] = useState(false);
-  const [submitting, setSubmitting] = useState<SwitchMode | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -42,22 +48,22 @@ export function SwitchSlotConfirmModal({
 
   if (!open) return null;
 
-  const cascadeBlocked = (preview?.cascade.blockers.length ?? 0) > 0;
-  const nextFreeBlocked = (preview?.next_free.blockers.length ?? 0) > 0;
-  const cascadeCount = preview?.cascade.displaced.length ?? 0;
-  const ytQuotaWarning =
-    platform === "youtube" && (preview?.uploaded_count ?? 0) > 10;
+  const plan = preview?.relocate ?? null;
+  const blocked = (plan?.blockers.length ?? 0) > 0;
+  const relocatedUploadedCount =
+    plan?.displaced.filter((d) => d.requires_platform_notification).length ?? 0;
+  const ytQuotaWarning = platform === "youtube" && relocatedUploadedCount > 10;
 
-  const choose = async (mode: SwitchMode) => {
+  const choose = async () => {
     if (!preview) return;
-    setSubmitting(mode); setError(null);
+    setSubmitting(true); setError(null);
     try {
-      await onChoose(mode, preview);
+      await onChoose("relocate", preview);
       onClose();
     } catch (err) {
       setError((err as Error).message);
     } finally {
-      setSubmitting(null);
+      setSubmitting(false);
     }
   };
 
@@ -72,72 +78,55 @@ export function SwitchSlotConfirmModal({
         <div className="flex items-center gap-2 mb-2">
           <ArrowLeftRight className="h-5 w-5 text-amber-500" />
           <h3 className="text-sm font-semibold">
-            Échanger le slot {PLATFORM_SHORT[platform]} · {fmt(slotIso)}
+            Prendre le slot {PLATFORM_SHORT[platform]} · {fmt(slotIso)}
           </h3>
         </div>
         <p className="text-xs text-[hsl(var(--muted-foreground))] mb-3">
-          Ce slot est occupé par «{preview?.occupant_title ?? "…"}». Choisissez
-          comment le libérer.
+          Ce slot est occupé par «{preview?.occupant_title ?? "…"}». Confirmer
+          le déplacera vers ses prochains slots libres (TikTok d'abord, les
+          autres plateformes suivent).
         </p>
 
         {loading && <div className="text-xs">Calcul des déplacements…</div>}
         {error && <div className="text-xs text-[hsl(var(--destructive))] mb-2">{error}</div>}
 
-        {preview && (
-          <div className="space-y-3">
-            <div className="rounded border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/30 p-3">
-              <div className="text-[11px] font-semibold mb-1">
-                Cascade en chaîne — {cascadeCount} vidéo{cascadeCount > 1 ? "s" : ""} déplacée{cascadeCount > 1 ? "s" : ""}
-              </div>
-              <div className="font-mono text-[11px] leading-relaxed text-[hsl(var(--muted-foreground))] max-h-32 overflow-y-auto">
-                {preview.cascade.displaced.map((d) => (
-                  <div key={d.project_id}>
-                    ↳ {d.anime_title} · {fmt(d.from_slot)} → {fmt(d.to_slot)}
+        {preview && plan && (
+          <div className="rounded border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/30 p-3">
+            <div className="text-[11px] font-semibold mb-1">
+              Nouveaux horaires de «{preview.occupant_title ?? "?"}»
+            </div>
+            <div className="font-mono text-[11px] leading-relaxed text-[hsl(var(--muted-foreground))] max-h-32 overflow-y-auto">
+              {plan.displaced.map((d) => {
+                const p = (d.platform ?? platform) as Platform;
+                return (
+                  <div key={`${d.project_id}:${p}`}>
+                    ↳ {PLATFORM_SHORT[p]} · {fmt(d.from_slot)} → {fmt(d.to_slot)}
                   </div>
-                ))}
-                {preview.cascade.blockers.map((b, i) => (
-                  <div key={i} className="text-[hsl(var(--destructive))]">✗ {b.reason}</div>
-                ))}
-              </div>
-              {ytQuotaWarning && (
-                <div className="text-[11px] text-amber-500 mt-1">
-                  ⚠ {preview.uploaded_count} vidéos YouTube déjà uploadées seront
-                  re-planifiées (~{preview.uploaded_count * 50} unités de quota API).
+                );
+              })}
+              {plan.blockers.map((b, i) => (
+                <div key={i} className="text-[hsl(var(--destructive))]">
+                  ✗ {PLATFORM_SHORT[b.platform] ?? b.platform}: {b.reason}
                 </div>
-              )}
+              ))}
             </div>
-
-            <div className="rounded border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/30 p-3">
-              <div className="text-[11px] font-semibold mb-1">Prochain slot libre — 1 vidéo déplacée</div>
-              <div className="font-mono text-[11px] text-[hsl(var(--muted-foreground))]">
-                {preview.next_free.displaced.map((d) => (
-                  <div key={d.project_id}>
-                    ↳ {d.anime_title} · {fmt(d.from_slot)} → {fmt(d.to_slot)}
-                  </div>
-                ))}
-                {preview.next_free.blockers.map((b, i) => (
-                  <div key={i} className="text-[hsl(var(--destructive))]">✗ {b.reason}</div>
-                ))}
+            {ytQuotaWarning && (
+              <div className="text-[11px] text-amber-500 mt-1">
+                ⚠ {relocatedUploadedCount} vidéos YouTube déjà uploadées seront
+                re-planifiées (~{relocatedUploadedCount * 50} unités de quota API).
               </div>
-            </div>
+            )}
           </div>
         )}
 
         <div className="flex justify-end gap-2 mt-4">
           <Button size="sm" variant="ghost" onClick={onClose}>Annuler</Button>
           <Button
-            size="sm" variant="outline"
-            disabled={!preview || nextFreeBlocked || submitting !== null}
-            onClick={() => choose("next_free")}
-          >
-            {submitting === "next_free" ? "…" : "Slot libre suivant (1 vidéo)"}
-          </Button>
-          <Button
             size="sm"
-            disabled={!preview || cascadeBlocked || submitting !== null}
-            onClick={() => choose("cascade")}
+            disabled={!preview || blocked || submitting}
+            onClick={choose}
           >
-            {submitting === "cascade" ? "…" : `Cascader (${cascadeCount} vidéo${cascadeCount > 1 ? "s" : ""})`}
+            {submitting ? "…" : "Libérer le slot"}
           </Button>
         </div>
       </motion.div>

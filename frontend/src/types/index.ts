@@ -544,7 +544,10 @@ export interface ResolveAnchorResult {
   conflicts: Array<{ platform: Platform; reason: string }>;
 }
 
-export type SwitchMode = "cascade" | "next_free";
+/** "relocate" = single push of the occupant to its nearest free slots,
+ * TikTok-first (the only mode the UI offers since 2026-08; the older modes
+ * remain valid on the wire). */
+export type SwitchMode = "cascade" | "next_free" | "relocate";
 export interface StealSpec { mode: SwitchMode; expected_occupant_id: string | null; }
 /** A displaced project whose TikTok would land after its other platforms. */
 export interface PrecedenceWarning {
@@ -552,12 +555,17 @@ export interface PrecedenceWarning {
   anime_title: string;
   platforms: Platform[];
 }
+export interface DisplacedMove {
+  project_id: string;
+  anime_title: string;
+  from_slot: string;
+  to_slot: string;
+  requires_platform_notification: boolean;
+  /** Set on relocate follow moves; null = the stolen slot's platform. */
+  platform?: Platform | null;
+}
 export interface SwitchPlanDto {
-  displaced: Array<{
-    project_id: string; anime_title: string;
-    from_slot: string; to_slot: string;
-    requires_platform_notification: boolean;
-  }>;
+  displaced: DisplacedMove[];
   blockers: Array<{ platform: Platform; reason: string }>;
   precedence_warnings?: PrecedenceWarning[];
 }
@@ -568,6 +576,63 @@ export interface SwitchPreview {
   uploaded_count: number;
   cascade: SwitchPlanDto;
   next_free: SwitchPlanDto;
+  relocate: SwitchPlanDto;
+}
+
+// ── Urgent-immediate flow (2026-08 redesign) ────────────────────────────────
+
+export interface UrgentCollisionItem {
+  platform: Platform;
+  slot: string;
+  scheduled_at: string;
+  manual: boolean;
+  movable: boolean;
+  /** unmovable_published | unmovable_processing | unmovable_window_passed */
+  reason: string | null;
+  /** TikTok inside the 15-min edit lock: PFM update is attempted best-effort. */
+  best_effort: boolean;
+  posted_url?: string | null;
+  suggested_slot?: string | null;
+}
+
+export interface UrgentCollisionProject {
+  project_id: string;
+  anime_title: string;
+  account_id: string;
+  items: UrgentCollisionItem[];
+}
+
+export interface UrgentPreview {
+  window_minutes: number;
+  platforms: Platform[];
+  immediate_platforms: Platform[];
+  phase1: UrgentCollisionProject[];
+  phase2: UrgentCollisionProject[];
+}
+
+/** One colliding project's deferred re-timing (applied only at final confirm). */
+export interface UrgentShiftSpec {
+  project_id: string;
+  kind: "anchor" | "platform";
+  platform?: Platform;
+  tiktok_slot?: string;
+  slot?: string;
+  manual_at?: string;
+  overrides?: Partial<Record<Platform, string>>;
+  steals?: Partial<Record<Platform, StealSpec>>;
+  expected_scheduled_at: Record<string, string>;
+}
+
+export interface UrgentApplyResult {
+  shifts: Array<{
+    project_id: string;
+    kind: string;
+    status: "ok" | "pending_retry" | "unmovable" | "failed";
+    reason?: string;
+    detail?: string;
+    notification_status?: Record<string, string>;
+  }>;
+  own_schedules: Record<string, { slot: string; scheduled_at: string }>;
 }
 
 export interface CascadePreview {

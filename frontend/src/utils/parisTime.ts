@@ -71,7 +71,12 @@ export function monthGridParis(anchor: string | Date): TZDate[] {
 export function parisWallTimeToUtcIso(dayKey: string, hhmm: string): string {
   const [y, m, d] = dayKey.split("-").map(Number);
   const [h, min] = hhmm.split(":").map(Number);
-  return new TZDate(y, m - 1, d, h, min, 0, PARIS_TZ).toISOString();
+  // @date-fns/tz >= 1.3 makes TZDate.toISOString() include the zone offset
+  // ("+02:00"); wrap in a plain Date to keep this function's contract of a
+  // canonical UTC "Z" instant.
+  return new Date(
+    new TZDate(y, m - 1, d, h, min, 0, PARIS_TZ).getTime(),
+  ).toISOString();
 }
 
 export function isSameParisDay(a: string | Date, b: string | Date): boolean {

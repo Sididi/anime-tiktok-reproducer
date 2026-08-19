@@ -73,6 +73,10 @@ class DisplacedItem:
     from_slot: datetime
     to_slot: datetime
     requires_platform_notification: bool
+    # Platform of this move when it differs from the stolen slot's platform
+    # (relocate mode moves the occupant's OTHER platforms after its TikTok).
+    # None = the stolen platform itself.
+    platform: str | None = None
 
 
 @dataclass
@@ -121,7 +125,19 @@ class SwitchResult:
     occupant_title: str | None
     cascade: SwitchPlan
     next_free: SwitchPlan
+    # Single push of the occupant to its nearest free slots, TikTok-first:
+    # the stolen platform moves to the next free slot; when that platform is
+    # TikTok, the occupant's other non-manual platforms follow to the nearest
+    # free slots >= the new TikTok slot (1 API call per platform).
+    relocate: SwitchPlan
     uploaded_count: int
+
+    def plan_for(self, mode: str) -> SwitchPlan:
+        if mode == "cascade":
+            return self.cascade
+        if mode == "relocate":
+            return self.relocate
+        return self.next_free
 
 
 @dataclass
@@ -133,14 +149,20 @@ class StealSpec:
 class SchedulingService:
     """Finds and reserves the next available upload slot per (account, platform)."""
 
-    _MIN_LEAD_MINUTES = 30
-    _JITTER_MINUTES = 30
+    _MIN_LEAD_MINUTES = 15
+    _JITTER_MINUTES = 5
     _MAX_LOOKAHEAD_DAYS = 90
-    # Freeze slot/caption 15 min before the TikTok publish instant. Must stay
-    # >= TIKTOK_SCHEDULE_LEAD_MINUTES (server/app/services/reminder_scheduler.py):
-    # the VPS creates the PFM scheduled post from this data at sched-10, so the
-    # freeze precedes post creation by 5 min.
+    # Freeze slot/caption 15 min before the TikTok publish instant. The PFM
+    # post is created by the backend at upload time (post_for_me_client);
+    # inside this window PFM/TikTok may already be processing the post, so
+    # normal reschedules are refused. Urgent-immediate flows bypass the lock
+    # (best-effort PFM update, degrading to a warning on failure).
     TIKTOK_EDIT_LOCK_MINUTES = 15
+    # With _MIN_LEAD_MINUTES == TIKTOK_EDIT_LOCK_MINUTES, a publish instant
+    # clamped to exactly now+lead would be timing-locked the moment it is
+    # created. Publish-instant clamps add this margin so a fresh reservation
+    # always starts editable.
+    _LOCK_SAFETY_MINUTES = 1
     _reservation_lock = Lock()
 
     # ------------------------------------------------------------------ helpers
@@ -242,7 +264,9 @@ class SchedulingService:
         lower = slot_dt - timedelta(minutes=jitter)
         upper = slot_dt + timedelta(minutes=jitter)
 
-        min_publish = now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES)
+        min_publish = now_utc + timedelta(
+            minutes=cls._MIN_LEAD_MINUTES + cls._LOCK_SAFETY_MINUTES
+        )
         if lower < min_publish:
             lower = min_publish
 
@@ -276,7 +300,9 @@ class SchedulingService:
         if project_id is None:
             return cls._randomize_slot(slot_dt, now_utc)
         scheduled = slot_dt + timedelta(minutes=cls._project_jitter_minutes(project_id))
-        min_publish = now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES)
+        min_publish = now_utc + timedelta(
+            minutes=cls._MIN_LEAD_MINUTES + cls._LOCK_SAFETY_MINUTES
+        )
         if scheduled < min_publish:
             scheduled = min_publish
         return scheduled.replace(second=0, microsecond=0)
@@ -819,7 +845,7 @@ class SchedulingService:
                 result = cls.compute_switch(project_id, account_id, platform, steal_slot)
                 if (result.occupant_project_id or None) != (spec.expected_occupant_id or None):
                     raise SchedulingConflictError("slot_state_changed")
-                plan = result.cascade if spec.mode == "cascade" else result.next_free
+                plan = result.plan_for(spec.mode)
                 if plan.blockers:
                     cls._raise_blocked("Switch blocked", plan.blockers)
                 if not allow_before_tiktok:
@@ -838,14 +864,15 @@ class SchedulingService:
             ] = {}
             for platform, plan in steal_plans:
                 for item in plan.displaced:
-                    key = (item.project_id, platform)
+                    item_platform = item.platform or platform
+                    key = (item.project_id, item_platform)
                     if key in displacement_snapshots:
                         continue
                     moved = ProjectService.load(item.project_id)
                     if moved is None:
                         continue
                     displacement_snapshots[key] = (moved.platform_schedules or {}).get(
-                        platform
+                        item_platform
                     )
 
             for platform, plan in steal_plans:
@@ -908,20 +935,30 @@ class SchedulingService:
         account_id: str,
         at: datetime,
         platforms: list[str],
+        *,
+        bypass_lock: bool = False,
+        bypass_lead: bool = False,
     ) -> dict[str, PlatformSchedule]:
         """Reserve an exact user-chosen time OUTSIDE the slot system.
 
         No slot-config check, no pool check, no jitter. Overwrites any
         existing entries for the given platforms (that's also the edit path).
+        `bypass_lock`/`bypass_lead` are for the urgent-immediate flow only:
+        it may shift posts inside the edit-lock / lead windows (best-effort
+        on the platform side).
         """
         with cls._reservation_lock:
             project = ProjectService.load(project_id)
             if project is None:
                 raise SchedulingNotFoundError("Project not found")
-            if cls.tiktok_timing_locked(project):
+            if not bypass_lock and cls.tiktok_timing_locked(project):
                 raise SchedulingLockedError("timing_locked")
             at_utc = cls._normalize_utc_datetime(at)
-            if at_utc < cls._earliest_allowed_publish_time():
+            # Strict: an instant exactly at the floor would be born inside the
+            # TikTok edit-lock window (lead == lock == 15 min).
+            if not bypass_lead and at_utc <= cls._earliest_allowed_publish_time():
+                raise SchedulingError("slot_too_close")
+            if bypass_lead and at_utc <= datetime.now(timezone.utc):
                 raise SchedulingError("slot_too_close")
             cls._validate_duplication_restrictions(project, account_id, [at_utc])
             if project.scheduled_account_id and project.scheduled_account_id != account_id:
@@ -938,6 +975,78 @@ class SchedulingService:
             return dict(schedules)
 
     @classmethod
+    def record_immediate_schedules(
+        cls, project_id: str, account_id: str, platforms: list[str]
+    ) -> dict[str, PlatformSchedule]:
+        """Record an urgent-immediate publish as manual now-schedules.
+
+        Manual entries are invisible to the pool but visible on the planning
+        board, so an immediate upload shows up with its real publish instant
+        without consuming a slot."""
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                raise SchedulingNotFoundError("Project not found")
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            if project.scheduled_account_id and project.scheduled_account_id != account_id:
+                project.platform_schedules = {}
+            schedules = dict(project.platform_schedules or {})
+            for platform in platforms:
+                schedules[platform] = PlatformSchedule(
+                    slot=now, scheduled_at=now, manual=True
+                )
+            project.platform_schedules = schedules
+            project.scheduled_account_id = account_id
+            cls._recompute_aggregates(project)
+            ProjectService.save(project)
+            return dict(schedules)
+
+    @classmethod
+    def reserve_platforms_not_before(
+        cls,
+        project_id: str,
+        account_id: str,
+        not_before: datetime,
+        platforms: list[str],
+    ) -> dict[str, tuple[datetime, datetime]]:
+        """Reserve each platform's first free slot at/after `not_before`.
+
+        Urgent TikTok-only mode: TikTok publishes immediately and the other
+        platforms are scheduled from the user's chosen starting instant."""
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                raise SchedulingNotFoundError("Project not found")
+            if project.scheduled_account_id and project.scheduled_account_id != account_id:
+                project.platform_schedules = {}
+            floor = cls._normalize_utc_datetime(not_before)
+            results: dict[str, tuple[datetime, datetime]] = {}
+            for platform in platforms:
+                if platform == "tiktok":
+                    continue
+                # Force a fresh reservation at/after the floor (drop any
+                # earlier one first so the reuse path can't keep it).
+                existing = (project.platform_schedules or {}).get(platform)
+                if (
+                    existing is not None
+                    and not existing.manual
+                    and cls._normalize_utc_datetime(existing.slot) < floor
+                ):
+                    schedules = dict(project.platform_schedules or {})
+                    schedules.pop(platform, None)
+                    project.platform_schedules = schedules
+                results[platform] = cls._reserve_platform_inplace(
+                    project, account_id, platform, not_before=floor
+                )
+            cls._validate_duplication_restrictions(
+                project, account_id, [slot for slot, _ in results.values()]
+            )
+            project.scheduled_account_id = account_id
+            cls._recompute_aggregates(project)
+            ProjectService.save(project)
+            return results
+
+    @classmethod
     def reschedule_anchor(
         cls,
         project_id: str,
@@ -945,6 +1054,8 @@ class SchedulingService:
         overrides: dict[str, datetime] | None = None,
         steals: dict[str, StealSpec] | None = None,
         allow_before_tiktok: bool = False,
+        *,
+        bypass_lock: bool = False,
     ) -> tuple[dict[str, PlatformSchedule], dict[str, SwitchResult]]:
         """Re-anchor a project's reservations on a new TT slot."""
         with cls._reservation_lock:
@@ -954,7 +1065,7 @@ class SchedulingService:
             account_id = project.scheduled_account_id
             if not account_id:
                 raise SchedulingError("Project has no scheduled account")
-            if cls.tiktok_timing_locked(project):
+            if not bypass_lock and cls.tiktok_timing_locked(project):
                 raise SchedulingLockedError("timing_locked")
             # Drop existing per-platform reservations so resolve_anchor sees
             # the slots as free in this pool.
@@ -977,6 +1088,9 @@ class SchedulingService:
         platform: str,
         new_slot: datetime,
         allow_before_tiktok: bool = False,
+        *,
+        bypass_lock: bool = False,
+        bypass_lead: bool = False,
     ) -> PlatformSchedule:
         """Replace a single platform's slot. Validates against the pool."""
         with cls._reservation_lock:
@@ -986,7 +1100,7 @@ class SchedulingService:
             account_id = project.scheduled_account_id
             if not account_id:
                 raise SchedulingError("Project has no scheduled account")
-            if cls.tiktok_timing_locked(project):
+            if not bypass_lock and cls.tiktok_timing_locked(project):
                 raise SchedulingLockedError("timing_locked")
             slot = cls._normalize_utc_datetime(new_slot)
             if not cls._is_slot_in_account_config(account_id, platform, slot):
@@ -1009,7 +1123,13 @@ class SchedulingService:
                     raise SchedulingError(f"Slot {slot.isoformat()} already taken in {platform} pool")
 
                 now_utc = datetime.now(timezone.utc)
-                if slot < now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES):
+                # Strict floor: see reserve_manual (lead == edit-lock boundary).
+                lead_floor = (
+                    now_utc
+                    if bypass_lead
+                    else now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES)
+                )
+                if slot <= lead_floor:
                     raise SchedulingError("slot_too_close")
 
                 new_sched = PlatformSchedule(
@@ -1174,7 +1294,9 @@ class SchedulingService:
         blockers: list[CascadeBlocker] = []
         now_utc = datetime.now(timezone.utc)
         earliest_allowed = now_utc + timedelta(minutes=cls._MIN_LEAD_MINUTES)
-        fb_horizon = now_utc + timedelta(days=29)
+        # 2026-08: no facebook horizon blocker anymore — targets beyond Meta's
+        # ~29-day native window are held by the /server and converted to a
+        # native scheduled post at T-28d (see upload_phase FB routing).
         tiktok_anchor: datetime | None = None
 
         for platform in platforms:
@@ -1209,10 +1331,6 @@ class SchedulingService:
                     blockers.append(CascadeBlocker(platform, "pool_full"))
                     blocked_for_platform = True
                     break
-                if platform == "facebook" and next_slot > fb_horizon:
-                    blockers.append(CascadeBlocker(platform, "facebook_horizon_exceeded"))
-                    blocked_for_platform = True
-                    break
                 displaced.append(DisplacedItem(
                     project_id=occupant.id,
                     anime_title=occupant.anime_name or occupant.id,
@@ -1244,6 +1362,49 @@ class SchedulingService:
         return CascadeResult(per_platform=per_platform, blockers=blockers)
 
     @classmethod
+    def _relocation_follow_moves(
+        cls, occupant: Project, new_tiktok_slot: datetime
+    ) -> tuple[list[DisplacedItem], list[CascadeBlocker]]:
+        """TikTok-first follow moves for a relocated occupant.
+
+        Every non-manual platform of the occupant scheduled BEFORE its new
+        TikTok slot moves to the nearest free slot at/after it, in the
+        occupant's own account pools. Manual entries stay (user's exact
+        choice, invisible to the pool)."""
+        moves: list[DisplacedItem] = []
+        blockers: list[CascadeBlocker] = []
+        occ_account = occupant.scheduled_account_id
+        if not occ_account:
+            return moves, blockers
+        new_tt = cls._normalize_utc_datetime(new_tiktok_slot)
+        for p, sched in sorted((occupant.platform_schedules or {}).items()):
+            if p == "tiktok" or sched.manual:
+                continue
+            p_slot = cls._normalize_utc_datetime(sched.slot)
+            if p_slot >= new_tt:
+                continue
+            pool_key = cls._resolve_pool_key(occ_account, p)
+            reservations = cls._collect_reserved_slots_for_pool(pool_key, p)
+            reservations.discard(p_slot.isoformat())  # its own slot frees up
+            candidate = cls._earliest_slot_at_or_after(occ_account, p, new_tt)
+            while candidate is not None and candidate.isoformat() in reservations:
+                candidate = cls._next_slot_after(occ_account, p, candidate)
+            if candidate is None:
+                blockers.append(CascadeBlocker(p, "pool_full"))
+                continue
+            moves.append(DisplacedItem(
+                project_id=occupant.id,
+                anime_title=occupant.anime_name or occupant.id,
+                from_slot=p_slot,
+                to_slot=candidate,
+                requires_platform_notification=(
+                    cls._project_requires_platform_notification(occupant, p)
+                ),
+                platform=p,
+            ))
+        return moves, blockers
+
+    @classmethod
     def compute_switch(
         cls, project_id: str, account_id: str, platform: str, slot: datetime,
     ) -> SwitchResult:
@@ -1255,7 +1416,8 @@ class SchedulingService:
         slot_utc = cls._normalize_utc_datetime(slot)
         now_utc = datetime.now(timezone.utc)
         earliest_allowed = cls._earliest_allowed_publish_time()
-        fb_horizon = now_utc + timedelta(days=29)
+        # 2026-08: facebook horizon blockers removed — >29d targets are held
+        # by the /server (native conversion at T-28d).
 
         pool_key = cls._resolve_pool_key(account_id, platform)
         occupancy = {
@@ -1276,6 +1438,7 @@ class SchedulingService:
 
         cascade = SwitchPlan(mode="cascade", displaced=[], blockers=list(shared))
         next_free = SwitchPlan(mode="next_free", displaced=[], blockers=list(shared))
+        relocate = SwitchPlan(mode="relocate", displaced=[], blockers=list(shared))
 
         if occupant is not None and not shared:
             # Chain: each occupant pushes into the next configured slot.
@@ -1284,11 +1447,6 @@ class SchedulingService:
                 nxt = cls._next_slot_after(account_id, platform, current_slot)
                 if nxt is None:
                     cascade.blockers.append(CascadeBlocker(platform, "pool_full"))
-                    break
-                if platform == "facebook" and nxt > fb_horizon:
-                    cascade.blockers.append(
-                        CascadeBlocker(platform, "facebook_horizon_exceeded")
-                    )
                     break
                 cascade.displaced.append(DisplacedItem(
                     project_id=current_occ.id,
@@ -1308,10 +1466,6 @@ class SchedulingService:
                 landing = cls._next_slot_after(account_id, platform, landing)
             if landing is None:
                 next_free.blockers.append(CascadeBlocker(platform, "pool_full"))
-            elif platform == "facebook" and landing > fb_horizon:
-                next_free.blockers.append(
-                    CascadeBlocker(platform, "facebook_horizon_exceeded")
-                )
             else:
                 next_free.displaced.append(DisplacedItem(
                     project_id=occupant.id,
@@ -1323,12 +1477,38 @@ class SchedulingService:
                     ),
                 ))
 
+            # Relocate: next_free's single push + TikTok-first auto-follow of
+            # the occupant's other non-manual platforms (each to its nearest
+            # free slot >= the occupant's new TikTok slot).
+            if next_free.blockers != shared or not next_free.displaced:
+                relocate.blockers = list(next_free.blockers)
+            else:
+                primary = next_free.displaced[0]
+                relocate.displaced.append(DisplacedItem(
+                    project_id=primary.project_id,
+                    anime_title=primary.anime_title,
+                    from_slot=primary.from_slot,
+                    to_slot=primary.to_slot,
+                    requires_platform_notification=primary.requires_platform_notification,
+                    platform=platform,
+                ))
+                if platform == "tiktok":
+                    follow_moves, follow_blockers = cls._relocation_follow_moves(
+                        occupant, primary.to_slot
+                    )
+                    relocate.displaced.extend(follow_moves)
+                    relocate.blockers.extend(follow_blockers)
+
         cascade.precedence_warnings = cls._displaced_tiktok_warnings(
             platform, cascade.displaced
         )
         next_free.precedence_warnings = cls._displaced_tiktok_warnings(
             platform, next_free.displaced
         )
+        # Relocate is precedence-safe by construction: follow moves land every
+        # non-manual platform at/after the occupant's new TikTok slot (manual
+        # entries are the user's exact choice and are ignored, matching
+        # _breaks_tiktok_precedence).
 
         uploaded_count = sum(
             1 for d in cascade.displaced if d.requires_platform_notification
@@ -1340,6 +1520,7 @@ class SchedulingService:
             occupant_title=(occupant.anime_name or occupant.id) if occupant else None,
             cascade=cascade,
             next_free=next_free,
+            relocate=relocate,
             uploaded_count=uploaded_count,
         )
 
@@ -1347,13 +1528,17 @@ class SchedulingService:
     def _apply_displacements(
         cls, platform: str, displaced: list[DisplacedItem], now_utc: datetime
     ) -> None:
-        """Persist displacement moves farthest-first. Caller holds the lock."""
+        """Persist displacement moves farthest-first. Caller holds the lock.
+
+        A move carrying its own `platform` (relocate follow moves) writes that
+        platform; others write the stolen slot's platform."""
         for item in reversed(displaced):
             project = ProjectService.load(item.project_id)
             if project is None:
                 continue
+            target_platform = item.platform or platform
             schedules = dict(project.platform_schedules or {})
-            schedules[platform] = PlatformSchedule(
+            schedules[target_platform] = PlatformSchedule(
                 slot=item.to_slot,
                 scheduled_at=cls._scheduled_at_for(item.project_id, item.to_slot, now_utc),
             )
@@ -1371,13 +1556,15 @@ class SchedulingService:
         mode: str,
         expected_occupant_id: str | None,
         allow_before_tiktok: bool = False,
+        *,
+        bypass_lock: bool = False,
     ) -> SwitchResult:
         """Steal `slot` on `platform`: displace the occupant per `mode`."""
         with cls._reservation_lock:
             result = cls.compute_switch(project_id, account_id, platform, slot)
             if (result.occupant_project_id or None) != (expected_occupant_id or None):
                 raise SchedulingConflictError("slot_state_changed")
-            plan = result.cascade if mode == "cascade" else result.next_free
+            plan = result.plan_for(mode)
             if plan.blockers:
                 cls._raise_blocked("Switch blocked", plan.blockers)
             if not allow_before_tiktok:
@@ -1388,7 +1575,7 @@ class SchedulingService:
             switcher = ProjectService.load(project_id)
             if switcher is None:
                 raise SchedulingNotFoundError("Project not found")
-            if cls.tiktok_timing_locked(switcher):
+            if not bypass_lock and cls.tiktok_timing_locked(switcher):
                 raise SchedulingLockedError("timing_locked")
             slot_utc = cls._normalize_utc_datetime(slot)
             if (

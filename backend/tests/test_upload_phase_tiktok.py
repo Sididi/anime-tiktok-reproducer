@@ -77,22 +77,22 @@ def test_no_upfront_skip_with_pfm_id():
     assert "tiktok" not in skips
 
 
-def test_vps_platforms_appends_tiktok_when_payload_exists():
+def test_vps_platforms_never_includes_tiktok_since_pfm_migration():
+    """2026-08 PFM migration: TikTok never joins the VPS job — the backend
+    creates the PFM post itself (_publish_tiktok_via_pfm)."""
     account = _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
     payload = {"social_account_id": "spc_1", "caption": "c"}
     platforms = UploadPhaseService._vps_platforms(
         ("youtube", "facebook", "instagram"), account, payload
     )
-    assert platforms == ["youtube", "facebook", "instagram", "tiktok"]
-    assert platforms.count("tiktok") == 1
+    assert platforms == ["youtube", "facebook", "instagram"]
 
 
-def test_vps_platforms_appends_tiktok_when_account_has_tiktok_slots():
-    account = _account(AccountTikTokConfig(slots=["lundi 18:00"]))
-    platforms = UploadPhaseService._vps_platforms(
-        ("youtube", "facebook", "instagram"), account, None
-    )
-    assert "tiktok" in platforms
+def test_vps_platforms_strips_stray_tiktok():
+    account = _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
+    payload = {"social_account_id": "spc_1", "caption": "c"}
+    platforms = UploadPhaseService._vps_platforms(("tiktok",), account, payload)
+    assert platforms == []
 
 
 def test_vps_platforms_no_tiktok_without_block():
@@ -102,24 +102,29 @@ def test_vps_platforms_no_tiktok_without_block():
     assert "tiktok" not in platforms
 
 
-def test_vps_platforms_no_tiktok_with_only_top_level_slots():
-    """Top-level `slots:` alone (no explicit `tiktok:` block) must not enroll the
-    account in TikTok VPS dispatch — that requires an explicit tiktok block."""
+def test_tiktok_enrolled_with_payload():
+    account = _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
+    payload = {"social_account_id": "spc_1", "caption": "c"}
+    assert UploadPhaseService._tiktok_enrolled(account, payload) is True
+
+
+def test_tiktok_enrolled_with_tiktok_slots_and_no_payload():
+    account = _account(AccountTikTokConfig(slots=["18:00"]))
+    assert UploadPhaseService._tiktok_enrolled(account, None) is True
+
+
+def test_tiktok_not_enrolled_with_only_top_level_slots():
+    """Top-level `slots:` alone (no explicit `tiktok:` block) must not enroll
+    the account in TikTok publishing — that requires an explicit tiktok block."""
     account = AccountConfig(
         id="anime_fr", name="Anime FR", language="fr", device="",
         slots=["06:00"], tiktok=None,
     )
-    platforms = UploadPhaseService._vps_platforms(
-        ("youtube", "facebook", "instagram"), account, None
-    )
-    assert "tiktok" not in platforms
+    assert UploadPhaseService._tiktok_enrolled(account, None) is False
 
 
-def test_vps_platforms_no_duplicate_tiktok():
-    account = _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
-    payload = {"social_account_id": "spc_1", "caption": "c"}
-    platforms = UploadPhaseService._vps_platforms(("tiktok",), account, payload)
-    assert platforms == ["tiktok"]
+def test_tiktok_not_enrolled_without_block():
+    assert UploadPhaseService._tiktok_enrolled(_account(None), None) is False
 
 
 def test_attach_tiktok_cover_business_only():

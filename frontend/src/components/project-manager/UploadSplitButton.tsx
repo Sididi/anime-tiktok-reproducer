@@ -83,7 +83,7 @@ export function UploadSplitButton({
             >
               <UploadCloud className="h-4 w-4 mt-0.5 text-[hsl(var(--primary))]" />
               <div>
-                <div>Upload now</div>
+                <div>Upload classic</div>
                 <div className="text-[11px] text-[hsl(var(--muted-foreground))]">Auto: next free slot</div>
               </div>
             </button>
@@ -108,8 +108,8 @@ export function UploadSplitButton({
             >
               <Zap className="h-4 w-4 mt-0.5" />
               <div>
-                <div>Upload urgently (push others)</div>
-                <div className="text-[11px] opacity-80">Take nearest slot · cascades existing</div>
+                <div>Upload urgently (immediate)</div>
+                <div className="text-[11px] opacity-80">right now · ignores slot system</div>
               </div>
             </button>
           </motion.div>

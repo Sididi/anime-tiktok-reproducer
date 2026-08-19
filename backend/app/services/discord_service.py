@@ -111,6 +111,7 @@ class DiscordService:
         platforms_requested: list[str],
         instagram: dict | None = None,
         tiktok: dict | None = None,
+        facebook: dict | None = None,
         platform_scheduled_at: dict[str, datetime] | None = None,
         platform_statuses: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
@@ -127,6 +128,8 @@ class DiscordService:
             body["instagram"] = instagram
         if tiktok is not None:
             body["tiktok"] = tiktok
+        if facebook is not None:
+            body["facebook"] = facebook
         if platform_scheduled_at is not None:
             body["platform_scheduled_at"] = {
                 platform: scheduled_at.isoformat()
@@ -155,6 +158,31 @@ class DiscordService:
             r = c.post(f"/api/internal/jobs/{project_id}/platform-status", json=body)
             r.raise_for_status()
             return None
+
+    @classmethod
+    @_swallow("VPS facebook_hold")
+    def facebook_hold(
+        cls,
+        project_id: str,
+        *,
+        account_id: str,
+        scheduled_at: datetime,
+        facebook: dict[str, Any],
+        anime_title: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Create-or-update a long-range Facebook hold on the VPS (native post
+        rescheduled beyond Meta's ~29d window; see server facebook_publisher)."""
+        body: dict[str, Any] = {
+            "account_id": account_id,
+            "scheduled_at": scheduled_at.isoformat(),
+            "facebook": facebook,
+        }
+        if anime_title is not None:
+            body["anime_title"] = anime_title
+        with _client() as c:
+            r = c.post(f"/api/internal/jobs/{project_id}/facebook-hold", json=body)
+            r.raise_for_status()
+            return r.json()
 
     @classmethod
     @_swallow("Discord delete_job")

@@ -187,6 +187,42 @@ class TikTokPublishState:
         )
 
 
+@dataclass(frozen=True)
+class FacebookPublishState:
+    """Long-range Facebook hold state (2026-08 upload flows redesign).
+
+    Two shapes: a CREATE hold (no video_id in the payload — the server
+    uploads the prepared video as a native scheduled post at T-28d) and a
+    RETIME hold (an existing native post whose scheduled_publish_time is
+    pushed to the real target once inside Meta's ~29-day window).
+    """
+
+    video_id: str | None = None
+    # created | retimed | failed (terminal states mirror platform_statuses)
+    stage: str | None = None
+    attempts: int = 0
+    last_error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "video_id": self.video_id,
+            "stage": self.stage,
+            "attempts": self.attempts,
+            "last_error": self.last_error,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> FacebookPublishState | None:
+        if not isinstance(d, dict):
+            return None
+        return cls(
+            video_id=d.get("video_id"),
+            stage=d.get("stage"),
+            attempts=int(d.get("attempts", 0)),
+            last_error=d.get("last_error"),
+        )
+
+
 @dataclass
 class Job:
     project_id: str
@@ -207,6 +243,8 @@ class Job:
     instagram_publish_state: InstagramPublishState | None = None
     tiktok_payload: dict | None = None
     tiktok_publish_state: TikTokPublishState | None = None
+    facebook_payload: dict | None = None
+    facebook_publish_state: FacebookPublishState | None = None
     platform_scheduled_at: dict[str, datetime] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
@@ -245,6 +283,12 @@ class Job:
                 if self.tiktok_publish_state
                 else None
             ),
+            "facebook_payload": self.facebook_payload,
+            "facebook_publish_state": (
+                self.facebook_publish_state.to_dict()
+                if self.facebook_publish_state
+                else None
+            ),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
@@ -279,6 +323,10 @@ class Job:
             tiktok_payload=d.get("tiktok_payload"),
             tiktok_publish_state=TikTokPublishState.from_dict(
                 d.get("tiktok_publish_state")
+            ),
+            facebook_payload=d.get("facebook_payload"),
+            facebook_publish_state=FacebookPublishState.from_dict(
+                d.get("facebook_publish_state")
             ),
             created_at=datetime.fromisoformat(d["created_at"]),
             updated_at=datetime.fromisoformat(d["updated_at"]),

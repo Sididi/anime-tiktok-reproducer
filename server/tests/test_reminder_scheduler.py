@@ -170,6 +170,7 @@ def _patch_phases(monkeypatch, *, stage=None, create=None, poll=None):
     return calls
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_dispatch_tiktok_happy_path(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -238,6 +239,7 @@ async def test_dispatch_tiktok_passes_thumbnail_url(
     assert calls["create"][0]["thumbnail_url"] == "https://drive.example/cover.jpg"
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_dispatch_tiktok_missing_payload_skips(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, caplog
 ):
@@ -282,6 +284,7 @@ async def test_dispatch_tiktok_skipped_status_missing_payload_no_warning(
     assert not any("no tiktok_payload" in record.message for record in caplog.records)
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_dispatch_tiktok_missing_api_key_counts_attempt(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
 ):
@@ -300,6 +303,7 @@ async def test_dispatch_tiktok_missing_api_key_counts_attempt(
     assert "ATR_PFM_API_KEY" in tt.detail
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_dispatch_tiktok_fails_after_max_attempts_and_pings(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -342,6 +346,7 @@ def _quota_failing_poll():
     return failing_poll
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_dispatch_tiktok_quota_error_fails_terminally_at_normal_cap(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -371,6 +376,7 @@ async def test_dispatch_tiktok_quota_error_fails_terminally_at_normal_cap(
     assert any("reached_active_user_cap" in c for c in contents)
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_dispatch_tiktok_first_failure_pings_with_error_detail(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -417,6 +423,7 @@ async def test_dispatch_tiktok_terminal_statuses_are_not_retried(
     assert calls["stage"] == [] and calls["create"] == []
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_dispatch_tiktok_resumes_uploading_after_crash(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -933,6 +940,7 @@ def test_tiktok_due_does_not_mutate_stored_time():
 # TikTok phase-behaviour tests
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_tiktok_media_staged_on_arrival_then_waits(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -957,6 +965,7 @@ async def test_tiktok_media_staged_on_arrival_then_waits(
     assert job.platform_statuses["tiktok"].attempts == 0   # staging is attempt-free
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_tiktok_staging_failure_before_window_is_quiet(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -987,6 +996,7 @@ async def test_tiktok_staging_failure_before_window_is_quiet(
     discord.post_message.assert_not_called()
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_tiktok_staging_failure_inside_window_counts_attempts(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -1008,6 +1018,7 @@ async def test_tiktok_staging_failure_inside_window_counts_attempts(
     assert job.platform_statuses["tiktok"].attempts == 1
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_tiktok_scheduled_create_inside_window(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -1033,6 +1044,7 @@ async def test_tiktok_scheduled_create_inside_window(
     assert updated.platform_statuses["tiktok"].status == "uploading"
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_tiktok_instant_create_when_slot_imminent(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -1054,6 +1066,7 @@ async def test_tiktok_instant_create_when_slot_imminent(
     assert updated.platform_statuses["tiktok"].status == "uploaded"
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_tiktok_slow_staging_refreshes_now_for_instant_decision(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -1102,6 +1115,7 @@ async def test_tiktok_slow_staging_refreshes_now_for_instant_decision(
 # Concurrent dispatch tests (in-flight registry)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_two_due_jobs_dispatch_concurrently(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):
@@ -1142,6 +1156,7 @@ async def test_two_due_jobs_dispatch_concurrently(
         assert job.platform_statuses["tiktok"].status == "uploaded"
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_inflight_job_is_not_double_dispatched(
     tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, monkeypatch
 ):

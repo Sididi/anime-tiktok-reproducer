@@ -33,6 +33,13 @@ class UploadProjectRequest(BaseModel):
     copyright_audio_path: str | None = None
     thumbnail_timestamp_ms: int | None = None
     thumbnail_candidate_index: int | None = None
+    # Urgent-immediate mode: publish right now instead of reserving slots.
+    # immediate_platforms=None ⇒ every reserved platform; ["tiktok"] ⇒ the
+    # TikTok-only toggle (other platforms keep/reuse their reservations).
+    immediate: bool = False
+    immediate_platforms: (
+        list[Literal["youtube", "facebook", "instagram", "tiktok"]] | None
+    ) = None
 
 
 class FacebookCheckRequest(BaseModel):
@@ -84,6 +91,8 @@ async def run_upload_phase(
             copyright_audio_path=req.copyright_audio_path,
             thumbnail_timestamp_ms=req.thumbnail_timestamp_ms,
             thumbnail_candidate_index=req.thumbnail_candidate_index,
+            immediate=req.immediate,
+            immediate_platforms=req.immediate_platforms,
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

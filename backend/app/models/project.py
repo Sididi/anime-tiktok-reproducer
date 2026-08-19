@@ -36,6 +36,33 @@ class PlatformSchedule(BaseModel):
     manual: bool = False
 
 
+class TikTokPfmState(BaseModel):
+    """Backend-owned Post for Me TikTok post state (per project.json).
+
+    Stages mirror server/app/models/job.py::TikTokPublishState:
+    media_uploaded | post_scheduled | post_created | published | failed.
+    post_scheduled posts can be rescheduled (PUT) or cancelled (DELETE);
+    post_created/published posts are immutable.
+    """
+
+    post_id: str | None = None
+    media_url: str | None = None
+    stage: str | None = None
+    social_account_id: str | None = None
+    post_for_me_platform: str = "tiktok"
+    scheduled_at: datetime | None = None
+    url: str | None = None
+    last_error: str | None = None
+    last_polled_at: datetime | None = None
+    # Snapshot of the create-post body fields needed to rebuild the body for
+    # PUT updates / delete+recreate reschedules (caption + toggles).
+    caption: str | None = None
+    privacy_status: str = "public"
+    allow_comment: bool = True
+    allow_duet: bool = True
+    allow_stitch: bool = True
+
+
 class Project(BaseModel):
     """A TikTok reproducer project."""
 
@@ -94,6 +121,11 @@ class Project(BaseModel):
     # could not be propagated to YT/FB/IG and is awaiting retry.
     # key = platform; value = {target_scheduled_at, retries, last_error, last_attempt_at}.
     reschedule_pending: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    # Backend-owned Post for Me TikTok post (created at upload time with its
+    # final scheduled_at). None for legacy projects whose TikTok was relayed
+    # to the VPS scheduler.
+    tiktok_pfm: "TikTokPfmState | None" = None
 
     @field_validator("min_playback_speed")
     @classmethod

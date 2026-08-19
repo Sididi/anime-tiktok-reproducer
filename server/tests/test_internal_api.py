@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from app.models.job import Job, PlatformStatus, TikTokPublishState
@@ -471,6 +472,7 @@ def test_create_job_blocks_connector_switch_with_live_post(
     assert job.tiktok_publish_state.post_id == "post_live"
 
 
+@pytest.mark.skip(reason="TikTok dispatch migrated to the backend (PFM native scheduling, 2026-08); server path kept commented")
 async def test_connector_switch_cannot_race_inflight_post_creation(
     monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
 ):
@@ -836,3 +838,83 @@ def test_list_job_statuses_is_throttled(
         internal_module._status_snapshot_at = 0.0
         r = client.get("/api/internal/jobs", headers=INTERNAL_AUTH)
         assert "p2" in r.json()["jobs"]
+
+
+# ---------------------------------------------------------------------------
+# Long-range Facebook holds (2026-08 upload flows redesign)
+# ---------------------------------------------------------------------------
+
+_FB_HOLD = {
+    "account_id": "anime_fr",
+    "scheduled_at": "2026-12-01T18:00:00+00:00",
+    "anime_title": "One Piece 1063",
+    "facebook": {
+        "page_id": "page_1",
+        "page_access_token": "tok",
+        "video_id": "fbv_1",
+        "graph_api_version": "v25.0",
+    },
+}
+
+
+def test_facebook_hold_creates_minimal_job(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, _discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/internal/jobs/p9/facebook-hold", json=_FB_HOLD, headers=INTERNAL_AUTH
+        )
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "created": True}
+    job = asyncio.run(app.state.job_store.get("p9"))
+    assert job.platforms_requested == ["facebook"]
+    assert job.facebook_payload["video_id"] == "fbv_1"
+    assert job.platform_statuses["facebook"].status == "pending"
+    assert job.platform_scheduled_at["facebook"].isoformat() == "2026-12-01T18:00:00+00:00"
+
+
+def test_facebook_hold_updates_existing_job(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, _discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        r0 = client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        assert r0.status_code == 200
+        r = client.post(
+            "/api/internal/jobs/p1/facebook-hold", json=_FB_HOLD, headers=INTERNAL_AUTH
+        )
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "created": False}
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert "facebook" in job.platforms_requested
+    assert job.facebook_payload["page_id"] == "page_1"
+    # The hold resets any previous facebook state so the dispatcher re-runs.
+    assert job.facebook_publish_state is None
+    assert job.platform_statuses["facebook"].status == "pending"
+
+
+def test_status_projection_exposes_facebook_video_id(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    import app.api.internal as internal_module
+    from app.models.job import FacebookPublishState
+
+    # The status snapshot is module-global with a 10s TTL: reset it so this
+    # test never sees a snapshot taken by an earlier test's app instance.
+    internal_module._status_snapshot = {}
+    internal_module._status_snapshot_at = 0.0
+
+    app, _discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        client.post(
+            "/api/internal/jobs/p9/facebook-hold", json=_FB_HOLD, headers=INTERNAL_AUTH
+        )
+        asyncio.run(
+            app.state.job_store.set_facebook_publish_state(
+                "p9", FacebookPublishState(video_id="fbv_1", stage="retimed")
+            )
+        )
+        r = client.get("/api/internal/jobs", headers=INTERNAL_AUTH)
+    assert r.status_code == 200
+    assert r.json()["jobs"]["p9"]["facebook_video_id"] == "fbv_1"

@@ -243,6 +243,8 @@ export const api = {
     copyrightAudioPath?: string,
     thumbnailTimestampMs?: number | null,
     thumbnailCandidateIndex?: number | null,
+    immediate?: boolean,
+    immediatePlatforms?: string[] | null,
   ) =>
     request<import("@/types").ProjectUploadJob>(
       `/project-manager/projects/${projectId}/upload`,
@@ -256,6 +258,8 @@ export const api = {
           copyright_audio_path: copyrightAudioPath ?? null,
           thumbnail_timestamp_ms: thumbnailTimestampMs ?? null,
           thumbnail_candidate_index: thumbnailCandidateIndex ?? null,
+          immediate: immediate ?? false,
+          immediate_platforms: immediatePlatforms ?? null,
         }),
       },
     ),
@@ -1490,6 +1494,32 @@ export const api = {
     return request(`/scheduling/projects/${project_id}/reserve-manual`, {
       method: "POST",
       body: JSON.stringify(payload),
+    });
+  },
+
+  async urgentPreview(
+    project_id: string,
+    payload: { account_id: string; tiktok_only?: boolean },
+  ): Promise<import("@/types").UrgentPreview> {
+    return request(`/scheduling/projects/${project_id}/urgent-preview`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  },
+
+  async urgentApply(
+    project_id: string,
+    payload: {
+      account_id: string;
+      tiktok_only: boolean;
+      shifts: import("@/types").UrgentShiftSpec[];
+      own_reservations?: { first_slot?: string; manual_at?: string } | null;
+      confirm_before_tiktok?: boolean;
+    },
+  ): Promise<import("@/types").UrgentApplyResult> {
+    return request(`/scheduling/projects/${project_id}/urgent-apply`, {
+      method: "POST",
+      body: JSON.stringify({ confirm_before_tiktok: true, ...payload }),
     });
   },
 

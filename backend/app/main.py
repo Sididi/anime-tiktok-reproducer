@@ -171,6 +171,18 @@ async def lifespan(app: FastAPI):
         ),
     )
 
+    # Resolve Post for Me TikTok outcomes around their publish instants while
+    # the app is running (throttled internally; also fired from /scheduling/events).
+    from .services.pfm_status_sync_service import PfmStatusSyncService
+
+    _track_app_task(
+        app,
+        asyncio.create_task(
+            PfmStatusSyncService.run_loop(reschedule_retry_stop),
+            name="pfm-status-sync-loop",
+        ),
+    )
+
     app.state.integrations_health = IntegrationHealthService.initialize_startup_state(
         integration_enabled=settings.integration_startup_health_check_enabled,
         storage_box_enabled=settings.storage_box_enabled,

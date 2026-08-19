@@ -1,4 +1,5 @@
 import type { FreeSlot } from "@/types";
+import { MIN_LEAD_MS } from "@/utils/scheduling";
 
 interface SlotChipsProps {
   slots: FreeSlot[];
@@ -8,8 +9,6 @@ interface SlotChipsProps {
   stolenIsos?: Set<string>;
   ownProjectId?: string;
 }
-
-const MIN_LEAD_MS = 30 * 60 * 1000;
 
 function fmtTime(iso: string): string {
   return new Intl.DateTimeFormat("fr-FR", {

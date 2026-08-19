@@ -76,6 +76,12 @@ class Settings(BaseSettings):
         """Effective base URL for /api/internal/* calls."""
         return self.tiktok_server_url or self.tiktok_server_base_url
 
+    # Post for Me — TikTok publishing. Since 2026-08 the backend creates the
+    # PFM scheduled post directly at upload time (post_for_me_client.py); the
+    # VPS TikTok dispatch path is retired (commented on the server).
+    pfm_api_key: str | None = None
+    pfm_base_url: str = "https://api.postforme.dev/v1"
+
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
 
     # LAN transfer (Premiere Pro PC pulls assets / pushes outputs over the LAN)

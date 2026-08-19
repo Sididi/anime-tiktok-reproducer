@@ -1,3 +1,8 @@
+// RETIRED 2026-08 (upload flows redesign): "Upload urgently" no longer
+// cascades into the nearest slot — it publishes immediately via
+// UrgentImmediateModal. This component (and the backend cascade-preview/
+// cascade-apply endpoints it drives) is kept unused per owner instruction;
+// the cascade machinery also still powers the "cascade" steal mode.
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { AlertTriangle } from "lucide-react";

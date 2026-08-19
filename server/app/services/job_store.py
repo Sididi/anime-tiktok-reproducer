@@ -11,7 +11,13 @@ from dataclasses import fields as _dc_fields
 from datetime import UTC, datetime
 from pathlib import Path
 
-from app.models.job import InstagramPublishState, Job, PlatformStatus, TikTokPublishState
+from app.models.job import (
+    FacebookPublishState,
+    InstagramPublishState,
+    Job,
+    PlatformStatus,
+    TikTokPublishState,
+)
 
 
 class JobStore:
@@ -147,6 +153,21 @@ class JobStore:
                 raise KeyError(project_id)
             job = Job.from_dict(jobs[project_id])
             job.tiktok_publish_state = state
+            job.updated_at = datetime.now(tz=UTC)
+            jobs[project_id] = job.to_dict()
+            self._write(jobs)
+            return job
+
+    async def set_facebook_publish_state(
+        self, project_id: str, state: FacebookPublishState | None
+    ) -> Job:
+        """Atomically replace the long-range Facebook hold state."""
+        async with self._lock:
+            jobs = self._read()
+            if project_id not in jobs:
+                raise KeyError(project_id)
+            job = Job.from_dict(jobs[project_id])
+            job.facebook_publish_state = state
             job.updated_at = datetime.now(tz=UTC)
             jobs[project_id] = job.to_dict()
             self._write(jobs)

@@ -16,10 +16,16 @@ import { UploadJobsPanel } from "./UploadJobsPanel";
 import { VideoPreviewModal } from "./VideoPreviewModal";
 import { ProjectTable } from "./ProjectTable";
 import { SlotPickerPopover } from "./SlotPickerPopover";
-import { UrgentCascadeModal } from "./UrgentCascadeModal";
+import { UrgentImmediateModal } from "./UrgentImmediateModal";
 import { YouTubeDurationModal } from "./YouTubeDurationModal";
 import { formatScheduledAt } from "./utils";
-import type { SortColumn, SortDirection, UploadMode, AnchorPayload } from "./types";
+import type {
+  SortColumn,
+  SortDirection,
+  UploadMode,
+  AnchorPayload,
+  UrgentPlan,
+} from "./types";
 import {
   getLibraryTypeLabel,
   isAccountCompatibleWithProjectRow,
@@ -49,6 +55,9 @@ interface PendingUploadContext {
   copyrightAudioPath?: string;
   thumbnailTimestampMs?: number | null;
   thumbnailCandidateIndex?: number | null;
+  /** Urgent-immediate plan: applied (urgent-apply) right before the upload is
+   * queued — abandoning the flow earlier leaves zero server-side writes. */
+  urgent?: UrgentPlan;
 }
 
 type UploadSessionStatus =
@@ -459,6 +468,28 @@ export function ProjectManagerModal({
       });
       setError(null);
       try {
+        if (context.urgent) {
+          // FIRST mutation of the whole urgent flow: shift the colliding
+          // posts + (TikTok-only) reserve the other platforms.
+          const applied = await api.urgentApply(context.projectId, {
+            account_id: context.accountId!,
+            tiktok_only: context.urgent.tiktokOnly,
+            shifts: context.urgent.shifts,
+            own_reservations: context.urgent.ownReservations ?? null,
+            confirm_before_tiktok: true,
+          });
+          const problems = applied.shifts.filter((s) => s.status !== "ok");
+          if (problems.length > 0) {
+            // Non-blocking: the urgent publish proceeds; surface what could
+            // not be shifted (published meanwhile, PFM processing, ...).
+            setError(
+              "Certains uploads n'ont pas pu être déplacés : " +
+                problems
+                  .map((p) => `${p.project_id} (${p.reason ?? p.detail ?? p.status})`)
+                  .join(", "),
+            );
+          }
+        }
         const job = await api.runProjectUpload(
           context.projectId,
           context.accountId,
@@ -468,6 +499,8 @@ export function ProjectManagerModal({
           context.copyrightAudioPath,
           context.thumbnailTimestampMs,
           context.thumbnailCandidateIndex,
+          !!context.urgent,
+          context.urgent?.tiktokOnly ? ["tiktok"] : null,
         );
         upsertUploadJob(job);
         if (isSessionCurrent(context.projectId, token)) {
@@ -604,6 +637,7 @@ export function ProjectManagerModal({
       accountId?: string,
       mode: UploadMode = "auto",
       anchorPayload?: AnchorPayload,
+      urgentPlan?: UrgentPlan,
     ) => {
       if (mode !== "auto" && !accountId) {
         setError("Manual scheduling requires an account selection");
@@ -634,24 +668,15 @@ export function ProjectManagerModal({
         }
       }
 
-      if (mode === "urgent") {
-        try {
-          try {
-            await api.cascadeApply(projectId, accountId!);
-          } catch (err) {
-            const confirmed = confirmTikTokPrecedence(err);
-            if (confirmed === null) throw err;
-            if (!confirmed) return;
-            await api.cascadeApply(projectId, accountId!, true);
-          }
-        } catch (err) {
-          setError((err as Error).message);
-          return;
-        }
-      }
-
+      // "urgent-immediate": every mutation (collision shifts + reservations
+      // + the publish itself) is deferred to enqueueUpload — abandoning any
+      // modal before that point leaves zero server-side writes.
       const token = createUploadToken();
-      const context: PendingUploadContext = { projectId, accountId };
+      const context: PendingUploadContext = {
+        projectId,
+        accountId,
+        urgent: mode === "urgent-immediate" ? urgentPlan : undefined,
+      };
       setUploadSession({
         token,
         context,
@@ -835,6 +860,13 @@ export function ProjectManagerModal({
   const [urgentForProject, setUrgentForProject] = useState<{
     row: ProjectManagerRow;
     accountId: string;
+  } | null>(null);
+  // TikTok-only urgent mode: after the urgent modal, the user schedules the
+  // OTHER platforms via the slot picker before the flow's final confirm.
+  const [urgentOthersPicker, setUrgentOthersPicker] = useState<{
+    row: ProjectManagerRow;
+    accountId: string;
+    plan: UrgentPlan;
   } | null>(null);
 
   const handleUploadSchedule = useCallback(
@@ -1416,22 +1448,78 @@ export function ProjectManagerModal({
           )}
 
           {urgentForProject && (
-            <UrgentCascadeModal
+            <UrgentImmediateModal
               open
               projectId={urgentForProject.row.project_id}
               projectTitle={urgentForProject.row.anime_title || "Project"}
               accountId={urgentForProject.accountId}
               onClose={() => setUrgentForProject(null)}
-              onConfirmed={() => {
+              onContinue={(plan) => {
                 const ctx = urgentForProject;
                 setUrgentForProject(null);
-                // Cascade already applied — call upload flow with mode=auto
-                // so it consumes freshly-reserved slots via
-                // _try_reuse_platform_reservation.
+                const acct = accounts.find((a) => a.id === ctx.accountId);
+                const hasOtherPlatforms = (
+                  ["youtube", "facebook", "instagram"] as Platform[]
+                ).some((p) => (acct?.slots_by_platform?.[p]?.length ?? 0) > 0);
+                if (plan.tiktokOnly && hasOtherPlatforms) {
+                  // Let the user schedule the other platforms first; every
+                  // mutation stays deferred to the final confirm.
+                  setUrgentOthersPicker({
+                    row: ctx.row,
+                    accountId: ctx.accountId,
+                    plan,
+                  });
+                  return;
+                }
                 void startUploadWithChecks(
                   ctx.row.project_id,
                   ctx.accountId,
-                  "auto",
+                  "urgent-immediate",
+                  undefined,
+                  plan,
+                );
+              }}
+            />
+          )}
+
+          {urgentOthersPicker && (
+            <SlotPickerPopover
+              open
+              mode="anchor"
+              projectId={urgentOthersPicker.row.project_id}
+              accountId={urgentOthersPicker.accountId}
+              anchorPlatform={(() => {
+                const acct = accounts.find(
+                  (a) => a.id === urgentOthersPicker.accountId,
+                );
+                return ((["youtube", "facebook", "instagram"] as Platform[]).find(
+                  (p) => (acct?.slots_by_platform?.[p]?.length ?? 0) > 0,
+                ) ?? "youtube") as Platform;
+              })()}
+              platformsForAnchor={
+                ["youtube", "facebook", "instagram"] as Platform[]
+              }
+              onClose={() => setUrgentOthersPicker(null)}
+              onConfirm={async (payload) => {
+                const ctx = urgentOthersPicker;
+                setUrgentOthersPicker(null);
+                const plan: UrgentPlan = {
+                  ...ctx.plan,
+                  ownReservations:
+                    "manual_at" in payload
+                      ? { manual_at: payload.manual_at }
+                      : "tiktok_slot" in payload
+                        ? // anchor-mode payload key; here it is the chosen
+                          // "not before" instant for the other platforms.
+                          { first_slot: payload.tiktok_slot }
+                        : undefined,
+                };
+                await startUploadWithChecks(
+                  ctx.row.project_id,
+                  ctx.accountId,
+                  "urgent-immediate",
+                  undefined,
+                  plan,
                 );
               }}
             />

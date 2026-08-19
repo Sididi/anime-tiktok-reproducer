@@ -374,12 +374,19 @@ test("Schedule mode queues upload when checks resolve immediately", async ({ pag
   );
 });
 
-function installCascadeMocks() {
+function installUrgentMocks(payload: {
+  withCollisions?: boolean;
+}) {
+  const { withCollisions } = payload;
   const testWindow = window as Window &
     typeof globalThis & {
-      __cascadeApplied?: boolean;
+      __urgentApplied?: boolean;
+      __urgentApplyBody?: unknown;
+      __uploadBody?: unknown;
     };
-  testWindow.__cascadeApplied = false;
+  testWindow.__urgentApplied = false;
+  const inThirty = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+  const inForty = new Date(Date.now() + 40 * 60 * 1000).toISOString();
   const orig = window.fetch.bind(window);
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const requestUrl =
@@ -394,42 +401,100 @@ function installCascadeMocks() {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
-    if (url.pathname.endsWith("/cascade-preview")) {
+    if (url.pathname.endsWith("/urgent-preview") && init?.method === "POST") {
+      const req = JSON.parse(String(init?.body ?? "{}")) as {
+        tiktok_only?: boolean;
+      };
+      if (!withCollisions) {
+        return json({
+          window_minutes: 60,
+          platforms: ["youtube", "tiktok"],
+          immediate_platforms: req.tiktok_only ? ["tiktok"] : ["youtube", "tiktok"],
+          phase1: [],
+          phase2: [],
+        });
+      }
       return json({
-        per_platform: [
+        window_minutes: 60,
+        platforms: ["youtube", "tiktok"],
+        immediate_platforms: req.tiktok_only ? ["tiktok"] : ["youtube", "tiktok"],
+        phase1: [
           {
-            platform: "tiktok",
-            target_slot: "2026-05-07T14:00:00Z",
-            target_scheduled_at: "2026-05-07T14:09:00Z",
-            displaced: [
+            project_id: "near1",
+            anime_title: "Near TT",
+            account_id: "acc_a",
+            items: [
               {
-                project_id: "x",
-                anime_title: "Bumped",
-                from_slot: "2026-05-07T14:00:00Z",
-                to_slot: "2026-05-07T18:00:00Z",
-                requires_platform_notification: true,
+                platform: "tiktok",
+                slot: inThirty,
+                scheduled_at: inThirty,
+                manual: false,
+                movable: true,
+                reason: null,
+                best_effort: false,
+                suggested_slot: null,
               },
             ],
           },
         ],
-        blockers: [],
+        phase2: req.tiktok_only
+          ? []
+          : [
+              {
+                project_id: "near2",
+                anime_title: "Near IG",
+                account_id: "acc_a",
+                items: [
+                  {
+                    platform: "instagram",
+                    slot: inForty,
+                    scheduled_at: inForty,
+                    manual: false,
+                    movable: false,
+                    reason: "unmovable_processing",
+                    best_effort: false,
+                    suggested_slot: null,
+                  },
+                ],
+              },
+            ],
       });
     }
-    if (url.pathname.endsWith("/cascade-apply") && init?.method === "POST") {
-      testWindow.__cascadeApplied = true;
+    if (url.pathname.endsWith("/urgent-apply") && init?.method === "POST") {
+      testWindow.__urgentApplied = true;
+      testWindow.__urgentApplyBody = JSON.parse(String(init?.body ?? "{}"));
+      return json({ shifts: [], own_schedules: {} });
+    }
+    if (url.pathname.endsWith("/upload") && init?.method === "POST") {
+      // This wrapper runs before installMocks' handler (it was installed
+      // after, so it is outermost): capture the body and answer directly.
+      testWindow.__uploadBody = JSON.parse(String(init?.body ?? "{}"));
+      (window as unknown as { __uploadCalled?: boolean }).__uploadCalled = true;
       return json({
-        per_platform: [],
-        blockers: [],
-        notification_status: {},
+        job_id: "j1",
+        project_id: "p1",
+        account_id: "acc_a",
+        status: "queued",
+        phase: "prepare",
+        message: null,
+        error: null,
+        platform_results: [],
+        result: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       });
     }
     return orig(input, init);
   };
 }
 
-test("Urgent mode queues upload when checks resolve immediately", async ({ page }) => {
-  await page.addInitScript(installCascadeMocks);
+test("Urgent immediate: no collisions → apply then upload with immediate flag", async ({
+  page,
+}) => {
+  // installMocks first so the urgent mocks wrap LAST (and therefore run
+  // FIRST at fetch time — their /upload handler must capture the body).
   await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
+  await page.addInitScript(installUrgentMocks, { withCollisions: false });
   await page.goto("/");
   await page.getByRole("button", { name: "Projects" }).click();
 
@@ -440,20 +505,51 @@ test("Urgent mode queues upload when checks resolve immediately", async ({ page 
   await page.getByRole("button", { name: "Account A" }).click();
 
   await projectRow.getByRole("button", { name: "Upload options" }).click();
-  await page.getByRole("button", { name: /Upload urgently/ }).click();
+  await page.getByRole("button", { name: /Upload urgently \(immediate\)/ }).click();
 
-  await expect(page.getByText(/will be shifted/i).first()).toBeVisible();
+  await expect(
+    page.getByText(/Aucun upload prévu dans l'heure à venir/),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Continuer" }).click();
 
-  await page.getByRole("button", { name: /Confirm urgent upload/ }).click();
-
+  // The urgent-apply call fires only at the very end (after the preflight
+  // checks), immediately before the upload request.
   await page.waitForFunction(
     () =>
-      (window as unknown as { __cascadeApplied?: boolean }).__cascadeApplied ===
-      true,
+      (window as unknown as { __urgentApplied?: boolean }).__urgentApplied === true,
   );
   await page.waitForFunction(
     () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled === true,
   );
+  const uploadBody = await page.evaluate(
+    () => (window as unknown as { __uploadBody?: unknown }).__uploadBody,
+  );
+  expect(uploadBody).toMatchObject({ immediate: true, immediate_platforms: null });
+});
+
+test("Urgent immediate: collisions render both phases; movable ones gate Continue", async ({
+  page,
+}) => {
+  await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
+  await page.addInitScript(installUrgentMocks, { withCollisions: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects" }).click();
+
+  const projectRow = page.locator("tr").filter({ hasText: "Show Alpha" });
+  await expect(projectRow).toBeVisible();
+  await page.getByRole("button", { name: "All Projects" }).click();
+  await page.getByRole("button", { name: "Account A" }).click();
+
+  await projectRow.getByRole("button", { name: "Upload options" }).click();
+  await page.getByRole("button", { name: /Upload urgently \(immediate\)/ }).click();
+
+  // Phase 1 lists the movable TikTok collision, phase 2 the unmovable one.
+  await expect(page.getByText(/1\. TikTok — uploads à moins de 60 min/)).toBeVisible();
+  await expect(page.getByText("Near TT")).toBeVisible();
+  await expect(page.getByText(/en cours de publication — publiera quand même/)).toBeVisible();
+  // A movable collision without a recorded re-timing blocks Continue.
+  await expect(page.getByRole("button", { name: "Continuer" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Re-planifier" })).toBeVisible();
 });
 
 // Helper: the day-cell label the calendar renders for "tomorrow". The calendar
@@ -518,14 +614,18 @@ function installManualMocks() {
 // Mocks for the amber-chip → switch modal → reserve-anchor steal flow. Anchors a
 // taken slot (occupied by projB / "Naruto") plus a decoy free slot to tomorrow.
 function installStealAnchorMocks() {
-  const tomorrowAt = (hourUtc: number): string => {
+  // Paris-LOCAL hours (the test pins timezoneId Europe/Paris): computing
+  // "tomorrow" in UTC breaks between 00:00–02:00 Paris, when the Paris day is
+  // already one ahead of the UTC day — the mocked slots would land on the
+  // Paris day BEFORE the one clickTomorrow selects.
+  const tomorrowAt = (hourLocal: number): string => {
     const d = new Date();
-    d.setUTCHours(hourUtc, 0, 0, 0);
-    d.setUTCDate(d.getUTCDate() + 1);
+    d.setDate(d.getDate() + 1);
+    d.setHours(hourLocal, 0, 0, 0);
     return d.toISOString();
   };
-  const takenIso = tomorrowAt(12); // 14:00 Paris
-  const freeIso = tomorrowAt(16); // 18:00 Paris
+  const takenIso = tomorrowAt(14); // 14:00 Paris
+  const freeIso = tomorrowAt(18); // 18:00 Paris
   const testWindow = window as Window &
     typeof globalThis & {
       __anchorBody?: unknown;
@@ -593,6 +693,27 @@ function installStealAnchorMocks() {
               from_slot: takenIso,
               to_slot: freeIso,
               requires_platform_notification: true,
+            },
+          ],
+          blockers: [],
+        },
+        relocate: {
+          displaced: [
+            {
+              project_id: "projB",
+              anime_title: "Naruto",
+              from_slot: takenIso,
+              to_slot: freeIso,
+              requires_platform_notification: true,
+              platform: "tiktok",
+            },
+            {
+              project_id: "projB",
+              anime_title: "Naruto",
+              from_slot: takenIso,
+              to_slot: freeIso,
+              requires_platform_notification: false,
+              platform: "youtube",
             },
           ],
           blockers: [],
@@ -665,7 +786,7 @@ test.describe("manual custom-time + slot switching", () => {
     expect(at).toMatch(/T15:23:00\.000Z$/);
   });
 
-  test("Amber chip opens switch modal and reserves with a next-free steal", async ({
+  test("Amber chip opens takeover modal and reserves with a relocate steal", async ({
     page,
   }) => {
     await page.addInitScript(installStealAnchorMocks);
@@ -693,17 +814,15 @@ test.describe("manual custom-time + slot switching", () => {
     await expect(amberChip).toBeEnabled();
     await amberChip.click();
 
-    // Switch modal: both displacement plans render.
+    // Takeover modal: the occupant's new TikTok-first timings render
+    // (single relocate strategy — the old cascade/next-free choice is gone).
     await expect(
-      page.getByText(/Cascade en chaîne — 2 vidéos déplacées/),
+      page.getByText(/Nouveaux horaires de «Naruto»/),
     ).toBeVisible();
-    await expect(
-      page.getByText(/Prochain slot libre — 1 vidéo déplacée/),
-    ).toBeVisible();
+    await expect(page.getByText(/↳ TT ·/)).toBeVisible();
+    await expect(page.getByText(/↳ YT ·/)).toBeVisible();
 
-    await page
-      .getByRole("button", { name: /Slot libre suivant \(1 vidéo\)/ })
-      .click();
+    await page.getByRole("button", { name: "Libérer le slot" }).click();
 
     // Completing the schedule reserves the anchor with the encoded steal.
     await page.getByRole("button", { name: "Schedule", exact: true }).click();
@@ -716,7 +835,7 @@ test.describe("manual custom-time + slot switching", () => {
     );
     expect(body).toMatchObject({
       steals: {
-        tiktok: { mode: "next_free", expected_occupant_id: "projB" },
+        tiktok: { mode: "relocate", expected_occupant_id: "projB" },
       },
     });
   });

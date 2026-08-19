@@ -57,8 +57,9 @@ def test_tiktok_paths_skip_cleanly_when_server_url_unset(monkeypatch):
 
 
 def test_tiktok_falls_back_to_tiktok_server_base_url(monkeypatch):
-    """When only the legacy tiktok_server_base_url is set, the reschedule
-    path should use it for the /api/internal/* calls."""
+    """Legacy (pre-PFM-migration) project without tiktok_pfm: a reschedule
+    still PATCHes the VPS job slot, using tiktok_server_base_url when only
+    the legacy var is set."""
     project = Project(id="p1", scheduled_account_id="acc_a")
     captured: dict = {}
     class FakeResp:
@@ -81,7 +82,9 @@ def test_tiktok_falls_back_to_tiktok_server_base_url(monkeypatch):
     )
     monkeypatch.setattr("app.services.platform_reschedule_service.httpx.patch", fake_patch)
 
-    result = PlatformRescheduleService.cancel(project, "tiktok")
+    result = PlatformRescheduleService.notify(
+        project, "tiktok", datetime(2026, 5, 8, 14, 0, tzinfo=timezone.utc)
+    )
     assert result.status == "ok"
     assert captured["url"].startswith("https://legacy.example.com/")
 
@@ -347,34 +350,143 @@ def test_notify_tiktok_patches_server_endpoint(monkeypatch):
     }
 
 
-def test_cancel_tiktok_marks_reminder_cancelled(monkeypatch):
-    """TT cancel keeps the job on the server (so other platforms' reminders
-    survive) but flips reminder_cancelled so the TT ping is skipped."""
-    project = Project(id="p1", scheduled_account_id="acc_a")
+def test_cancel_tiktok_deletes_pfm_post(monkeypatch):
+    """2026-08 PFM migration: cancelling TikTok deletes the backend-owned
+    scheduled PFM post (the legacy reminder_cancelled PATCH was a server-side
+    no-op) and clears tiktok_pfm."""
+    from app.models.project import TikTokPfmState
 
-    captured: dict = {}
-    class FakeResp:
-        status_code = 200
-        def raise_for_status(self): return None
-    def fake_patch(url, json=None, headers=None, timeout=None):
-        captured["url"] = url
-        captured["json"] = json
-        return FakeResp()
-
+    project = Project(
+        id="p1",
+        scheduled_account_id="acc_a",
+        tiktok_pfm=TikTokPfmState(
+            post_id="sp_123", stage="post_scheduled", social_account_id="spc_1"
+        ),
+    )
+    deleted: list[str] = []
     monkeypatch.setattr(
-        "app.services.platform_reschedule_service.settings.tiktok_server_url",
-        "https://server.example.com",
+        "app.services.post_for_me_client.PostForMeClient.delete_post",
+        classmethod(lambda cls, post_id: deleted.append(post_id)),
     )
     monkeypatch.setattr(
-        "app.services.platform_reschedule_service.settings.tiktok_server_internal_token",
-        "secret",
+        "app.services.project_service.ProjectService.save", lambda p: None
     )
-    monkeypatch.setattr("app.services.platform_reschedule_service.httpx.patch", fake_patch)
 
     result = PlatformRescheduleService.cancel(project, "tiktok")
     assert result.status == "ok"
-    assert captured["url"] == "https://server.example.com/api/internal/jobs/p1/slot"
-    assert captured["json"] == {"reminder_cancelled": True}
+    assert deleted == ["sp_123"]
+    assert project.tiktok_pfm is None
+
+
+def test_cancel_tiktok_published_post_is_skipped(monkeypatch):
+    from app.models.project import TikTokPfmState
+
+    project = Project(
+        id="p1",
+        scheduled_account_id="acc_a",
+        tiktok_pfm=TikTokPfmState(post_id="sp_123", stage="published"),
+    )
+    result = PlatformRescheduleService.cancel(project, "tiktok")
+    assert result.status == "skipped"
+    assert "published" in (result.error or "")
+
+
+def test_cancel_tiktok_legacy_project_is_skipped():
+    """Legacy VPS-relayed project (no tiktok_pfm): nothing safe to do
+    per-platform (deleting the VPS job would also cancel Instagram)."""
+    project = Project(id="p1", scheduled_account_id="acc_a")
+    result = PlatformRescheduleService.cancel(project, "tiktok")
+    assert result.status == "skipped"
+
+
+def test_notify_tiktok_updates_scheduled_pfm_post(monkeypatch):
+    from app.models.project import TikTokPfmState
+
+    project = Project(
+        id="p1",
+        scheduled_account_id="acc_a",
+        tiktok_pfm=TikTokPfmState(
+            post_id="sp_123",
+            stage="post_scheduled",
+            social_account_id="spc_1",
+            media_url="https://pfm/media/1",
+            caption="cap",
+        ),
+    )
+    updates: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        "app.services.post_for_me_client.PostForMeClient.update_post",
+        classmethod(lambda cls, post_id, body: updates.append((post_id, body))),
+    )
+    monkeypatch.setattr(
+        "app.services.project_service.ProjectService.save", lambda p: None
+    )
+
+    new_at = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    result = PlatformRescheduleService.notify(project, "tiktok", new_at)
+    assert result.status == "ok"
+    assert updates and updates[0][0] == "sp_123"
+    assert updates[0][1]["scheduled_at"] == new_at.isoformat()
+    assert project.tiktok_pfm.scheduled_at == new_at
+
+
+def test_notify_tiktok_falls_back_to_delete_recreate(monkeypatch):
+    from app.models.project import TikTokPfmState
+    from app.services.post_for_me_client import PostForMeError
+
+    project = Project(
+        id="p1",
+        scheduled_account_id="acc_a",
+        tiktok_pfm=TikTokPfmState(
+            post_id="sp_old",
+            stage="post_scheduled",
+            social_account_id="spc_1",
+            media_url="https://pfm/media/1",
+            caption="cap",
+        ),
+    )
+    def raise_put(cls, post_id, body):
+        raise PostForMeError("update_post: HTTP 405", 405)
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        "app.services.post_for_me_client.PostForMeClient.update_post",
+        classmethod(raise_put),
+    )
+    monkeypatch.setattr(
+        "app.services.post_for_me_client.PostForMeClient.delete_post",
+        classmethod(lambda cls, post_id: deleted.append(post_id)),
+    )
+    monkeypatch.setattr(
+        "app.services.post_for_me_client.PostForMeClient.create_post",
+        classmethod(lambda cls, body: "sp_new"),
+    )
+    monkeypatch.setattr(
+        "app.services.project_service.ProjectService.save", lambda p: None
+    )
+
+    result = PlatformRescheduleService.notify(
+        project, "tiktok", datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    )
+    assert result.status == "ok"
+    assert deleted == ["sp_old"]
+    assert project.tiktok_pfm.post_id == "sp_new"
+
+
+def test_notify_tiktok_processing_post_is_skipped():
+    from app.models.project import TikTokPfmState
+
+    project = Project(
+        id="p1",
+        scheduled_account_id="acc_a",
+        tiktok_pfm=TikTokPfmState(
+            post_id="sp_123", stage="post_created", media_url="https://pfm/media/1"
+        ),
+    )
+    result = PlatformRescheduleService.notify(
+        project, "tiktok", datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    )
+    assert result.status == "skipped"
+    assert "post_created" in (result.error or "")
 
 
 def test_cancel_instagram_deletes_server_job(monkeypatch):

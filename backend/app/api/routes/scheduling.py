@@ -68,6 +68,29 @@ def _local_job_running(project: Project) -> bool:
     )
 
 
+def _pfm_event_status(project: Project) -> tuple[str, str | None] | None:
+    """Status for a backend-owned Post for Me TikTok post (2026-08 migration).
+
+    Returns None for legacy projects without tiktok_pfm state — those fall
+    back to the VPS-status derivation."""
+    state = project.tiktok_pfm
+    if state is None:
+        return None
+    if state.stage == "published":
+        return "complete", state.url
+    if state.stage == "failed":
+        return "failed", None
+    if state.stage == "post_created":
+        # Instant post or past-publish-instant scheduled post: processing.
+        return "running", None
+    if state.stage == "post_scheduled":
+        # Post exists on PFM, fires server-side at scheduled_at.
+        return "dispatched", None
+    if state.stage == "media_uploaded":
+        return "running", None
+    return "scheduled", None
+
+
 def _vps_event_status(project: Project, platform: str) -> tuple[str, str | None]:
     """Status for VPS-published platforms (instagram/tiktok).
 
@@ -122,8 +145,23 @@ def _project_event_status(project: Project, platform: str) -> tuple[str, str | N
     from ...services.project_upload_service import project_upload_queue  # noqa: PLC0415
     from ...services.scheduling_service import platform_upload_result_entry  # noqa: PLC0415
 
-    if platform in ("instagram", "tiktok"):
+    if platform == "tiktok":
+        pfm_status = _pfm_event_status(project)
+        if pfm_status is not None:
+            return pfm_status
         return _vps_event_status(project, platform)
+    if platform == "instagram":
+        return _vps_event_status(project, platform)
+    if platform == "facebook":
+        # Long-range (>29d) holds live on the VPS: once its status cache has
+        # a facebook entry, it is authoritative (pending hold → "dispatched",
+        # converted → "complete"). Native posts keep the local derivation.
+        from ...services.vps_status_sync_service import VpsStatusSyncService  # noqa: PLC0415
+
+        if not _local_job_running(project) and (
+            VpsStatusSyncService.cached_status(project.id, "facebook") is not None
+        ):
+            return _vps_event_status(project, platform)
 
     jobs = [j for j in project_upload_queue.list_jobs() if j.project_id == project.id]
     persisted = platform_upload_result_entry(project, platform)
@@ -207,12 +245,14 @@ async def list_events(
     range_start: datetime | None = None,
     range_end: datetime | None = None,
 ):
+    from ...services.pfm_status_sync_service import PfmStatusSyncService  # noqa: PLC0415
     from ...services.vps_status_sync_service import VpsStatusSyncService  # noqa: PLC0415
 
-    # Fire-and-forget: pull IG/TT publish outcomes from the VPS job store
-    # (throttled internally; results land in cache + project.json for the
-    # next refetch).
+    # Fire-and-forget: pull IG (and legacy TT) publish outcomes from the VPS
+    # job store, and TikTok outcomes from Post for Me (both throttled
+    # internally; results land in cache + project.json for the next refetch).
     VpsStatusSyncService.request_sync()
+    PfmStatusSyncService.request_sync()
 
     accounts = AccountService.all_accounts()
     wanted_platforms = (
@@ -312,7 +352,10 @@ class ResolveAnchorRequest(BaseModel):
 
 
 class StealSpecModel(BaseModel):
-    mode: Literal["cascade", "next_free"]
+    # "relocate" = single push of the occupant to its nearest free slots,
+    # TikTok-first (the UI's only offered mode since 2026-08; the older modes
+    # stay accepted).
+    mode: Literal["cascade", "next_free", "relocate"]
     expected_occupant_id: str | None = None
 
 
@@ -401,15 +444,22 @@ async def _notify_switch_displacements(switches, steals) -> dict[str, dict[str, 
     notification_status: dict[str, dict[str, str]] = {}
     for platform, result in switches.items():
         spec = steals[platform]
-        plan = result.cascade if spec.mode == "cascade" else result.next_free
+        plan = result.plan_for(spec.mode)
         notification_status[platform] = {}
         for displaced in plan.displaced:
+            # Relocate follow moves carry their own platform.
+            item_platform = displaced.platform or platform
             moved = ProjectService.load(displaced.project_id)
-            sched = (moved.platform_schedules or {}).get(platform) if moved else None
+            sched = (moved.platform_schedules or {}).get(item_platform) if moved else None
             if sched is None:
                 continue
-            notification_status[platform][displaced.project_id] = await asyncio.to_thread(
-                _notify_displaced, displaced.project_id, platform, sched.scheduled_at
+            key = (
+                displaced.project_id
+                if item_platform == platform
+                else f"{displaced.project_id}:{item_platform}"
+            )
+            notification_status[platform][key] = await asyncio.to_thread(
+                _notify_displaced, displaced.project_id, item_platform, sched.scheduled_at
             )
     return notification_status
 
@@ -610,7 +660,7 @@ class SwitchPreviewRequest(BaseModel):
 
 
 class SwitchApplyRequest(SwitchPreviewRequest):
-    mode: Literal["cascade", "next_free"]
+    mode: Literal["cascade", "next_free", "relocate"]
     expected_occupant_id: str | None = None
     # User acknowledged the "another platform would post before TikTok" warning.
     confirm_before_tiktok: bool = False
@@ -625,6 +675,8 @@ def _switch_plan_payload(plan) -> dict:
                 "from_slot": d.from_slot.isoformat(),
                 "to_slot": d.to_slot.isoformat(),
                 "requires_platform_notification": d.requires_platform_notification,
+                # None = the stolen slot's platform; set on relocate follow moves.
+                "platform": d.platform,
             }
             for d in plan.displaced
         ],
@@ -642,6 +694,7 @@ def _switch_to_payload(result) -> dict:
         "uploaded_count": result.uploaded_count,
         "cascade": _switch_plan_payload(result.cascade),
         "next_free": _switch_plan_payload(result.next_free),
+        "relocate": _switch_plan_payload(result.relocate),
     }
 
 
@@ -662,21 +715,98 @@ async def switch_apply(project_id: str, req: SwitchApplyRequest):
         req.mode, req.expected_occupant_id, req.confirm_before_tiktok,
     )
 
-    plan = result.cascade if req.mode == "cascade" else result.next_free
+    plan = result.plan_for(req.mode)
     notification_status: dict[str, str] = {}
     for displaced in plan.displaced:
+        item_platform = displaced.platform or req.platform
         moved = ProjectService.load(displaced.project_id)
         if moved is None:
             continue
-        sched = (moved.platform_schedules or {}).get(req.platform)
+        sched = (moved.platform_schedules or {}).get(item_platform)
         if sched is None:
             continue
-        notification_status[displaced.project_id] = await asyncio.to_thread(
-            _notify_displaced, displaced.project_id, req.platform, sched.scheduled_at
+        key = (
+            displaced.project_id
+            if item_platform == req.platform
+            else f"{displaced.project_id}:{item_platform}"
+        )
+        notification_status[key] = await asyncio.to_thread(
+            _notify_displaced, displaced.project_id, item_platform, sched.scheduled_at
         )
     payload = _switch_to_payload(result)
     payload["notification_status"] = notification_status
     return payload
+
+
+class UrgentPreviewRequest(BaseModel):
+    account_id: str
+    tiktok_only: bool = False
+
+
+class UrgentShiftModel(BaseModel):
+    """One colliding project's deferred re-timing, applied at final confirm."""
+
+    project_id: str
+    kind: Literal["anchor", "platform"] = "anchor"
+    platform: Platform | None = None      # kind = "platform"
+    tiktok_slot: datetime | None = None   # kind = "anchor"
+    slot: datetime | None = None          # kind = "platform"
+    manual_at: datetime | None = None
+    overrides: dict[str, datetime] | None = None
+    steals: dict[str, StealSpecModel] | None = None
+    # Race guard: {platform: scheduled_at ISO seen at preview time}. A post
+    # that changed/published meanwhile degrades to an "unmovable" item result.
+    expected_scheduled_at: dict[str, str] = {}
+
+
+class UrgentOwnReservations(BaseModel):
+    """TikTok-only mode: when the urgent project's other platforms are
+    scheduled instead of published immediately."""
+
+    first_slot: datetime | None = None
+    manual_at: datetime | None = None
+
+
+class UrgentApplyRequest(BaseModel):
+    account_id: str
+    tiktok_only: bool = False
+    shifts: list[UrgentShiftModel] = []
+    own_reservations: UrgentOwnReservations | None = None
+    confirm_before_tiktok: bool = True
+
+
+@router.post("/projects/{project_id}/urgent-preview")
+async def urgent_preview(project_id: str, req: UrgentPreviewRequest):
+    """Two-phase (<60 min, same pool) collision scan for urgent-immediate.
+
+    Read-only: the whole urgent flow defers every mutation to urgent-apply."""
+    from ...services.urgent_upload_service import UrgentUploadService  # noqa: PLC0415
+
+    return await asyncio.to_thread(
+        UrgentUploadService.compute_preview, project_id, req.account_id, req.tiktok_only
+    )
+
+
+@router.post("/projects/{project_id}/urgent-apply")
+async def urgent_apply(project_id: str, req: UrgentApplyRequest):
+    """Apply the urgent plan: shift the colliding posts (per-item degradation)
+    and, in TikTok-only mode, reserve the urgent project's other platforms.
+    The immediate upload itself is then triggered via the normal upload
+    endpoint with immediate=true."""
+    from ...services.urgent_upload_service import UrgentUploadService  # noqa: PLC0415
+
+    shifts = [s.model_dump(mode="json") for s in req.shifts]
+    own = req.own_reservations.model_dump(mode="json") if req.own_reservations else None
+    return await asyncio.to_thread(
+        lambda: UrgentUploadService.apply_plan(
+            project_id,
+            req.account_id,
+            shifts=shifts,
+            own_reservations=own,
+            tiktok_only=req.tiktok_only,
+            confirm_before_tiktok=req.confirm_before_tiktok,
+        )
+    )
 
 
 @router.get("/reschedule-pending")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -29,6 +29,11 @@ from .metadata import MetadataService
 from .meta_token_service import MetaTokenService
 from .music_config_service import MusicConfigService
 from .platform_reschedule_service import PlatformRescheduleService
+from .post_for_me_client import (
+    PostForMeClient,
+    PostForMeError,
+    build_post_body,
+)
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
 from .social_upload_service import PlatformUploadResult, SocialUploadService
@@ -180,6 +185,10 @@ class UploadPhaseService:
     """Project manager view, upload execution, and managed delete flow."""
     _SUPPORTED_PLATFORMS = ("youtube", "facebook", "instagram")
     _INSTAGRAM_DRIVE_FILENAME = "output_instagram.mp4"
+    _FACEBOOK_DRIVE_FILENAME = "facebook_upload.mp4"
+    # Meta's scheduled_publish_time window (~30 days documented; 29 kept as a
+    # safety margin). Targets beyond it are deferred to the /server hold.
+    _FACEBOOK_NATIVE_HORIZON_DAYS = 29
     _FRENCH_TZ = ZoneInfo("Europe/Paris")
     _TIKTOK_NOT_CONFIGURED_DETAIL = "No Post for Me account configured for this account"
     _drive_video_cache: dict[str, dict[str, Any]] = {}
@@ -773,22 +782,186 @@ class UploadPhaseService:
         account: AccountConfig | None,
         tiktok_payload: dict[str, Any] | None,
     ) -> list[str]:
-        """Platforms recorded on the VPS job. TikTok is server-published, so it
-        joins the job whenever a payload exists or the account has an explicit
-        `tiktok:` block that schedules it (slots) — it is never part of the
-        locally-uploaded platforms. Without a payload, top-level `slots:` alone
-        (no `tiktok:` block) does not count, since `slots_for` falls back to
-        the top-level list for every platform."""
+        """Platforms recorded on the VPS job.
+
+        2026-08: TikTok no longer joins the VPS job — the backend creates the
+        PFM scheduled post directly at upload time (see _publish_tiktok_via_pfm
+        / post_for_me_client.py). The old join logic is kept commented below
+        per owner instruction (never delete)."""
         platforms = list(requested_platforms)
         if "tiktok" in platforms:
-            return platforms
-        if tiktok_payload is not None or (
+            # tiktok is not in _SUPPORTED_PLATFORMS; defensive strip in case a
+            # caller ever passes it through.
+            platforms = [p for p in platforms if p != "tiktok"]
+        # --- legacy VPS TikTok join (pre 2026-08 PFM migration) -------------
+        # if "tiktok" in platforms:
+        #     return platforms
+        # if tiktok_payload is not None or (
+        #     account is not None
+        #     and account.tiktok is not None
+        #     and account.slots_for("tiktok")
+        # ):
+        #     platforms.append("tiktok")
+        # ---------------------------------------------------------------------
+        del account, tiktok_payload  # kept in the signature for the legacy path
+        return platforms
+
+    @classmethod
+    def _tiktok_enrolled(
+        cls,
+        account: AccountConfig | None,
+        tiktok_payload: dict[str, Any] | None,
+    ) -> bool:
+        """Whether this upload should publish to TikTok (via PFM).
+
+        Same enrollment rule as the legacy VPS join: a payload exists, or the
+        account has an explicit `tiktok:` block with slots (top-level `slots:`
+        alone does not count — `slots_for` falls back to it for every
+        platform)."""
+        if tiktok_payload is not None:
+            return True
+        return (
             account is not None
             and account.tiktok is not None
-            and account.slots_for("tiktok")
-        ):
-            platforms.append("tiktok")
-        return platforms
+            and bool(account.slots_for("tiktok"))
+        )
+
+    @classmethod
+    def _publish_tiktok_via_pfm(
+        cls,
+        *,
+        project: Project,
+        payload: dict[str, Any],
+        video_path: Path,
+        scheduled_at: datetime | None,
+        wait_for_result: bool = False,
+    ) -> PlatformUploadResult:
+        """Stage media + create the PFM post (scheduled or instant).
+
+        Mutates and persists `project.tiktok_pfm` at every stage transition so
+        a crash never orphans a live PFM post without local state. With
+        `wait_for_result` (urgent-immediate), blocks on the publish outcome
+        (bounded poll); otherwise the post is left scheduled/processing and
+        PfmStatusSyncService picks the result up later.
+        """
+        from ..models.project import TikTokPfmState
+
+        social_account_id = str(payload["social_account_id"])
+        pfm_platform = str(payload.get("post_for_me_platform") or "tiktok")
+        caption = str(payload.get("caption") or "")
+        state = TikTokPfmState(
+            social_account_id=social_account_id,
+            post_for_me_platform=pfm_platform,
+            scheduled_at=scheduled_at,
+            caption=caption,
+            privacy_status=str(payload.get("privacy_status") or "public"),
+            allow_comment=bool(payload.get("allow_comment", True)),
+            allow_duet=bool(payload.get("allow_duet", True)),
+            allow_stitch=bool(payload.get("allow_stitch", True)),
+        )
+
+        def persist_state() -> None:
+            project.tiktok_pfm = state
+            try:
+                ProjectService.save(project)
+            except Exception:
+                logger.warning(
+                    "Failed to persist tiktok_pfm state for %s", project.id, exc_info=True
+                )
+
+        def failed(detail: str) -> PlatformUploadResult:
+            state.stage = "failed"
+            state.last_error = detail
+            persist_state()
+            return PlatformUploadResult(
+                platform="tiktok", status="failed", detail=detail
+            )
+
+        try:
+            state.media_url = PostForMeClient.stage_media(video_path)
+        except PostForMeError as exc:
+            return failed(f"PFM media staging failed: {exc.detail}")
+        state.stage = "media_uploaded"
+        persist_state()
+
+        body = build_post_body(
+            social_account_id=social_account_id,
+            media_url=state.media_url,
+            caption=caption,
+            post_for_me_platform=pfm_platform,
+            privacy_status=state.privacy_status,
+            allow_comment=state.allow_comment,
+            allow_duet=state.allow_duet,
+            allow_stitch=state.allow_stitch,
+            scheduled_at=scheduled_at,
+        )
+        try:
+            state.post_id = PostForMeClient.create_post(body)
+        except PostForMeError as exc:
+            return failed(f"PFM post creation failed: {exc.detail}")
+        state.stage = "post_scheduled" if scheduled_at is not None else "post_created"
+        persist_state()
+
+        if wait_for_result:
+            outcome = PostForMeClient.poll_outcome(state.post_id, social_account_id)
+            state.last_polled_at = datetime.now(timezone.utc)
+            if outcome.success:
+                state.stage = "published"
+                state.url = outcome.url
+                persist_state()
+                return PlatformUploadResult(
+                    platform="tiktok", status="uploaded", url=outcome.url
+                )
+            if outcome.detail and "resumable=true" in outcome.detail:
+                # Poll timeout: PFM is still processing — not terminal.
+                state.last_error = outcome.detail
+                persist_state()
+                return PlatformUploadResult(
+                    platform="tiktok",
+                    status="uploaded",
+                    detail="Publishing via Post for Me (result pending)",
+                )
+            return failed(f"TikTok publish failed: {outcome.detail}")
+
+        if scheduled_at is not None:
+            detail = (
+                f"Scheduled via Post for Me at {scheduled_at.isoformat()} "
+                f"(post {state.post_id})"
+            )
+        else:
+            detail = f"Publishing via Post for Me (post {state.post_id})"
+        return PlatformUploadResult(platform="tiktok", status="uploaded", detail=detail)
+
+    @classmethod
+    def _publish_instagram_immediate(
+        cls,
+        *,
+        payload: dict[str, Any],
+        video_path: Path | None,
+        video_url: str | None,
+    ) -> PlatformUploadResult:
+        """Urgent-immediate Instagram publish (backend-side Graph API)."""
+        from .instagram_immediate_service import InstagramImmediateService
+
+        result = InstagramImmediateService.publish_now(
+            ig_user_id=str(payload.get("ig_user_id") or ""),
+            ig_access_token=str(payload.get("ig_access_token") or ""),
+            caption=str(payload.get("caption") or ""),
+            video_path=video_path,
+            video_url=video_url,
+            graph_api_version=str(
+                payload.get("graph_api_version") or settings.meta_graph_api_version
+            ),
+        )
+        if result.success:
+            return PlatformUploadResult(
+                platform="instagram", status="uploaded", url=result.permalink
+            )
+        return PlatformUploadResult(
+            platform="instagram",
+            status="failed",
+            detail=f"Immediate Instagram publish failed: {result.detail}",
+        )
 
     @classmethod
     def _normalize_platforms(cls, platforms: list[str] | None) -> tuple[str, ...]:
@@ -892,6 +1065,119 @@ class UploadPhaseService:
                 "instagram_speed_factor": (
                     f"{prep.speed_factor}" if prep.transcoded and prep.speed_factor else "1.0"
                 ),
+                # tmp-dir path consumed (and popped) by the urgent-immediate
+                # publish; never persisted.
+                "instagram_prepared_local_path": str(prep.video_path),
+            },
+        )
+
+    @classmethod
+    def _prepare_facebook_drive_video(
+        cls,
+        *,
+        project_id: str,
+        source_video_path: Path,
+        drive_folder_id: str,
+        facebook_strategy: str | None,
+        max_duration_seconds: float,
+        work_dir: Path,
+    ) -> tuple[PlatformUploadResult | None, dict[str, str]]:
+        """Prepare + Drive-host the Facebook artifact for a >29d server hold.
+
+        Applies the user's duration strategy (cut / sped_up / auto) exactly
+        like the native scheduled path, then uploads the ready-to-publish file
+        to Drive so the /server can create the native scheduled post at T-28d.
+        Mirrors _prepare_instagram_drive_video."""
+        strategy = facebook_strategy or "auto"
+        if strategy == "cut":
+            cut_output = work_dir / f"{source_video_path.stem}.facebook_cut.mp4"
+            cut_error = SocialUploadService._cut_facebook_video(
+                input_path=source_video_path,
+                output_path=cut_output,
+                max_duration_seconds=max_duration_seconds,
+            )
+            if cut_error:
+                return (
+                    PlatformUploadResult(
+                        platform="facebook",
+                        status="failed",
+                        detail=f"Facebook cut failed: {cut_error}",
+                    ),
+                    {},
+                )
+            prepared_video_path = cut_output
+        else:
+            cached = None
+            if strategy == "sped_up":
+                prep_dir = cls._facebook_prep_dir(project_id)
+                candidate = prep_dir / "sped_up.mp4"
+                cached = candidate if candidate.exists() else None
+            if cached is not None:
+                prepared_video_path = cached
+            else:
+                prep = SocialUploadService._prepare_facebook_video_for_upload(
+                    source_video_path=source_video_path,
+                    work_dir=work_dir,
+                    max_duration_seconds=max_duration_seconds,
+                )
+                if prep.status == "skip":
+                    return (
+                        PlatformUploadResult(
+                            platform="facebook", status="skipped", detail=prep.detail
+                        ),
+                        {},
+                    )
+                if prep.status != "ready" or prep.video_path is None:
+                    return (
+                        PlatformUploadResult(
+                            platform="facebook",
+                            status="failed",
+                            detail=prep.detail or "Facebook video preparation failed.",
+                        ),
+                        {},
+                    )
+                prepared_video_path = prep.video_path
+
+        media_validation_error = SocialUploadService._validate_facebook_reel_media(
+            video_path=prepared_video_path,
+            max_duration_seconds=max_duration_seconds,
+        )
+        if media_validation_error:
+            return (
+                PlatformUploadResult(
+                    platform="facebook", status="failed", detail=media_validation_error
+                ),
+                {},
+            )
+
+        drive = GoogleDriveService.client()
+        uploaded = GoogleDriveService.upsert_local_file(
+            parent_id=drive_folder_id,
+            filename=cls._FACEBOOK_DRIVE_FILENAME,
+            local_path=prepared_video_path,
+            chunksize=settings.drive_upload_chunk_mb * 1024 * 1024,
+            drive=drive,
+        )
+        file_id = str(uploaded.get("id") or "").strip()
+        if not file_id:
+            return (
+                PlatformUploadResult(
+                    platform="facebook",
+                    status="failed",
+                    detail=(
+                        f"Drive upload returned no file id for {cls._FACEBOOK_DRIVE_FILENAME}"
+                    ),
+                ),
+                {},
+            )
+        GoogleDriveService.set_public_read(file_id, drive=drive)
+        return (
+            None,
+            {
+                "facebook_drive_file_id": file_id,
+                "facebook_drive_video_url": GoogleDriveService.get_direct_download_url(
+                    file_id
+                ),
             },
         )
 
@@ -908,6 +1194,7 @@ class UploadPhaseService:
         thumbnail_timestamp_ms: int | None = None,
         thumbnail_candidate_index: int | None = None,
         reserved_slots: dict[str, tuple[datetime, datetime]] | None = None,
+        immediate_platforms: list[str] | None = None,
         progress_callback: Callable[[float, str, str], None] | None = None,
         platform_result_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
@@ -937,6 +1224,13 @@ class UploadPhaseService:
         if not project:
             raise ValueError("Project not found")
         requested_platforms = cls._normalize_platforms(platforms)
+        # Urgent-immediate mode: these platforms publish right now (no
+        # scheduled_at). "tiktok" is a valid member here even though it is
+        # not part of _SUPPORTED_PLATFORMS (it is PFM-published, not
+        # locally uploaded).
+        immediate: set[str] = {
+            str(p).strip().lower() for p in (immediate_platforms or []) if str(p).strip()
+        }
         configured_accounts = AccountService.list_accounts()
 
         # Validate account if provided
@@ -994,6 +1288,10 @@ class UploadPhaseService:
         # Calculate per-platform scheduled times if account has slots for that platform.
         if account and account_id:
             for _platform in ("youtube", "facebook", "instagram", "tiktok"):
+                if _platform in immediate:
+                    # Immediate platforms publish now: no scheduled_at at all
+                    # (YT public, FB direct publish, TT instant PFM post).
+                    continue
                 if not account.slots_for(_platform):
                     continue
                 _pre = (reserved_slots or {}).get(_platform)
@@ -1004,6 +1302,21 @@ class UploadPhaseService:
                         account_id, _platform, project_id=project_id
                     )
                 platform_scheduled_at[_platform] = _sched
+
+        # Facebook long-range routing: Meta's scheduled_publish_time only
+        # accepts targets within ~29 days. Beyond that the upload is DEFERRED
+        # to the /server, which converts the hold to a native scheduled post
+        # at T-28d (server/app/services/facebook_publisher.py).
+        _fb_target = platform_scheduled_at.get("facebook")
+        fb_deferred = (
+            "facebook" in requested_platforms
+            and account is not None
+            and account.meta is not None
+            and account_id is not None
+            and _fb_target is not None
+            and _fb_target
+            > datetime.now(timezone.utc) + timedelta(days=cls._FACEBOOK_NATIVE_HORIZON_DAYS)
+        )
 
         # Duplicated-project restrictions: same account never uploads two
         # linked projects; same-language duplicates must be >= 30 days apart.
@@ -1028,10 +1341,15 @@ class UploadPhaseService:
         direct_drive_download = GoogleDriveService.get_direct_download_url(drive_video_id)
 
         vps_platforms = cls._vps_platforms(requested_platforms, account, tiktok_payload)
+        if "instagram" in immediate:
+            # Urgent-immediate Instagram publishes from the backend — keep it
+            # off the VPS job so the server never double-publishes.
+            vps_platforms = [p for p in vps_platforms if p != "instagram"]
+        tiktok_enrolled = cls._tiktok_enrolled(account, tiktok_payload)
         results_by_platform: dict[str, PlatformUploadResult] = dict(
             cls._compute_upfront_skips(requested_platforms, account)
         )
-        if "tiktok" in vps_platforms and tiktok_payload is None:
+        if tiktok_enrolled and tiktok_payload is None:
             results_by_platform.setdefault(
                 "tiktok",
                 PlatformUploadResult(
@@ -1042,6 +1360,7 @@ class UploadPhaseService:
             )
         discord_message_id: str | None = None
         instagram_drive_metadata: dict[str, str] = {}
+        facebook_drive_metadata: dict[str, str] = {}
 
         def emit_platform_result(
             result: PlatformUploadResult,
@@ -1136,6 +1455,11 @@ class UploadPhaseService:
                     emit_progress(0.30, "download", "Downloading final video from Drive...")
                     GoogleDriveService.download_file(drive_video_id, local_video_path)
 
+            # TikTok deliberately keeps the ORIGINAL copyrighted audio: capture
+            # the pre-remux file for the PFM media staging before
+            # local_video_path is swapped to the copyright-replaced variant.
+            tiktok_source_path = local_video_path
+
             # When copyright audio replacement is active, re-mux the video with the
             # new audio track.  We keep the *original* direct_drive_download URL for
             # the Discord message (TikTok uses the original copyrighted audio), but
@@ -1225,7 +1549,27 @@ class UploadPhaseService:
                 else:
                     ig_prep_needed = True
 
+            # Hosted-cover attach must precede the TikTok job closure below
+            # (the PFM body is built from the payload inside the worker).
+            cls._attach_tiktok_cover(tiktok_payload, cover_drive_url)
+
             jobs: dict[str, Any] = {}
+
+            # TikTok job — backend-owned PFM post (2026-08 migration off the
+            # VPS). Uses the pre-copyright-remux file: TikTok keeps the
+            # original audio.
+            if tiktok_payload is not None:
+                _tt_payload = dict(tiktok_payload)
+                _tt_scheduled_at = platform_scheduled_at.get("tiktok")
+                _tt_immediate = "tiktok" in immediate
+                _tt_source = tiktok_source_path
+                jobs["tiktok"] = lambda: cls._publish_tiktok_via_pfm(
+                    project=project,
+                    payload=_tt_payload,
+                    video_path=_tt_source,
+                    scheduled_at=None if _tt_immediate else _tt_scheduled_at,
+                    wait_for_result=_tt_immediate,
+                )
 
             # YouTube job
             if (
@@ -1270,7 +1614,13 @@ class UploadPhaseService:
                 )
 
             # Facebook job. Instagram is deferred to the VPS scheduler via create_job above.
-            if account and account.meta and account_id and "facebook" in requested_platforms:
+            # A >29d Facebook target is deferred too (fb_deferred): the /server
+            # converts it to a native scheduled post at T-28d.
+            if (
+                account and account.meta and account_id
+                and "facebook" in requested_platforms
+                and not fb_deferred
+            ):
                 meta_creds = AccountService.get_meta_credentials(account_id)
 
                 _fb_strategy = facebook_strategy  # capture for lambda
@@ -1312,6 +1662,9 @@ class UploadPhaseService:
                     )
 
             selected_jobs = {platform: jobs[platform] for platform in requested_platforms if platform in jobs}
+            # TikTok is PFM-published, never part of requested_platforms.
+            if "tiktok" in jobs:
+                selected_jobs["tiktok"] = jobs["tiktok"]
 
             emit_progress(0.55, "platform_upload", "Uploading to social platforms...")
             worker_count = len(selected_jobs) + (1 if ig_prep_needed else 0)
@@ -1324,6 +1677,21 @@ class UploadPhaseService:
                     executor.submit(job): platform
                     for platform, job in selected_jobs.items()
                 }
+
+                # >29d Facebook hold: prepare + Drive-host the artifact the
+                # /server will upload as a native scheduled post at T-28d.
+                fb_payload: dict[str, Any] | None = None
+                fb_prep_future = None
+                if fb_deferred:
+                    fb_prep_future = executor.submit(
+                        cls._prepare_facebook_drive_video,
+                        project_id=project_id,
+                        source_video_path=local_video_path,
+                        drive_folder_id=readiness.drive_folder_id,
+                        facebook_strategy=facebook_strategy,
+                        max_duration_seconds=facebook_max_duration,
+                        work_dir=Path(tmp_dir),
+                    )
 
                 # Instagram Drive prep (transcode + Drive re-upload) runs alongside
                 # the YouTube/Facebook uploads; only the Discord/VPS job created
@@ -1343,10 +1711,33 @@ class UploadPhaseService:
                     except Exception:
                         abort_platform_jobs = True
                         raise
+                    ig_prepared_local_path = instagram_drive_metadata.pop(
+                        "instagram_prepared_local_path", None
+                    )
                     if ig_result is not None:
                         results_by_platform["instagram"] = ig_result
                         ig_payload = None
                         emit_platform_result(ig_result, update_discord=False)
+                    elif "instagram" in immediate:
+                        # Urgent-immediate: publish from the backend right now
+                        # instead of handing a scheduled job to the VPS.
+                        _ig_payload_now = dict(ig_payload)
+                        _ig_local = (
+                            Path(ig_prepared_local_path)
+                            if ig_prepared_local_path
+                            else None
+                        )
+                        _ig_drive_url = instagram_drive_metadata.get(
+                            "instagram_drive_video_url"
+                        )
+                        ig_immediate_future = executor.submit(
+                            cls._publish_instagram_immediate,
+                            payload=_ig_payload_now,
+                            video_path=_ig_local,
+                            video_url=_ig_drive_url,
+                        )
+                        future_to_platform[ig_immediate_future] = "instagram"
+                        ig_payload = None  # never reaches the VPS job
                     else:
                         ig_payload["prepared_video_url"] = instagram_drive_metadata[
                             "instagram_drive_video_url"
@@ -1360,7 +1751,39 @@ class UploadPhaseService:
                         if cover_drive_url is not None:
                             ig_payload["cover_url"] = cover_drive_url
 
-                cls._attach_tiktok_cover(tiktok_payload, cover_drive_url)
+                if fb_prep_future is not None:
+                    try:
+                        fb_result, facebook_drive_metadata = fb_prep_future.result()
+                    except Exception:
+                        abort_platform_jobs = True
+                        raise
+                    if fb_result is not None:
+                        results_by_platform["facebook"] = fb_result
+                        emit_platform_result(fb_result, update_discord=False)
+                    else:
+                        meta_creds_fb = AccountService.get_meta_credentials(account_id)
+                        fb_payload = {
+                            "page_id": meta_creds_fb.page_id,
+                            "page_access_token": meta_creds_fb.facebook_page_access_token,
+                            "title": metadata.facebook.title,
+                            "description": metadata.facebook.description,
+                            "prepared_video_url": facebook_drive_metadata[
+                                "facebook_drive_video_url"
+                            ],
+                            "graph_api_version": settings.meta_graph_api_version,
+                        }
+                        results_by_platform["facebook"] = PlatformUploadResult(
+                            platform="facebook",
+                            status="skipped",
+                            detail=(
+                                "Deferred to the server "
+                                f"(>{cls._FACEBOOK_NATIVE_HORIZON_DAYS}d): native "
+                                "scheduling at T-28d"
+                            ),
+                        )
+                        emit_platform_result(
+                            results_by_platform["facebook"], update_discord=False
+                        )
 
                 discord_message_id = None
                 try:
@@ -1381,7 +1804,12 @@ class UploadPhaseService:
                         drive_video_url=direct_drive_download or drive_video_url,
                         platforms_requested=vps_platforms,
                         instagram=ig_payload,
-                        tiktok=tiktok_payload,
+                        # 2026-08 PFM migration: TikTok is published by the
+                        # backend (see _publish_tiktok_via_pfm); the VPS job no
+                        # longer carries a tiktok payload.
+                        # tiktok=tiktok_payload,
+                        tiktok=None,
+                        facebook=fb_payload,
                         platform_scheduled_at=platform_scheduled_at,
                         platform_statuses=cls._platform_status_payload(results_by_platform),
                     )
@@ -1468,10 +1896,14 @@ class UploadPhaseService:
                     cancel_futures=abandon_jobs,
                 )
 
-            # Keep deterministic ordering in reports/messages.
+            # Keep deterministic ordering in reports/messages. TikTok (PFM)
+            # is appended after the locally-uploaded platforms.
+            _ordered_platforms = list(requested_platforms)
+            if "tiktok" in results_by_platform and "tiktok" not in _ordered_platforms:
+                _ordered_platforms.append("tiktok")
             platform_results = [
                 results_by_platform[platform]
-                for platform in requested_platforms
+                for platform in _ordered_platforms
                 if platform in results_by_platform
             ]
 
@@ -1511,6 +1943,7 @@ class UploadPhaseService:
             "drive_video_id": drive_video_id,
             "drive_video_name": drive_video_name,
             **instagram_drive_metadata,
+            **facebook_drive_metadata,
         }
 
         # Save scheduling info. Per-platform reservations are already persisted

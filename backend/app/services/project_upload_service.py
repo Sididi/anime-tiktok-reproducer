@@ -111,6 +111,11 @@ class UploadRequestSpec:
     copyright_audio_path: str | None = None
     thumbnail_timestamp_ms: int | None = None
     thumbnail_candidate_index: int | None = None
+    # Urgent-immediate mode: these platforms publish right now (no slot
+    # reservation; recorded as manual now-schedules). immediate=True with
+    # immediate_platforms=None means every reserved platform.
+    immediate: bool = False
+    immediate_platforms: list[str] | None = None
 
 
 class ProjectUploadService:
@@ -197,6 +202,8 @@ class ProjectUploadService:
         copyright_audio_path: str | None = None,
         thumbnail_timestamp_ms: int | None = None,
         thumbnail_candidate_index: int | None = None,
+        immediate: bool = False,
+        immediate_platforms: list[str] | None = None,
     ) -> ProjectUploadJob:
         project = ProjectService.load(project_id)
         if project is None:
@@ -232,6 +239,10 @@ class ProjectUploadService:
             copyright_audio_path=copyright_audio_path,
             thumbnail_timestamp_ms=thumbnail_timestamp_ms,
             thumbnail_candidate_index=thumbnail_candidate_index,
+            immediate=immediate,
+            immediate_platforms=(
+                list(immediate_platforms) if immediate_platforms is not None else None
+            ),
         )
         await self._publish_job(job)
         asyncio.create_task(
@@ -295,6 +306,7 @@ class ProjectUploadService:
     async def _run_job(self, project_id: str, job_id: str) -> None:
         await self._semaphore.acquire()
         reserved_slots: dict[str, tuple[datetime, datetime]] = {}
+        immediate_set: set[str] = set()
         try:
             job = self._jobs.get(project_id)
             if job is None or job.job_id != job_id:
@@ -317,6 +329,23 @@ class ProjectUploadService:
                 account = AccountService.get_account(request.account_id)
                 if account is not None:
                     platforms_to_reserve = _platforms_to_reserve(account, request.platforms)
+                    if request.immediate:
+                        # Urgent-immediate: these platforms publish right now —
+                        # no slot reservation, recorded as manual now-schedules
+                        # (invisible to the pool, visible on the planning board).
+                        requested_immediate = {
+                            str(p).strip().lower()
+                            for p in (request.immediate_platforms or [])
+                            if str(p).strip()
+                        }
+                        immediate_set = (
+                            requested_immediate & set(platforms_to_reserve)
+                            if requested_immediate
+                            else set(platforms_to_reserve)
+                        )
+                        platforms_to_reserve = [
+                            p for p in platforms_to_reserve if p not in immediate_set
+                        ]
                     if platforms_to_reserve:
                         reserved_slots = await asyncio.to_thread(
                             SchedulingService.reserve_all_platform_slots,
@@ -329,6 +358,19 @@ class ProjectUploadService:
                             status="running",
                             phase="scheduled",
                             message="Reserved scheduled upload slot.",
+                        )
+                    if immediate_set:
+                        await asyncio.to_thread(
+                            SchedulingService.record_immediate_schedules,
+                            project_id,
+                            request.account_id,
+                            sorted(immediate_set),
+                        )
+                        await self._set_job_state(
+                            job,
+                            status="running",
+                            phase="scheduled",
+                            message="Publishing immediately (urgent mode).",
                         )
 
             loop = asyncio.get_running_loop()
@@ -393,6 +435,7 @@ class ProjectUploadService:
                 thumbnail_timestamp_ms=request.thumbnail_timestamp_ms,
                 thumbnail_candidate_index=request.thumbnail_candidate_index,
                 reserved_slots=reserved_slots,
+                immediate_platforms=sorted(immediate_set) if immediate_set else None,
                 progress_callback=progress_callback,
                 platform_result_callback=platform_result_callback,
             )
@@ -406,7 +449,7 @@ class ProjectUploadService:
                 result=result,
             )
         except Exception as exc:
-            if reserved_slots:
+            if reserved_slots or immediate_set:
                 try:
                     await asyncio.to_thread(SchedulingService.clear_reserved_slots, project_id)
                 except Exception:
