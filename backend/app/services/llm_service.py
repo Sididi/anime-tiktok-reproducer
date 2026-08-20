@@ -45,9 +45,15 @@ class LLMService:
         *,
         preset_key: str | None = None,
         tier: Tier = "big",
+        response_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> dict[str, Any]:
         return OpenRouterService.generate_json(
-            prompt, preset_key=preset_key, tier=tier
+            prompt,
+            preset_key=preset_key,
+            tier=tier,
+            response_schema=response_schema,
+            schema_name=schema_name,
         )
 
     @classmethod
@@ -57,9 +63,15 @@ class LLMService:
         *,
         preset_key: str | None = None,
         tier: Tier = "big",
+        response_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> Any:
         return OpenRouterService.generate_json_value(
-            prompt, preset_key=preset_key, tier=tier
+            prompt,
+            preset_key=preset_key,
+            tier=tier,
+            response_schema=response_schema,
+            schema_name=schema_name,
         )
 
     @classmethod

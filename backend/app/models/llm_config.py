@@ -14,9 +14,14 @@ class AnthropicThinking(BaseModel):
 
 
 class GeminiThinking(BaseModel):
-    """Reasoning shape for Gemini models — effort level."""
+    """Effort-based reasoning shape (GPT / Gemini / Grok).
 
-    effort: Literal["low", "medium", "high", "xhigh"]
+    "none" fully disables reasoning where the provider supports it; models
+    with mandatory reasoning (e.g. Gemini 3.1 Pro, Grok 4.x) reject it, so
+    use "low" as the floor there.
+    """
+
+    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"]
     model_config = {"extra": "forbid"}
 
 

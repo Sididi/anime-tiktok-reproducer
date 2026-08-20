@@ -1030,6 +1030,11 @@ class ScriptAutomationService:
                     prompt,
                     preset_key=project.resolved_llm_preset_key(),
                     tier="big",
+                    response_schema=cls._script_response_schema(
+                        target_language=target_language,
+                        scene_count=len(transcription.scenes),
+                    ),
+                    schema_name="script",
                 )
                 coerced_script_payload: dict[str, Any] | None = None
                 try:
@@ -1201,6 +1206,8 @@ class ScriptAutomationService:
                         metadata_prompt,
                         preset_key=project.resolved_llm_preset_key(),
                         tier="light",
+                        response_schema=cls._metadata_response_schema(),
+                        schema_name="metadata",
                     )
                     validated_metadata = MetadataService.validate_candidate_payload(
                         raw_metadata_payload

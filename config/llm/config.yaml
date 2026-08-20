@@ -2,55 +2,55 @@ default: gpt
 
 presets:
   gpt:
-    label: "GPT (5.5 + 5.4 Mini)"
+    label: "GPT (5.6 Sol + Luna)"
     big:
-      openrouter_id: openai/gpt-5.5
-      thinking:
-        effort: high
+      openrouter_id: openai/gpt-5.6-sol
+      thinking: null
     light:
-      openrouter_id: openai/gpt-5.4-mini
-      thinking:
-        effort: medium
+      openrouter_id: openai/gpt-5.6-luna
+      thinking: null
 
   claude:
     label: "Claude (Sonnet 5 + Haiku 4.5)"
     big:
       openrouter_id: anthropic/claude-sonnet-5
-      thinking:
-        max_tokens: 3000
+      thinking: null
     light:
       openrouter_id: anthropic/claude-haiku-4.5
-      thinking:
-        max_tokens: 2000
+      thinking: null
 
   gemini:
-    label: "Gemini (3.1 Pro + 3.5 Flash)"
+    label: "Gemini (3.1 Pro + 3.7 Flash)"
+    # "low" empirically disables thinking on 3.1 Pro (A/B 2026-08-20);
+    # the provider default reasons heavily (~7k tokens, 3.7x the cost).
     big:
       openrouter_id: google/gemini-3.1-pro-preview
       thinking:
-        effort: high
+        effort: low
     light:
-      openrouter_id: google/gemini-3.5-flash
+      openrouter_id: google/gemini-3.7-flash
       thinking:
-        effort: medium
+        effort: low
 
   mistral:
-    label: "Mistral (Large 3 2512 + Small 4)"
+    label: "Mistral (Medium 3.5 + Small 4)"
     big:
-      openrouter_id: mistralai/mistral-large-2512
+      openrouter_id: mistralai/mistral-medium-3-5
       thinking: null
     light:
       openrouter_id: mistralai/mistral-small-2603
       thinking: null
 
   grok:
-    label: "Grok (4.3)"
+    label: "Grok (4.6)"
+    # effort high returns EMPTY responses with json_schema enforcement
+    # (A/B 2026-08-20) — keep low on both tiers.
     big:
-      openrouter_id: x-ai/grok-4.3
+      openrouter_id: x-ai/grok-4.6
       thinking:
-        effort: high
+        effort: low
     light:
-      openrouter_id: x-ai/grok-4.3
+      openrouter_id: x-ai/grok-4.6
       thinking:
         effort: low
 

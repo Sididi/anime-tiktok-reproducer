@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Any, Literal
 
-from openai import OpenAI, APITimeoutError
+from openai import OpenAI, APITimeoutError, BadRequestError
 
 from ..config import settings
 from ..models.llm_config import (
@@ -71,6 +71,8 @@ class OpenRouterService:
         entry: LLMPresetEntry,
         system: str | None = None,
         max_output_tokens: int | None = None,
+        response_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> str:
         client = cls._get_client()
         messages: list[dict[str, str]] = []
@@ -84,6 +86,15 @@ class OpenRouterService:
         }
         if max_output_tokens:
             kwargs["max_tokens"] = max_output_tokens
+        if response_schema is not None:
+            kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": response_schema,
+                },
+            }
 
         extra_body: dict[str, Any] = {}
         reasoning = cls._build_reasoning(entry)
@@ -93,7 +104,21 @@ class OpenRouterService:
             kwargs["extra_body"] = extra_body
 
         try:
-            response = client.chat.completions.create(**kwargs)
+            try:
+                response = client.chat.completions.create(**kwargs)
+            except BadRequestError:
+                if response_schema is None:
+                    raise
+                # Some provider/model combos reject json_schema enforcement.
+                # Degrade to prompt-only JSON so the preset keeps working, but
+                # never silently: the warning names the model so we can fix it.
+                logger.warning(
+                    "OpenRouter rejected json_schema response_format for %s; "
+                    "retrying without schema enforcement",
+                    entry.openrouter_id,
+                )
+                kwargs.pop("response_format", None)
+                response = client.chat.completions.create(**kwargs)
         except APITimeoutError as exc:
             raise RuntimeError(
                 f"OpenRouter timeout after {settings.openrouter_timeout}s "
@@ -161,12 +186,16 @@ class OpenRouterService:
         *,
         preset_key: str | None = None,
         tier: Tier = "big",
+        response_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> Any:
         entry = cls._resolve_entry(preset_key=preset_key, tier=tier)
         raw = cls._chat(
             prompt,
             entry=entry,
             system="You must respond with valid JSON only. No markdown fences, no explanation.",
+            response_schema=response_schema,
+            schema_name=schema_name,
         )
         return cls._parse_json_value(raw)
 
@@ -195,8 +224,16 @@ class OpenRouterService:
         *,
         preset_key: str | None = None,
         tier: Tier = "big",
+        response_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
     ) -> dict[str, Any]:
-        parsed = cls.generate_json_value(prompt, preset_key=preset_key, tier=tier)
+        parsed = cls.generate_json_value(
+            prompt,
+            preset_key=preset_key,
+            tier=tier,
+            response_schema=response_schema,
+            schema_name=schema_name,
+        )
         if isinstance(parsed, dict):
             return parsed
         raise RuntimeError("OpenRouter JSON response must be a JSON object")
