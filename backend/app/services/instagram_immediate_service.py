@@ -181,7 +181,37 @@ class InstagramImmediateService:
         video_path: Path | None,
         video_url: str | None,
     ) -> tuple[str | None, str | None]:
-        """Returns (container_id, error_detail)."""
+        """Returns (container_id, error_detail).
+
+        video_url ingest is tried FIRST: the prepared Drive artifact is
+        already public, Meta's ingest is tolerant of it, and the resumable
+        rupload endpoint intermittently 400s (ProcessingFailedError) on files
+        that skipped the VPS publisher's extra IG normalization pass —
+        observed live 2026-08-20. rupload of the local file stays as the
+        fallback."""
+        ingest_error: str | None = None
+        if video_url:
+            try:
+                container_id, _ = cls._create_container(
+                    client,
+                    base=base,
+                    ig_user_id=ig_user_id,
+                    ig_access_token=ig_access_token,
+                    caption=caption,
+                    share_to_feed=share_to_feed,
+                    upload_method="video_url",
+                    video_url=video_url,
+                )
+                return container_id, None
+            except httpx.HTTPStatusError as e:
+                ingest_error = f"video_url container: {_response_detail(e.response)}"
+            except (httpx.HTTPError, KeyError, ValueError) as e:
+                ingest_error = f"video_url container: {type(e).__name__}: {e}"
+            logger.warning(
+                "Instagram immediate video_url ingest failed (%s); trying rupload",
+                ingest_error,
+            )
+
         rupload_error: str | None = None
         if video_path is not None and video_path.exists():
             try:
@@ -219,32 +249,9 @@ class InstagramImmediateService:
                 rupload_error = f"rupload container: {_response_detail(e.response)}"
             except (httpx.HTTPError, KeyError, ValueError, OSError) as e:
                 rupload_error = f"rupload: {type(e).__name__}: {e}"
-            logger.warning(
-                "Instagram immediate rupload failed (%s); trying video_url ingest",
-                rupload_error,
-            )
 
-        if video_url:
-            try:
-                container_id, _ = cls._create_container(
-                    client,
-                    base=base,
-                    ig_user_id=ig_user_id,
-                    ig_access_token=ig_access_token,
-                    caption=caption,
-                    share_to_feed=share_to_feed,
-                    upload_method="video_url",
-                    video_url=video_url,
-                )
-                return container_id, None
-            except httpx.HTTPStatusError as e:
-                detail = f"video_url container: {_response_detail(e.response)}"
-            except (httpx.HTTPError, KeyError, ValueError) as e:
-                detail = f"video_url container: {type(e).__name__}: {e}"
-            if rupload_error:
-                detail = f"{rupload_error}; {detail}"
-            return None, detail
-        return None, rupload_error or "no video source"
+        detail = "; ".join(x for x in (ingest_error, rupload_error) if x)
+        return None, detail or "no video source"
 
     @classmethod
     def _poll_finished(

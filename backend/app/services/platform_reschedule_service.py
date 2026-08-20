@@ -152,7 +152,13 @@ class PlatformRescheduleService:
         video_id = cls._youtube_video_id(url)
         if not video_id:
             return NotificationResult(status="skipped")
-        creds = AccountService.get_youtube_credentials(project.scheduled_account_id)
+        try:
+            creds = AccountService.get_youtube_credentials(project.scheduled_account_id)
+        except ValueError as exc:
+            # Permanent config gap (account has no YouTube credentials):
+            # retrying can never succeed — surface and skip instead of
+            # feeding the retry loop forever.
+            return NotificationResult(status="skipped", error=str(exc))
         youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
         body = {
             "id": video_id,
@@ -363,7 +369,10 @@ class PlatformRescheduleService:
         video_id = cls._youtube_video_id(url)
         if not video_id:
             return NotificationResult(status="skipped")
-        creds = AccountService.get_youtube_credentials(project.scheduled_account_id)
+        try:
+            creds = AccountService.get_youtube_credentials(project.scheduled_account_id)
+        except ValueError as exc:
+            return NotificationResult(status="skipped", error=str(exc))
         youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
         body = {
             "id": video_id,

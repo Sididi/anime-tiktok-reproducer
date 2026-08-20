@@ -103,13 +103,17 @@ def _dispatch_worthwhile(job: Job, platform: str) -> bool:
             return False
         return status.status not in ("uploaded", "failed", "skipped")
     # instagram
+    if status.status in ("uploaded", "skipped"):
+        return False
     if not job.instagram_payload:
-        logger.warning(
-            "Job %s has 'instagram' in platforms_requested but no instagram_payload",
+        # Expected for display-only rows (2026-08): an urgent-immediate
+        # Instagram publish is backend-side — the row exists on the job for
+        # the Discord embed but carries no payload and is never dispatched.
+        logger.debug(
+            "Job %s has 'instagram' in platforms_requested but no instagram_payload "
+            "(display-only row)",
             job.project_id,
         )
-        return False
-    if status.status in ("uploaded", "skipped"):
         return False
     if status.status == "failed":
         if _should_retry_recoverable_instagram_failure(status):

@@ -77,22 +77,24 @@ def test_no_upfront_skip_with_pfm_id():
     assert "tiktok" not in skips
 
 
-def test_vps_platforms_never_includes_tiktok_since_pfm_migration():
-    """2026-08 PFM migration: TikTok never joins the VPS job — the backend
-    creates the PFM post itself (_publish_tiktok_via_pfm)."""
+def test_vps_platforms_includes_tiktok_row_for_embed():
+    """TikTok stays in the VPS job's platform list so the Discord embed
+    shows its row; the backend publishes it (no payload is sent, so the
+    server never dispatches it)."""
     account = _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
     payload = {"social_account_id": "spc_1", "caption": "c"}
     platforms = UploadPhaseService._vps_platforms(
         ("youtube", "facebook", "instagram"), account, payload
     )
-    assert platforms == ["youtube", "facebook", "instagram"]
+    assert platforms == ["youtube", "facebook", "instagram", "tiktok"]
+    assert platforms.count("tiktok") == 1
 
 
-def test_vps_platforms_strips_stray_tiktok():
+def test_vps_platforms_no_duplicate_tiktok():
     account = _account(AccountTikTokConfig(post_for_me_account_id="spc_1"))
     payload = {"social_account_id": "spc_1", "caption": "c"}
     platforms = UploadPhaseService._vps_platforms(("tiktok",), account, payload)
-    assert platforms == []
+    assert platforms == ["tiktok"]
 
 
 def test_vps_platforms_no_tiktok_without_block():

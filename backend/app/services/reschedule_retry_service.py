@@ -22,10 +22,14 @@ _POLL_INTERVAL_SECONDS = 60
 
 
 async def _post_discord_alert(message: str) -> None:
-    """Best-effort Discord alert — silenced on error."""
+    """Best-effort Discord alert — silenced on error.
+
+    (2026-08 fix: this used to call a nonexistent DiscordService.post_alert,
+    so the max-retries alert never actually reached Discord.)"""
     try:
         from .discord_service import DiscordService  # noqa: PLC0415
-        await DiscordService.post_alert(message)
+
+        await asyncio.to_thread(DiscordService.post_message, message)
     except Exception as exc:  # pragma: no cover - best-effort
         logger.warning("Discord alert failed: %s", exc)
 
@@ -72,6 +76,17 @@ class RescheduleRetryService:
                     PlatformRescheduleService.notify, project, platform, target
                 )
                 if result.status == "ok":
+                    pending.pop(platform, None)
+                    updated = True
+                    continue
+                if result.status == "skipped":
+                    # Permanent condition (no video / no platform config /
+                    # immutable post): retrying can never succeed.
+                    logger.warning(
+                        "Dropping unretriable reschedule notification: "
+                        "project=%s platform=%s detail=%s",
+                        project.id, platform, result.error,
+                    )
                     pending.pop(platform, None)
                     updated = True
                     continue

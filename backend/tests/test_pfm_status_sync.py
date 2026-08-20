@@ -52,6 +52,15 @@ def test_sync_marks_published_and_persists_result(projects_dir, monkeypatch):
             )
         ),
     )
+    embed_updates: list[tuple] = []
+    monkeypatch.setattr(
+        "app.services.discord_service.DiscordService.update_job_platform",
+        classmethod(
+            lambda cls, project_id, platform, **kw: embed_updates.append(
+                (project_id, platform, kw)
+            )
+        ),
+    )
     PfmStatusSyncService.sync_once()
     saved = ProjectService.load("p1")
     assert saved.tiktok_pfm.stage == "published"
@@ -63,6 +72,18 @@ def test_sync_marks_published_and_persists_result(projects_dir, monkeypatch):
     )
     assert entry["status"] == "uploaded"
     assert entry["source"] == "pfm"
+    # The Discord embed's TikTok row gets the post URL.
+    assert embed_updates == [
+        (
+            "p1",
+            "tiktok",
+            {
+                "status": "uploaded",
+                "url": "https://www.tiktok.com/@u/video/1",
+                "detail": None,
+            },
+        )
+    ]
 
 
 def test_sync_skips_not_yet_due_posts(projects_dir, monkeypatch):

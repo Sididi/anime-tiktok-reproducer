@@ -97,6 +97,25 @@ def test_retry_alerts_after_5_failures(project_dir):
     assert "youtube" in project.reschedule_pending
 
 
+def test_retry_drops_unretriable_skipped_entries(project_dir):
+    """A permanently-skipped notification (e.g. account lost its YouTube
+    config) must leave the pending map instead of retrying forever."""
+    target = datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    _seed("p1", target, retries=2,
+          last_attempt=datetime.now(timezone.utc) - timedelta(hours=2))
+
+    with patch(
+        "app.services.reschedule_retry_service.PlatformRescheduleService.notify",
+        return_value=NotificationResult(
+            status="skipped", error="No YouTube config for account acc_x"
+        ),
+    ):
+        asyncio.run(RescheduleRetryService.run_once())
+
+    project = ProjectService.load("p1")
+    assert project.reschedule_pending == {}
+
+
 def test_retry_skips_when_backoff_not_elapsed(project_dir):
     target = datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
     _seed("p1", target, retries=0,

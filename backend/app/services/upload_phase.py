@@ -782,28 +782,23 @@ class UploadPhaseService:
         account: AccountConfig | None,
         tiktok_payload: dict[str, Any] | None,
     ) -> list[str]:
-        """Platforms recorded on the VPS job.
+        """Platforms recorded on the VPS job (= the Discord embed's rows).
 
-        2026-08: TikTok no longer joins the VPS job — the backend creates the
-        PFM scheduled post directly at upload time (see _publish_tiktok_via_pfm
-        / post_for_me_client.py). The old join logic is kept commented below
-        per owner instruction (never delete)."""
+        Every targeted platform joins the list so the embed shows a row (with
+        its post URL pushed via update_job_platform as results land). Since
+        the 2026-08 PFM migration the server only DISPATCHES platforms whose
+        payload is present on the job: TikTok is backend-published (its
+        payload is never sent — see _publish_tiktok_via_pfm), and an
+        urgent-immediate Instagram row arrives without a payload too."""
         platforms = list(requested_platforms)
         if "tiktok" in platforms:
-            # tiktok is not in _SUPPORTED_PLATFORMS; defensive strip in case a
-            # caller ever passes it through.
-            platforms = [p for p in platforms if p != "tiktok"]
-        # --- legacy VPS TikTok join (pre 2026-08 PFM migration) -------------
-        # if "tiktok" in platforms:
-        #     return platforms
-        # if tiktok_payload is not None or (
-        #     account is not None
-        #     and account.tiktok is not None
-        #     and account.slots_for("tiktok")
-        # ):
-        #     platforms.append("tiktok")
-        # ---------------------------------------------------------------------
-        del account, tiktok_payload  # kept in the signature for the legacy path
+            return platforms
+        if tiktok_payload is not None or (
+            account is not None
+            and account.tiktok is not None
+            and account.slots_for("tiktok")
+        ):
+            platforms.append("tiktok")
         return platforms
 
     @classmethod
@@ -1341,10 +1336,6 @@ class UploadPhaseService:
         direct_drive_download = GoogleDriveService.get_direct_download_url(drive_video_id)
 
         vps_platforms = cls._vps_platforms(requested_platforms, account, tiktok_payload)
-        if "instagram" in immediate:
-            # Urgent-immediate Instagram publishes from the backend — keep it
-            # off the VPS job so the server never double-publishes.
-            vps_platforms = [p for p in vps_platforms if p != "instagram"]
         tiktok_enrolled = cls._tiktok_enrolled(account, tiktok_payload)
         results_by_platform: dict[str, PlatformUploadResult] = dict(
             cls._compute_upfront_skips(requested_platforms, account)
@@ -1673,6 +1664,10 @@ class UploadPhaseService:
             timed_out_platforms = False
             abort_platform_jobs = False
             try:
+                # All platform jobs run in parallel — including in the
+                # urgent-immediate mode (owner decision 2026-08-20: no
+                # TikTok-first gating; publish order across platforms is
+                # whatever each platform's processing yields).
                 future_to_platform = {
                     executor.submit(job): platform
                     for platform, job in selected_jobs.items()
@@ -1730,13 +1725,17 @@ class UploadPhaseService:
                         _ig_drive_url = instagram_drive_metadata.get(
                             "instagram_drive_video_url"
                         )
-                        ig_immediate_future = executor.submit(
-                            cls._publish_instagram_immediate,
-                            payload=_ig_payload_now,
-                            video_path=_ig_local,
-                            video_url=_ig_drive_url,
+
+                        def _ig_publish_now() -> PlatformUploadResult:
+                            return cls._publish_instagram_immediate(
+                                payload=_ig_payload_now,
+                                video_path=_ig_local,
+                                video_url=_ig_drive_url,
+                            )
+
+                        future_to_platform[executor.submit(_ig_publish_now)] = (
+                            "instagram"
                         )
-                        future_to_platform[ig_immediate_future] = "instagram"
                         ig_payload = None  # never reaches the VPS job
                     else:
                         ig_payload["prepared_video_url"] = instagram_drive_metadata[
@@ -1792,6 +1791,19 @@ class UploadPhaseService:
                         or project.scheduled_at
                         or datetime.now(timezone.utc)
                     )
+                    # Seed in-flight immediate platforms as "uploading" so the
+                    # embed shows their rows right away; the real result (URL /
+                    # failure) lands via update_job_platform when each job ends.
+                    seeded_statuses = cls._platform_status_payload(results_by_platform)
+                    for _p in immediate:
+                        seeded_statuses.setdefault(
+                            _p,
+                            {
+                                "status": "uploading",
+                                "url": None,
+                                "detail": "Publication immédiate en cours",
+                            },
+                        )
                     job_response = DiscordService.create_job(
                         project_id=project_id,
                         # Use the live account_id arg (validated above), not
@@ -1811,7 +1823,7 @@ class UploadPhaseService:
                         tiktok=None,
                         facebook=fb_payload,
                         platform_scheduled_at=platform_scheduled_at,
-                        platform_statuses=cls._platform_status_payload(results_by_platform),
+                        platform_statuses=seeded_statuses,
                     )
                 except Exception:
                     logger.warning(

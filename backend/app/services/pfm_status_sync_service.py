@@ -122,6 +122,7 @@ class PfmStatusSyncService:
                 state.last_error = None
                 project.tiktok_pfm = state
                 cls._persist_result(project, status="uploaded", url=outcome.url, detail=None)
+                cls._update_embed(project, status="uploaded", url=outcome.url, detail=None)
                 logger.info(
                     "PFM TikTok publish confirmed project=%s url=%s", project.id, outcome.url
                 )
@@ -130,6 +131,9 @@ class PfmStatusSyncService:
                 state.last_error = outcome.detail
                 project.tiktok_pfm = state
                 cls._persist_result(
+                    project, status="failed", url=None, detail=outcome.detail
+                )
+                cls._update_embed(
                     project, status="failed", url=None, detail=outcome.detail
                 )
                 cls._ping_failure(project, outcome.detail)
@@ -178,6 +182,20 @@ class PfmStatusSyncService:
         result["platforms"] = entries
         project.upload_last_result = result
         cls._save_quiet(project)
+
+    @classmethod
+    def _update_embed(
+        cls, project, *, status: str, url: str | None, detail: str | None
+    ) -> None:
+        """Refresh the Discord embed's TikTok row (best-effort, swallowed)."""
+        try:
+            from .discord_service import DiscordService  # noqa: PLC0415
+
+            DiscordService.update_job_platform(
+                project.id, "tiktok", status=status, url=url, detail=detail
+            )
+        except Exception:  # pragma: no cover - best-effort
+            logger.warning("PFM embed update failed for %s", project.id, exc_info=True)
 
     @classmethod
     def _ping_failure(cls, project, detail: str | None) -> None:
