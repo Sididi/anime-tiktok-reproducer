@@ -67,6 +67,32 @@ DUPLICATE_MICRO_MAX_SECONDS = 0.65
 DUPLICATE_MICRO_DETECTOR_MAX_SECONDS = 0.50
 DUPLICATE_MICRO_CONFIDENCE_MARGIN = 0.08
 DUPLICATE_REGION_MIN_SECONDS = 0.40
+# A two-probe consensus is normally too small to replace a beam track.  It is
+# sufficient for a sub-0.75s *same-episode* duplicate when it wins clearly:
+# changing episode on so little evidence could erase a real short edit.
+MICRO_DOMINANT_MAX_SECONDS = 0.75
+MICRO_DOMINANT_MIN_SUPPORT = 2
+MICRO_DOMINANT_CONFIDENCE_MARGIN = 0.07
+# The first detector fragment has no left-hand continuity evidence.  Permit a
+# slightly wider duplicate repair only there, and only when a strong retrieved
+# start anchor also agrees with the following supported track.
+OPENING_DUPLICATE_MAX_SECONDS = 0.65
+OPENING_DUPLICATE_FOLLOWING_MIN_CONFIDENCE = 0.45
+OPENING_DUPLICATE_ANCHOR_MIN_CONFIDENCE = 0.60
+OPENING_DUPLICATE_ANCHOR_MARGIN = 0.15
+OPENING_DUPLICATE_PROPOSAL_JOIN_SECONDS = 2.0
+OPENING_DUPLICATE_ANCHOR_QUERY_SECONDS = 0.15
+# Post-verification repairs use already-paid retrieval/track evidence.  Their
+# gates are deliberately stronger than the ordinary assembly heuristics.
+STRONG_ABSTENTION_MIN_SUPPORT = 3
+STRONG_ABSTENTION_MIN_CONFIDENCE = 0.55
+FLANK_ISLAND_MAX_SECONDS = 1.10
+FLANK_ISLAND_MAX_CONFIDENCE = 0.50
+FLANK_MIN_INLIERS_PER_SIDE = 2
+FLANK_MIN_TOTAL_INLIERS = 8
+FLANK_MIN_INLIER_RATIO = 0.70
+FLANK_MAX_MEDIAN_RESIDUAL_SECONDS = 0.36
+FLANK_HYPOTHESIS_POINTS_PER_SIDE = 12
 # Source index timestamps are spaced at 0.5s.  Affine extrapolation from a
 # short track can therefore land well before the first retrieved frame even
 # when that frame is the first one from the correct source shot.  Keep only a
@@ -374,6 +400,41 @@ class HierarchicalMatcherService:
         diagnostics.phase_timings["v2_native_verify"] = time.perf_counter() - started
         diagnostics.counters["native_source_seconds"] = native_seconds
         diagnostics.counters["variant_embeddings"] = float(variant_count)
+
+        # Keep the new collapse/abstention rescues after native arbitration.
+        # In addition to avoiding another expensive pass, this preserves its
+        # deterministic job ordering and budget for every unrelated segment:
+        # collapsing an opening fragment beforehand would otherwise free a
+        # verification job and could change a remote duplicate decision.
+        before_opening_duplicate = len(segments)
+        segments = cls._repair_opening_duplicate_region(
+            segments,
+            candidates,
+            samples,
+        )
+        diagnostics.counters["opening_duplicate_repairs"] = float(
+            max(0, before_opening_duplicate - len(segments))
+        )
+        before_flank_bridge = len(segments)
+        segments = cls._repair_supported_flank_islands(segments)
+        diagnostics.counters["supported_flank_bridges"] = float(
+            max(0, before_flank_bridge - len(segments)) // 2
+        )
+        abstained_before_rescue = sum(
+            segment.episode is None for segment in segments
+        )
+        segments = cls._rescue_strong_abstentions(
+            segments,
+            candidates,
+            samples,
+        )
+        diagnostics.counters["strong_abstention_rescues"] = float(
+            max(
+                0,
+                abstained_before_rescue
+                - sum(segment.episode is None for segment in segments),
+            )
+        )
 
         # Native arbitration can replace one side of a formerly discontinuous
         # pair with the adjacent affine track.  Re-run the same strict
@@ -1810,10 +1871,21 @@ class HierarchicalMatcherService:
                 >= 2.0
             )
             required = max(3, int(math.ceil(len(segment.points) * 0.80)))
+            ordinary_consensus = (
+                proposal.support >= required
+                and proposal.confidence >= segment.confidence + 0.05
+            )
+            micro_duplicate_consensus = (
+                segment.q_end - segment.q_start <= MICRO_DOMINANT_MAX_SECONDS
+                and proposal.episode == segment.episode
+                and proposal.support >= MICRO_DOMINANT_MIN_SUPPORT
+                and proposal.support > len(segment.points)
+                and proposal.confidence
+                >= segment.confidence + MICRO_DOMINANT_CONFIDENCE_MARGIN
+            )
             if (
                 distinct
-                and proposal.support >= required
-                and proposal.confidence >= segment.confidence + 0.05
+                and (ordinary_consensus or micro_duplicate_consensus)
             ):
                 promoted = cls._segment_from_proposal(
                     segment,
@@ -1829,6 +1901,54 @@ class HierarchicalMatcherService:
                 output.append(promoted)
             else:
                 output.append(segment)
+        return output
+
+    @classmethod
+    def _rescue_strong_abstentions(
+        cls,
+        segments: list[TrackSegment],
+        candidates: list[list[RetrievalCandidate]],
+        samples: list[QueryFrame],
+    ) -> list[TrackSegment]:
+        """Resolve an abstention only when three probes agree strongly.
+
+        This runs after bounded native verification.  A single native midpoint
+        can be weak under a crop or transition, while three independently
+        sampled retrieval probes describe a supported timeline.  Anything
+        below this certificate remains an honest no-match.
+        """
+        output: list[TrackSegment] = []
+        for segment in segments:
+            if segment.episode is not None:
+                output.append(segment)
+                continue
+            proposals = cls._line_proposals(segment, candidates, samples)
+            if not proposals:
+                output.append(segment)
+                continue
+            proposal = proposals[0]
+            if (
+                proposal.support < STRONG_ABSTENTION_MIN_SUPPORT
+                or proposal.confidence < STRONG_ABSTENTION_MIN_CONFIDENCE
+            ):
+                output.append(segment)
+                continue
+            replacement = cls._segment_from_proposal(
+                segment,
+                segment.q_start,
+                segment.q_end,
+                proposal,
+                candidates,
+                samples,
+            )
+            replacement.uncertain = True
+            replacement.doubt_reasons = sorted(
+                set(
+                    replacement.doubt_reasons
+                    + ["strong_retrieval_rescue"]
+                )
+            )
+            output.append(replacement)
         return output
 
     @classmethod
@@ -2162,6 +2282,391 @@ class HierarchicalMatcherService:
             else:
                 result[index + 1] = extended
                 result.pop(index)
+        return result
+
+    @staticmethod
+    def _weighted_affine_fit(
+        points: list[RetrievalCandidate],
+    ) -> tuple[float, float] | None:
+        """Fit an affine line without the ordinary unit-rate preference."""
+        if len(points) < 2:
+            return None
+        x = np.asarray([point.t_query for point in points], dtype=np.float64)
+        y = np.asarray([point.t_source for point in points], dtype=np.float64)
+        w = np.asarray(
+            [max(0.05, point.similarity) ** 2 for point in points],
+            dtype=np.float64,
+        )
+        x_mean = float(np.average(x, weights=w))
+        y_mean = float(np.average(y, weights=w))
+        denominator = float(np.sum(w * (x - x_mean) ** 2))
+        if denominator <= 1e-9:
+            return None
+        rate = float(np.sum(w * (x - x_mean) * (y - y_mean)) / denominator)
+        offset = y_mean - rate * x_mean
+        return rate, offset
+
+    @staticmethod
+    def _bounded_hypothesis_points(
+        points: list[RetrievalCandidate],
+    ) -> list[RetrievalCandidate]:
+        """Return deterministic, evenly spaced points for bounded pair seeding."""
+        if len(points) <= FLANK_HYPOTHESIS_POINTS_PER_SIDE:
+            return points
+        indices = np.linspace(
+            0,
+            len(points) - 1,
+            FLANK_HYPOTHESIS_POINTS_PER_SIDE,
+        )
+        return [
+            points[index]
+            for index in sorted({int(round(value)) for value in indices})
+        ]
+
+    @classmethod
+    def _fit_supported_flanks(
+        cls,
+        left: TrackSegment,
+        right: TrackSegment,
+    ) -> tuple[float, float, float, list[RetrievalCandidate]] | None:
+        """Find one robust affine line supported independently on both flanks."""
+        if left.episode is None or left.episode != right.episode:
+            return None
+        left_points = sorted(
+            (
+                point
+                for point in left.points
+                if point.episode == left.episode
+            ),
+            key=lambda point: point.t_query,
+        )
+        right_points = sorted(
+            (
+                point
+                for point in right.points
+                if point.episode == left.episode
+            ),
+            key=lambda point: point.t_query,
+        )
+        if (
+            len(left_points) < FLANK_MIN_INLIERS_PER_SIDE
+            or len(right_points) < FLANK_MIN_INLIERS_PER_SIDE
+        ):
+            return None
+
+        points = left_points + right_points
+        hypotheses: list[tuple[float, float]] = [
+            (left.a, left.b),
+            (right.a, right.b),
+        ]
+        pooled = cls._weighted_affine_fit(points)
+        if pooled is not None:
+            hypotheses.append(pooled)
+        for first in cls._bounded_hypothesis_points(left_points):
+            for last in cls._bounded_hypothesis_points(right_points):
+                query_delta = last.t_query - first.t_query
+                if query_delta <= 1e-9:
+                    continue
+                rate = (last.t_source - first.t_source) / query_delta
+                if MIN_SOURCE_RATE <= rate <= MAX_SOURCE_RATE:
+                    hypotheses.append(
+                        (rate, first.t_source - rate * first.t_query)
+                    )
+
+        unique_hypotheses: dict[tuple[float, float], tuple[float, float]] = {}
+        for rate, offset in hypotheses:
+            if MIN_SOURCE_RATE <= rate <= MAX_SOURCE_RATE:
+                unique_hypotheses.setdefault(
+                    (round(rate, 6), round(offset, 4)),
+                    (rate, offset),
+                )
+
+        best: tuple[
+            tuple[int, int, float, float],
+            float,
+            float,
+            float,
+            list[RetrievalCandidate],
+        ] | None = None
+        left_count = len(left_points)
+        for rate, offset in unique_hypotheses.values():
+            inliers: list[RetrievalCandidate] = []
+            for _ in range(2):
+                inliers = [
+                    point
+                    for point in points
+                    if abs(point.t_source - (rate * point.t_query + offset))
+                    <= TRACK_RESIDUAL_SECONDS
+                ]
+                refined = cls._weighted_affine_fit(inliers)
+                if refined is None:
+                    break
+                rate, offset = refined
+                if not MIN_SOURCE_RATE <= rate <= MAX_SOURCE_RATE:
+                    inliers = []
+                    break
+            if not inliers or not MIN_SOURCE_RATE <= rate <= MAX_SOURCE_RATE:
+                continue
+
+            residuals = [
+                abs(point.t_source - (rate * point.t_query + offset))
+                for point in points
+            ]
+            mask = [value <= TRACK_RESIDUAL_SECONDS for value in residuals]
+            left_inliers = sum(mask[:left_count])
+            right_inliers = sum(mask[left_count:])
+            total_inliers = left_inliers + right_inliers
+            if (
+                left_inliers < FLANK_MIN_INLIERS_PER_SIDE
+                or right_inliers < FLANK_MIN_INLIERS_PER_SIDE
+                or total_inliers < FLANK_MIN_TOTAL_INLIERS
+                or total_inliers / len(points) < FLANK_MIN_INLIER_RATIO
+            ):
+                continue
+            median_residual = float(
+                np.median(
+                    [
+                        residual
+                        for residual, selected in zip(
+                            residuals, mask, strict=False
+                        )
+                        if selected
+                    ]
+                )
+            )
+            if median_residual > FLANK_MAX_MEDIAN_RESIDUAL_SECONDS:
+                continue
+            selected_points = [
+                point
+                for point, selected in zip(points, mask, strict=False)
+                if selected
+            ]
+            score = (
+                total_inliers,
+                min(left_inliers, right_inliers),
+                sum(point.similarity for point in selected_points),
+                -median_residual,
+            )
+            candidate = (
+                score,
+                rate,
+                offset,
+                median_residual,
+                selected_points,
+            )
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+
+        if best is None:
+            return None
+        _, rate, offset, residual, inliers = best
+        return rate, offset, residual, sorted(
+            inliers,
+            key=lambda point: point.t_query,
+        )
+
+    @classmethod
+    def _repair_supported_flank_islands(
+        cls,
+        segments: list[TrackSegment],
+    ) -> list[TrackSegment]:
+        """Replace only short, disproved islands between one robust track.
+
+        Unlike the ordinary weak-fragment absorber, this accepts an island up
+        to 1.1s and does not require weak-similarity labelling.  In exchange it
+        requires eight selected-track inliers, independent support on both
+        sides, and one low-residual affine line across the complete gap.
+        """
+        result = list(segments)
+        index = 1
+        while index + 1 < len(result):
+            left, island, right = result[index - 1 : index + 2]
+            duration = island.q_end - island.q_start
+            if (
+                duration <= 0.0
+                or duration > FLANK_ISLAND_MAX_SECONDS
+                or island.confidence > FLANK_ISLAND_MAX_CONFIDENCE
+                or left.episode is None
+                or right.episode != left.episode
+            ):
+                index += 1
+                continue
+            fitted = cls._fit_supported_flanks(left, right)
+            if fitted is None:
+                index += 1
+                continue
+            rate, offset, residual, points = fitted
+            midpoint = 0.5 * (island.q_start + island.q_end)
+            incompatible = (
+                island.episode != left.episode
+                or abs(
+                    island.source_at(midpoint)
+                    - (rate * midpoint + offset)
+                )
+                > 2.0
+            )
+            if not incompatible:
+                index += 1
+                continue
+
+            confidence = float(
+                np.median([point.similarity for point in points])
+            )
+            recomputed = {"weak_similarity", "sparse_support", "timing_residual"}
+            reasons = {
+                reason
+                for segment in (left, island, right)
+                for reason in segment.doubt_reasons
+                if reason not in recomputed
+            }
+            reasons.add("supported_flank_bridge")
+            if confidence < 0.36:
+                reasons.add("weak_similarity")
+            merged = TrackSegment(
+                q_start=left.q_start,
+                q_end=right.q_end,
+                episode=left.episode,
+                a=rate,
+                b=offset,
+                points=points,
+                confidence=confidence,
+                residual=residual,
+                uncertain=True,
+                doubt_reasons=sorted(reasons),
+            )
+            result[index - 1 : index + 2] = [merged]
+            index = max(1, index - 1)
+        return result
+
+    @classmethod
+    def _repair_opening_duplicate_region(
+        cls,
+        segments: list[TrackSegment],
+        candidates: list[list[RetrievalCandidate]],
+        samples: list[QueryFrame],
+    ) -> list[TrackSegment]:
+        """Anchor a disputed opening fragment to its strong start candidate.
+
+        This is deliberately restricted to query time zero.  Applying the
+        wider 0.65s allowance to interior fragments regresses valid cuts; at
+        the opening edge there is no left track, so a strong retrieved anchor
+        plus right-hand continuity is the missing certificate.
+        """
+        result = list(segments)
+        if len(result) < 2:
+            return result
+        micro, following = result[:2]
+        duration = micro.q_end - micro.q_start
+        if (
+            abs(micro.q_start) > 1e-3
+            or not DUPLICATE_REGION_MIN_SECONDS
+            <= duration
+            <= OPENING_DUPLICATE_MAX_SECONDS
+            or micro.episode is None
+            or following.episode != micro.episode
+            or following.q_end - following.q_start < 1.0
+            or following.confidence
+            < OPENING_DUPLICATE_FOLLOWING_MIN_CONFIDENCE
+            or "duplicate_margin" not in micro.doubt_reasons
+            or abs(
+                following.source_at(micro.q_end)
+                - micro.source_at(micro.q_end)
+            )
+            < 2.0
+        ):
+            return result
+
+        aligned = [
+            proposal
+            for proposal in cls._line_proposals(micro, candidates, samples)
+            if proposal.episode == following.episode
+            and proposal.confidence >= OPENING_DUPLICATE_ANCHOR_MIN_CONFIDENCE
+            and proposal.confidence
+            >= micro.confidence + OPENING_DUPLICATE_ANCHOR_MARGIN
+            and abs(
+                proposal.source_at(micro.q_end)
+                - following.source_at(micro.q_end)
+            )
+            <= OPENING_DUPLICATE_PROPOSAL_JOIN_SECONDS
+            and abs(
+                proposal.source_at(0.5 * (micro.q_start + micro.q_end))
+                - micro.source_at(0.5 * (micro.q_start + micro.q_end))
+            )
+            >= 2.0
+        ]
+        if not aligned:
+            return result
+        anchor = max(
+            aligned,
+            key=lambda proposal: (proposal.confidence, proposal.support),
+        )
+        anchor_segment = cls._segment_from_proposal(
+            micro,
+            micro.q_start,
+            micro.q_end,
+            anchor,
+            candidates,
+            samples,
+        )
+        opening_points = [
+            point
+            for point in anchor_segment.points
+            if point.t_query
+            <= micro.q_start + OPENING_DUPLICATE_ANCHOR_QUERY_SECONDS
+            and point.similarity >= OPENING_DUPLICATE_ANCHOR_MIN_CONFIDENCE
+        ]
+        if not opening_points:
+            return result
+
+        source_start = anchor.source_at(micro.q_start)
+        source_end = following.source_at(following.q_end)
+        query_span = following.q_end - micro.q_start
+        if source_end <= source_start or query_span <= 1e-9:
+            return result
+        rate = (source_end - source_start) / query_span
+        if not MIN_SOURCE_RATE <= rate <= MAX_SOURCE_RATE:
+            return result
+        offset = source_start - rate * micro.q_start
+        if abs(
+            (rate * micro.q_end + offset)
+            - following.source_at(micro.q_end)
+        ) > TRACK_RESIDUAL_SECONDS:
+            return result
+
+        points = sorted(
+            anchor_segment.points + following.points,
+            key=lambda point: point.t_query,
+        )
+        residual = float(
+            np.median(
+                [
+                    abs(point.t_source - (rate * point.t_query + offset))
+                    for point in points
+                ]
+            )
+        )
+        confidence = float(
+            np.median([point.similarity for point in points])
+        )
+        reasons = set(micro.doubt_reasons + following.doubt_reasons)
+        reasons.discard("timing_residual")
+        reasons.add("opening_duplicate_anchored")
+        if residual > 0.45:
+            reasons.add("timing_residual")
+        result[:2] = [
+            TrackSegment(
+                q_start=micro.q_start,
+                q_end=following.q_end,
+                episode=following.episode,
+                a=rate,
+                b=offset,
+                points=points,
+                confidence=confidence,
+                residual=residual,
+                uncertain=True,
+                doubt_reasons=sorted(reasons),
+            )
+        ]
         return result
 
     @classmethod

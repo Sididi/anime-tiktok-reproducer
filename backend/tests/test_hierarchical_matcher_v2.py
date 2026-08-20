@@ -462,6 +462,83 @@ def test_weak_micro_fragment_does_not_bridge_discontinuous_flanks():
     assert merged == segments
 
 
+def test_supported_flanks_replace_a_short_wrong_duplicate_island():
+    left_points = [
+        _candidate(index, 0.25 * index, 50.0 + 1.5 * 0.25 * index)
+        for index in range(4)
+    ]
+    right_points = [
+        _candidate(
+            index + 4,
+            1.5 + 0.25 * index,
+            50.0 + 1.5 * (1.5 + 0.25 * index),
+        )
+        for index in range(4)
+    ]
+    segments = [
+        TrackSegment(
+            0.0,
+            1.0,
+            "episode-1",
+            1.5,
+            50.0,
+            points=left_points,
+            confidence=0.64,
+        ),
+        TrackSegment(
+            1.0,
+            1.5,
+            "episode-1",
+            1.0,
+            700.0,
+            points=[_candidate(8, 1.25, 701.25)],
+            confidence=0.46,
+        ),
+        TrackSegment(
+            1.5,
+            2.5,
+            "episode-1",
+            1.5,
+            50.0,
+            points=right_points,
+            confidence=0.62,
+        ),
+    ]
+
+    repaired = HierarchicalMatcherService._repair_supported_flank_islands(
+        segments
+    )
+
+    assert len(repaired) == 1
+    assert repaired[0].q_start == 0.0
+    assert repaired[0].q_end == 2.5
+    assert repaired[0].a == pytest.approx(1.5, abs=0.05)
+    assert repaired[0].source_at(1.25) == pytest.approx(51.875, abs=0.2)
+    assert "supported_flank_bridge" in repaired[0].doubt_reasons
+
+
+def test_supported_flank_bridge_requires_eight_inliers():
+    left_points = [
+        _candidate(index, 0.25 * index, 50.0 + 0.25 * index)
+        for index in range(3)
+    ]
+    right_points = [
+        _candidate(index + 3, 1.5 + 0.25 * index, 51.5 + 0.25 * index)
+        for index in range(3)
+    ]
+    segments = [
+        TrackSegment(0.0, 1.0, "episode-1", points=left_points, confidence=0.64),
+        TrackSegment(1.0, 1.5, "wrong", 1.0, 700.0, confidence=0.40),
+        TrackSegment(1.5, 2.5, "episode-1", points=right_points, confidence=0.62),
+    ]
+
+    repaired = HierarchicalMatcherService._repair_supported_flank_islands(
+        segments
+    )
+
+    assert repaired == segments
+
+
 def test_short_leading_duplicate_can_pool_into_longer_winning_track():
     micro_points = [
         _candidate(index, 1.0 + 0.2 * index, 901.0 + 0.2 * index)
@@ -503,6 +580,97 @@ def test_short_leading_duplicate_can_pool_into_longer_winning_track():
     assert collapsed[0].q_end == 3.0
     assert collapsed[0].source_at(1.45) == pytest.approx(51.45, abs=0.3)
     assert "duplicate_region_collapsed" in collapsed[0].doubt_reasons
+
+
+def test_opening_duplicate_uses_strong_start_anchor_before_pooling():
+    samples = [_sample(value) for value in (0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5)]
+    candidates = [
+        [
+            _candidate(0, 0.0, 737.0, similarity=0.76),
+            _candidate(0, 0.0, 686.0, similarity=0.45),
+        ],
+        [_candidate(1, 0.25, 686.0, similarity=0.46)],
+        [_candidate(2, 0.5, 686.0, similarity=0.44)],
+        [_candidate(3, 0.75, 739.0, similarity=0.48)],
+        [_candidate(4, 1.0, 739.0, similarity=0.52)],
+        [_candidate(5, 1.5, 739.0, similarity=0.48)],
+        [_candidate(6, 2.0, 740.0, similarity=0.64)],
+        [_candidate(7, 2.5, 740.0, similarity=0.51)],
+    ]
+    micro = TrackSegment(
+        0.0,
+        0.625,
+        "episode-1",
+        1.0,
+        685.63,
+        points=[candidates[1][0], candidates[2][0]],
+        confidence=0.452,
+        uncertain=True,
+        doubt_reasons=["duplicate_margin"],
+    )
+    following = TrackSegment(
+        0.625,
+        2.7333333333333334,
+        "episode-1",
+        1.0,
+        737.9,
+        points=[values[0] for values in candidates[3:]],
+        confidence=0.479,
+        uncertain=True,
+        doubt_reasons=["duplicate_margin"],
+    )
+
+    repaired = HierarchicalMatcherService._repair_opening_duplicate_region(
+        [micro, following], candidates, samples
+    )
+
+    assert len(repaired) == 1
+    source_start, source_end = HierarchicalMatcherService._safe_primary_source_interval(
+        repaired[0]
+    )
+    assert source_start == pytest.approx(737.0, abs=0.05)
+    assert source_end == pytest.approx(740.633, abs=0.2)
+    assert repaired[0].a == pytest.approx(1.33, abs=0.08)
+    assert "opening_duplicate_anchored" in repaired[0].doubt_reasons
+
+
+def test_opening_duplicate_relaxation_never_applies_to_an_interior_fragment():
+    samples = [_sample(value) for value in (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)]
+    candidates = [
+        [_candidate(0, 1.0, 737.0, similarity=0.76)],
+        [_candidate(1, 1.25, 686.0, similarity=0.46)],
+        [_candidate(2, 1.5, 686.0, similarity=0.44)],
+        [_candidate(3, 1.75, 739.0, similarity=0.48)],
+        [_candidate(4, 2.0, 739.0, similarity=0.52)],
+        [_candidate(5, 2.5, 740.0, similarity=0.64)],
+        [_candidate(6, 3.0, 740.0, similarity=0.51)],
+    ]
+    micro = TrackSegment(
+        1.0,
+        1.625,
+        "episode-1",
+        1.0,
+        685.63,
+        points=[candidates[1][0], candidates[2][0]],
+        confidence=0.452,
+        uncertain=True,
+        doubt_reasons=["duplicate_margin"],
+    )
+    following = TrackSegment(
+        1.625,
+        3.2,
+        "episode-1",
+        1.0,
+        737.0,
+        points=[values[0] for values in candidates[3:]],
+        confidence=0.479,
+    )
+
+    repaired = HierarchicalMatcherService._repair_opening_duplicate_region(
+        [micro, following], candidates, samples
+    )
+
+    assert repaired == [micro, following]
 
 
 def test_sub_four_tenths_leading_shot_is_not_pooled():
@@ -599,6 +767,121 @@ def test_top60_consensus_can_replace_a_weaker_primary_track():
     )
     assert promoted[0].source_at(0.5) == pytest.approx(30.5, abs=0.5)
     assert "dominant_retrieval" in promoted[0].doubt_reasons
+
+
+def test_two_point_same_episode_consensus_can_fix_a_micro_duplicate():
+    samples = [_sample(value) for value in (159.5, 160.0)]
+    candidates = [
+        [
+            _candidate(0, 159.5, 1211.5, similarity=0.458),
+            _candidate(0, 159.5, 1058.5, similarity=0.35),
+        ],
+        [
+            _candidate(1, 160.0, 1212.0, similarity=0.45),
+            _candidate(1, 160.0, 1059.0, similarity=0.352),
+        ],
+    ]
+    primary = TrackSegment(
+        159.46666666666667,
+        160.14666666666665,
+        "episode-1",
+        1.0,
+        899.0,
+        points=[candidates[1][1]],
+        confidence=0.352,
+        uncertain=True,
+        doubt_reasons=["duplicate_margin", "weak_similarity"],
+    )
+
+    promoted = HierarchicalMatcherService._promote_dominant_proposals(
+        [primary], candidates, samples
+    )
+
+    assert promoted[0].source_at(160.0) == pytest.approx(1212.0, abs=0.3)
+    assert "dominant_retrieval" in promoted[0].doubt_reasons
+
+
+def test_two_point_micro_consensus_cannot_cross_episode_boundaries():
+    samples = [_sample(value) for value in (10.0, 10.25)]
+    candidates = [
+        [
+            _candidate(0, 10.0, 100.0, episode="episode-2", similarity=0.70),
+            _candidate(0, 10.0, 20.0, similarity=0.50),
+        ],
+        [
+            _candidate(1, 10.25, 100.25, episode="episode-2", similarity=0.70),
+            _candidate(1, 10.25, 20.25, similarity=0.50),
+        ],
+    ]
+    primary = TrackSegment(
+        10.0,
+        10.5,
+        "episode-1",
+        1.0,
+        10.0,
+        points=[values[1] for values in candidates],
+        confidence=0.50,
+    )
+
+    promoted = HierarchicalMatcherService._promote_dominant_proposals(
+        [primary], candidates, samples
+    )
+
+    assert promoted == [primary]
+
+
+def test_strong_multi_probe_proposal_rescues_an_abstained_segment():
+    samples = [_sample(value) for value in (94.25, 94.5, 94.75, 95.0)]
+    candidates = [
+        [
+            _candidate(
+                index,
+                sample.t_query,
+                1130.5 + sample.t_query,
+                episode="episode-14",
+                similarity=0.68,
+                variant="wide_pad",
+            )
+        ]
+        for index, sample in enumerate(samples)
+    ]
+    abstained = TrackSegment(
+        94.2,
+        95.2,
+        None,
+        confidence=0.0,
+        uncertain=True,
+        doubt_reasons=["no_evidence"],
+    )
+
+    rescued = HierarchicalMatcherService._rescue_strong_abstentions(
+        [abstained], candidates, samples
+    )
+
+    assert rescued[0].episode == "episode-14"
+    assert rescued[0].source_at(94.5) == pytest.approx(1225.0, abs=0.3)
+    assert "strong_retrieval_rescue" in rescued[0].doubt_reasons
+
+
+def test_strong_abstention_rescue_requires_three_distinct_probes():
+    samples = [_sample(value) for value in (1.0, 1.25)]
+    candidates = [
+        [_candidate(index, sample.t_query, 30.0 + sample.t_query, similarity=0.75)]
+        for index, sample in enumerate(samples)
+    ]
+    abstained = TrackSegment(
+        1.0,
+        1.5,
+        None,
+        uncertain=True,
+        doubt_reasons=["no_evidence"],
+    )
+
+    rescued = HierarchicalMatcherService._rescue_strong_abstentions(
+        [abstained], candidates, samples
+    )
+
+    assert rescued == [abstained]
 
 
 def test_native_recovery_budget_exhaustion_is_deterministic(monkeypatch):
