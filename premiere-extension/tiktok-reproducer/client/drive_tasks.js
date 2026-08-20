@@ -1701,12 +1701,36 @@ function formatCleanupError(err) {
   return message || code || "Unknown cleanup failure";
 }
 
+function toCleanupFsPath(targetPath) {
+  var normalized = String(targetPath || "").trim();
+  if (
+    process.platform === "win32" &&
+    normalized &&
+    path.toNamespacedPath
+  ) {
+    // CEP's bundled Node runtime does not consistently opt into Win32 long
+    // paths. The extended-length form keeps deeply nested anime filenames
+    // deletable regardless of the machine's LongPathsEnabled policy.
+    return path.toNamespacedPath(path.resolve(normalized));
+  }
+  return normalized;
+}
+
+function cleanupPathExists(targetPath) {
+  try {
+    return fs.existsSync(toCleanupFsPath(targetPath));
+  } catch (e) {
+    return false;
+  }
+}
+
 function collectCleanupRemainingEntries(rootPath, limit) {
   var normalizedRoot = String(rootPath || "").trim();
   var maxCount = Math.max(1, Number(limit || CLEANUP_REMAINING_PREVIEW_LIMIT));
   var out = [];
 
-  if (!normalizedRoot || !fs.existsSync(normalizedRoot)) {
+  var cleanupRoot = toCleanupFsPath(normalizedRoot);
+  if (!normalizedRoot || !cleanupPathExists(normalizedRoot)) {
     return out;
   }
 
@@ -1744,7 +1768,7 @@ function collectCleanupRemainingEntries(rootPath, limit) {
     }
   }
 
-  walk(normalizedRoot, "");
+  walk(cleanupRoot, "");
   return out.slice(0, maxCount);
 }
 
@@ -1752,7 +1776,7 @@ function removePathWithWindowsFallback(targetPath) {
   if (
     process.platform !== "win32" ||
     !targetPath ||
-    !fs.existsSync(targetPath)
+    !cleanupPathExists(targetPath)
   ) {
     return {
       attempted: false,
@@ -1760,31 +1784,11 @@ function removePathWithWindowsFallback(targetPath) {
     };
   }
   var errors = [];
+  var cleanupTarget = toCleanupFsPath(targetPath);
+  var cleanupEnv = Object.assign({}, process.env, {
+    ATR_CLEANUP_TARGET_PATH: cleanupTarget,
+  });
   try {
-    childProcess.execFileSync(
-      "cmd.exe",
-      ["/d", "/c", "rmdir", "/s", "/q", targetPath],
-      { windowsHide: true },
-    );
-    return {
-      attempted: true,
-      ok: !fs.existsSync(targetPath),
-      method: "cmd_rmdir",
-    };
-  } catch (e) {
-    errors.push(e);
-  }
-  if (!fs.existsSync(targetPath)) {
-    return {
-      attempted: true,
-      ok: true,
-      method: "cmd_rmdir",
-    };
-  }
-  try {
-    var powershellEnv = Object.assign({}, process.env, {
-      ATR_CLEANUP_TARGET_PATH: targetPath,
-    });
     childProcess.execFileSync(
       "powershell.exe",
       [
@@ -1797,16 +1801,45 @@ function removePathWithWindowsFallback(targetPath) {
       ],
       {
         windowsHide: true,
-        env: powershellEnv,
+        env: cleanupEnv,
       },
     );
     return {
       attempted: true,
-      ok: !fs.existsSync(targetPath),
+      ok: !cleanupPathExists(targetPath),
       method: "powershell_remove_item",
     };
-  } catch (psErr) {
-    errors.push(psErr);
+  } catch (e) {
+    errors.push(e);
+  }
+  if (!cleanupPathExists(targetPath)) {
+    return {
+      attempted: true,
+      ok: true,
+      method: "powershell_remove_item",
+    };
+  }
+  try {
+    childProcess.execFileSync(
+      "cmd.exe",
+      [
+        "/d",
+        "/s",
+        "/c",
+        'rmdir /s /q "%ATR_CLEANUP_TARGET_PATH%"',
+      ],
+      {
+        windowsHide: true,
+        env: cleanupEnv,
+      },
+    );
+    return {
+      attempted: true,
+      ok: !cleanupPathExists(targetPath),
+      method: "cmd_rmdir",
+    };
+  } catch (cmdErr) {
+    errors.push(cmdErr);
   }
   return {
     attempted: true,
@@ -1818,7 +1851,8 @@ function removePathWithWindowsFallback(targetPath) {
 
 function makePathWritableRecursive(targetPath) {
   var normalized = String(targetPath || "").trim();
-  if (!normalized || !fs.existsSync(normalized)) {
+  var cleanupTarget = toCleanupFsPath(normalized);
+  if (!normalized || !cleanupPathExists(normalized)) {
     return;
   }
 
@@ -1853,12 +1887,13 @@ function makePathWritableRecursive(targetPath) {
       chmodPath(entryPath, !!(stat && stat.isDirectory()));
     }
   }
-  walk(normalized);
-  chmodPath(normalized, true);
+  walk(cleanupTarget);
+  chmodPath(cleanupTarget, true);
 }
 
 function removePathOnce(targetPath) {
   var normalized = String(targetPath || "").trim();
+  var cleanupTarget = toCleanupFsPath(normalized);
   var windowsFallbackUsed = false;
   if (!normalized) {
     return {
@@ -1867,7 +1902,7 @@ function removePathOnce(targetPath) {
     };
   }
 
-  if (!fs.existsSync(normalized)) {
+  if (!cleanupPathExists(normalized)) {
     return {
       ok: true,
       removed: false,
@@ -1877,14 +1912,14 @@ function removePathOnce(targetPath) {
   try {
     makePathWritableRecursive(normalized);
     if (fs.rmSync) {
-      fs.rmSync(normalized, {
+      fs.rmSync(cleanupTarget, {
         recursive: true,
         force: true,
         maxRetries: CLEANUP_NODE_RM_MAX_RETRIES,
         retryDelay: CLEANUP_NODE_RM_RETRY_DELAY_MS,
       });
     } else {
-      fs.rmdirSync(normalized, { recursive: true });
+      fs.rmdirSync(cleanupTarget, { recursive: true });
     }
   } catch (e) {
     var fallbackAfterError = removePathWithWindowsFallback(normalized);
@@ -1902,13 +1937,13 @@ function removePathOnce(targetPath) {
         error: reportedError,
         retryable_lock_hint:
           isCleanupRetryableError(e) ||
-          (process.platform === "win32" && fs.existsSync(normalized)),
+          (process.platform === "win32" && cleanupPathExists(normalized)),
         windows_delete_fallback_used: windowsFallbackUsed,
       };
     }
   }
 
-  if (fs.existsSync(normalized)) {
+  if (cleanupPathExists(normalized)) {
     var fallbackAfterExists = removePathWithWindowsFallback(normalized);
     windowsFallbackUsed = !!fallbackAfterExists.attempted;
     if (!fallbackAfterExists.ok) {
@@ -1918,7 +1953,7 @@ function removePathOnce(targetPath) {
           fallbackAfterExists.error ||
           new Error("Path still exists after cleanup: " + normalized),
         retryable_lock_hint:
-          process.platform === "win32" && fs.existsSync(normalized),
+          process.platform === "win32" && cleanupPathExists(normalized),
         windows_delete_fallback_used: windowsFallbackUsed,
       };
     }

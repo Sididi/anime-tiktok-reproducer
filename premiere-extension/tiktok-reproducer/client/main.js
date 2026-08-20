@@ -70,6 +70,7 @@
   var CLEANUP_PROXY_SETTLE_MS = 1000;
   var CLEANUP_MEDIA_SETTLE_MS = 1000;
   var CLEANUP_PURGE_SETTLE_MS = 2500;
+  var CLEANUP_PROXY_DETACH_MAX_PASSES = 5;
   var PROXY_RECONCILE_MAX_ATTACH_ATTEMPTS = 120;
   var MAX_LOG_ENTRIES = 200;
   var AME_CLEAR_MAX_ATTEMPTS = 3;
@@ -151,6 +152,7 @@
   var proxyRenderProcessMap = {}; // job_id -> { project_id, process, output_path }
   var proxyTrackedProjects = {}; // project_id -> true while proxy automation is active
   var proxyReconcileState = {}; // project_id -> { started_at_ms, last_attempt_ms }
+  var proxyCleanupBlockedProjects = {}; // project_id -> true once cleanup starts
   var encoderPollTimer = null;
   var encoderPollTick = 0;
   var driveTasksFallback = null;
@@ -530,7 +532,11 @@
   function isAutomationProjectActive(projectId) {
     var id = String(projectId || "").trim();
     var runtime = ensureBatchRuntime();
-    if (!id || getBatchRuntimeHelper().isProjectSleeping(runtime, id)) {
+    if (
+      !id ||
+      proxyCleanupBlockedProjects[id] ||
+      getBatchRuntimeHelper().isProjectSleeping(runtime, id)
+    ) {
       return false;
     }
     return (
@@ -1274,6 +1280,67 @@
         }
       } catch (killErr) {}
       delete proxyRenderProcessMap[jobId];
+      delete encoderJobMap[jobId];
+    });
+    return canceled;
+  }
+
+  function stopProxyAutomationForCleanup(projectIds) {
+    var ids = Array.isArray(projectIds) ? projectIds : [projectIds];
+    var selected = {};
+    ids.forEach(function (projectId) {
+      var id = String(projectId || "").trim();
+      if (!id) {
+        return;
+      }
+      selected[id] = true;
+      proxyCleanupBlockedProjects[id] = true;
+      delete proxyReconcileState[id];
+      delete proxyTrackedProjects[id];
+    });
+
+    var canceled = 0;
+    Object.keys(proxyRenderProcessMap).forEach(function (jobId) {
+      var entry = proxyRenderProcessMap[jobId];
+      var entryProjectId = String(
+        entry && entry.project_id ? entry.project_id : "",
+      ).trim();
+      if (!entry || !selected[entryProjectId]) {
+        return;
+      }
+      entry.canceled = true;
+      canceled += 1;
+      try {
+        if (entry.process && !entry.process.killed) {
+          entry.process.kill();
+        }
+      } catch (killErr) {}
+      delete proxyRenderProcessMap[jobId];
+      delete encoderJobMap[jobId];
+    });
+    Object.keys(encoderJobMap).forEach(function (jobId) {
+      var mapped = encoderJobMap[jobId];
+      var mappedProjectId = String(
+        mapped && mapped.project_id ? mapped.project_id : "",
+      ).trim();
+      var renderKind = String((mapped && mapped.render_kind) || "").trim();
+      if (renderKind === "proxy" && selected[mappedProjectId]) {
+        delete encoderJobMap[jobId];
+        canceled += 1;
+      }
+    });
+
+    Object.keys(selected).forEach(function (projectId) {
+      if (!projectStates[projectId]) {
+        return;
+      }
+      upsertProjectState(projectId, {
+        proxy_status: "canceled",
+        proxy_error: null,
+        proxy_pending_count: 0,
+        proxy_job_ids: [],
+        proxy_last_run_at: nowIso(),
+      });
     });
     return canceled;
   }
@@ -1945,6 +2012,11 @@
     } else if (String(localRootPath || "").trim()) {
       cleanupRoots = [String(localRootPath || "").trim()];
     }
+    if (cleanupRoots.length === 0) {
+      return Promise.reject(
+        new Error("Cleanup refused because no local project root was provided"),
+      );
+    }
 
     function parseCleanupHostResult(result, phaseLabel) {
       var raw = String(result || "").trim();
@@ -1996,20 +2068,72 @@
       });
     }
 
-    var preparation = {};
-    return runPreparationStage("detach")
-      .then(function (detachSummary) {
-        preparation.detach = detachSummary;
-        // This panel-side timer is intentional: unlike $.sleep(), it returns
-        // control to Premiere so Windows can commit detachProxy() and release
-        // proxy handles before the next host operation.
-        return sleep(CLEANUP_PROXY_SETTLE_MS);
-      })
+    function runDetachPass(passNumber, preparation) {
+      return runPreparationStage("detach")
+        .then(function (detachSummary) {
+          preparation.detach_attempts.push(detachSummary);
+          // A panel-side timer yields Premiere's UI thread; $.sleep() inside
+          // ExtendScript does not let detachProxy() commit on affected Windows
+          // installations.
+          return sleep(CLEANUP_PROXY_SETTLE_MS);
+        })
+        .then(function () {
+          return runPreparationStage("verify_detach");
+        })
+        .then(function (verifySummary) {
+          preparation.detach_verification = verifySummary;
+          if (
+            verifySummary.ok ||
+            passNumber >= CLEANUP_PROXY_DETACH_MAX_PASSES
+          ) {
+            return verifySummary;
+          }
+          return runDetachPass(passNumber + 1, preparation);
+        });
+    }
+
+    var preparation = {
+      detach_attempts: [],
+      detach_verification: null,
+      offline: null,
+      media_encoder_release: null,
+    };
+    return prepareMediaEncoderForExportInHost()
+      .then(
+        function (mediaEncoderSummary) {
+          preparation.media_encoder_release = mediaEncoderSummary || null;
+        },
+        function (mediaEncoderError) {
+          // AME queue cleanup releases completed-job handles on some Windows
+          // systems. Failure is non-fatal: the verified Premiere purge and the
+          // filesystem retry loop remain authoritative.
+          preparation.media_encoder_release = {
+            ok: false,
+            error: mediaEncoderError.message,
+          };
+        },
+      )
       .then(function () {
+        return runDetachPass(1, preparation);
+      })
+      .then(function (detachVerification) {
+        if (!detachVerification.ok) {
+          // setOffline() while a proxy is still attached is the operation that
+          // can raise Premiere's blocking "link missing proxies" dialog. Purge
+          // the project item while both files still exist instead.
+          preparation.offline = {
+            ok: true,
+            skipped: true,
+            reason: "proxy_detach_not_verified",
+          };
+          return null;
+        }
         return runPreparationStage("offline");
       })
       .then(function (offlineSummary) {
-        preparation.offline = offlineSummary;
+        if (offlineSummary) {
+          preparation.offline = offlineSummary;
+        }
         return sleep(CLEANUP_MEDIA_SETTLE_MS);
       })
       .then(function () {
@@ -2022,6 +2146,36 @@
       .then(function (result) {
         var summary = parseCleanupHostResult(result, "project purge");
         summary.preparation = preparation;
+        // Project-item deletion and setOffline() release handles
+        // asynchronously on Windows. Yield, then inspect every open project;
+        // local deletion is forbidden while any source/proxy link survives.
+        return sleep(CLEANUP_PURGE_SETTLE_MS).then(function () {
+          var verifyCall =
+            'verifyImportedProjectsCleanup("' +
+            escapeForEval(JSON.stringify(cleanupRoots)) +
+            '")';
+          return evalHost(verifyCall).then(function (verifyResult) {
+            var releaseVerification = parseCleanupHostResult(
+              verifyResult,
+              "post-purge release verification",
+            );
+            summary.release_verification = releaseVerification;
+            if (!releaseVerification.ok) {
+              summary.ok = false;
+              summary.error =
+                "Premiere still has linked source/proxy media after purge";
+              summary.remaining_media_references = Number(
+                releaseVerification.remaining_media_references || 0,
+              );
+              summary.remaining_proxy_references = Number(
+                releaseVerification.remaining_proxy_references || 0,
+              );
+            }
+            return summary;
+          });
+        });
+      })
+      .then(function (summary) {
         if (!quiet && summary) {
           var sequencesDeleted = Number(summary.sequences_deleted || 0);
           var movedItems = Number(summary.items_moved_to_purge_bin || 0);
@@ -2030,11 +2184,26 @@
           var warningCount = Array.isArray(summary.warnings)
             ? summary.warnings.length
             : Number(summary.warning_count || 0);
-          var detachedProxyCount = Number(summary.detached_proxy_count || 0);
-          var detachFailedCount = Number(summary.detach_failed_count || 0);
-          var mediaOfflineCount = Number(summary.media_offline_count || 0);
+          var detachAttempts = preparation.detach_attempts || [];
+          var lastDetachAttempt =
+            detachAttempts.length > 0
+              ? detachAttempts[detachAttempts.length - 1]
+              : {};
+          var detachedProxyCount = Number(
+            lastDetachAttempt.detached_proxy_count || 0,
+          );
+          var detachFailedCount = Number(
+            preparation.detach_verification &&
+              preparation.detach_verification.remaining_attached_proxy_count ||
+              0,
+          );
+          var mediaOfflineCount = Number(
+            preparation.offline && preparation.offline.media_offline_count || 0,
+          );
           var mediaOfflineDeferredProxyCount = Number(
-            summary.media_offline_deferred_proxy_count || 0,
+            preparation.offline &&
+              preparation.offline.media_offline_deferred_proxy_count ||
+              0,
           );
           log(
             "Premiere cleanup for " +
@@ -2047,6 +2216,8 @@
               remainingSequences +
               ", remainingRootItems=" +
               remainingRootItems +
+              ", targetProjects=" +
+              Number(summary.target_project_count || 0) +
               ", detachedProxies=" +
               detachedProxyCount +
               ", detachFailed=" +
@@ -2060,12 +2231,7 @@
             detachFailedCount > 0 ? "warn" : "info",
           );
         }
-        // Project-item deletion and setOffline() also release file handles
-        // asynchronously on Windows. Do not start recursive disk deletion in
-        // the same event-loop turn as the purge.
-        return sleep(CLEANUP_PURGE_SETTLE_MS).then(function () {
-          return summary;
-        });
+        return summary;
       });
   }
 
@@ -2246,6 +2412,7 @@
 
   function removeProjectState(projectId) {
     clearCleanupRetry(projectId);
+    delete proxyCleanupBlockedProjects[String(projectId || "").trim()];
     delete projectStates[projectId];
     try {
       fs.unlinkSync(projectStatePath(projectId));
@@ -2271,6 +2438,8 @@
       log("Cannot reset " + id + " while a job is active", "warn");
       return;
     }
+
+    delete proxyCleanupBlockedProjects[id];
 
     var removedJobs = 0;
     jobStore.queue = jobStore.queue.filter(function (job) {
@@ -2376,6 +2545,14 @@
       "Moved to purge bin: " +
         Number(hostSummary.items_moved_to_purge_bin || 0),
     );
+    parts.push(
+      "Remaining media links: " +
+        Number(hostSummary.remaining_media_references || 0),
+    );
+    parts.push(
+      "Remaining proxy links: " +
+        Number(hostSummary.remaining_proxy_references || 0),
+    );
     var warningCount = Array.isArray(hostSummary.warnings)
       ? hostSummary.warnings.length
       : Number(hostSummary.warning_count || 0);
@@ -2433,7 +2610,7 @@
     }
 
     disarmExportMonitor(id);
-    cancelLocalProxyRenderProcessesForExport();
+    stopProxyAutomationForCleanup([id]);
     var isBatchProject = getBatchRuntimeHelper().isProjectInExportBatch(
       ensureBatchRuntime(),
       id,
@@ -2987,6 +3164,8 @@
         new Error("Neither Drive nor LAN transfer is configured"),
       );
     }
+
+    delete proxyCleanupBlockedProjects[String(projectId || "").trim()];
 
     upsertProjectState(projectId, {
       status: "downloading",
@@ -4130,7 +4309,7 @@
         " project(s).",
       "info",
     );
-    cancelLocalProxyRenderProcessesForExport();
+    stopProxyAutomationForCleanup(batchIds);
 
     var batchCleanupRoots = batchIds
       .map(function (projectId) {
@@ -4705,6 +4884,9 @@
 
   function reconcileProxyingProjects() {
     Object.keys(projectStates).forEach(function (projectId) {
+      if (proxyCleanupBlockedProjects[projectId]) {
+        return;
+      }
       var state = projectStates[projectId] || {};
       var proxyStatus = String(state.proxy_status || "").trim();
       var previousProxySummary = state.proxy_summary || {};
@@ -4767,6 +4949,9 @@
           proxyPlan,
         )
           .then(function (scheduleResult) {
+            if (proxyCleanupBlockedProjects[projectId]) {
+              return;
+            }
             runtime.in_flight = false;
             proxyReconcileState[projectId] = runtime;
             var jobIds =
@@ -4792,6 +4977,9 @@
             );
           })
           .catch(function (err) {
+            if (proxyCleanupBlockedProjects[projectId]) {
+              return;
+            }
             runtime.in_flight = false;
             proxyReconcileState[projectId] = runtime;
             upsertProjectState(projectId, {
@@ -4805,6 +4993,10 @@
 
       reconcileAtrProjectProxiesInHost(projectId, state.local_root, proxyPlan)
         .then(function (summary) {
+          if (proxyCleanupBlockedProjects[projectId]) {
+            delete proxyReconcileState[projectId];
+            return;
+          }
           var latestState = getProjectState(projectId) || {};
           if (String(latestState.proxy_status || "").trim() === "canceled") {
             delete proxyReconcileState[projectId];
@@ -4941,6 +5133,10 @@
           }
         })
         .catch(function (err) {
+          if (proxyCleanupBlockedProjects[projectId]) {
+            delete proxyReconcileState[projectId];
+            return;
+          }
           runtime.in_flight = false;
           proxyReconcileState[projectId] = runtime;
           upsertProjectState(projectId, {

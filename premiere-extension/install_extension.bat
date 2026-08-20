@@ -27,12 +27,24 @@ echo       %EXT_DIR%
 if exist "%EXT_DIR%" (
     echo       Removing previous installation...
     rmdir /s /q "%EXT_DIR%"
+    if exist "%EXT_DIR%" (
+        echo ERROR: Previous installation is still in use.
+        echo Close Premiere Pro and Adobe Media Encoder, then run this installer again.
+        pause
+        exit /b 1
+    )
 )
 if exist "%LEGACY_EXT_DIR%" (
     echo       Removing legacy JSX Runner installation...
     rmdir /s /q "%LEGACY_EXT_DIR%"
+    if exist "%LEGACY_EXT_DIR%" (
+        echo ERROR: Legacy installation is still in use.
+        echo Close Premiere Pro and run this installer again.
+        pause
+        exit /b 1
+    )
 )
-xcopy "%SOURCE_DIR%" "%EXT_DIR%" /e /i /q >nul
+xcopy "%SOURCE_DIR%" "%EXT_DIR%" /e /i /q /y >nul
 if errorlevel 1 (
     echo ERROR: Failed to copy extension files.
     pause

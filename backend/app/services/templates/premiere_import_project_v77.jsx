@@ -675,16 +675,6 @@
   function sleep(ms) {
     $.sleep(ms);
   }
-  // Non-fatal issues (for example a missing V2 border) are collected here and
-  // published to $.global.__ATR_IMPORT_WARNINGS__ after main() so the CEP
-  // panel can surface them without failing the whole import.
-  var IMPORT_WARNINGS = [];
-  function recordImportWarning(msg) {
-    var text = msg ? msg.toString() : "";
-    if (!text) return;
-    IMPORT_WARNINGS.push(text);
-    log("Warning: " + text);
-  }
   var TICKS_PER_SECOND = 254016000000; // Premiere Pro timebase constant
   var SEQ_FPS = 60; // TikTok preset is 60fps
   var SOURCE_FPS_NUM = 24000;
@@ -694,10 +684,7 @@
   var TRACK_ITEM_WAIT_MAX_STEP_MS = 45;
   var TRACK_ITEM_WAIT_STEP_BACKOFF_MS = 10;
   var TRACK_ITEM_WAIT_MAX_MS = 180;
-  var BORDER_MOGRT_MAX_ATTEMPTS = 5;
   var BORDER_MOGRT_WAIT_MAX_MS = 1000;
-  var BORDER_MOGRT_RETRY_BASE_MS = 250;
-  var BORDER_MOGRT_INSTALL_WAIT_MS = 2000;
   var SPEED_RETRY_FAST_WAIT_MS = 12;
   var SPEED_RETRY_LONG_WAIT_MS = 60;
   var SOURCE_AUDIO_POLICY_RETRY_WAIT_MS = 40;
@@ -1579,170 +1566,9 @@
     return false;
   }
 
-  function normalizeMogrtNameKey(name) {
-    var text = name ? name.toString().replace(/^\s+|\s+$/g, "") : "";
-    try {
-      text = decodeURI(text);
-    } catch (eDecodeMogrtName) {}
-    if (text.toLowerCase().substr(-6) === ".mogrt") {
-      text = text.substring(0, text.length - 6);
-    }
-    return normalizeNameKey(text);
-  }
-
-  function findReusableWhiteBorderProjectItem(currentSequence) {
-    if (!app || !app.project || !app.project.sequences) return null;
-    var sequences = app.project.sequences;
-    var sequenceCount = Number(sequences.numSequences || 0);
-    var borderFile = new File(BORDER_MOGRT_PATH);
-    var expectedBorderName = normalizeMogrtNameKey(
-      borderFile.displayName || borderFile.name || "",
-    );
-    if (!expectedBorderName) return null;
-
-    // Every generated ATR sequence reserves V2 exclusively for the border.
-    // Reuse its ProjectItem instead of importing/installing the same MOGRT
-    // again for every project in a batch.
-    for (var i = sequenceCount - 1; i >= 0; i--) {
-      var candidateSequence = sequences[i];
-      if (!candidateSequence || candidateSequence === currentSequence) continue;
-
-      var candidateName = "";
-      try {
-        candidateName = candidateSequence.name
-          ? candidateSequence.name.toString()
-          : "";
-      } catch (eSequenceName) {}
-      if (candidateName.indexOf("ATR_BATCH__") !== 0) continue;
-      if (candidateName === BATCH_SEQUENCE_NAME) continue;
-
-      var candidateTrack = null;
-      try {
-        candidateTrack =
-          candidateSequence.videoTracks.numTracks > 1
-            ? candidateSequence.videoTracks[1]
-            : null;
-      } catch (eCandidateTrack) {}
-      if (!candidateTrack) continue;
-
-      var candidateBorder = findTrackItemAtStart(candidateTrack, 0, null);
-      if (!candidateBorder) continue;
-
-      try {
-        if (candidateBorder.projectItem) {
-          var candidateProjectItem = candidateBorder.projectItem;
-          // Touch and compare the name so stale references and a different
-          // configured border variant (for example 5px vs 10px) are rejected.
-          var projectItemName = candidateProjectItem.name
-            ? candidateProjectItem.name.toString()
-            : "";
-          var trackItemName = candidateBorder.name
-            ? candidateBorder.name.toString()
-            : "";
-          var projectItemKey = normalizeMogrtNameKey(projectItemName);
-          var trackItemKey = normalizeMogrtNameKey(trackItemName);
-          if (
-            projectItemKey === expectedBorderName ||
-            trackItemKey === expectedBorderName
-          ) {
-            return candidateProjectItem;
-          }
-        }
-      } catch (eCandidateProjectItem) {}
-    }
-    return null;
-  }
-
-  function findInstalledBorderMogrtProjectItem() {
-    // importMGT can materialize the MOGRT project item even when its return
-    // value / timeline placement flakes. Walk the whole project for it so a
-    // later overwriteClip can rescue the border without another import.
-    var root = getProjectRootItem();
-    if (!root) return null;
-    var borderFile = new File(BORDER_MOGRT_PATH);
-    var expectedBorderName = normalizeMogrtNameKey(
-      borderFile.displayName || borderFile.name || "",
-    );
-    if (!expectedBorderName) return null;
-    var found = null;
-    walkProjectItems(root, function (item) {
-      if (found || isBinItem(item)) return;
-      var itemName = "";
-      try {
-        itemName = item.name ? item.name.toString() : "";
-      } catch (eBorderItemName) {}
-      if (itemName && normalizeMogrtNameKey(itemName) === expectedBorderName) {
-        found = item;
-      }
-    });
-    return found;
-  }
-
-  function placeBorderProjectItemOnTrack(sequence, track, projectItem, label) {
-    if (!projectItem) return null;
-    log("Placing Border Mogrt project item on V2 (" + label + ")...");
-    try {
-      track.overwriteClip(projectItem, "0");
-    } catch (ePlaceBorder) {
-      log(
-        "Border Mogrt placement error (" +
-          label +
-          "): " +
-          (ePlaceBorder && ePlaceBorder.message
-            ? ePlaceBorder.message
-            : ePlaceBorder),
-      );
-    }
-    refreshSequenceUI(sequence);
-    return waitForTrackItemAtStart(track, 0, null, BORDER_MOGRT_WAIT_MAX_MS);
-  }
-
-  function installBorderMogrtFromFile(sequence) {
-    if (!app || !app.project || !app.project.importFiles) {
-      log(
-        "Border Mogrt installation fallback unavailable: " +
-          "app.project.importFiles is missing.",
-      );
-      return false;
-    }
-
-    log(
-      "Direct Border Mogrt placement failed; installing bundled template " +
-        "through Premiere media import...",
-    );
-    var importResult = false;
-    try {
-      // Premiere 25+ treats regular media import of a .mogrt as installation
-      // into My Templates, matching File > Import / Graphics Templates install.
-      importResult = app.project.importFiles(
-        [BORDER_MOGRT_PATH],
-        true,
-        getProjectSearchRoot(),
-        false,
-      );
-    } catch (eInstallBorder) {
-      log(
-        "Border Mogrt installation error: " +
-          (eInstallBorder && eInstallBorder.message
-            ? eInstallBorder.message
-            : eInstallBorder),
-      );
-      return false;
-    }
-
-    refreshSequenceUI(sequence);
-    sleep(BORDER_MOGRT_INSTALL_WAIT_MS);
-    if (importResult === false) {
-      log("Border Mogrt media import reported installation failure.");
-      return false;
-    }
-    log("Bundled Border Mogrt installed through Premiere media import.");
-    return true;
-  }
-
   function pruneExtraBorderClips(track) {
-    // V2 is dedicated to the border and every copy starts at 0; repeated
-    // importMGT attempts can stack duplicates. Keep the first clip only.
+    // V2 is dedicated to the border. A delayed importMGT result can appear
+    // after the project-item repair; keep the first clip only.
     // Never identity-compare TrackItems here: ExtendScript wrapper objects
     // for the same clip are not ===-equal.
     if (!track || !track.clips) return 0;
@@ -1769,82 +1595,21 @@
       return null;
     }
     if (!sequence || !track) {
-      recordImportWarning(
-        "Border Mogrt skipped: V2 track unavailable. " +
-          "Drag the border MOGRT onto V2 manually before export.",
-      );
+      log("Border Mogrt skipped: V2 track unavailable.");
       return null;
     }
     if (!new File(BORDER_MOGRT_PATH).exists) {
-      recordImportWarning(
-        "Border Mogrt skipped: file missing at " +
-          BORDER_MOGRT_PATH +
-          ". Drag the border MOGRT onto V2 manually before export.",
-      );
+      log("Border Mogrt skipped: file missing at " + BORDER_MOGRT_PATH + ".");
       return null;
     }
 
-    // V2 is dedicated to the white border. Check the timeline before importing
-    // so a delayed result from a previous attempt cannot create duplicates.
     var borderItem = findTrackItemAtStart(track, 0, null);
     if (!borderItem) {
-      log("Adding Border Mogrt to V2...");
-    }
-
-    if (!borderItem) {
-      var reusableBorderProjectItem =
-        findReusableWhiteBorderProjectItem(sequence);
-      if (reusableBorderProjectItem) {
-        log("Reusing Border Mogrt project item from an earlier batch sequence...");
-        try {
-          track.overwriteClip(reusableBorderProjectItem, "0");
-        } catch (eReuseBorder) {
-          log(
-            "Border Mogrt reuse error: " +
-              (eReuseBorder && eReuseBorder.message
-                ? eReuseBorder.message
-                : eReuseBorder),
-          );
-        }
-        refreshSequenceUI(sequence);
-        borderItem = waitForTrackItemAtStart(
-          track,
-          0,
-          null,
-          BORDER_MOGRT_WAIT_MAX_MS,
-        );
-        if (borderItem) {
-          log("Reused existing Border Mogrt on V2 without re-importing it.");
-        }
-      }
-    }
-
-    if (!borderItem) {
-      // A previous run may have materialized the MOGRT project item without
-      // persisting it on any timeline; rescue it before spending importMGT
-      // attempts.
-      var installedBorderProjectItem = findInstalledBorderMogrtProjectItem();
-      if (installedBorderProjectItem) {
-        borderItem = placeBorderProjectItemOnTrack(
-          sequence,
-          track,
-          installedBorderProjectItem,
-          "pre-import project search",
-        );
-      }
-    }
-
-    var borderInstallAttempted = false;
-    var borderInstallSucceeded = false;
-    for (
-      var borderAttempt = 1;
-      borderAttempt <= BORDER_MOGRT_MAX_ATTEMPTS && !borderItem;
-      borderAttempt++
-    ) {
+      log("Adding packaged Border Mogrt to V2...");
       var importedBorderCandidate = null;
       try {
         perfCounterInc("importMGTCalls");
-        // Premiere's API requires insertion time as a string of ticks.
+        // Premiere's documented API requires insertion time as ticks text.
         importedBorderCandidate = sequence.importMGT(
           BORDER_MOGRT_PATH,
           "0",
@@ -1853,38 +1618,11 @@
         );
       } catch (eBorder) {
         log(
-          "Border Mogrt attempt " +
-            borderAttempt +
-            " error: " +
+          "Border Mogrt import error: " +
             (eBorder && eBorder.message ? eBorder.message : eBorder),
         );
       }
 
-      if (!importedBorderCandidate) {
-        // Same two-form pattern as the subtitle MOGRTs: retry the call with a
-        // numeric seconds start when the ticks-string form returned nothing.
-        try {
-          perfCounterInc("importMGTCalls");
-          importedBorderCandidate = sequence.importMGT(
-            BORDER_MOGRT_PATH,
-            0,
-            1,
-            0,
-          );
-        } catch (eBorderSeconds) {
-          log(
-            "Border Mogrt attempt " +
-              borderAttempt +
-              " seconds-form error: " +
-              (eBorderSeconds && eBorderSeconds.message
-                ? eBorderSeconds.message
-                : eBorderSeconds),
-          );
-        }
-      }
-
-      // Never trust importMGT's return value alone. In a reused Premiere
-      // session it can return a TrackItem that never appears in V2.
       refreshSequenceUI(sequence);
       borderItem = waitForTrackItemAtStart(
         track,
@@ -1903,14 +1641,8 @@
       }
 
       if (!borderItem && importedBorderProjectItem) {
-        log(
-          "Border Mogrt attempt " +
-            borderAttempt +
-            " returned a non-persisted item; placing its project item on V2...",
-        );
+        log("Repairing Border Mogrt placement from its project item...");
         try {
-          // importMGT has already materialized the MOGRT project item. Standard
-          // overwrite placement is more reliable than repeating the import.
           track.overwriteClip(importedBorderProjectItem, "0");
         } catch (eOverwriteBorder) {
           log(
@@ -1928,67 +1660,27 @@
           BORDER_MOGRT_WAIT_MAX_MS,
         );
       }
-
-      if (!borderItem) {
-        // The failed call may still have materialized the project item
-        // somewhere in the project; look it up and place it directly.
-        var midLoopBorderProjectItem = findInstalledBorderMogrtProjectItem();
-        if (midLoopBorderProjectItem) {
-          borderItem = placeBorderProjectItemOnTrack(
-            sequence,
-            track,
-            midLoopBorderProjectItem,
-            "attempt " + borderAttempt + " project search",
-          );
-        }
-      }
-
-      if (!borderItem && !borderInstallAttempted && borderAttempt >= 2) {
-        borderInstallAttempted = true;
-        borderInstallSucceeded = installBorderMogrtFromFile(sequence);
-      }
-
-      if (!borderItem && borderAttempt < BORDER_MOGRT_MAX_ATTEMPTS) {
-        log(
-          "Border Mogrt attempt " +
-            borderAttempt +
-            " produced no V2 item; retrying...",
-        );
-        sleep(BORDER_MOGRT_RETRY_BASE_MS * borderAttempt);
-      }
     }
 
     if (!borderItem) {
-      var installStatusText = "not attempted";
-      if (borderInstallAttempted) {
-        if (borderInstallSucceeded) {
-          installStatusText = "succeeded";
-        } else {
-          installStatusText = "failed";
-        }
-      }
-      recordImportWarning(
-        "Border Mogrt could not be placed on V2 after " +
-          BORDER_MOGRT_MAX_ATTEMPTS +
-          " attempts (install fallback " +
-          installStatusText +
-          "). Drag the border MOGRT onto V2 manually before export.",
-      );
+      log("Border Mogrt was not placed on V2; continuing without it.");
       return null;
     }
 
     var prunedBorderClips = pruneExtraBorderClips(track);
     if (prunedBorderClips > 0) {
-      log("Removed " + prunedBorderClips + " duplicate Border Mogrt clip(s) from V2.");
+      log(
+        "Removed " +
+          prunedBorderClips +
+          " duplicate Border Mogrt clip(s) from V2.",
+      );
       refreshSequenceUI(sequence);
       borderItem = findTrackItemAtStart(track, 0, null) || borderItem;
     }
 
     if (!setTrackItemEndSeconds(borderItem, endSec)) {
-      recordImportWarning(
-        "Border Mogrt placed on V2 but its end time could not be verified at " +
-          endSec +
-          "s. Check the V2 border duration manually.",
+      log(
+        "Border Mogrt end time could not be verified at " + endSec + "s.",
       );
       return borderItem;
     }
@@ -7443,7 +7135,4 @@
   }
 
   main();
-  try {
-    $.global.__ATR_IMPORT_WARNINGS__ = IMPORT_WARNINGS.join(" | ");
-  } catch (ePublishWarnings) {}
 })();

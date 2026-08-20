@@ -7,7 +7,7 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-08-13-host-rpc-v13";
+var ATR_HOST_BUILD_ID = "2026-08-20-windows-cleanup-v14";
 // Separates runScript()'s status from the non-fatal warnings the executed
 // script published. Must stay in sync with HOST_RUN_WARNING_SEPARATOR in
 // client/main.js.
@@ -17,6 +17,8 @@ var __atrEncoderJobProjectMap = {};
 var __atrEncoderJobMetaMap = {};
 var __atrTempAudioSequenceByJob = {};
 var __atrProxyAttachAttemptMap = {};
+var __atrImportedProjectRefs = [];
+var __atrCleanupTargetProjectRefs = [];
 var __atrEncoderCallbacksBound = false;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
 var __atrProjectPurgeBinName = "__ATR_PURGE__";
@@ -180,6 +182,92 @@ function __atrWalkProjectItems(containerItem, visitor) {
       __atrWalkProjectItems(child, visitor);
     }
   }
+}
+
+function __atrGetProjectIdentity(projectObject) {
+  if (!projectObject) {
+    return "";
+  }
+  var documentId = "";
+  var projectPath = "";
+  var projectName = "";
+  try {
+    documentId = __atrSafeString(projectObject.documentID || "");
+  } catch (eDocumentId) {}
+  try {
+    projectPath = __atrNormalizeComparePath(projectObject.path || "");
+  } catch (eProjectPath) {}
+  try {
+    projectName = __atrSafeString(projectObject.name || "");
+  } catch (eProjectName) {}
+  return documentId || projectPath || projectName;
+}
+
+function __atrPushUniqueProject(projects, projectObject) {
+  if (!projectObject) {
+    return;
+  }
+  var candidateIdentity = __atrGetProjectIdentity(projectObject);
+  for (var i = 0; i < projects.length; i += 1) {
+    try {
+      if (projects[i] === projectObject) {
+        return;
+      }
+    } catch (eSameProject) {}
+    var existingIdentity = __atrGetProjectIdentity(projects[i]);
+    if (
+      candidateIdentity &&
+      existingIdentity &&
+      candidateIdentity === existingIdentity
+    ) {
+      return;
+    }
+  }
+  projects.push(projectObject);
+}
+
+function __atrGetOpenProjects() {
+  var projects = [];
+  try {
+    if (app && app.projects) {
+      var count = Number(app.projects.numProjects || app.projects.length || 0);
+      for (var i = 0; i < count; i += 1) {
+        __atrPushUniqueProject(projects, app.projects[i]);
+      }
+    }
+  } catch (eProjects) {}
+  try {
+    if (app && app.project) {
+      __atrPushUniqueProject(projects, app.project);
+    }
+  } catch (eActiveProject) {}
+  return projects;
+}
+
+function __atrProjectIsOpen(projectObject, openProjects) {
+  if (!projectObject) {
+    return false;
+  }
+  var projects = openProjects || __atrGetOpenProjects();
+  var identity = __atrGetProjectIdentity(projectObject);
+  for (var i = 0; i < projects.length; i += 1) {
+    try {
+      if (projects[i] === projectObject) {
+        return true;
+      }
+    } catch (eSameProject) {}
+    if (identity && identity === __atrGetProjectIdentity(projects[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function __atrRememberImportedProject(projectObject) {
+  if (!projectObject) {
+    return;
+  }
+  __atrPushUniqueProject(__atrImportedProjectRefs, projectObject);
 }
 
 function __atrPushUniqueProjectItem(items, seen, item) {
@@ -784,6 +872,7 @@ function __atrInspectImportedSubtree(
   normalizedRootPath,
   depth,
   report,
+  includeProxyReferences,
 ) {
   var importedLeaves = 0;
   var foreignLeaves = 0;
@@ -802,6 +891,7 @@ function __atrInspectImportedSubtree(
         normalizedRootPath,
         depth + 1,
         report,
+        includeProxyReferences,
       );
       if (subtree.imported_leaves > 0 && subtree.foreign_leaves === 0) {
         report.deletable_bins.push({
@@ -815,7 +905,18 @@ function __atrInspectImportedSubtree(
     }
 
     var mediaPath = __atrGetProjectItemMediaPath(child);
-    if (mediaPath && __atrPathStartsWith(mediaPath, normalizedRootPath)) {
+    var proxyPath = "";
+    if (includeProxyReferences && child.hasProxy && child.getProxyPath) {
+      try {
+        if (child.hasProxy()) {
+          proxyPath = __atrSafeString(child.getProxyPath());
+        }
+      } catch (eProxyPath) {}
+    }
+    if (
+      (mediaPath && __atrPathStartsWith(mediaPath, normalizedRootPath)) ||
+      (proxyPath && __atrPathStartsWith(proxyPath, normalizedRootPath))
+    ) {
       report.imported_leaf_items.push(child);
       importedLeaves += 1;
     } else {
@@ -829,27 +930,186 @@ function __atrInspectImportedSubtree(
   };
 }
 
-function __atrBuildImportedCleanupScan(normalizedRootPath) {
+function __atrBuildImportedCleanupScan(
+  normalizedRootPath,
+  projectObject,
+  includeProxyReferences,
+) {
   var report = {
     imported_leaf_items: [],
     deletable_bins: [],
   };
 
-  if (!app || !app.project || !app.project.rootItem) {
+  var targetProject = projectObject || (app && app.project ? app.project : null);
+  if (!targetProject || !targetProject.rootItem) {
     return report;
   }
 
   __atrInspectImportedSubtree(
-    app.project.rootItem,
+    targetProject.rootItem,
     normalizedRootPath,
     0,
     report,
+    !!includeProxyReferences,
   );
 
   report.deletable_bins.sort(function (a, b) {
     return Number(b.depth || 0) - Number(a.depth || 0);
   });
 
+  return report;
+}
+
+function __atrProjectReferencesAnyCleanupRoot(projectObject, normalizedRoots) {
+  if (!projectObject || !projectObject.rootItem) {
+    return false;
+  }
+  for (var i = 0; i < normalizedRoots.length; i += 1) {
+    var scan = __atrBuildImportedCleanupScan(
+      normalizedRoots[i],
+      projectObject,
+      true,
+    );
+    if (scan.imported_leaf_items.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function __atrResolveCleanupTargetProjects(normalizedRoots, rememberMatches) {
+  if (!normalizedRoots || normalizedRoots.length === 0) {
+    return [];
+  }
+  var openProjects = __atrGetOpenProjects();
+  var resolved = [];
+
+  for (var i = 0; i < openProjects.length; i += 1) {
+    if (__atrProjectReferencesAnyCleanupRoot(openProjects[i], normalizedRoots)) {
+      __atrPushUniqueProject(resolved, openProjects[i]);
+    }
+  }
+
+  // The detach/offline stages can make media-path discovery unavailable on
+  // some Premiere builds. Keep the exact project objects found on the first
+  // pass, rather than falling back to whichever project happens to be active.
+  if (resolved.length === 0 && !rememberMatches) {
+    for (var remembered = 0;
+      remembered < __atrCleanupTargetProjectRefs.length;
+      remembered += 1) {
+      if (
+        __atrProjectIsOpen(
+          __atrCleanupTargetProjectRefs[remembered],
+          openProjects,
+        )
+      ) {
+        __atrPushUniqueProject(
+          resolved,
+          __atrCleanupTargetProjectRefs[remembered],
+        );
+      }
+    }
+  }
+
+  // runScript() records the owning project before and after every import. Use
+  // that as an initial-stage fallback only when it identifies one unambiguous
+  // open project. Reusing every historical import here could purge an unrelated
+  // project during a later disk-only cleanup retry.
+  if (resolved.length === 0 && rememberMatches) {
+    var openImportedProjects = [];
+    for (
+      var imported = 0;
+      imported < __atrImportedProjectRefs.length;
+      imported += 1
+    ) {
+      if (__atrProjectIsOpen(__atrImportedProjectRefs[imported], openProjects)) {
+        __atrPushUniqueProject(
+          openImportedProjects,
+          __atrImportedProjectRefs[imported],
+        );
+      }
+    }
+    if (openImportedProjects.length === 1) {
+      __atrPushUniqueProject(resolved, openImportedProjects[0]);
+    }
+  }
+
+  if (rememberMatches) {
+    __atrCleanupTargetProjectRefs = [];
+    for (var target = 0; target < resolved.length; target += 1) {
+      __atrPushUniqueProject(
+        __atrCleanupTargetProjectRefs,
+        resolved[target],
+      );
+    }
+  }
+  return resolved;
+}
+
+function __atrInspectOpenProjectCleanupReferences(normalizedRoots) {
+  var report = {
+    ok: true,
+    open_project_count: 0,
+    referencing_project_count: 0,
+    remaining_media_references: 0,
+    remaining_proxy_references: 0,
+    samples: [],
+  };
+  var openProjects = __atrGetOpenProjects();
+  report.open_project_count = openProjects.length;
+
+  for (var p = 0; p < openProjects.length; p += 1) {
+    var projectObject = openProjects[p];
+    var projectHasReference = false;
+    if (!projectObject || !projectObject.rootItem) {
+      continue;
+    }
+    __atrWalkProjectItems(projectObject.rootItem, function (item) {
+      if (!item || __atrGetProjectItemChildCount(item) > 0) {
+        return;
+      }
+      var mediaPath = __atrGetProjectItemMediaPath(item);
+      var proxyPath = "";
+      try {
+        if (item.hasProxy && item.getProxyPath && item.hasProxy()) {
+          proxyPath = __atrSafeString(item.getProxyPath());
+        }
+      } catch (eProxyState) {}
+
+      for (var r = 0; r < normalizedRoots.length; r += 1) {
+        var rootPath = normalizedRoots[r];
+        var mediaMatches =
+          mediaPath && __atrPathStartsWith(mediaPath, rootPath);
+        var proxyMatches =
+          proxyPath && __atrPathStartsWith(proxyPath, rootPath);
+        if (!mediaMatches && !proxyMatches) {
+          continue;
+        }
+        projectHasReference = true;
+        if (mediaMatches) {
+          report.remaining_media_references += 1;
+        }
+        if (proxyMatches) {
+          report.remaining_proxy_references += 1;
+        }
+        if (report.samples.length < 8) {
+          report.samples.push(
+            (__atrGetProjectIdentity(projectObject) || "project") +
+              ":" +
+              (__atrGetProjectItemName(item) || "item"),
+          );
+        }
+        break;
+      }
+    });
+    if (projectHasReference) {
+      report.referencing_project_count += 1;
+    }
+  }
+
+  report.ok =
+    report.remaining_media_references === 0 &&
+    report.remaining_proxy_references === 0;
   return report;
 }
 
@@ -893,7 +1153,10 @@ function __atrCloseSourceMonitorForCleanup(result) {
   }
 }
 
-function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
+function __atrDetachManagedProxiesForCleanupObject(
+  localRootPath,
+  projectObject,
+) {
   var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
   var result = {
     ok: true,
@@ -904,7 +1167,8 @@ function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
     detach_proxy_warnings: [],
   };
 
-  if (!normalizedRootPath || !app || !app.project || !app.project.rootItem) {
+  var targetProject = projectObject || (app && app.project ? app.project : null);
+  if (!normalizedRootPath || !targetProject || !targetProject.rootItem) {
     return result;
   }
 
@@ -921,7 +1185,11 @@ function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
     );
   }
 
-  var scan = __atrBuildImportedCleanupScan(normalizedRootPath);
+  var scan = __atrBuildImportedCleanupScan(
+    normalizedRootPath,
+    targetProject,
+    true,
+  );
   for (var i = 0; i < scan.imported_leaf_items.length; i += 1) {
     var item = scan.imported_leaf_items[i];
     if (!item || !item.hasProxy || !item.getProxyPath) {
@@ -1006,7 +1274,70 @@ function __atrDetachManagedProxiesForCleanupObject(localRootPath) {
   return result;
 }
 
-function __atrSetImportedMediaOfflineForCleanupObject(localRootPath) {
+function __atrVerifyManagedProxiesDetachedForCleanupObject(
+  localRootPath,
+  projectObject,
+) {
+  var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
+  var result = {
+    ok: true,
+    considered_proxy_items: 0,
+    remaining_attached_proxy_count: 0,
+    detach_proxy_warnings: [],
+  };
+  var targetProject = projectObject || (app && app.project ? app.project : null);
+  if (!normalizedRootPath || !targetProject || !targetProject.rootItem) {
+    return result;
+  }
+
+  var scan = __atrBuildImportedCleanupScan(
+    normalizedRootPath,
+    targetProject,
+    true,
+  );
+  for (var i = 0; i < scan.imported_leaf_items.length; i += 1) {
+    var item = scan.imported_leaf_items[i];
+    if (!item || !item.hasProxy || !item.getProxyPath) {
+      continue;
+    }
+    try {
+      if (!item.hasProxy()) {
+        continue;
+      }
+      var proxyPath = __atrSafeString(item.getProxyPath());
+      if (
+        !__atrPathStartsWith(proxyPath, normalizedRootPath) &&
+        !__atrLooksLikeManagedProxyPath(proxyPath, normalizedRootPath)
+      ) {
+        continue;
+      }
+      result.considered_proxy_items += 1;
+      result.remaining_attached_proxy_count += 1;
+      if (result.detach_proxy_warnings.length < 5) {
+        result.detach_proxy_warnings.push(
+          "Proxy remains attached for " + __atrGetProjectItemName(item),
+        );
+      }
+    } catch (eProxyState) {
+      result.remaining_attached_proxy_count += 1;
+      if (result.detach_proxy_warnings.length < 5) {
+        result.detach_proxy_warnings.push(
+          "Could not verify proxy state for " +
+            __atrGetProjectItemName(item) +
+            ": " +
+            __atrSafeString(eProxyState.message || eProxyState),
+        );
+      }
+    }
+  }
+  result.ok = result.remaining_attached_proxy_count === 0;
+  return result;
+}
+
+function __atrSetImportedMediaOfflineForCleanupObject(
+  localRootPath,
+  projectObject,
+) {
   var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
   var result = {
     ok: true,
@@ -1018,13 +1349,18 @@ function __atrSetImportedMediaOfflineForCleanupObject(localRootPath) {
     media_release_warnings: [],
   };
 
-  if (!normalizedRootPath || !app || !app.project || !app.project.rootItem) {
+  var targetProject = projectObject || (app && app.project ? app.project : null);
+  if (!normalizedRootPath || !targetProject || !targetProject.rootItem) {
     return result;
   }
 
   __atrCloseSourceMonitorForCleanup(result);
 
-  var scan = __atrBuildImportedCleanupScan(normalizedRootPath);
+  var scan = __atrBuildImportedCleanupScan(
+    normalizedRootPath,
+    targetProject,
+    false,
+  );
   for (var i = 0; i < scan.imported_leaf_items.length; i += 1) {
     var item = scan.imported_leaf_items[i];
     if (!item) {
@@ -1039,7 +1375,13 @@ function __atrSetImportedMediaOfflineForCleanupObject(localRootPath) {
     try {
       if (item.hasProxy && item.getProxyPath && item.hasProxy()) {
         var attachedProxyPath = __atrSafeString(item.getProxyPath());
-        if (__atrPathStartsWith(attachedProxyPath, normalizedRootPath)) {
+        if (
+          __atrPathStartsWith(attachedProxyPath, normalizedRootPath) ||
+          __atrLooksLikeManagedProxyPath(
+            attachedProxyPath,
+            normalizedRootPath,
+          )
+        ) {
           result.media_offline_deferred_proxy_count += 1;
           continue;
         }
@@ -1721,7 +2063,12 @@ function __atrDeleteSequenceByName(sequenceName) {
 
     try {
       if (sequence.projectItem && sequence.projectItem.deleteBin) {
-        return !!sequence.projectItem.deleteBin();
+        var deleteBinResult = sequence.projectItem.deleteBin();
+        return (
+          deleteBinResult === 0 ||
+          deleteBinResult === "0" ||
+          deleteBinResult === true
+        );
       }
     } catch (eDeleteBin) {}
 
@@ -1773,8 +2120,9 @@ function cleanupOrphanTempAudioSequences() {
   }
 }
 
-function __atrGetSequenceCount() {
-  var sequences = app && app.project ? app.project.sequences : null;
+function __atrGetSequenceCount(projectObject) {
+  var targetProject = projectObject || (app && app.project ? app.project : null);
+  var sequences = targetProject ? targetProject.sequences : null;
   if (!sequences) {
     return 0;
   }
@@ -1798,22 +2146,23 @@ function __atrGetRootChildCount(rootItem) {
   }
 }
 
-function __atrDeleteSequenceObject(sequence) {
-  if (!sequence || !app || !app.project) {
+function __atrDeleteSequenceObject(sequence, projectObject) {
+  var targetProject = projectObject || (app && app.project ? app.project : null);
+  if (!sequence || !targetProject) {
     return false;
   }
 
   var deleted = false;
   try {
-    if (app.project.deleteSequence && sequence.sequenceID !== undefined) {
-      deleted = !!app.project.deleteSequence(sequence.sequenceID);
+    if (targetProject.deleteSequence && sequence.sequenceID !== undefined) {
+      deleted = !!targetProject.deleteSequence(sequence.sequenceID);
     }
   } catch (eDeleteById) {}
 
   if (!deleted) {
     try {
-      if (app.project.deleteSequence) {
-        deleted = !!app.project.deleteSequence(sequence);
+      if (targetProject.deleteSequence) {
+        deleted = !!targetProject.deleteSequence(sequence);
       }
     } catch (eDeleteByObject) {}
   }
@@ -1821,7 +2170,12 @@ function __atrDeleteSequenceObject(sequence) {
   if (!deleted) {
     try {
       if (sequence.projectItem && sequence.projectItem.deleteBin) {
-        deleted = !!sequence.projectItem.deleteBin();
+        var deleteBinResult = sequence.projectItem.deleteBin();
+        // ProjectItem.deleteBin() reports success as numeric 0.
+        deleted =
+          deleteBinResult === 0 ||
+          deleteBinResult === "0" ||
+          deleteBinResult === true;
       }
     } catch (eDeleteBin) {}
   }
@@ -1831,10 +2185,10 @@ function __atrDeleteSequenceObject(sequence) {
       if (
         sequence.projectItem &&
         sequence.projectItem.select &&
-        app.project.deleteSelection
+        targetProject.deleteSelection
       ) {
         sequence.projectItem.select();
-        deleted = !!app.project.deleteSelection();
+        deleted = !!targetProject.deleteSelection();
       }
     } catch (eDeleteSelection) {}
   }
@@ -1842,13 +2196,15 @@ function __atrDeleteSequenceObject(sequence) {
   return deleted;
 }
 
-function purgeActiveProject() {
+function purgeActiveProject(projectObject) {
   try {
-    if (!app || !app.project || !app.project.rootItem) {
-      return "ERROR: No active Premiere project is available";
+    var targetProject =
+      projectObject || (app && app.project ? app.project : null);
+    if (!targetProject || !targetProject.rootItem) {
+      return "ERROR: No target Premiere project is available";
     }
 
-    var root = app.project.rootItem;
+    var root = targetProject.rootItem;
     var warnings = [];
     var sequencesDeleted = 0;
     var sequencesFailed = 0;
@@ -1859,12 +2215,12 @@ function purgeActiveProject() {
     var purgeBinCreateFailed = false;
     var purgeBinDeleteFailed = false;
 
-    for (var s = __atrGetSequenceCount() - 1; s >= 0; s -= 1) {
-      var sequence = app.project.sequences[s];
+    for (var s = __atrGetSequenceCount(targetProject) - 1; s >= 0; s -= 1) {
+      var sequence = targetProject.sequences[s];
       if (!sequence) {
         continue;
       }
-      if (__atrDeleteSequenceObject(sequence)) {
+      if (__atrDeleteSequenceObject(sequence, targetProject)) {
         sequencesDeleted += 1;
       } else {
         sequencesFailed += 1;
@@ -1937,8 +2293,8 @@ function purgeActiveProject() {
         }
         if (!purgeBinDeleted) {
           try {
-            if (app.project.deleteBin) {
-              app.project.deleteBin(purgeBin);
+            if (targetProject.deleteBin) {
+              targetProject.deleteBin(purgeBin);
               purgeBinDeleted = true;
             }
           } catch (eDeleteBin1) {
@@ -1951,7 +2307,7 @@ function purgeActiveProject() {
       }
     }
 
-    var remainingSequences = __atrGetSequenceCount();
+    var remainingSequences = __atrGetSequenceCount(targetProject);
     var remainingRootItems = __atrGetRootChildCount(root);
     var result = {
       ok: remainingSequences === 0 && remainingRootItems === 0,
@@ -1964,6 +2320,7 @@ function purgeActiveProject() {
       remaining_root_items: remainingRootItems,
       purge_bin_create_failed: purgeBinCreateFailed,
       purge_bin_delete_failed: purgeBinDeleteFailed,
+      project_identity: __atrGetProjectIdentity(targetProject),
       warning_count: warnings.length,
       warnings: warnings,
     };
@@ -2011,71 +2368,128 @@ function prepareImportedProjectsForCleanup(localRootsJson, stage) {
       media_offline_count: 0,
       media_offline_failed_count: 0,
       media_offline_deferred_proxy_count: 0,
+      remaining_attached_proxy_count: 0,
+      target_project_count: 0,
       summaries: [],
       warnings: [],
     };
 
-    if (normalizedStage !== "detach" && normalizedStage !== "offline") {
+    if (
+      normalizedStage !== "detach" &&
+      normalizedStage !== "verify_detach" &&
+      normalizedStage !== "offline"
+    ) {
       return "ERROR: Unknown Premiere cleanup preparation stage: " + stage;
     }
 
+    var normalizedRoots = [];
     for (var i = 0; i < roots.length; i += 1) {
-      var rootPath = __atrSafeString(roots[i]);
-      if (!rootPath) {
-        continue;
+      var normalizedRoot = __atrNormalizeComparePath(roots[i]);
+      if (normalizedRoot) {
+        normalizedRoots.push(normalizedRoot);
       }
-      result.root_count += 1;
+    }
+    if (normalizedRoots.length === 0) {
+      return "ERROR: No local project roots were provided for cleanup preparation";
+    }
+    result.root_count = normalizedRoots.length;
+    var targetProjects = __atrResolveCleanupTargetProjects(
+      normalizedRoots,
+      normalizedStage === "detach",
+    );
+    result.target_project_count = targetProjects.length;
 
-      if (normalizedStage === "detach") {
-        var detachSummary =
-          __atrDetachManagedProxiesForCleanupObject(rootPath);
-        detachSummary.local_root = rootPath;
-        result.summaries.push(detachSummary);
-        result.detached_proxy_count += Number(
-          detachSummary.detached_proxy_count || 0,
-        );
-        result.detach_failed_count += Number(
-          detachSummary.detach_proxy_failed_count || 0,
-        );
-        if (
-          detachSummary.detach_proxy_warnings &&
-          detachSummary.detach_proxy_warnings.length
-        ) {
-          for (
-            var dw = 0;
-            dw < detachSummary.detach_proxy_warnings.length;
-            dw += 1
+    for (var p = 0; p < targetProjects.length; p += 1) {
+      var targetProject = targetProjects[p];
+      for (var rootIndex = 0; rootIndex < normalizedRoots.length; rootIndex += 1) {
+        var rootPath = normalizedRoots[rootIndex];
+        if (normalizedStage === "detach") {
+          var detachSummary = __atrDetachManagedProxiesForCleanupObject(
+            rootPath,
+            targetProject,
+          );
+          detachSummary.local_root = rootPath;
+          detachSummary.project_identity =
+            __atrGetProjectIdentity(targetProject);
+          result.summaries.push(detachSummary);
+          result.detached_proxy_count += Number(
+            detachSummary.detached_proxy_count || 0,
+          );
+          result.detach_failed_count += Number(
+            detachSummary.detach_proxy_failed_count || 0,
+          );
+          if (
+            detachSummary.detach_proxy_warnings &&
+            detachSummary.detach_proxy_warnings.length
           ) {
-            if (result.warnings.length < 10) {
-              result.warnings.push(detachSummary.detach_proxy_warnings[dw]);
+            for (
+              var dw = 0;
+              dw < detachSummary.detach_proxy_warnings.length;
+              dw += 1
+            ) {
+              if (result.warnings.length < 10) {
+                result.warnings.push(detachSummary.detach_proxy_warnings[dw]);
+              }
             }
           }
-        }
-      } else {
-        var offlineSummary =
-          __atrSetImportedMediaOfflineForCleanupObject(rootPath);
-        offlineSummary.local_root = rootPath;
-        result.summaries.push(offlineSummary);
-        result.media_offline_count += Number(
-          offlineSummary.media_offline_count || 0,
-        );
-        result.media_offline_failed_count += Number(
-          offlineSummary.media_offline_failed_count || 0,
-        );
-        result.media_offline_deferred_proxy_count += Number(
-          offlineSummary.media_offline_deferred_proxy_count || 0,
-        );
-        if (
-          offlineSummary.media_release_warnings &&
-          offlineSummary.media_release_warnings.length
-        ) {
-          for (
-            var ow = 0;
-            ow < offlineSummary.media_release_warnings.length;
-            ow += 1
+        } else if (normalizedStage === "verify_detach") {
+          var verifySummary =
+            __atrVerifyManagedProxiesDetachedForCleanupObject(
+              rootPath,
+              targetProject,
+            );
+          verifySummary.local_root = rootPath;
+          verifySummary.project_identity =
+            __atrGetProjectIdentity(targetProject);
+          result.summaries.push(verifySummary);
+          result.remaining_attached_proxy_count += Number(
+            verifySummary.remaining_attached_proxy_count || 0,
+          );
+          if (
+            verifySummary.detach_proxy_warnings &&
+            verifySummary.detach_proxy_warnings.length
           ) {
-            if (result.warnings.length < 10) {
-              result.warnings.push(offlineSummary.media_release_warnings[ow]);
+            for (
+              var vw = 0;
+              vw < verifySummary.detach_proxy_warnings.length;
+              vw += 1
+            ) {
+              if (result.warnings.length < 10) {
+                result.warnings.push(verifySummary.detach_proxy_warnings[vw]);
+              }
+            }
+          }
+        } else {
+          var offlineSummary =
+            __atrSetImportedMediaOfflineForCleanupObject(
+              rootPath,
+              targetProject,
+            );
+          offlineSummary.local_root = rootPath;
+          offlineSummary.project_identity =
+            __atrGetProjectIdentity(targetProject);
+          result.summaries.push(offlineSummary);
+          result.media_offline_count += Number(
+            offlineSummary.media_offline_count || 0,
+          );
+          result.media_offline_failed_count += Number(
+            offlineSummary.media_offline_failed_count || 0,
+          );
+          result.media_offline_deferred_proxy_count += Number(
+            offlineSummary.media_offline_deferred_proxy_count || 0,
+          );
+          if (
+            offlineSummary.media_release_warnings &&
+            offlineSummary.media_release_warnings.length
+          ) {
+            for (
+              var ow = 0;
+              ow < offlineSummary.media_release_warnings.length;
+              ow += 1
+            ) {
+              if (result.warnings.length < 10) {
+                result.warnings.push(offlineSummary.media_release_warnings[ow]);
+              }
             }
           }
         }
@@ -2084,7 +2498,8 @@ function prepareImportedProjectsForCleanup(localRootsJson, stage) {
 
     result.ok =
       result.detach_failed_count === 0 &&
-      result.media_offline_failed_count === 0;
+      result.media_offline_failed_count === 0 &&
+      result.remaining_attached_proxy_count === 0;
     return JSON.stringify(result);
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
@@ -2105,104 +2520,125 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
     if (!roots || !roots.length) {
       roots = [];
     }
-
-    var detachSummaries = [];
-    var mediaReleaseSummaries = [];
-    var detachedProxyCount = 0;
-    var detachFailedCount = 0;
-    var mediaOfflineCount = 0;
-    var mediaOfflineDeferredProxyCount = 0;
-    var detachWarnings = [];
-    var mediaReleaseWarnings = [];
+    var normalizedRoots = [];
     for (var i = 0; i < roots.length; i += 1) {
-      var rootPath = __atrSafeString(roots[i]);
-      if (!rootPath) {
-        continue;
+      var normalizedRoot = __atrNormalizeComparePath(roots[i]);
+      if (normalizedRoot) {
+        normalizedRoots.push(normalizedRoot);
       }
-      var detachSummary = __atrDetachManagedProxiesForCleanupObject(rootPath);
-      detachSummary.local_root = rootPath;
-      detachSummaries.push(detachSummary);
-      detachedProxyCount += Number(detachSummary.detached_proxy_count || 0);
-      detachFailedCount += Number(detachSummary.detach_proxy_failed_count || 0);
-      if (detachSummary.detach_proxy_warnings && detachSummary.detach_proxy_warnings.length) {
-        for (var w = 0; w < detachSummary.detach_proxy_warnings.length; w += 1) {
-          if (detachWarnings.length < 10) {
-            detachWarnings.push(detachSummary.detach_proxy_warnings[w]);
-          }
-        }
-      }
-
-      var mediaReleaseSummary =
-        __atrSetImportedMediaOfflineForCleanupObject(rootPath);
-      mediaReleaseSummary.local_root = rootPath;
-      mediaReleaseSummaries.push(mediaReleaseSummary);
-      mediaOfflineCount += Number(mediaReleaseSummary.media_offline_count || 0);
-      mediaOfflineDeferredProxyCount += Number(
-        mediaReleaseSummary.media_offline_deferred_proxy_count || 0,
-      );
-      if (
-        mediaReleaseSummary.media_release_warnings &&
-        mediaReleaseSummary.media_release_warnings.length
-      ) {
-        for (
-          var mw = 0;
-          mw < mediaReleaseSummary.media_release_warnings.length;
-          mw += 1
-        ) {
-          if (mediaReleaseWarnings.length < 10) {
-            mediaReleaseWarnings.push(
-              mediaReleaseSummary.media_release_warnings[mw],
-            );
-          }
-        }
-      }
+    }
+    if (normalizedRoots.length === 0) {
+      return "ERROR: No local project roots were provided for project cleanup";
     }
 
     try {
       __atrCloseSourceMonitorForCleanup(null);
     } catch (eCloseBeforePurge) {}
 
-    var purgeRaw = purgeActiveProject();
-    if (purgeRaw && String(purgeRaw).indexOf("ERROR:") === 0) {
-      return purgeRaw;
-    }
-    var purgeSummary = {};
-    try {
-      purgeSummary = JSON.parse(purgeRaw || "{}");
-    } catch (ePurgeParse) {
-      purgeSummary = {
-        ok: true,
-        raw: __atrSafeString(purgeRaw),
-      };
+    var targetProjects = __atrResolveCleanupTargetProjects(
+      normalizedRoots,
+      false,
+    );
+    var purgeSummary = {
+      ok: true,
+      target_project_count: targetProjects.length,
+      project_summaries: [],
+      sequences_deleted: 0,
+      sequences_failed: 0,
+      items_moved_to_purge_bin: 0,
+      move_failures: 0,
+      move_passes: 0,
+      remaining_sequences: 0,
+      remaining_root_items: 0,
+      purge_bin_create_failed: false,
+      purge_bin_delete_failed: false,
+      warning_count: 0,
+      warnings: [],
+    };
+
+    for (var p = 0; p < targetProjects.length; p += 1) {
+      var purgeRaw = purgeActiveProject(targetProjects[p]);
+      if (purgeRaw && String(purgeRaw).indexOf("ERROR:") === 0) {
+        purgeSummary.ok = false;
+        purgeSummary.warnings.push(__atrSafeString(purgeRaw));
+        continue;
+      }
+      var projectSummary = {};
+      try {
+        projectSummary = JSON.parse(purgeRaw || "{}");
+      } catch (ePurgeParse) {
+        projectSummary = {
+          ok: false,
+          error: "Invalid project purge response",
+          raw: __atrSafeString(purgeRaw),
+        };
+      }
+      purgeSummary.project_summaries.push(projectSummary);
+      purgeSummary.ok = purgeSummary.ok && projectSummary.ok !== false;
+      purgeSummary.sequences_deleted += Number(
+        projectSummary.sequences_deleted || 0,
+      );
+      purgeSummary.sequences_failed += Number(
+        projectSummary.sequences_failed || 0,
+      );
+      purgeSummary.items_moved_to_purge_bin += Number(
+        projectSummary.items_moved_to_purge_bin || 0,
+      );
+      purgeSummary.move_failures += Number(
+        projectSummary.move_failures || 0,
+      );
+      purgeSummary.move_passes += Number(projectSummary.move_passes || 0);
+      purgeSummary.remaining_sequences += Number(
+        projectSummary.remaining_sequences || 0,
+      );
+      purgeSummary.remaining_root_items += Number(
+        projectSummary.remaining_root_items || 0,
+      );
+      purgeSummary.purge_bin_create_failed =
+        purgeSummary.purge_bin_create_failed ||
+        !!projectSummary.purge_bin_create_failed;
+      purgeSummary.purge_bin_delete_failed =
+        purgeSummary.purge_bin_delete_failed ||
+        !!projectSummary.purge_bin_delete_failed;
+      var projectWarnings = projectSummary.warnings || [];
+      for (var warningIndex = 0;
+        warningIndex < projectWarnings.length &&
+        purgeSummary.warnings.length < 12;
+        warningIndex += 1) {
+        purgeSummary.warnings.push(projectWarnings[warningIndex]);
+      }
+      if (projectSummary.error && !purgeSummary.error) {
+        purgeSummary.error = __atrSafeString(projectSummary.error);
+      }
     }
 
     try {
       __atrCloseSourceMonitorForCleanup(null);
     } catch (eCloseAfterPurge) {}
 
-    purgeSummary.detach_proxy_summaries = detachSummaries;
-    purgeSummary.media_release_summaries = mediaReleaseSummaries;
-    purgeSummary.detached_proxy_count = detachedProxyCount;
-    purgeSummary.detach_failed_count = detachFailedCount;
-    purgeSummary.media_offline_count = mediaOfflineCount;
-    purgeSummary.media_offline_deferred_proxy_count =
-      mediaOfflineDeferredProxyCount;
-    purgeSummary.detach_proxy_warnings = detachWarnings;
-    purgeSummary.media_release_warnings = mediaReleaseWarnings;
-    purgeSummary.warning_count =
-      Number(purgeSummary.warning_count || 0) +
-      detachWarnings.length +
-      mediaReleaseWarnings.length;
-    if (detachWarnings.length > 0 || mediaReleaseWarnings.length > 0) {
-      if (!purgeSummary.warnings) {
-        purgeSummary.warnings = [];
+    var referenceSummary =
+      __atrInspectOpenProjectCleanupReferences(normalizedRoots);
+    purgeSummary.release_verification = referenceSummary;
+    purgeSummary.referencing_project_count =
+      referenceSummary.referencing_project_count;
+    purgeSummary.remaining_media_references =
+      referenceSummary.remaining_media_references;
+    purgeSummary.remaining_proxy_references =
+      referenceSummary.remaining_proxy_references;
+    purgeSummary.warning_count = purgeSummary.warnings.length;
+    if (!referenceSummary.ok) {
+      purgeSummary.ok = false;
+      purgeSummary.error =
+        "Premiere still references local source or proxy media after purge";
+      if (referenceSummary.samples.length > 0) {
+        purgeSummary.warnings.push(
+          "Remaining references: " + referenceSummary.samples.join(", "),
+        );
+        purgeSummary.warning_count = purgeSummary.warnings.length;
       }
-      for (var j = 0; j < detachWarnings.length; j += 1) {
-        purgeSummary.warnings.push(detachWarnings[j]);
-      }
-      for (var k = 0; k < mediaReleaseWarnings.length; k += 1) {
-        purgeSummary.warnings.push(mediaReleaseWarnings[k]);
-      }
+    }
+    if (!purgeSummary.ok && !purgeSummary.error) {
+      purgeSummary.error = "Premiere project purge incomplete";
     }
     try {
       if ($ && $.gc) {
@@ -2210,6 +2646,36 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
       }
     } catch (eCleanupGc) {}
     return JSON.stringify(purgeSummary);
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
+function verifyImportedProjectsCleanup(localRootsJson) {
+  try {
+    var roots = [];
+    try {
+      roots =
+        typeof localRootsJson === "string"
+          ? JSON.parse(localRootsJson || "[]")
+          : localRootsJson;
+    } catch (eParse) {
+      roots = [];
+    }
+    var normalizedRoots = [];
+    for (var i = 0; roots && i < roots.length; i += 1) {
+      var normalizedRoot = __atrNormalizeComparePath(roots[i]);
+      if (normalizedRoot) {
+        normalizedRoots.push(normalizedRoot);
+      }
+    }
+    if (normalizedRoots.length === 0) {
+      return "ERROR: No local project roots were provided for cleanup verification";
+    }
+    __atrCloseSourceMonitorForCleanup(null);
+    return JSON.stringify(
+      __atrInspectOpenProjectCleanupReferences(normalizedRoots),
+    );
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }
@@ -2232,7 +2698,16 @@ function runScript(scriptPath) {
     try {
       $.global.__ATR_IMPORT_WARNINGS__ = "";
     } catch (eClearImportWarnings) {}
+    // Keep the owning Project object. app.project means "currently active",
+    // which may be a different open project by the time upload and cleanup
+    // finish.
+    try {
+      __atrRememberImportedProject(app && app.project ? app.project : null);
+    } catch (eRememberBefore) {}
     $.evalFile(file);
+    try {
+      __atrRememberImportedProject(app && app.project ? app.project : null);
+    } catch (eRememberAfter) {}
     // Report the warnings in THIS round-trip. The panel used to fetch them with
     // a second evalScript right after a multi-minute import; that follow-up call
     // can be swallowed once Premiere returns to its event loop, which stranded

@@ -9,8 +9,8 @@ CEP panel for Premiere Pro 25.x with:
 
 ## One-time Installation
 
-1. Run `premiere-extension/install_extension.bat`
-2. Restart Premiere Pro 2025
+1. Close Premiere Pro and Adobe Media Encoder, then run `premiere-extension/install_extension.bat`
+2. Start Premiere Pro 2025
 3. Open `Window > Extensions > Tiktok Reproducer`
 
 ## One-time Setup (inside panel)
@@ -137,7 +137,9 @@ The panel starts AME export with configured `.epr`, tracks encoder job events, t
 Checkbox **Delete local folder after successful upload** is enabled by default.
 Deletion happens only after:
 - a confirmed successful Drive upload,
-- Premiere project cleanup fully purges the active ATR project,
+- proxy generation/reconciliation is stopped and managed proxies are detached,
+- every open Premiere project containing the downloaded source/proxy paths is purged,
+- Premiere verifies that no source or proxy links to those paths remain,
 - the local downloaded folder is fully removed.
 
 ## Reliability / Recovery
