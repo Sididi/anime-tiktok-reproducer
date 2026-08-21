@@ -673,6 +673,111 @@ def test_opening_duplicate_relaxation_never_applies_to_an_interior_fragment():
     assert repaired == [micro, following]
 
 
+def test_supported_opening_continuation_extends_the_longer_affine_track():
+    times = (
+        0.14, 0.25, 0.35, 0.50, 0.56,
+        0.75, 0.926667, 1.0, 1.25, 1.50, 1.75,
+    )
+    samples = [_sample(value) for value in times]
+    candidates = [
+        [
+            _candidate(0, 0.14, 198.5, similarity=0.34),
+            _candidate(0, 0.14, 200.5, similarity=0.33),
+        ],
+        [
+            _candidate(1, 0.25, 198.5, similarity=0.49),
+            _candidate(1, 0.25, 200.0, similarity=0.48),
+        ],
+        [
+            _candidate(2, 0.35, 199.0, similarity=0.59),
+            _candidate(2, 0.35, 200.5, similarity=0.58),
+        ],
+        [
+            _candidate(3, 0.50, 199.0, similarity=0.66),
+            _candidate(3, 0.50, 200.5, similarity=0.65),
+        ],
+        [
+            _candidate(4, 0.56, 199.0, similarity=0.68),
+            _candidate(4, 0.56, 201.0, similarity=0.67),
+        ],
+    ]
+    following_sources = (201.0, 201.5, 201.5, 201.5, 202.0, 202.0)
+    for index, (query, source) in enumerate(
+        zip(times[5:], following_sources, strict=True),
+        start=5,
+    ):
+        candidates.append(
+            [_candidate(index, query, source, similarity=0.60)]
+        )
+
+    opening = TrackSegment(
+        0.0,
+        0.7,
+        "episode-1",
+        1.0,
+        198.466,
+        points=[values[0] for values in candidates[:5]],
+        confidence=0.58,
+        uncertain=True,
+        doubt_reasons=["detector_discontinuity", "weak_similarity"],
+    )
+    following = TrackSegment(
+        0.7,
+        1.833333,
+        "episode-1",
+        1.0,
+        200.375,
+        points=[values[0] for values in candidates[5:]],
+        confidence=0.60,
+        uncertain=True,
+        doubt_reasons=["detector_discontinuity"],
+    )
+
+    repaired = HierarchicalMatcherService._extend_supported_opening_continuation(
+        [opening, following], candidates, samples
+    )
+
+    assert len(repaired) == 1
+    assert repaired[0].a == pytest.approx(1.0)
+    assert repaired[0].b == pytest.approx(200.375)
+    source_start, source_end = HierarchicalMatcherService._safe_primary_source_interval(
+        repaired[0]
+    )
+    assert source_start == pytest.approx(200.48)
+    assert source_end == pytest.approx(202.208333, abs=1e-5)
+    assert "supported_opening_continuation" in repaired[0].doubt_reasons
+
+
+def test_supported_opening_continuation_requires_three_strong_probes():
+    samples = [_sample(value) for value in (0.25, 0.5, 0.6, 0.75, 1.0, 1.25)]
+    candidates = [
+        [_candidate(0, 0.25, 200.5, similarity=0.60)],
+        [_candidate(1, 0.5, 201.0, similarity=0.60)],
+        # The third geometrically aligned probe is too weak.
+        [_candidate(2, 0.6, 201.0, similarity=0.54)],
+        [_candidate(3, 0.75, 201.0, similarity=0.60)],
+        [_candidate(4, 1.0, 201.5, similarity=0.60)],
+        [_candidate(5, 1.25, 201.5, similarity=0.60)],
+    ]
+    opening = TrackSegment(
+        0.0, 0.7, "episode-1", 1.0, 198.5,
+        confidence=0.58, uncertain=True,
+        doubt_reasons=["detector_discontinuity", "weak_similarity"],
+    )
+    following = TrackSegment(
+        0.7, 1.8, "episode-1", 1.0, 200.375,
+        points=[values[0] for values in candidates[3:]] * 2,
+        confidence=0.60, uncertain=True,
+        doubt_reasons=["detector_discontinuity"],
+    )
+
+    repaired = HierarchicalMatcherService._extend_supported_opening_continuation(
+        [opening, following], candidates, samples
+    )
+
+    assert repaired == [opening, following]
+
+
 def test_sub_four_tenths_leading_shot_is_not_pooled():
     micro = TrackSegment(
         1.0,
@@ -972,6 +1077,49 @@ def test_native_check_can_test_neighbor_for_short_duplicate_island():
     assert distance == pytest.approx(0.0)
 
 
+def test_native_check_skips_a_near_primary_cluster_for_equal_remote_evidence():
+    segment = TrackSegment(
+        34.2,
+        35.45,
+        "ep",
+        1.0,
+        241.482853,
+        confidence=0.5545,
+        uncertain=True,
+        doubt_reasons=["duplicate_margin"],
+    )
+    midpoint = 0.5 * (segment.q_start + segment.q_end)
+    near = LineProposal(
+        "ep", 1.0, 278.807 - midpoint, 0.5946, 9, "timeline_cluster"
+    )
+    exact = LineProposal(
+        "ep", 1.0, 467.09 - midpoint, 0.5760, 9, "timeline_cluster"
+    )
+
+    chosen, _ = HierarchicalMatcherService._verification_alternative(
+        [segment], 0, [near, exact]
+    )
+
+    assert chosen is not None
+    assert chosen.source_at(midpoint) == pytest.approx(467.09)
+    assert chosen.algorithm == "native_distinct_timeline_cluster"
+    assert HierarchicalMatcherService._verification_priority(
+        [segment], 0, chosen, float("inf")
+    ) > 1.10
+
+
+def test_native_check_keeps_near_cluster_when_remote_evidence_is_weaker():
+    segment = TrackSegment(0.0, 1.25, "ep", 1.0, 10.0, confidence=0.55)
+    near = LineProposal("ep", 1.0, 12.5, 0.60, 9, "timeline_cluster")
+    remote = LineProposal("ep", 1.0, 100.0, 0.50, 9, "timeline_cluster")
+
+    chosen, _ = HierarchicalMatcherService._verification_alternative(
+        [segment], 0, [near, remote]
+    )
+
+    assert chosen is near
+
+
 def test_primary_source_start_does_not_precede_first_in_scene_evidence():
     point = _candidate(0, 6.0, 161.0)
     segment = TrackSegment(
@@ -986,7 +1134,7 @@ def test_primary_source_start_does_not_precede_first_in_scene_evidence():
     source_start, source_end = (
         HierarchicalMatcherService._safe_primary_source_interval(segment)
     )
-    assert source_start == pytest.approx(160.92)
+    assert source_start == pytest.approx(160.98)
     assert source_end > source_start
 
 

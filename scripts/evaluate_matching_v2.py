@@ -120,6 +120,8 @@ def evaluate_project(
     matcher: str,
     runs: int,
     output_dir: Path,
+    *,
+    build_review: bool = True,
 ) -> tuple[dict, list[dict]]:
     project = ProjectService.load(snapshot.project_id)
     if project is None or not project.video_path:
@@ -209,21 +211,22 @@ def evaluate_project(
     (output_dir / f"{snapshot.project_id}_{matcher}.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
     )
-    review_assets = build_review_assets(
-        output_dir,
-        snapshot.project_id,
-        video,
-        project.library_type,
-        intervals,
-        rows,
-    )
-    write_review_html(
-        output_dir / f"{snapshot.project_id}_{matcher}_review.html",
-        snapshot.project_id,
-        metrics,
-        intervals,
-        review_assets,
-    )
+    if build_review:
+        review_assets = build_review_assets(
+            output_dir,
+            snapshot.project_id,
+            video,
+            project.library_type,
+            intervals,
+            rows,
+        )
+        write_review_html(
+            output_dir / f"{snapshot.project_id}_{matcher}_review.html",
+            snapshot.project_id,
+            metrics,
+            intervals,
+            review_assets,
+        )
     snapshot.assert_unchanged()
     return metrics, rows
 
@@ -238,6 +241,11 @@ def main() -> int:
         help="bounded selects the new default matcher; v2 selects the old compatibility matcher",
     )
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument(
+        "--skip-review-assets",
+        action="store_true",
+        help="skip frame extraction/HTML while retaining metrics and hash checks",
+    )
     parser.add_argument(
         "--baseline-json",
         type=Path,
@@ -260,7 +268,11 @@ def main() -> int:
     try:
         for snapshot in snapshots:
             metrics, rows = evaluate_project(
-                snapshot, args.matcher, max(1, args.runs), output_dir
+                snapshot,
+                args.matcher,
+                max(1, args.runs),
+                output_dir,
+                build_review=not args.skip_review_assets,
             )
             results.append(metrics)
             rows_by_project[snapshot.project_id] = rows

@@ -82,6 +82,31 @@ OPENING_DUPLICATE_ANCHOR_MIN_CONFIDENCE = 0.60
 OPENING_DUPLICATE_ANCHOR_MARGIN = 0.15
 OPENING_DUPLICATE_PROPOSAL_JOIN_SECONDS = 2.0
 OPENING_DUPLICATE_ANCHOR_QUERY_SECONDS = 0.15
+# A separate, narrower opening certificate handles a false 0.65--0.75s
+# detector cut when the following affine track is already visible in at least
+# three independently retrieved opening probes.  This deliberately does not
+# relax the ordinary duplicate/merge thresholds.
+OPENING_CONTINUATION_MAX_SECONDS = 0.75
+OPENING_CONTINUATION_MIN_FOLLOWING_CONFIDENCE = 0.55
+OPENING_CONTINUATION_MIN_FOLLOWING_SUPPORT = 6
+OPENING_CONTINUATION_MIN_PROBES = 3
+OPENING_CONTINUATION_MIN_SIMILARITY = 0.55
+OPENING_CONTINUATION_MAX_RETRIEVAL_RANK = 5
+OPENING_CONTINUATION_MIN_PROBE_SPAN_SECONDS = 0.20
+OPENING_CONTINUATION_MIN_SOURCE_JUMP_SECONDS = 1.25
+OPENING_CONTINUATION_MAX_SOURCE_JUMP_SECONDS = 2.25
+OPENING_CONTINUATION_MAX_RATE_DELTA = 0.15
+# Native verification should spend its one alternative on a genuinely
+# distinct hypothesis.  A near-primary source interval may survive the UI's
+# 2s clustering even though it is visibly the same shot.
+VERIFY_PRIMARY_CLUSTER_MIN_SECONDS = 3.0
+VERIFY_PRIMARY_CLUSTER_DURATION_MULTIPLIER = 1.0
+VERIFY_REDUNDANT_CLUSTER_CONFIDENCE_DELTA = 0.03
+VERIFY_REDUNDANT_CLUSTER_SUPPORT_DELTA = 1
+VERIFY_DISTINCT_CLUSTER_PRIORITY_BONUS = 0.20
+VERIFY_DISTINCT_STRONG_MIN_CONFIDENCE = 0.55
+VERIFY_DISTINCT_STRONG_MIN_SUPPORT = 8
+VERIFY_DISTINCT_STRONG_PRIORITY_BONUS = 0.35
 # Post-verification repairs use already-paid retrieval/track evidence.  Their
 # gates are deliberately stronger than the ordinary assembly heuristics.
 STRONG_ABSTENTION_MIN_SUPPORT = 3
@@ -94,11 +119,13 @@ FLANK_MIN_INLIER_RATIO = 0.70
 FLANK_MAX_MEDIAN_RESIDUAL_SECONDS = 0.36
 FLANK_HYPOTHESIS_POINTS_PER_SIDE = 12
 # Source index timestamps are spaced at 0.5s.  Affine extrapolation from a
-# short track can therefore land well before the first retrieved frame even
-# when that frame is the first one from the correct source shot.  Keep only a
-# tiny lead-in before concrete in-segment evidence; avoiding a previous-shot
-# flash is more important than preserving a few uncertain opening frames.
-SOURCE_START_MAX_PREROLL_SECONDS = 0.08
+# short track can therefore land before the first retrieved frame even when
+# that frame is the first one from the correct source shot.  Never synthesize
+# extra multi-frame lead-in before concrete in-segment evidence: those frames
+# can be the previous shot and create a visible flash in the rendered edit.
+# Keep only a sub-frame 20ms tolerance so a coarse 0.5s index timestamp does
+# not move an otherwise-correct borderline fit across the 1s acceptance band.
+SOURCE_START_MAX_PREROLL_SECONDS = 0.02
 # How much a manual-merge prior tilts the episode vote. Big enough to break a
 # near-tie toward the fragment the owner said this span continues, small enough
 # that a clear body of fresh retrieval still overrules it.
@@ -414,6 +441,15 @@ class HierarchicalMatcherService:
         )
         diagnostics.counters["opening_duplicate_repairs"] = float(
             max(0, before_opening_duplicate - len(segments))
+        )
+        before_opening_continuation = len(segments)
+        segments = cls._extend_supported_opening_continuation(
+            segments,
+            candidates,
+            samples,
+        )
+        diagnostics.counters["opening_continuation_extensions"] = float(
+            max(0, before_opening_continuation - len(segments))
         )
         before_flank_bridge = len(segments)
         segments = cls._repair_supported_flank_islands(segments)
@@ -2670,6 +2706,131 @@ class HierarchicalMatcherService:
         return result
 
     @classmethod
+    def _extend_supported_opening_continuation(
+        cls,
+        segments: list[TrackSegment],
+        candidates: list[list[RetrievalCandidate]],
+        samples: list[QueryFrame],
+    ) -> list[TrackSegment]:
+        """Remove one narrowly certified false detector cut at query zero.
+
+        The first fragment has no left-hand timeline with which to establish
+        continuity.  For the otherwise-untouched 0.65--0.75s band, accept the
+        following line only when several *independent opening query frames*
+        already retrieve that extrapolated line near the top of their FAISS
+        results.  The longer following fit remains the timing authority; the
+        opening candidates are concrete evidence and guard the emitted source
+        start from preceding-shot preroll.
+        """
+        result = list(segments)
+        if len(result) < 2:
+            return result
+        opening, following = result[:2]
+        duration = opening.q_end - opening.q_start
+        source_jump = (
+            following.source_at(opening.q_end)
+            - opening.source_at(opening.q_end)
+        )
+        if (
+            abs(opening.q_start) > 1e-3
+            or not OPENING_DUPLICATE_MAX_SECONDS
+            < duration
+            <= OPENING_CONTINUATION_MAX_SECONDS
+            or opening.episode is None
+            or following.episode != opening.episode
+            or following.q_end - following.q_start < 1.0
+            or following.confidence
+            < OPENING_CONTINUATION_MIN_FOLLOWING_CONFIDENCE
+            or len(following.points) < OPENING_CONTINUATION_MIN_FOLLOWING_SUPPORT
+            or "weak_similarity" not in opening.doubt_reasons
+            or "detector_discontinuity" not in opening.doubt_reasons
+            or "detector_discontinuity" not in following.doubt_reasons
+            or abs(opening.a - following.a)
+            > OPENING_CONTINUATION_MAX_RATE_DELTA
+            or not OPENING_CONTINUATION_MIN_SOURCE_JUMP_SECONDS
+            <= source_jump
+            <= OPENING_CONTINUATION_MAX_SOURCE_JUMP_SECONDS
+        ):
+            return result
+
+        supported_points: list[RetrievalCandidate] = []
+        for sample_index, sample in enumerate(samples):
+            if not opening.q_start <= sample.t_query < opening.q_end:
+                continue
+            predicted = following.source_at(sample.t_query)
+            aligned = [
+                candidate
+                for candidate in candidates[sample_index][
+                    :OPENING_CONTINUATION_MAX_RETRIEVAL_RANK
+                ]
+                if candidate.episode == following.episode
+                and candidate.similarity >= OPENING_CONTINUATION_MIN_SIMILARITY
+                and abs(candidate.t_source - predicted)
+                <= TRACK_RESIDUAL_SECONDS
+            ]
+            if aligned:
+                supported_points.append(
+                    max(
+                        aligned,
+                        key=lambda candidate: (
+                            candidate.similarity
+                            - 0.06 * abs(candidate.t_source - predicted)
+                        ),
+                    )
+                )
+        supported_times = sorted(
+            {round(point.t_query, 6) for point in supported_points}
+        )
+        if (
+            len(supported_times) < OPENING_CONTINUATION_MIN_PROBES
+            or supported_times[-1] - supported_times[0]
+            < OPENING_CONTINUATION_MIN_PROBE_SPAN_SECONDS
+        ):
+            return result
+
+        points = sorted(
+            supported_points + following.points,
+            key=lambda point: point.t_query,
+        )
+        residual = float(
+            np.median(
+                [
+                    abs(
+                        point.t_source
+                        - following.source_at(point.t_query)
+                    )
+                    for point in points
+                ]
+            )
+        )
+        confidence = float(
+            np.median([point.similarity for point in points])
+        )
+        reasons = set(opening.doubt_reasons + following.doubt_reasons)
+        reasons.discard("weak_similarity")
+        reasons.discard("timing_residual")
+        reasons.add("supported_opening_continuation")
+        if confidence < 0.36:
+            reasons.add("weak_similarity")
+        if residual > 0.45:
+            reasons.add("timing_residual")
+        result[:2] = [
+            TrackSegment(
+                q_start=opening.q_start,
+                q_end=following.q_end,
+                episode=following.episode,
+                a=following.a,
+                b=following.b,
+                points=points,
+                confidence=confidence,
+                residual=residual,
+                uncertain=True,
+                doubt_reasons=sorted(reasons),
+            )
+        ]
+        return result
+
+    @classmethod
     def _collapse_leading_duplicate_regions(
         cls,
         segments: list[TrackSegment],
@@ -2878,15 +3039,55 @@ class HierarchicalMatcherService:
         """
         segment = segments[segment_index]
         midpoint = 0.5 * (segment.q_start + segment.q_end)
-        distinct = [
+        primary_separation = max(
+            VERIFY_PRIMARY_CLUSTER_MIN_SECONDS,
+            VERIFY_PRIMARY_CLUSTER_DURATION_MULTIPLIER
+            * (segment.q_end - segment.q_start),
+        )
+
+        def source_distance(proposal: LineProposal) -> float:
+            if proposal.episode != segment.episode:
+                return math.inf
+            return abs(
+                proposal.source_at(midpoint) - segment.source_at(midpoint)
+            )
+
+        # Keep track of the narrow 2--3s band that the old selector considered
+        # independent.  If an equally supported remote proposal exists, that
+        # near-primary option is redundant native work rather than diversity.
+        redundant_near = [
+            proposal
+            for proposal in proposals
+            if 2.0 <= source_distance(proposal) < primary_separation
+        ]
+        ordinary_distinct = [
             proposal
             for proposal in proposals
             if proposal.episode != segment.episode
-            or abs(
-                proposal.source_at(midpoint) - segment.source_at(midpoint)
-            )
-            >= 2.0
+            or source_distance(proposal) >= 2.0
         ]
+        competitive_remote = [
+            proposal
+            for proposal in ordinary_distinct
+            if source_distance(proposal) >= primary_separation
+            and any(
+                proposal.confidence
+                >= near.confidence - VERIFY_REDUNDANT_CLUSTER_CONFIDENCE_DELTA
+                and proposal.support
+                >= near.support - VERIFY_REDUNDANT_CLUSTER_SUPPORT_DELTA
+                for near in redundant_near
+            )
+        ]
+        prefer_diverse = bool(redundant_near and competitive_remote)
+        distinct = (
+            [
+                proposal
+                for proposal in ordinary_distinct
+                if source_distance(proposal) >= primary_separation
+            ]
+            if prefer_diverse
+            else ordinary_distinct
+        )
         # A short duplicate island may have lost the adjacent cluster from its
         # own top proposals even though the neighbour is a strong affine
         # hypothesis.  Native verification is exactly the place to test that
@@ -2917,11 +3118,7 @@ class HierarchicalMatcherService:
                 )
                 if (
                     proposal.episode == segment.episode
-                    and abs(
-                        proposal.source_at(midpoint)
-                        - segment.source_at(midpoint)
-                    )
-                    < 2.0
+                    and source_distance(proposal) < primary_separation
                 ):
                     continue
                 if any(
@@ -2974,6 +3171,11 @@ class HierarchicalMatcherService:
                 value.support,
             ),
         )
+        if prefer_diverse:
+            proposal = replace(
+                proposal,
+                algorithm=f"native_distinct_{proposal.algorithm}",
+            )
         return proposal, cls._proposal_neighbor_distance(
             segments,
             segment_index,
@@ -3008,6 +3210,14 @@ class HierarchicalMatcherService:
             priority += 0.40
         if alternative.algorithm == "neighbor_continuation":
             priority += 3.0
+        if alternative.algorithm.startswith("native_distinct_"):
+            priority += VERIFY_DISTINCT_CLUSTER_PRIORITY_BONUS
+            if (
+                alternative.confidence
+                >= VERIFY_DISTINCT_STRONG_MIN_CONFIDENCE
+                and alternative.support >= VERIFY_DISTINCT_STRONG_MIN_SUPPORT
+            ):
+                priority += VERIFY_DISTINCT_STRONG_PRIORITY_BONUS
         plausible_gap = max(3.0, 2.0 * (segment.q_end - segment.q_start))
         left_distance = math.inf
         right_distance = math.inf
