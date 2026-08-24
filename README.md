@@ -171,7 +171,7 @@ pixi run backend
 
 # Or start in a subshell
 pixi shell
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --reload-dir app --port 8000
 
 # Terminal 2: Frontend
 cd frontend
