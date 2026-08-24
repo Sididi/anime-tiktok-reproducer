@@ -196,7 +196,6 @@ export function ProjectManagerModal({
   const [previewTarget, setPreviewTarget] = useState<{
     driveVideoId: string | null;
     projectId: string;
-    localVideoAvailable: boolean;
   } | null>(null);
   const loadRequestIdRef = useRef(0);
 
@@ -1406,8 +1405,6 @@ export function ProjectManagerModal({
 
           <VideoPreviewModal
             driveVideoId={previewTarget?.driveVideoId ?? null}
-            projectId={previewTarget?.projectId ?? null}
-            localVideoAvailable={previewTarget?.localVideoAvailable ?? false}
             onClose={() => setPreviewTarget(null)}
           />
 

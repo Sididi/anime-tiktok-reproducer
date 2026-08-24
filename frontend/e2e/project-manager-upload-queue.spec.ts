@@ -36,7 +36,6 @@ const INITIAL_PROJECT_ROWS = [
     drive_folder_id: "folder-alpha",
     drive_folder_url: "https://drive.example/folder-alpha",
     drive_video_id: "drive-alpha",
-    local_video_available: false,
     created_at: "2026-04-12T09:00:00Z",
     scheduled_at: null,
     scheduled_account_id: null,
@@ -58,7 +57,6 @@ const INITIAL_PROJECT_ROWS = [
     drive_folder_id: "folder-beta",
     drive_folder_url: "https://drive.example/folder-beta",
     drive_video_id: "drive-beta",
-    local_video_available: false,
     created_at: "2026-04-12T09:05:00Z",
     scheduled_at: null,
     scheduled_account_id: null,
@@ -493,9 +491,6 @@ function installProjectManagerUploadMocks({
       ) ||
       /^\/api\/project-manager\/projects\/[^/]+\/upload-source-preview$/.test(
         url.pathname,
-      ) ||
-      /^\/api\/project-manager\/projects\/[^/]+\/local-video$/.test(
-        url.pathname,
       )
     ) {
       return new Response("", {
@@ -652,40 +647,3 @@ test("Project Manager applies one three-minute choice to YouTube and Instagram",
   });
 });
 
-test("Project Manager previews a local-first video via native <video> when no Drive video exists", async ({
-  page,
-}) => {
-  const LOCAL_FIRST_ROW = {
-    ...INITIAL_PROJECT_ROWS[0],
-    project_id: "project-gamma",
-    anime_title: "Project Gamma",
-    drive_video_count: 0,
-    drive_video_name: null,
-    drive_video_web_url: null,
-    drive_folder_id: null,
-    drive_folder_url: null,
-    drive_video_id: null,
-    local_video_available: true,
-  };
-
-  await page.addInitScript(installProjectManagerUploadMocks, {
-    sourceDetails: SOURCE_DETAILS,
-    initialProjectRows: [LOCAL_FIRST_ROW],
-    projectConfigs: {},
-  });
-
-  await page.goto("/");
-  await page.getByRole("button", { name: "Projects" }).click();
-
-  const gammaRow = page.locator("tr").filter({ hasText: "Project Gamma" });
-  await expect(gammaRow).toBeVisible();
-
-  await gammaRow.getByRole("button", { name: "Preview video" }).click();
-
-  const video = page.locator("video");
-  await expect(video).toBeVisible();
-  await expect(video).toHaveAttribute(
-    "src",
-    /\/api\/project-manager\/projects\/project-gamma\/local-video$/,
-  );
-});

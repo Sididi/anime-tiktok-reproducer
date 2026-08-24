@@ -83,13 +83,10 @@ class Settings(BaseSettings):
     pfm_base_url: str = "https://api.postforme.dev/v1"
 
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
-
-    # LAN transfer (Premiere Pro PC pulls assets / pushes outputs over the LAN)
-    lan_transfer_token: str | None = None
-    # Master switch (ATR_LAN_TRANSFER_ENABLED=false in .env to kill the feature):
-    # when False, /api/lan/* returns 503 and local-first reads are bypassed, so
-    # the backend behaves exactly as before the LAN feature (pure Drive).
-    lan_transfer_enabled: bool = True
+    # Premiere Link: after a /processing Drive export, ask the VPS to auto-launch
+    # the project in the Premiere Pro panel (VPS-brokered WebSocket). Uses the
+    # tiktok_server_* URL/token. ATR_CEP_LINK_ENABLED=false keeps Discord-link-only.
+    cep_link_enabled: bool = True
 
     # Scheduling v2 feature flag (Planning system Phase 1)
     scheduling_v2_enabled: bool = True

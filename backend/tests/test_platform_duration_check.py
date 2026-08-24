@@ -10,7 +10,6 @@ import pytest
 
 import app.services.upload_phase as up
 from app.services.google_drive_service import DriveVideoMetadataLookupError
-from app.services.lan_transfer_service import LanTransferService
 from app.services.upload_phase import (
     UploadPhaseService,
     UploadPreflightUnavailableError,
@@ -23,7 +22,7 @@ def _readiness(**overrides):
         status="green", metadata_exists=True, drive_video_count=0,
         drive_video_id="d1", drive_video_name="final.mp4",
         drive_video_web_url=None, reasons=[], drive_folder_id="folder-1",
-        drive_folder_url=None, local_video_path=None, local_video_name=None,
+        drive_folder_url=None,
     )
     base.update(overrides)
     return UploadReadiness(**base)
@@ -91,27 +90,6 @@ def test_over_limit_via_drive_metadata_triggers_background_download(check_env, m
     assert check_env == ["p1"]
 
 
-def test_local_video_probed_in_place(check_env, tmp_path, monkeypatch):
-    video = tmp_path / "output.mp4"
-    video.write_bytes(b"v")
-    probed = []
-
-    def probe(video_path):
-        probed.append(video_path)
-        return SimpleNamespace(duration_seconds=200.0), None
-
-    monkeypatch.setattr(
-        up.GoogleDriveService, "get_video_duration_seconds",
-        classmethod(lambda cls, fid: pytest.fail("should not hit Drive")),
-    )
-    readiness = _readiness(
-        local_video_path=str(video), local_video_name="output.mp4"
-    )
-    result = _run_check(monkeypatch, readiness, probe_media=probe, max_duration=180.0)
-    assert probed == [video]
-    assert result["needed"] is True
-
-
 def test_preflight_reuses_recent_manager_drive_result(tmp_path, monkeypatch):
     metadata = tmp_path / "metadata.json"
     metadata.write_text("{}")
@@ -132,11 +110,6 @@ def test_preflight_reuses_recent_manager_drive_result(tmp_path, monkeypatch):
         up.ProjectService,
         "get_metadata_file",
         classmethod(lambda cls, project_id: metadata),
-    )
-    monkeypatch.setattr(
-        LanTransferService,
-        "find_local_upload_video",
-        classmethod(lambda cls, project_id: None),
     )
     monkeypatch.setattr(
         UploadPhaseService,

@@ -16,7 +16,6 @@ def _readiness(**overrides):
         status="green", metadata_exists=True, drive_video_count=0,
         drive_video_id=None, drive_video_name=None, drive_video_web_url=None,
         reasons=[], drive_folder_id="folder-1", drive_folder_url=None,
-        local_video_path=None, local_video_name=None,
     )
     base.update(overrides)
     return UploadReadiness(**base)
@@ -36,18 +35,6 @@ def source_cache(tmp_path, monkeypatch):
 
 def test_cached_source_video_none_when_empty(source_cache):
     assert UploadPhaseService.cached_source_video("p1") is None
-
-
-def test_ensure_source_video_copies_local(source_cache, tmp_path):
-    video = tmp_path / "output.mp4"
-    video.write_bytes(b"local-bytes")
-    readiness = _readiness(
-        local_video_path=str(video), local_video_name="output.mp4"
-    )
-    result = UploadPhaseService._ensure_source_video("p1", readiness)
-    assert result.read_bytes() == b"local-bytes"
-    assert result.name == "output.mp4"
-    assert UploadPhaseService.cached_source_video("p1") == result
 
 
 def test_ensure_source_video_downloads_from_drive(source_cache, monkeypatch):

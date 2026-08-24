@@ -549,6 +549,67 @@ async def delete_job(project_id: str, request: Request) -> None:
             )
 
     await store.delete(project_id)
+    # A Premiere Link launch may still be pending for a project whose publish
+    # job is being torn down; never replay it afterwards.
+    await request.app.state.cep_launch_store.delete(project_id)
+
+
+# ---- Premiere Link (VPS-brokered CEP auto-launch) ---------------------------
+
+
+class CepLaunchRequest(BaseModel):
+    project_id: str
+    requested_at: datetime
+    anime_title: str = ""
+    discord_message_id: str | None = None
+    discord_content: str | None = None
+
+
+@router.post("/cep/launches", status_code=202)
+async def create_cep_launch(req: CepLaunchRequest, request: Request) -> dict:
+    """Queue (or supersede) the launch of `project_id` in the Premiere panel.
+
+    Stored durably first, then pushed live if a panel is connected; otherwise
+    it is replayed the next time one connects (until the 7-day TTL)."""
+    store = request.app.state.cep_launch_store
+    hub = request.app.state.cep_link
+    launch = await store.upsert(
+        project_id=req.project_id,
+        anime_title=req.anime_title,
+        requested_at=req.requested_at,
+        discord_message_id=req.discord_message_id,
+        discord_content=req.discord_content,
+    )
+    await hub.notify_outcome(launch)
+    delivered = await hub.push(launch)
+    return {
+        "launch_id": launch.launch_id,
+        "status": launch.status,
+        "connected": hub.status()["connected"],
+        "delivered": delivered,
+    }
+
+
+@router.get("/cep/launches/{project_id}")
+async def get_cep_launch(project_id: str, request: Request) -> dict:
+    launch = await request.app.state.cep_launch_store.get(project_id)
+    if launch is None:
+        raise HTTPException(404, f"No Premiere launch for project {project_id!r}")
+    return launch.to_dict()
+
+
+@router.delete("/cep/launches/{project_id}", status_code=204)
+async def delete_cep_launch(project_id: str, request: Request) -> None:
+    """Idempotent: the backend calls this for every project deletion, whether
+    or not a launch (or a publish job) ever existed."""
+    await request.app.state.cep_launch_store.delete(project_id)
+
+
+@router.get("/cep/status")
+async def cep_status(request: Request) -> dict:
+    hub = request.app.state.cep_link
+    pending = await request.app.state.cep_launch_store.list_pending(datetime.now(UTC))
+    return {**hub.status(), "pending_count": len(pending)}
 
 
 @router.post("/discord/messages")

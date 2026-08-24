@@ -23,7 +23,7 @@ interface ProjectRowProps {
   onUploadSchedule: (row: ProjectManagerRow) => void;
   onUploadUrgent: (row: ProjectManagerRow) => void;
   onDelete: (row: ProjectManagerRow) => void;
-  onPreview: (target: { driveVideoId: string | null; projectId: string; localVideoAvailable: boolean }) => void;
+  onPreview: (target: { driveVideoId: string | null; projectId: string }) => void;
   multiDeleteMode: boolean;
   isSelected: boolean;
   onToggleSelect: (id: string) => void;
@@ -208,7 +208,7 @@ export function ProjectRow({
       <td className="py-3 pr-3">
         <div className="flex items-center gap-1.5">
           {/* Video preview (always reserve space for alignment) */}
-          {(row.drive_video_id || row.local_video_available) ? (
+          {row.drive_video_id ? (
             <Button
               size="icon"
               variant="ghost"
@@ -216,7 +216,6 @@ export function ProjectRow({
                 onPreview({
                   driveVideoId: row.drive_video_id,
                   projectId: row.project_id,
-                  localVideoAvailable: !!row.local_video_available,
                 })
               }
               className="h-9 w-9 active:scale-95 transition-transform shrink-0"

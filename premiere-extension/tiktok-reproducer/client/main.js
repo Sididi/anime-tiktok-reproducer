@@ -32,7 +32,7 @@
   var SETTINGS_PATH = path.join(STATE_DIR, "settings.json");
 
   var atrConstants = require(getClientFilePath("constants.js"));
-  var lanTrigger = require(getClientFilePath("lan_trigger.js"));
+  var cepLinkModule = require(getClientFilePath("cep_link.js"));
   var hostRpcModule = require(getClientFilePath("host_rpc.js"));
   var hostRpc = hostRpcModule.createHostRpc(function (script, callback) {
     cs.evalScript(script, callback);
@@ -86,9 +86,8 @@
     client_secret: "",
     refresh_token: "",
     parent_folder_id: "",
-    lan_base_url: "",
-    lan_token: "",
-    lan_probe_timeout_ms: 2500,
+    link_url: cepLinkModule.DEFAULT_LINK_URL,
+    link_token: "",
     port: DEFAULT_PORT,
     preset_epr_path: "",
     audio_preset_epr_path: "",
@@ -104,6 +103,7 @@
   var btnBrowseAudioPreset = document.getElementById("btn-browse-audio-preset");
   var btnSaveSettings = document.getElementById("btn-save-settings");
   var btnTestDrive = document.getElementById("btn-test-drive");
+  var btnTestLink = document.getElementById("btn-test-link");
 
   var projectSelect = document.getElementById("project-select");
   var exportAudioNoMusicCheckbox = document.getElementById(
@@ -119,8 +119,8 @@
   var settingParentFolderId = document.getElementById(
     "setting-parent-folder-id",
   );
-  var settingLanBaseUrl = document.getElementById("setting-lan-base-url");
-  var settingLanToken = document.getElementById("setting-lan-token");
+  var settingLinkUrl = document.getElementById("setting-link-url");
+  var settingLinkToken = document.getElementById("setting-link-token");
   var settingPort = document.getElementById("setting-port");
   var settingPresetEpr = document.getElementById("setting-preset-epr");
   var settingAudioPresetEpr = document.getElementById(
@@ -146,6 +146,7 @@
   var localServer = null;
   var localServerStarted = false;
   var localServerError = null;
+  var linkClient = null; // Premiere Link client (cep_link.js)
 
   var exportMonitors = {}; // project_id -> monitor
   var encoderJobMap = {}; // job_id -> { project_id, render_kind? }
@@ -698,6 +699,8 @@
     merged.export_audio_no_music_default =
       !!merged.export_audio_no_music_default;
     merged.auto_proxy_non_h264_default = !!merged.auto_proxy_non_h264_default;
+    merged.link_url = cepLinkModule.normalizeLinkUrl(merged.link_url);
+    merged.link_token = String(merged.link_token || "").trim();
 
     return merged;
   }
@@ -712,8 +715,8 @@
     settingClientSecret.value = settings.client_secret || "";
     settingRefreshToken.value = settings.refresh_token || "";
     settingParentFolderId.value = settings.parent_folder_id || "";
-    settingLanBaseUrl.value = settings.lan_base_url || "";
-    settingLanToken.value = settings.lan_token || "";
+    settingLinkUrl.value = settings.link_url || "";
+    settingLinkToken.value = settings.link_token || "";
     settingPort.value = String(settings.port || DEFAULT_PORT);
     settingPresetEpr.value = settings.preset_epr_path || "";
     settingAudioPresetEpr.value = settings.audio_preset_epr_path || "";
@@ -736,11 +739,8 @@
       client_secret: String(settingClientSecret.value || "").trim(),
       refresh_token: String(settingRefreshToken.value || "").trim(),
       parent_folder_id: String(settingParentFolderId.value || "").trim(),
-      lan_base_url: String(settingLanBaseUrl.value || "")
-        .trim()
-        .replace(/\/+$/, ""),
-      lan_token: String(settingLanToken.value || "").trim(),
-      lan_probe_timeout_ms: Number(settings.lan_probe_timeout_ms || 2500),
+      link_url: cepLinkModule.normalizeLinkUrl(settingLinkUrl.value),
+      link_token: String(settingLinkToken.value || "").trim(),
       port: Math.floor(parsedPort),
       preset_epr_path: String(settingPresetEpr.value || "").trim(),
       audio_preset_epr_path: String(settingAudioPresetEpr.value || "").trim(),
@@ -1798,9 +1798,6 @@
         client_secret: settings.client_secret,
         refresh_token: settings.refresh_token,
         parent_folder_id: settings.parent_folder_id,
-        lan_base_url: settings.lan_base_url || "",
-        lan_token: settings.lan_token || "",
-        lan_probe_timeout_ms: Number(settings.lan_probe_timeout_ms || 2500),
       },
       app_data_path: APPDATA,
     };
@@ -3117,52 +3114,14 @@
     });
   }
 
-  var lanTasks = null;
-
-  function runTransferTask(taskName, payload, onProgress) {
-    var lanBaseUrl =
-      payload && payload.settings
-        ? String(payload.settings.lan_base_url || "")
-        : "";
-    if (!lanBaseUrl) {
-      return runDriveTask(taskName, payload, onProgress);
-    }
-    if (!lanTasks) {
-      lanTasks = require(getClientFilePath("lan_tasks.js"));
-    }
-    return lanTasks.probe(payload.settings).then(
-      function () {
-        log("LAN mode selected for " + taskName, "info");
-        return lanTasks.runTask(taskName, payload, onProgress).catch(function (
-          err,
-        ) {
-          log("LAN task failed: " + err.message, "error");
-          throw err; // clean failure — re-run re-probes (spec: no silent mid-job engine switch)
-        });
-      },
-      function (probeErr) {
-        log(
-          "LAN probe failed (" +
-            probeErr.message +
-            "), falling back to Drive for " +
-            taskName,
-          "warn",
-        );
-        return runDriveTask(taskName, payload, onProgress);
-      },
-    );
-  }
-
   // --- Drive automation jobs ---
 
   function executeDownloadImport(projectId) {
     if (!validateProjectId(projectId)) {
       return Promise.reject(new Error("Invalid project ID: " + projectId));
     }
-    if (!isDriveConfigured() && !String((settings && settings.lan_base_url) || "")) {
-      return Promise.reject(
-        new Error("Neither Drive nor LAN transfer is configured"),
-      );
+    if (!isDriveConfigured()) {
+      return Promise.reject(new Error("Drive is not configured"));
     }
 
     delete proxyCleanupBlockedProjects[String(projectId || "").trim()];
@@ -3189,7 +3148,7 @@
     var downloadPayload = buildDrivePayloadBase();
     downloadPayload.project_id = projectId;
 
-    return runTransferTask(
+    return runDriveTask(
       "downloadProject",
       downloadPayload,
       function (progress) {
@@ -3489,10 +3448,8 @@
         ),
       );
     }
-    if (!isDriveConfigured() && !String((settings && settings.lan_base_url) || "")) {
-      return Promise.reject(
-        new Error("Neither Drive nor LAN transfer is configured"),
-      );
+    if (!isDriveConfigured()) {
+      return Promise.reject(new Error("Drive is not configured"));
     }
 
     var expectedOutputs = getExpectedOutputPaths(state);
@@ -3529,7 +3486,7 @@
 
     var lastProgressPct = -1;
 
-    return runTransferTask(
+    return runDriveTask(
       "uploadOutput",
       uploadPayload,
       function (progress) {
@@ -3670,7 +3627,7 @@
       completion_notified_at: null,
       batch_queue_state: acceptance.is_sleeping ? "sleeping" : "active",
     };
-    if (source === "http" || source === "lan") {
+    if (source === "http" || source === "link") {
       nextPatch.orchestration_metrics =
         getOrchestrationMetricsHelper().createInitialMetrics(
           queueOptions.httpReceivedAt || nowIso(),
@@ -4525,8 +4482,12 @@
       server_started: !!localServerStarted,
       server_error: localServerError,
       port: settings.port,
-      listen_host: lanTrigger.getListenHost(settings),
-      lan_auto_trigger_enabled: lanTrigger.isEnabled(settings),
+      listen_host: "127.0.0.1",
+      link_enabled: !!getLinkState().enabled,
+      link_connected: !!getLinkState().connected,
+      link_last_error: getLinkState().last_error || null,
+      link_reconnect_attempt: Number(getLinkState().reconnect_attempt || 0),
+      link_last_launch_at: getLinkState().last_launch_at || null,
       drive_configured: isDriveConfigured(),
       batch_phase: getBatchPhase(),
       active_batch_projects: getTrackedBatchProjectIds().length,
@@ -4542,69 +4503,6 @@
   function handleLocalRequest(req, res) {
     var parsed = url.parse(req.url || "", true);
     var pathname = parsed.pathname || "/";
-    var lanRoute = lanTrigger.matchRoute(req.method, pathname);
-
-    if (lanRoute) {
-      if (!lanTrigger.isEnabled(settings)) {
-        respondJson(res, 503, {
-          ok: false,
-          error: "LAN auto-trigger is not configured",
-        });
-        return;
-      }
-      if (!lanTrigger.isAuthorized(req, settings)) {
-        respondJson(res, 401, { ok: false, error: "Invalid LAN token" });
-        return;
-      }
-
-      if (lanRoute.type === "ping") {
-        respondJson(res, 200, {
-          ok: true,
-          api_version: lanTrigger.API_VERSION,
-          service: "atr-cep-trigger",
-          batch_phase: getBatchPhase(),
-        });
-        return;
-      }
-
-      if (lanRoute.type === "start_project") {
-        var lanReceivedAt = nowIso();
-        try {
-          var accepted = queueDownloadImport(lanRoute.project_id, "lan", {
-            httpReceivedAt: lanReceivedAt,
-          });
-          var acceptedState = getProjectState(lanRoute.project_id) || {};
-          respondJson(res, 202, {
-            ok: true,
-            accepted: accepted,
-            duplicate: !accepted,
-            project_id: lanRoute.project_id,
-            status: acceptedState.status || null,
-            queue_state: acceptedState.batch_queue_state || null,
-            batch_phase: getBatchPhase(),
-          });
-          log(
-            "LAN auto-trigger received for project " + lanRoute.project_id,
-            "info",
-          );
-        } catch (lanErr) {
-          respondJson(res, 400, { ok: false, error: String(lanErr.message) });
-        }
-        return;
-      }
-    }
-
-    // Binding to 0.0.0.0 is required for the authenticated LAN API. Keep the
-    // historical browser endpoints local-only so exposing the listener does
-    // not also expose project state or an unauthenticated trigger.
-    var remoteAddress =
-      (req.socket && req.socket.remoteAddress) ||
-      (req.connection && req.connection.remoteAddress) ||
-      "";
-    if (!lanTrigger.isLoopbackAddress(remoteAddress)) {
-      respondJson(res, 403, { error: "Local endpoint" });
-      return;
-    }
 
     if (pathname === "/health") {
       respondJson(res, 200, buildHealthPayload());
@@ -4653,6 +4551,138 @@
     }
 
     respondJson(res, 404, { error: "Not found" });
+  }
+
+  // --- Premiere Link (VPS-brokered automatic project launch) ---
+
+  function getLinkState() {
+    return linkClient
+      ? linkClient.getState()
+      : { enabled: false, connected: false, connecting: false, last_error: null };
+  }
+
+  function describeLinkState() {
+    var state = getLinkState();
+    if (!state.enabled) {
+      return "disabled";
+    }
+    if (state.connected) {
+      return "online";
+    }
+    if (state.connecting) {
+      return "connecting";
+    }
+    return "offline" + (state.last_error ? " (" + state.last_error + ")" : "");
+  }
+
+  function syncLinkIndicator() {
+    if (statusIndicator) {
+      statusIndicator.title = "Premiere Link: " + describeLinkState();
+    }
+  }
+
+  // Same intake as the /p/{project_id} localhost URL: same queue, same
+  // sleeping queue, same per-session duplicate rule. The returned outcome is
+  // acked to the VPS, which writes it into the project's Discord message.
+  function handleLinkLaunch(launch) {
+    var projectId = String((launch && launch.project_id) || "").trim();
+    var label = projectId + (launch && launch.replay ? " (replayed)" : "");
+    try {
+      if (!validateProjectId(projectId)) {
+        throw new Error("Invalid project id: " + projectId);
+      }
+      var accepted = queueDownloadImport(projectId, "link", {
+        httpReceivedAt: nowIso(),
+      });
+      var state = getProjectState(projectId) || {};
+      if (accepted) {
+        log("Premiere Link launch accepted for " + label, "success");
+      } else {
+        log(
+          "Premiere Link launch ignored for " +
+            label +
+            " (duplicate in this Premiere session)",
+          "warn",
+        );
+      }
+      return {
+        result: accepted ? "accepted" : "duplicate",
+        detail: accepted ? null : "already tracked in this Premiere session",
+        status: state.status || null,
+        queue_state: state.batch_queue_state || null,
+        batch_phase: getBatchPhase(),
+      };
+    } catch (err) {
+      log(
+        "Premiere Link launch failed for " + label + ": " + err.message,
+        "error",
+      );
+      return {
+        result: "error",
+        detail: String((err && err.message) || err),
+        batch_phase: getBatchPhase(),
+      };
+    }
+  }
+
+  function ensureLinkClient() {
+    if (linkClient) {
+      return linkClient;
+    }
+    linkClient = cepLinkModule.createLinkClient({
+      getSettings: function () {
+        return settings;
+      },
+      log: log,
+      onLaunch: handleLinkLaunch,
+      onStateChange: function () {
+        syncLinkIndicator();
+      },
+      panelBuildId: PANEL_BUILD_ID,
+      getPort: function () {
+        return settings ? settings.port : null;
+      },
+    });
+    return linkClient;
+  }
+
+  function startLinkClient() {
+    ensureLinkClient().start();
+    syncLinkIndicator();
+  }
+
+  function stopLinkClient(reason) {
+    if (linkClient) {
+      linkClient.stop(reason);
+    }
+    syncLinkIndicator();
+  }
+
+  function restartLinkClient() {
+    ensureLinkClient().restart();
+    syncLinkIndicator();
+  }
+
+  function testLinkFromUi() {
+    var client = ensureLinkClient();
+    if (!client.isEnabled()) {
+      setSettingsStatus("Premiere Link settings are incomplete", true);
+      log("Cannot test Premiere Link: URL or token not set", "error");
+      return;
+    }
+    setSettingsStatus("Testing Premiere Link...", false);
+    client
+      .testOnce(8000)
+      .then(function (result) {
+        var label =
+          "Link OK (pending: " + Number((result && result.pending_count) || 0) + ")";
+        setSettingsStatus(label, false);
+        log(label, "success");
+      })
+      .catch(function (err) {
+        setSettingsStatus("Link test failed: " + err.message, true);
+        log("Premiere Link test failed: " + err.message, "error");
+      });
   }
 
   function stopLocalServer() {
@@ -4710,16 +4740,11 @@
           settleOnce();
         });
 
-        var listenHost = lanTrigger.getListenHost(settings);
-        server.listen(settings.port, listenHost, function () {
+        server.listen(settings.port, "127.0.0.1", function () {
           localServerStarted = true;
           localServerError = null;
           log(
-            (lanTrigger.isEnabled(settings) ? "Local/LAN" : "Local") +
-              " server listening on " +
-              listenHost +
-              ":" +
-              settings.port,
+            "Local server listening on http://127.0.0.1:" + settings.port,
             "info",
           );
           updateGlobalStatus();
@@ -5792,6 +5817,7 @@
   // --- Global status synthesis ---
 
   function updateGlobalStatus() {
+    syncLinkIndicator();
     if (hostCompatibility.status === "incompatible") {
       setStatus("error");
       return;
@@ -5884,12 +5910,19 @@
   }
 
   function saveSettingsFromUi() {
+    var previous = settings || {};
     var next = readSettingsForm();
+    var linkChanged =
+      String(previous.link_url || "") !== String(next.link_url || "") ||
+      String(previous.link_token || "") !== String(next.link_token || "");
     saveSettings(next);
     renderSettingsForm();
     setSettingsStatus("Settings saved", false);
     log("Settings saved", "success");
 
+    if (linkChanged) {
+      restartLinkClient();
+    }
     startLocalServer().then(function () {
       updateGlobalStatus();
     });
@@ -5922,6 +5955,7 @@
   }
 
   function cleanupBeforeUnload() {
+    stopLinkClient("unload");
     try {
       if (watcher) {
         watcher.close();
@@ -6010,6 +6044,9 @@
     startLocalServer().then(function () {
       updateGlobalStatus();
     });
+    // Only after the host build check passed (init gates this): a mismatched
+    // host.jsx keeps launches waiting on the VPS instead of failing them here.
+    startLinkClient();
 
     processJobQueue();
     log(
@@ -6051,6 +6088,9 @@
     }
     btnSaveSettings.addEventListener("click", saveSettingsFromUi);
     btnTestDrive.addEventListener("click", testDriveConnectionFromUi);
+    if (btnTestLink) {
+      btnTestLink.addEventListener("click", testLinkFromUi);
+    }
     projectStatusList.addEventListener("click", handleProjectStatusClick);
     if (settingsToggle) {
       settingsToggle.addEventListener("click", toggleSettingsSection);

@@ -122,6 +122,11 @@ class Project(BaseModel):
     # key = platform; value = {target_scheduled_at, retries, last_error, last_attempt_at}.
     reschedule_pending: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
+    # Premiere Link launch request that could not reach the VPS yet; retried
+    # by CepLinkService.run_loop. Shape: {project_id, requested_at, anime_title,
+    # discord_message_id, discord_content, retries, last_error, last_attempt_at}.
+    cep_launch_request: dict[str, Any] | None = None
+
     # Backend-owned Post for Me TikTok post (created at upload time with its
     # final scheduled_at). None for legacy projects whose TikTok was relayed
     # to the VPS scheduler.

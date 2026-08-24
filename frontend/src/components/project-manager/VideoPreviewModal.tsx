@@ -5,18 +5,14 @@ import { Button } from "@/components/ui";
 
 interface VideoPreviewModalProps {
   driveVideoId: string | null;
-  projectId: string | null;
-  localVideoAvailable: boolean;
   onClose: () => void;
 }
 
 export function VideoPreviewModal({
   driveVideoId,
-  projectId,
-  localVideoAvailable,
   onClose,
 }: VideoPreviewModalProps) {
-  const isOpen = Boolean(driveVideoId) || Boolean(projectId && localVideoAvailable);
+  const isOpen = Boolean(driveVideoId);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -59,21 +55,12 @@ export function VideoPreviewModal({
                 <X className="h-5 w-5" />
               </Button>
             </div>
-            {localVideoAvailable && projectId ? (
-              <video
-                controls
-                autoPlay
-                className="w-full h-full"
-                src={`/api/project-manager/projects/${projectId}/local-video`}
-              />
-            ) : (
-              <iframe
-                src={`https://drive.google.com/file/d/${driveVideoId}/preview`}
-                className="w-full h-full"
-                allow="autoplay"
-                allowFullScreen
-              />
-            )}
+            <iframe
+              src={`https://drive.google.com/file/d/${driveVideoId}/preview`}
+              className="w-full h-full"
+              allow="autoplay"
+              allowFullScreen
+            />
           </motion.div>
         </motion.div>
       )}

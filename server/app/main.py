@@ -11,10 +11,13 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from app.api.cep import router as cep_router
 from app.api.health import router as health_router
 from app.api.internal import router as internal_router
 from app.api.public import router as public_router
 from app.config import Settings
+from app.services.cep_launch_store import CepLaunchStore
+from app.services.cep_link import CepLinkHub
 from app.services.discord_client import DiscordClient
 from app.services.instagram_prepared_media import cleanup_expired_prepared_media
 from app.services.job_store import JobStore
@@ -72,6 +75,16 @@ def create_app() -> FastAPI:  # noqa: PLR0915
     )
     data_dir.mkdir(parents=True, exist_ok=True)
     job_store = JobStore(data_dir / "jobs.json")
+    cep_launch_store = CepLaunchStore(data_dir / "cep_launches.json")
+    cep_link = CepLinkHub(
+        store=cep_launch_store,
+        settings=settings,
+        # Resolved at call time: the real DiscordClient only exists inside the
+        # lifespan, and tests inject an AsyncMock on app.state.
+        discord_provider=lambda: app.state.discord,
+        heartbeat_interval_s=float(os.environ.get("ATR_CEP_LINK_HEARTBEAT_SECONDS", "25")),
+        auth_timeout_s=float(os.environ.get("ATR_CEP_LINK_AUTH_TIMEOUT_SECONDS", "5")),
+    )
     _cleanup_instagram_temp_downloads()
     _cleanup_instagram_temp_downloads(data_dir / "tmp" / "instagram")
     expired_prepared = cleanup_expired_prepared_media(data_dir / "instagram-prepared")
@@ -105,6 +118,14 @@ def create_app() -> FastAPI:  # noqa: PLR0915
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
+        def _start_cep_maintenance() -> tuple[asyncio.Task, asyncio.Event]:
+            stop_event = asyncio.Event()
+            return asyncio.create_task(cep_link.maintenance_loop(stop_event)), stop_event
+
+        async def _stop_cep_link(task: asyncio.Task, stop_event: asyncio.Event) -> None:
+            await cep_link.shutdown()
+            await _stop_scheduler(task, stop_event)
+
         if app.state.discord is None:
             async with DiscordClient(bot_token=settings.discord.bot_token) as discord:
                 app.state.settings = settings
@@ -120,9 +141,11 @@ def create_app() -> FastAPI:  # noqa: PLR0915
                 )
                 await listener.start()
                 sched_task, stop_event = await _start_scheduler(discord)
+                cep_task, cep_stop = _start_cep_maintenance()
                 try:
                     yield
                 finally:
+                    await _stop_cep_link(cep_task, cep_stop)
                     await _stop_scheduler(sched_task, stop_event)
                     await listener.stop()
                     app.state.discord = None
@@ -130,9 +153,11 @@ def create_app() -> FastAPI:  # noqa: PLR0915
             app.state.settings = settings
             app.state.job_store = job_store
             sched_task, stop_event = await _start_scheduler(app.state.discord)
+            cep_task, cep_stop = _start_cep_maintenance()
             try:
                 yield
             finally:
+                await _stop_cep_link(cep_task, cep_stop)
                 await _stop_scheduler(sched_task, stop_event)
                 app.state.discord = None
 
@@ -142,10 +167,13 @@ def create_app() -> FastAPI:  # noqa: PLR0915
     # or assign `app.state.discord = AsyncMock()` directly.
     app.state.settings = settings
     app.state.job_store = job_store
+    app.state.cep_launch_store = cep_launch_store
+    app.state.cep_link = cep_link
     app.state.discord = None
     app.include_router(health_router)
     app.include_router(internal_router)
     app.include_router(public_router)
+    app.include_router(cep_router)
     return app
 
 

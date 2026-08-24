@@ -55,6 +55,7 @@ def example_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("ATR_DISCORD_REMINDER_CHANNEL_ID", "333")
     monkeypatch.setenv("ATR_DISCORD_REMINDER_ROLE_ID", "444")
     monkeypatch.setenv("ATR_PUBLIC_BASE_URL", "https://tiktok.sididi.tv")
+    monkeypatch.setenv("ATR_CEP_LINK_TOKEN", "cep_secret")
     yield
 
 

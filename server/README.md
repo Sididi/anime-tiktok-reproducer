@@ -136,3 +136,31 @@ The embed shows `🎯 TikTok — Post manuel (réagis ✅ une fois posté)`. Fiv
 jump link to the original post). React ✅ on either message: the embed flips to
 `✅ TikTok — Posté manuellement`, the bot mirrors ✅ on the original post and deletes the
 reminder. Reacting before the reminder fires cancels it.
+
+### 9. Premiere Link round trip (CEP auto-launch)
+
+Requires `ATR_CEP_LINK_TOKEN` in the VPS `.env` and the nginx `/api/cep/ws`
+block (DEPLOYMENT.md §14). The panel is a browser WebSocket; from a shell use
+the Python client that ships with the server env:
+
+```bash
+# Terminal A — pretend to be the panel
+cd server && uv run python -m websockets wss://tiktok.sididi.tv/api/cep/ws
+> {"type":"auth","token":"<ATR_CEP_LINK_TOKEN>","panel_build_id":"smoke","port":0}
+< {"type":"auth_ok", ... "pending_count":0}
+# answer every {"type":"ping","ts":...} with {"type":"pong","ts":"<same ts>"} or expect close 4408 after ~50 s
+
+# Terminal B — pretend to be the backend
+curl -s -X POST "$BASE/api/internal/cep/launches" \
+  -H "Authorization: Bearer $INTERNAL" -H "Content-Type: application/json" \
+  -d '{"project_id":"smoke-1","requested_at":"2026-08-24T12:00:00+00:00","anime_title":"Smoke","discord_message_id":null,"discord_content":null}' | jq
+# Expected: {"launch_id":"l_...","status":"pending","connected":true,"delivered":true}
+# Terminal A prints {"type":"launch","project_id":"smoke-1",...}; reply:
+> {"type":"ack","launch_id":"l_...","project_id":"smoke-1","result":"accepted","detail":null}
+
+curl -s "$BASE/api/internal/cep/launches/smoke-1" -H "Authorization: Bearer $INTERNAL" | jq .status
+# Expected: "accepted"
+curl -s "$BASE/api/internal/cep/status" -H "Authorization: Bearer $INTERNAL" | jq
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE "$BASE/api/internal/cep/launches/smoke-1" -H "Authorization: Bearer $INTERNAL"
+# Expected: 204
+```

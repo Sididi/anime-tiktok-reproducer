@@ -223,6 +223,11 @@ def test_never_uploaded_project_deletes_without_archive(monkeypatch):
         "app.services.upload_phase.GoogleDriveService.archive_project_folder", archive
     )
     _mock_delete_collaborators(monkeypatch, calls)
+    # Premiere Link: a pending panel launch must be cancelled on delete.
+    delete_launch = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.cep_link_service.CepLinkService.delete_launch", delete_launch
+    )
 
     # No pending platforms: no confirmation required.
     result = UploadPhaseService.managed_delete(project.id)
@@ -231,6 +236,7 @@ def test_never_uploaded_project_deletes_without_archive(monkeypatch):
     assert result["archive"] is None
     assert result["status"] == "deleted"
     assert calls == ["drive-delete", "local-delete"]
+    delete_launch.assert_called_once_with("project1")
 
 
 def test_posted_project_with_past_schedules_archives(monkeypatch):

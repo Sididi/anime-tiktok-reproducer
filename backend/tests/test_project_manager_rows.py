@@ -13,7 +13,6 @@ import pytest
 
 from app.models import Project
 from app.services import upload_phase as up
-from app.services.lan_transfer_service import LanTransferService
 from app.services.upload_phase import UploadPhaseService, _persisted_drive_video
 
 
@@ -36,9 +35,6 @@ def drive_calls(tmp_path, monkeypatch):
         up.ProjectService,
         "get_project_dir",
         classmethod(lambda cls, pid: tmp_path / "missing" / pid),
-    )
-    monkeypatch.setattr(
-        LanTransferService, "find_local_upload_video", classmethod(lambda cls, pid: None)
     )
 
     monkeypatch.setattr(up.GoogleDriveService, "is_configured", classmethod(lambda cls: True))

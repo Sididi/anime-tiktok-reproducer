@@ -40,6 +40,9 @@ class Settings:
     data_dir: Path
     pfm_api_key: str | None = None
     pfm_base_url: str = "https://api.postforme.dev/v1"
+    # Premiere Link: shared secret the CEP panel presents on /api/cep/ws.
+    # Unset = the WebSocket rejects every connection (4401).
+    cep_link_token: str | None = None
 
     @classmethod
     def load(
@@ -93,4 +96,5 @@ class Settings:
             pfm_base_url=os.environ.get(
                 "ATR_PFM_BASE_URL", "https://api.postforme.dev/v1"
             ),
+            cep_link_token=os.environ.get("ATR_CEP_LINK_TOKEN") or None,
         )

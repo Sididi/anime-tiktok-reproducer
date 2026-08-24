@@ -169,6 +169,7 @@ ls server/avatars/
 - `ATR_DISCORD_GUILD_ID`, `ATR_DISCORD_UPLOAD_CHANNEL_ID`, `ATR_DISCORD_REMINDER_CHANNEL_ID`, `ATR_DISCORD_REMINDER_ROLE_ID` — right-click each in Discord (developer mode on) → Copy ID.
 - `ATR_PFM_API_KEY` — Post for Me API key — TikTok auto-publish (docs/POST_FOR_ME_SETUP.md).
 - `ATR_PUBLIC_BASE_URL=https://tiktok.sididi.tv`
+- `ATR_CEP_LINK_TOKEN` — Premiere Link secret (`openssl rand -hex 32`); the same value goes into the Premiere Pro panel's "Premiere Link token" setting. See §14.
 
 **Key checklist for `config/config.yaml`:**
 - One `devices` entry per phone you'll use. Device id should match the suffix in your `ATR_MOBILE_TOKEN_<DEVICE>` env vars (e.g., `iphone_13_pro` → `ATR_MOBILE_TOKEN_IPHONE_13_PRO`).
@@ -319,7 +320,7 @@ sudo systemctl enable tiktok-server.service
 
 ### Backups
 
-The only stateful data is `data/jobs.json` in the named Docker volume `jobs-data`. Tiny (~kilobytes). A weekly tarball is plenty:
+The only stateful data is `data/jobs.json` plus `data/cep_launches.json` (Premiere Link queue) in the named Docker volume `jobs-data`. Tiny (~kilobytes). A weekly tarball is plenty:
 
 ```bash
 # /etc/cron.weekly/tiktok-server-backup (chmod +x)
@@ -548,3 +549,56 @@ INFO ... ReactionListener gateway connection starting
 INFO ... ReactionListener ready as bot user <id>
 ```
 and, when a manual job comes due: `TikTok manual reminder posted for <project_id>`.
+
+---
+
+## 14. Premiere Link (CEP ↔ VPS WebSocket, 2026-08-24)
+
+The Premiere Pro panel no longer talks to the backend PC directly. Both sides
+connect **outbound** to this VPS: the backend `POST`s a launch request right
+after a project's Drive export finishes, the panel keeps a WebSocket open on
+`/api/cep/ws`, and the VPS brokers between them (durable queue in
+`data/cep_launches.json`, replay on reconnect, 7-day TTL, Discord outcome line).
+
+### Deploy steps
+
+1. **Secret** — add to `/opt/tiktok/server/.env`:
+   ```bash
+   ATR_CEP_LINK_TOKEN=$(openssl rand -hex 32)
+   ```
+   Paste the same value into the panel's *Premiere Link token* field.
+
+2. **nginx** — certbot rewrote `/etc/nginx/sites-available/tiktok-server.conf`
+   in place (§8), so do **not** re-copy the repo template. Hand-add the
+   `location = /api/cep/ws { ... }` block from `deploy/nginx-tiktok-server.conf`
+   inside the `listen 443 ssl` server block (above `location /api/avatars/`),
+   then:
+   ```bash
+   sudo nginx -t && sudo systemctl reload nginx
+   ```
+   Without it the WebSocket handshake is downgraded and idle sockets die at 60 s.
+
+3. **Container**
+   ```bash
+   cd /opt/tiktok/server && git pull && docker compose up -d --build
+   ```
+
+4. **Verify**
+   ```bash
+   curl -s -H "Authorization: Bearer $INTERNAL" https://tiktok.sididi.tv/api/internal/cep/status | jq
+   # {"connected":false,...,"pending_count":0} until the panel connects
+   docker compose logs -f | grep "CEP link"
+   # "CEP link connected (build=..., client=...)" once Premiere is open
+   ```
+   README § "Smoke test" step 9 walks the full round trip with the Python
+   `websockets` client.
+
+### Notes
+
+- Single device: whoever holds the token *is* the panel. Two panels with the
+  same token both receive (and replay) every launch — run one Premiere PC per
+  token.
+- The Discord generation message keeps its `http://localhost:48653/p/{id}`
+  link as the manual fallback; the VPS only appends a `Premiere: …` outcome
+  line (⏳ waiting / ✅ accepted / ⚠️ duplicate / ❌ error / ⌛ expired).
+- Backups: `cep_launches.json` lives in the same `jobs-data` volume (§10).

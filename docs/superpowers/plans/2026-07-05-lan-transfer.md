@@ -1,3 +1,9 @@
+> **Superseded 2026-08-24.** The LAN transfer engine (backend `/api/lan/*`, CEP
+> `lan_tasks.js`) and the LAN auto-trigger receiver (`lan_trigger.js`) were removed.
+> Automatic project launching now goes through **Premiere Link**, a VPS-brokered
+> WebSocket — see `docs/superpowers/specs/2026-08-24-premiere-link-design.md`.
+> Kept as history only.
+
 # LAN Transfer Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

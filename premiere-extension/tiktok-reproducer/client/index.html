@@ -80,17 +80,18 @@
               />
             </label>
             <label>
-              LAN base URL (empty = Drive only)
+              Premiere Link URL (VPS WebSocket)
               <input
-                id="setting-lan-base-url"
+                id="setting-link-url"
                 type="text"
                 autocomplete="off"
+                placeholder="wss://tiktok.sididi.tv/api/cep/ws"
               />
             </label>
             <label>
-              LAN token
+              Premiere Link token
               <input
-                id="setting-lan-token"
+                id="setting-link-token"
                 type="password"
                 autocomplete="off"
               />
@@ -133,6 +134,7 @@
           <div class="button-row settings-actions">
             <button id="btn-save-settings" type="button">Save Settings</button>
             <button id="btn-test-drive" type="button">Test Drive</button>
+            <button id="btn-test-link" type="button">Test Link</button>
             <span id="settings-status"></span>
           </div>
         </div>

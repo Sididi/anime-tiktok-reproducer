@@ -1,3 +1,9 @@
+> **Superseded 2026-08-24.** The LAN transfer engine (backend `/api/lan/*`, CEP
+> `lan_tasks.js`) and the LAN auto-trigger receiver (`lan_trigger.js`) were removed.
+> Automatic project launching now goes through **Premiere Link**, a VPS-brokered
+> WebSocket — see `docs/superpowers/specs/2026-08-24-premiere-link-design.md`.
+> Kept as history only.
+
 # LAN Transfer for Premiere Pro Phase — Design
 
 **Date:** 2026-07-05

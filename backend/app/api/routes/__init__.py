@@ -17,7 +17,6 @@ from .project_manager import router as project_manager_router
 from .integrations import router as integrations_router
 from .tiktok_url_db import router as tiktok_url_db_router
 from .scheduling import router as scheduling_router
-from .lan_transfer import router as lan_transfer_router
 # TEMPORARILY DISABLED - Subtitle video generation feature
 
 api_router = APIRouter(prefix="/api")
@@ -38,7 +37,6 @@ api_router.include_router(project_manager_router)
 api_router.include_router(integrations_router)
 api_router.include_router(tiktok_url_db_router)
 api_router.include_router(scheduling_router)
-api_router.include_router(lan_transfer_router)
 # TEMPORARILY DISABLED - Subtitle video generation feature
 
 __all__ = ["api_router"]

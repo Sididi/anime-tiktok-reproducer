@@ -31,11 +31,11 @@ from .library_types import LibraryType
 from .services.account_service import AccountService
 from .services.indexation_queue import indexation_queue
 from .services.integration_health_service import IntegrationHealthService
-from .services.lan_transfer_service import LanTransferService
 from .services.library_hydration_service import LibraryHydrationService
 from .services.project_service import ProjectService
 from .services.project_startup_service import project_startup_queue
 from .services.project_upload_service import project_upload_queue
+from .services.cep_link_service import CepLinkService
 from .services.reschedule_retry_service import RescheduleRetryService
 from .services.scheduling_errors import SchedulingError
 from .services.google_drive_service import GoogleDriveService
@@ -158,8 +158,6 @@ async def lifespan(app: FastAPI):
     # Resume Storage Box uploads for releases finalized locally before a
     # crash/stop: the series stays usable; only the upload restarts.
     await indexation_queue.resume_pending_uploads()
-    if settings.lan_transfer_enabled:
-        LanTransferService.sweep_stale_tmp_files()
 
     reschedule_retry_stop = asyncio.Event()
     app.state.reschedule_retry_stop = reschedule_retry_stop
@@ -168,6 +166,15 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(
             RescheduleRetryService.run_loop(reschedule_retry_stop),
             name="reschedule-retry-loop",
+        ),
+    )
+    # Premiere Link: re-send launch requests the VPS could not take at export
+    # time (first tick runs immediately, so a restart also flushes them).
+    _track_app_task(
+        app,
+        asyncio.create_task(
+            CepLinkService.run_loop(reschedule_retry_stop),
+            name="cep-link-retry-loop",
         ),
     )
 

@@ -34,6 +34,7 @@ from ...services import (
     MusicConfigService,
     AudioSpeedService,
 )
+from ...services.cep_link_service import CepLinkService
 from ...services.forced_alignment import ForcedAlignmentService
 from ...services.llm_config_service import LLMConfigService
 from ...services.template_service import TemplateService
@@ -158,16 +159,24 @@ def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
 
         anime_title = project.anime_name or "Inconnu"
         trigger_url = settings.cep_trigger_url_template.format(project_id=project.id)
-        discord_message = DiscordService.post_message(
-            "\n".join(
-                [
-                    f"**{anime_title}**: Génération terminée pour le projet `{project.id}`.",
-                    f"Lien de génération: <{trigger_url}>",
-                ]
-            )
+        content = "\n".join(
+            [
+                f"**{anime_title}**: Génération terminée pour le projet `{project.id}`.",
+                f"Lien de génération: <{trigger_url}>",
+            ]
         )
+        discord_message = DiscordService.post_message(content)
         if discord_message:
             project.generation_discord_message_id = discord_message.id
+        # Premiere Link: the VPS pushes the launch to the Premiere panel (or holds
+        # it until the panel connects) and appends the outcome to this message.
+        # Requested even when the Discord post failed; never raises, and a
+        # failed request is parked on the project for the retry loop.
+        CepLinkService.request_launch(
+            project,
+            discord_message_id=discord_message.id if discord_message else None,
+            discord_content=content,
+        )
         ProjectService.save(project)
     except Exception:
         # Notification must not impact API completion semantics.

@@ -64,8 +64,6 @@ class UploadReadiness:
     reasons: list[str]
     drive_folder_id: str | None
     drive_folder_url: str | None
-    local_video_path: str | None = None
-    local_video_name: str | None = None
 
 
 def _vps_publish_errors(project: "Project") -> list[str]:
@@ -309,34 +307,6 @@ class UploadPhaseService:
         return None, None
 
     @classmethod
-    def _ensure_drive_video(cls, project, readiness: "UploadReadiness") -> tuple[str | None, str | None]:
-        """Drive file id/name of the final video, uploading the local copy if Drive lacks it."""
-        if readiness.drive_video_id:
-            return readiness.drive_video_id, readiness.drive_video_name
-        if not readiness.local_video_path or not GoogleDriveService.is_configured():
-            return None, None
-        local = Path(readiness.local_video_path)
-        if not local.exists():
-            return None, None
-        folder_id = readiness.drive_folder_id
-        if not folder_id:
-            folder_id, folder_url = GoogleDriveService.ensure_project_folder(
-                ExportService.output_folder_name(project)
-            )
-            readiness.drive_folder_id = folder_id
-            if not readiness.drive_folder_url:
-                readiness.drive_folder_url = folder_url
-        else:
-            readiness.drive_folder_id = folder_id
-        uploaded = GoogleDriveService.upsert_local_file(
-            parent_id=folder_id,
-            filename=local.name,
-            local_path=local,
-            chunksize=settings.drive_upload_chunk_mb * 1024 * 1024,
-        )
-        return str(uploaded.get("id") or "") or None, local.name
-
-    @classmethod
     def _build_readiness(
         cls,
         *,
@@ -345,10 +315,9 @@ class UploadPhaseService:
         folder_url: str | None,
         video_files: list[dict[str, Any]],
         video_lookup_failed: bool = False,
-        local_video: Path | None = None,
     ) -> UploadReadiness:
         reasons: list[str] = []
-        if not folder_id and local_video is None:
+        if not folder_id:
             reasons.append("no output video found")
 
         video_count = len(video_files)
@@ -356,18 +325,15 @@ class UploadPhaseService:
 
         if not metadata_exists:
             reasons.append("no metadata found")
-        if local_video is None:
-            if video_count == 0:
-                if video_lookup_failed and folder_id:
-                    reasons.append("unable to verify output video in Drive")
-                else:
-                    reasons.append("no output video found")
-            elif video_count > 1:
-                reasons.append("more than one output video found (conflicting)")
+        if video_count == 0:
+            if video_lookup_failed and folder_id:
+                reasons.append("unable to verify output video in Drive")
+            else:
+                reasons.append("no output video found")
+        elif video_count > 1:
+            reasons.append("more than one output video found (conflicting)")
 
-        if local_video is not None:
-            status = "green" if metadata_exists else "orange"
-        elif metadata_exists and video_count == 1:
+        if metadata_exists and video_count == 1:
             status = "green"
         elif metadata_exists or video_count == 1:
             status = "orange"
@@ -384,30 +350,11 @@ class UploadPhaseService:
             reasons=sorted(set(reasons)),
             drive_folder_id=folder_id,
             drive_folder_url=folder_url,
-            local_video_path=str(local_video) if local_video else None,
-            local_video_name=local_video.name if local_video else None,
         )
 
     @classmethod
     def compute_readiness(cls, project: Project) -> UploadReadiness:
         metadata_exists = ProjectService.get_metadata_file(project.id).exists()
-
-        from .lan_transfer_service import LanTransferService
-
-        local_video = LanTransferService.find_local_upload_video(project.id)
-        if local_video is not None:
-            # Use whatever folder info is already cached on the project; never
-            # query Drive (no folder-by-name search, no video lookup) when a
-            # local video already answers the readiness question.
-            folder_id = project.drive_folder_id
-            folder_url = project.drive_folder_url
-            return cls._build_readiness(
-                metadata_exists=metadata_exists,
-                folder_id=folder_id,
-                folder_url=folder_url,
-                video_files=[],
-                local_video=local_video,
-            )
 
         folder_id, folder_url = cls._resolve_drive_folder(project)
 
@@ -452,18 +399,6 @@ class UploadPhaseService:
         """Reuse the manager's recent Drive result before issuing another query."""
         metadata_exists = ProjectService.get_metadata_file(project.id).exists()
 
-        from .lan_transfer_service import LanTransferService
-
-        local_video = LanTransferService.find_local_upload_video(project.id)
-        if local_video is not None:
-            return cls._build_readiness(
-                metadata_exists=metadata_exists,
-                folder_id=project.drive_folder_id,
-                folder_url=project.drive_folder_url,
-                video_files=[],
-                local_video=local_video,
-            )
-
         folder_id, folder_url = cls._resolve_drive_folder_offline(project, None)
         cached_video = _persisted_drive_video(project) or cls._cached_drive_video(
             project_id=project.id,
@@ -484,12 +419,7 @@ class UploadPhaseService:
 
     @classmethod
     def list_manager_rows(cls) -> list[dict[str, Any]]:
-        from .lan_transfer_service import LanTransferService
-
         projects = ProjectService.list_all()
-        local_videos: dict[str, Path | None] = {
-            project.id: LanTransferService.find_local_upload_video(project.id) for project in projects
-        }
         # Upload-locked rows (already posted, or scheduled with a dispatched
         # upload) render with the Upload button disabled, so their Drive
         # readiness is never shown: keep them out of the batch video lookup
@@ -508,7 +438,7 @@ class UploadPhaseService:
                     folder_candidates_by_name = GoogleDriveService.list_project_folders_under_parent(drive=drive)
                     folder_ids: list[str] = []
                     for project in projects:
-                        if local_videos[project.id] is not None or upload_locked[project.id]:
+                        if upload_locked[project.id]:
                             continue
                         folder_id, _ = cls._resolve_drive_folder(
                             project,
@@ -547,18 +477,7 @@ class UploadPhaseService:
         def _build_row(project: Project) -> dict[str, Any]:
             project_dir = ProjectService.get_project_dir(project.id)
             metadata_exists = ProjectService.get_metadata_file(project.id).exists()
-            local_video = local_videos.get(project.id)
-            if local_video is not None:
-                # Local-first: a video already exists on disk (delivered over LAN),
-                # so skip any Drive folder/video lookup entirely.
-                readiness = cls._build_readiness(
-                    metadata_exists=metadata_exists,
-                    folder_id=project.drive_folder_id,
-                    folder_url=project.drive_folder_url,
-                    video_files=[],
-                    local_video=local_video,
-                )
-            elif upload_locked[project.id]:
+            if upload_locked[project.id]:
                 # Upload-locked: the row's readiness is never surfaced, so
                 # answer from persisted data (folder link, preview video id)
                 # without touching Drive or the shared video cache.
@@ -620,7 +539,6 @@ class UploadPhaseService:
                 "drive_folder_id": readiness.drive_folder_id,
                 "drive_folder_url": readiness.drive_folder_url,
                 "drive_video_id": readiness.drive_video_id,
-                "local_video_available": local_video is not None,
                 "created_at": project.created_at.isoformat() if project.created_at else None,
                 "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
                 "scheduled_account_id": project.scheduled_account_id,
@@ -1265,17 +1183,10 @@ class UploadPhaseService:
         )
 
         readiness = cls.compute_readiness(project)
-        if readiness.status != "green" or (
-            not readiness.drive_video_id and not readiness.local_video_path
-        ):
+        if readiness.status != "green" or not readiness.drive_video_id:
             raise ValueError(f"Project is not ready for upload: {', '.join(readiness.reasons)}")
 
-        drive_video_id, drive_video_name = cls._ensure_drive_video(project, readiness)
-        if not drive_video_id:
-            raise ValueError(
-                "Final video is unavailable: not found on Drive and the local "
-                "copy (via LAN transfer) could not be uploaded to Drive either"
-            )
+        drive_video_id, drive_video_name = readiness.drive_video_id, readiness.drive_video_name
 
         if not readiness.drive_folder_id:
             raise ValueError("Drive folder ID is required but not resolved")
@@ -1435,20 +1346,15 @@ class UploadPhaseService:
                 }
 
         with tempfile.TemporaryDirectory(prefix=f"atr-upload-{project_id}-") as tmp_dir:
-            local_video = Path(readiness.local_video_path) if readiness.local_video_path else None
-            video_name = drive_video_name or (local_video.name if local_video else "final_video.mp4")
+            video_name = drive_video_name or "final_video.mp4"
             local_video_path = Path(tmp_dir) / video_name
-            if local_video is not None and local_video.exists():
-                emit_progress(0.30, "download", "Copying final video from local output...")
-                shutil.copy2(local_video, local_video_path)
+            cached_source = cls.cached_source_video(project_id)
+            if cached_source is not None and cached_source.exists():
+                emit_progress(0.30, "download", "Copying final video from preview cache...")
+                shutil.copy2(cached_source, local_video_path)
             else:
-                cached_source = cls.cached_source_video(project_id)
-                if cached_source is not None and cached_source.exists():
-                    emit_progress(0.30, "download", "Copying final video from preview cache...")
-                    shutil.copy2(cached_source, local_video_path)
-                else:
-                    emit_progress(0.30, "download", "Downloading final video from Drive...")
-                    GoogleDriveService.download_file(drive_video_id, local_video_path)
+                emit_progress(0.30, "download", "Downloading final video from Drive...")
+                GoogleDriveService.download_file(drive_video_id, local_video_path)
 
             # TikTok deliberately keeps the ORIGINAL copyrighted audio: capture
             # the pre-remux file for the PFM media staging before
@@ -2115,29 +2021,20 @@ class UploadPhaseService:
             if cached is not None:
                 return cached
 
-            video_name = (
-                readiness.drive_video_name
-                or readiness.local_video_name
-                or "final_video.mp4"
-            )
+            video_name = readiness.drive_video_name or "final_video.mp4"
             cache_dir = cls._source_cache_dir(project_id)
             cache_dir.mkdir(parents=True, exist_ok=True)
             destination = cache_dir / video_name
             partial = cache_dir / f"{video_name}.part"
 
             try:
-                if readiness.local_video_path and Path(readiness.local_video_path).exists():
-                    shutil.copy2(readiness.local_video_path, partial)
-                elif readiness.drive_video_id:
-                    total = GoogleDriveService.get_file_size(readiness.drive_video_id)
-                    if total is not None:
-                        with cls._source_download_guard:
-                            cls._source_download_totals[project_id] = total
-                    GoogleDriveService.download_file(readiness.drive_video_id, partial)
-                else:
-                    raise ValueError(
-                        "Final video unavailable: not present locally and no Drive copy"
-                    )
+                if not readiness.drive_video_id:
+                    raise ValueError("Final video unavailable: no Drive copy")
+                total = GoogleDriveService.get_file_size(readiness.drive_video_id)
+                if total is not None:
+                    with cls._source_download_guard:
+                        cls._source_download_totals[project_id] = total
+                GoogleDriveService.download_file(readiness.drive_video_id, partial)
                 ensure_bt709_tags(partial)
                 partial.replace(destination)
             finally:
@@ -2355,17 +2252,6 @@ class UploadPhaseService:
         probe_media: Callable[..., Any],
     ) -> float:
         """Duration of the final video without downloading a Drive-only file."""
-        if readiness.local_video_path:
-            local = Path(readiness.local_video_path)
-            if local.exists():
-                probe, probe_error = probe_media(video_path=local)
-                if (
-                    not probe_error
-                    and probe is not None
-                    and probe.duration_seconds is not None
-                ):
-                    return probe.duration_seconds
-
         if readiness.drive_video_id:
             try:
                 duration = GoogleDriveService.get_video_duration_seconds(
@@ -2421,9 +2307,7 @@ class UploadPhaseService:
             return cls._neutral_duration_check_result()
 
         readiness = cls._compute_preflight_readiness(project)
-        if readiness.status != "green" or not (
-            readiness.drive_video_id or readiness.local_video_path
-        ):
+        if readiness.status != "green" or not readiness.drive_video_id:
             raise ValueError(
                 f"Project is not ready for upload: {', '.join(readiness.reasons)}"
             )
@@ -2648,6 +2532,10 @@ class UploadPhaseService:
                 )
 
         try:
+            # Premiere Link: never let the panel launch a project that is gone.
+            from .cep_link_service import CepLinkService  # noqa: PLC0415 - import cycle
+
+            CepLinkService.delete_launch(project_id)
             if project.final_upload_discord_message_id:
                 # Removes the VPS job and all associated Discord messages.
                 DiscordService.delete_job(project_id)
@@ -2733,17 +2621,12 @@ class UploadPhaseService:
 
         prep_dir = cls._copyright_audio_dir(project_id)
 
-        # Prefer the locally produced output_no_music.wav (LAN transfer); fall
-        # back to downloading it from Drive by file id.
         no_music_path = prep_dir / "output_no_music.wav"
         if not no_music_path.exists():
-            local_no_music = ExportService.get_output_dir(project_id) / "output_no_music.wav"
-            if local_no_music.exists():
-                shutil.copy2(local_no_music, no_music_path)
-            elif no_music_file_id:
+            if no_music_file_id:
                 GoogleDriveService.download_file(no_music_file_id, no_music_path)
             else:
-                raise ValueError("output_no_music.wav not found locally or on Drive")
+                raise ValueError("output_no_music.wav not found on Drive")
 
         if music_key is None:
             # No music - use output_no_music.wav as-is
