@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 import pytest
 
+from app.services import runtime_memory
 from app.services.indexation_queue import indexation_queue
 from app.services.runtime_memory import memory_snapshot
 from app.services.transcriber import TranscriberService, TranscriptionProgress
@@ -71,3 +72,57 @@ async def test_transcription_stream_close_always_requests_model_unload(
     await stream.aclose()
 
     assert len(unload_calls) == 1
+
+
+@pytest.fixture
+def _release_spy(monkeypatch: pytest.MonkeyPatch):
+    runtime_memory.reset_release_debounce()
+    calls: list[str] = []
+
+    def fake_release(stage: str, **extra):
+        calls.append(stage)
+        return {"stage": stage}
+
+    monkeypatch.setattr(runtime_memory, "release_unused_memory", fake_release)
+    yield calls
+    runtime_memory.reset_release_debounce()
+
+
+def test_schedule_release_is_debounced_outside_a_loop(_release_spy) -> None:
+    assert runtime_memory.schedule_release_unused_memory("first") is True
+    assert runtime_memory.schedule_release_unused_memory("second") is False
+    assert _release_spy == ["first"]
+
+    runtime_memory.reset_release_debounce()
+    assert runtime_memory.schedule_release_unused_memory("third") is True
+    assert _release_spy == ["first", "third"]
+
+
+@pytest.mark.asyncio
+async def test_schedule_release_runs_off_the_loop_thread(_release_spy, monkeypatch) -> None:
+    import asyncio
+    import threading
+
+    seen_threads: list[str] = []
+
+    def fake_release(stage: str, **extra):
+        seen_threads.append(threading.current_thread().name)
+        return {"stage": stage}
+
+    monkeypatch.setattr(runtime_memory, "release_unused_memory", fake_release)
+    assert runtime_memory.schedule_release_unused_memory("idle") is True
+    # Still in flight / within the debounce window: skipped.
+    assert runtime_memory.schedule_release_unused_memory("idle") is False
+    for _ in range(50):
+        if seen_threads:
+            break
+        await asyncio.sleep(0.01)
+    assert seen_threads and seen_threads[0] != threading.main_thread().name
+
+
+def test_release_unused_memory_collects_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    collections: list[None] = []
+    monkeypatch.setattr(runtime_memory.gc, "collect", lambda: collections.append(None) or 0)
+    monkeypatch.setattr(runtime_memory, "trim_native_heap", lambda: False)
+    runtime_memory.release_unused_memory("test")
+    assert len(collections) == 1

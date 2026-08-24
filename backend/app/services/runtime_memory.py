@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import gc
 import logging
 import os
 import resource
 import sys
+import threading
+import time
 from typing import Any
 
 
 logger = logging.getLogger("uvicorn.error")
+
+# A full release right after every heavy batch is what the UI feels as a
+# freeze at "job complete"; once every 30 s is plenty for arena hygiene.
+RELEASE_DEBOUNCE_SECONDS = 30.0
+
+_release_lock = threading.Lock()
+_release_in_flight = False
+_last_release_monotonic: float | None = None
 
 
 def _status_values() -> dict[str, int]:
@@ -141,8 +152,13 @@ def trim_native_heap() -> bool:
 
 
 def release_unused_memory(stage: str, **extra: Any) -> dict[str, Any]:
-    """Collect Python/CUDA garbage, trim glibc, then record the resulting state."""
-    gc.collect()
+    """Collect Python/CUDA garbage, trim glibc, then record the resulting state.
+
+    ``gc.collect()`` holds the GIL for its whole duration wherever it runs, so
+    callers on the event loop should prefer :func:`schedule_release_unused_memory`,
+    which debounces it and moves the GIL-releasing parts (CUDA cache flush,
+    ``malloc_trim``, the ``/proc`` walk) off the loop thread.
+    """
     gc.collect()
 
     torch = sys.modules.get("torch")
@@ -155,3 +171,51 @@ def release_unused_memory(stage: str, **extra: Any) -> dict[str, Any]:
 
     trimmed = trim_native_heap()
     return log_memory(stage, native_heap_trimmed=trimmed, **extra)
+
+
+def schedule_release_unused_memory(stage: str, **extra: Any) -> bool:
+    """Debounced :func:`release_unused_memory` off the event loop.
+
+    Returns ``True`` when a release was started (on the loop's default
+    executor when called from a running loop, inline otherwise) and ``False``
+    when one ran less than :data:`RELEASE_DEBOUNCE_SECONDS` ago or is still in
+    flight — in which case only a memory snapshot is logged.
+    """
+    global _release_in_flight, _last_release_monotonic
+    now = time.monotonic()
+    with _release_lock:
+        recent = (
+            _last_release_monotonic is not None
+            and now - _last_release_monotonic < RELEASE_DEBOUNCE_SECONDS
+        )
+        if _release_in_flight or recent:
+            log_memory(stage, memory_release="skipped", **extra)
+            return False
+        _release_in_flight = True
+        _last_release_monotonic = now
+
+    def _run() -> None:
+        global _release_in_flight
+        try:
+            release_unused_memory(stage, **extra)
+        except Exception:
+            logger.exception("release_unused_memory failed")
+        finally:
+            with _release_lock:
+                _release_in_flight = False
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _run()
+        return True
+    loop.run_in_executor(None, _run)
+    return True
+
+
+def reset_release_debounce() -> None:
+    """Forget the last release time (tests)."""
+    global _release_in_flight, _last_release_monotonic
+    with _release_lock:
+        _release_in_flight = False
+        _last_release_monotonic = None

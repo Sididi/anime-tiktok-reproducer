@@ -17,7 +17,7 @@ from .library_hydration_service import LibraryHydrationService
 from .pending_publish_store import PendingPublishRecord, PendingPublishStore
 from .storage_box_progress import ProgressSnapshot
 from .storage_box_repository import StorageBoxRepository
-from .runtime_memory import log_memory, release_unused_memory
+from .runtime_memory import log_memory, schedule_release_unused_memory
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".ts", ".m4v"}
 
@@ -105,7 +105,10 @@ class IndexationQueueService:
             "heavy_kinds": dict(self._active_heavy_kinds),
         }
         if self._active_heavy_jobs == 0:
-            release_unused_memory("heavy_jobs_idle", **details)
+            # Off the loop and debounced: this fires exactly when the UI is
+            # waiting for "job complete", and a full GC + CUDA flush inline
+            # here used to freeze every request for up to seconds.
+            schedule_release_unused_memory("heavy_jobs_idle", **details)
         else:
             log_memory("heavy_job_finished", **details)
 
