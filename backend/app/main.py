@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 
 # Set BEFORE any import that may transitively load torch (e.g. anime_searcher).
@@ -29,6 +28,11 @@ from .config import settings
 from .api import api_router
 from .library_types import LibraryType
 from .services.account_service import AccountService
+from .services.executors import (
+    executor_stats,
+    install_default_executor,
+    shutdown_executors,
+)
 from .services.indexation_queue import indexation_queue
 from .services.integration_health_service import IntegrationHealthService
 from .services.library_hydration_service import LibraryHydrationService
@@ -138,17 +142,9 @@ async def _run_integration_health_check_background() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load local state quickly, then warm external readiness in the background."""
-    try:
-        backend_workers = int(os.environ.get("ATR_BACKEND_THREAD_WORKERS", "8"))
-    except ValueError:
-        backend_workers = 8
-    backend_worker_count = max(2, min(backend_workers, 16))
-    backend_executor = ThreadPoolExecutor(
-        max_workers=backend_worker_count,
-        thread_name_prefix="atr-backend",
-    )
-    asyncio.get_running_loop().set_default_executor(backend_executor)
-    app.state.backend_executor = backend_executor
+    # Light I/O pool as the loop default; heavy work goes through
+    # services.executors.run_heavy (see that module for the split).
+    install_default_executor(asyncio.get_running_loop())
 
     AccountService.load()
     ProjectService.sync_all_project_pins()
@@ -221,7 +217,7 @@ async def lifespan(app: FastAPI):
             ),
         )
 
-    log_memory("backend_startup", backend_thread_workers=backend_worker_count)
+    log_memory("backend_startup", **executor_stats())
     yield
     reschedule_retry_stop.set()
     await _cancel_app_tasks(app)
@@ -235,7 +231,7 @@ async def lifespan(app: FastAPI):
 
         TranscriberService.unload_models()
     release_unused_memory("backend_shutdown")
-    backend_executor.shutdown(wait=True, cancel_futures=True)
+    shutdown_executors(wait=True)
 
 
 app = FastAPI(

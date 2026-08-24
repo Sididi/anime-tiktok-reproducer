@@ -20,6 +20,7 @@ from pathlib import Path
 
 from scenedetect import open_video, SceneManager, ContentDetector
 
+from .executors import heavy_executor, run_heavy
 from ..config import settings
 from ..library_types import LibraryType
 from ..models import SceneMatch
@@ -421,7 +422,7 @@ class GapResolutionService:
         """Probe fps + duration once for the episode and prime the FPS cache."""
         resolved_path = episode_path.resolve()
         cache_key = str(resolved_path)
-        probe = await asyncio.to_thread(AnimeLibraryService.probe_source_media_sync, resolved_path)
+        probe = await run_heavy(AnimeLibraryService.probe_source_media_sync, resolved_path)
 
         cached_fps = cls._fps_cache.get(cache_key)
         if cached_fps is not None:
@@ -726,7 +727,7 @@ class GapResolutionService:
         loop = asyncio.get_event_loop()
         async with cls._scene_cut_semaphore:
             return await loop.run_in_executor(
-                None,
+                heavy_executor(),
                 cls._detect_scene_cuts_window_sync,
                 str(episode_path),
                 interval_start,
@@ -1052,7 +1053,7 @@ class GapResolutionService:
         loop = asyncio.get_event_loop()
         async with cls._scene_cut_semaphore:
             cuts = await loop.run_in_executor(
-                None,
+                heavy_executor(),
                 cls._detect_scene_cuts_sync,
                 episode_path,
                 threshold,

@@ -14,6 +14,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
+from .executors import run_heavy
 from ..config import settings
 from ..library_types import LibraryType
 from ..models import Project, SceneMatch
@@ -652,7 +653,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
         started_at = time.perf_counter()
         folder_name = cls.output_folder_name(project)
-        _, entries = await asyncio.to_thread(cls.build_manifest, project, matches)
+        _, entries = await run_heavy(cls.build_manifest, project, matches)
         diagnostics = cls._build_manifest_diagnostics(entries)
         total_bytes = diagnostics["total_bytes"]
         adapter = _RcloneDriveProgressAdapter(
@@ -661,7 +662,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             total_bytes=total_bytes,
         )
         adapter.emit_manifest()
-        folder_id, folder_url = await asyncio.to_thread(
+        folder_id, folder_url = await run_heavy(
             GoogleDriveService.ensure_project_folder,
             folder_name,
             project.drive_folder_id,
@@ -683,14 +684,14 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
         )
         sync_started_at = time.perf_counter()
         try:
-            await asyncio.to_thread(cls._stage_manifest_tree, entries, stage_dir)
+            await run_heavy(cls._stage_manifest_tree, entries, stage_dir)
             await GoogleDriveRclone.sync_tree(
                 stage_dir,
                 folder_id=folder_id,
                 stats_callback=adapter.on_stats,
             )
         finally:
-            await asyncio.to_thread(shutil.rmtree, stage_dir, True)
+            await run_heavy(shutil.rmtree, stage_dir, True)
         adapter.emit_persist()
 
         sync_duration = time.perf_counter() - sync_started_at

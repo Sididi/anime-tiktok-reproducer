@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable
 
+from .executors import run_heavy
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
@@ -119,7 +120,7 @@ async def _sha256_files_parallel(
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             return dict(zip(paths, pool.map(_sha256_file, paths)))
 
-    return await asyncio.to_thread(_hash_all)
+    return await run_heavy(_hash_all)
 
 
 def _format_bytes(value: int) -> str:

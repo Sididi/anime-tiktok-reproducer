@@ -13,6 +13,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from .executors import heavy_executor, run_heavy
 from ..models import Word, SceneTranscription, Transcription, Scene, SceneList, SceneMatch, MatchList
 from ..models.raw_scene import RawSceneDetectionResult
 from ..services import ProjectService
@@ -1192,7 +1193,7 @@ class TranscriberService:
                     "Extracting audio track for transcription...",
                 )
                 extraction_task = asyncio.create_task(
-                    asyncio.to_thread(cls._extract_audio_for_whisper, video_path, wav_path)
+                    run_heavy(cls._extract_audio_for_whisper, video_path, wav_path)
                 )
                 native_futures.append(extraction_task)
                 while True:
@@ -1220,7 +1221,7 @@ class TranscriberService:
             # Pass the pre-extracted WAV directly so WhisperX doesn't create a temp copy
             loop = asyncio.get_running_loop()
             transcription_future = loop.run_in_executor(
-                None,
+                heavy_executor(),
                 lambda: cls._transcribe_sync(wav_path, lang_code, "large-v3"),
             )
             native_futures.append(transcription_future)
@@ -1272,7 +1273,7 @@ class TranscriberService:
 
                 is_pure = project.library_type == LibraryType.PURE
                 diarization_future = loop.run_in_executor(
-                    None,
+                    heavy_executor(),
                     lambda: RawSceneDetectorService.detect(
                         wav_path,
                         [scene.model_copy(deep=True) for scene in original_scenes],

@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from pydub import AudioSegment
 
+from ...services.executors import run_heavy
 from ...config import settings
 from ...library_types import resolve_static_overlay_title
 from ...models import ProjectPhase
@@ -595,7 +596,7 @@ async def upload_restructured_script(
             uploaded_audio_path = tmp_path / f"upload{suffix}"
             await _write_upload_to_path(audio, uploaded_audio_path)
             try:
-                await asyncio.to_thread(
+                await run_heavy(
                     _normalize_audio_file_to_wav,
                     uploaded_audio_path,
                     audio_path,
@@ -638,7 +639,7 @@ async def upload_restructured_script(
                 await _write_upload_to_path(part, uploaded_path)
                 normalized_part_path = parts_dir / f"part_{i + 1:04d}.wav"
                 try:
-                    await asyncio.to_thread(
+                    await run_heavy(
                         _normalize_audio_file_to_wav,
                         uploaded_path,
                         normalized_part_path,
@@ -663,7 +664,7 @@ async def upload_restructured_script(
                 combined_audio.export(str(audio_path), format="wav")
 
             try:
-                await asyncio.to_thread(_concat_parts_to_wav)
+                await run_heavy(_concat_parts_to_wav)
             except Exception:
                 raise HTTPException(
                     status_code=400,
@@ -929,7 +930,7 @@ async def stage_preview_audio(
             uploaded_audio_path = tmp_path / f"preview_upload{suffix}"
             await _write_upload_to_path(audio, uploaded_audio_path)
             try:
-                await asyncio.to_thread(
+                await run_heavy(
                     _normalize_audio_file_to_wav,
                     uploaded_audio_path,
                     staged_path,
@@ -946,7 +947,7 @@ async def stage_preview_audio(
                 part_paths.append(part_path)
 
             try:
-                await asyncio.to_thread(_concat_audio_parts_to_wav, part_paths, staged_path)
+                await run_heavy(_concat_audio_parts_to_wav, part_paths, staged_path)
             except Exception:
                 raise HTTPException(status_code=400, detail="Failed to process audio parts")
 
@@ -999,7 +1000,7 @@ async def build_preview(project_id: str, request: PreviewBuildRequest):
         preview_source = source_audio
 
     try:
-        duration = await asyncio.to_thread(
+        duration = await run_heavy(
             _build_preview_audio_sync,
             source_audio=preview_source,
             preview_path=preview_path,
@@ -1173,14 +1174,14 @@ async def create_bundle(project_id: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
     async def stream_progress():
         yield f"data: {json.dumps({'status': 'processing', 'step': 'bundle', 'progress': 0.1, 'message': 'Building ZIP bundle...'})}\n\n"
         try:
-            await asyncio.to_thread(ExportService.build_bundle, project, matches.matches)
+            await run_heavy(ExportService.build_bundle, project, matches.matches)
             yield f"data: {json.dumps({'status': 'complete', 'step': 'bundle', 'progress': 1.0, 'message': 'Bundle ready', 'download_url': f'/api/projects/{project_id}/download/bundle'})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'step': 'bundle', 'progress': 0.0, 'error': str(exc), 'message': 'Bundle generation failed'})}\n\n"

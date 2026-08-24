@@ -16,6 +16,7 @@ from typing import AsyncIterator
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps
 
+from .executors import heavy_executor
 from ..library_types import LibraryType
 from ..models import AlternativeMatch, MatchCandidate, MatchList, Scene, SceneMatch, SceneList
 from .anime_matcher import AnimeMatcherService, MatchProgress
@@ -717,7 +718,7 @@ class SceneAlignerService:
         yield MatchProgress("starting", 0.0, "Initializing global aligner...", 0, total)
         loop = asyncio.get_running_loop()
         init_success = await loop.run_in_executor(
-            None,
+            heavy_executor(),
             AnimeMatcherService._init_searcher,
             library_path,
             library_type,
@@ -747,7 +748,7 @@ class SceneAlignerService:
             total,
         )
         result = await loop.run_in_executor(
-            None,
+            heavy_executor(),
             partial(
                 cls.align_scenes_sync,
                 video_path,

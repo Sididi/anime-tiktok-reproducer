@@ -7,6 +7,7 @@ from urllib.parse import unquote
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
+from ...services.executors import run_heavy
 from ...services import (
     AnimeLibraryService,
     ProjectService,
@@ -313,7 +314,7 @@ async def get_source_video_descriptor(
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_path = await _resolve_source_path(project, path)
-    return await asyncio.to_thread(_probe_source_metadata_sync, source_path)
+    return await run_heavy(_probe_source_metadata_sync, source_path)
 
 
 @router.post("/video/source/preview/warmup")
@@ -353,7 +354,7 @@ async def get_source_video_preview(
         raise HTTPException(status_code=404, detail="Project not found")
 
     source_path = await _resolve_source_path(project, path)
-    is_direct_compatible = await asyncio.to_thread(
+    is_direct_compatible = await run_heavy(
         BrowserMediaService.is_browser_preview_compatible_sync,
         source_path,
         include_audio=False,

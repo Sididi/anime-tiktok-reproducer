@@ -6,6 +6,7 @@ from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from ...services.executors import run_heavy
 from ...services import UploadPhaseService
 from ...services.google_drive_service import GoogleDriveService
 from ...services.project_duplication_service import UploadRestrictionService
@@ -65,7 +66,7 @@ class CopyrightBuildAudioRequest(BaseModel):
 async def list_project_manager_projects():
     """List locally stored projects enriched with Drive/upload status."""
     try:
-        rows = await asyncio.to_thread(UploadPhaseService.list_manager_rows)
+        rows = await run_heavy(UploadPhaseService.list_manager_rows)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"projects": rows}
@@ -361,7 +362,7 @@ async def copyright_video(project_id: str):
         prep_dir.mkdir(parents=True, exist_ok=True)
         video_name = readiness.drive_video_name or "preview.mp4"
         video_path = prep_dir / video_name
-        await asyncio.to_thread(GoogleDriveService.download_file, readiness.drive_video_id, video_path)
+        await run_heavy(GoogleDriveService.download_file, readiness.drive_video_id, video_path)
         return FileResponse(path=video_path, media_type="video/mp4")
     except HTTPException:
         raise

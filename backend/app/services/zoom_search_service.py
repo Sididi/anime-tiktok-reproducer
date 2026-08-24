@@ -21,6 +21,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .executors import heavy_executor
 from ..library_types import LibraryType
 from .event_hub import event_hub
 
@@ -253,7 +254,7 @@ class ZoomSearchService:
                 self._broadcast(job)
 
                 init_success = await loop.run_in_executor(
-                    None,
+                    heavy_executor(),
                     AnimeMatcherService._init_searcher,
                     source_path,
                     project.library_type,
@@ -263,7 +264,7 @@ class ZoomSearchService:
                     return self._fail(job, "Failed to initialize anime_searcher")
 
                 outcome = await loop.run_in_executor(
-                    None,
+                    heavy_executor(),
                     partial(
                         ZoomRematchService.search_scene_sync,
                         video_path,

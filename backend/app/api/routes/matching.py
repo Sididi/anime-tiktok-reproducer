@@ -12,6 +12,7 @@ import re
 
 logger = logging.getLogger("uvicorn.error")
 
+from ...services.executors import heavy_executor
 from ...config import settings
 from ...library_types import LibraryType
 from ...models import ProjectPhase, MatchList, SceneMatch, SceneList
@@ -963,7 +964,7 @@ async def merge_with_previous(project_id: str, scene_index: int):
                 # match_scenes initializes the searcher itself; the bounded
                 # partial path requires it to be live already.
                 init_success = await loop.run_in_executor(
-                    None,
+                    heavy_executor(),
                     AnimeMatcherService._init_searcher,
                     source_path,
                     project.library_type,
@@ -976,7 +977,7 @@ async def merge_with_previous(project_id: str, scene_index: int):
                     )
                 try:
                     rematched_matches = await loop.run_in_executor(
-                        None,
+                        heavy_executor(),
                         partial(
                             HierarchicalMatcherService.rematch_scene_sync,
                             video_path,

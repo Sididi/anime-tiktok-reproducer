@@ -4,6 +4,7 @@ import asyncio
 
 from scenedetect import open_video, SceneManager, ContentDetector
 
+from .executors import heavy_executor
 from ..models import Scene
 
 
@@ -111,7 +112,7 @@ class SceneDetectorService:
         try:
             loop = asyncio.get_running_loop()
             detect_future = loop.run_in_executor(
-                None,
+                heavy_executor(),
                 cls._detect_sync,
                 video_path,
                 threshold,

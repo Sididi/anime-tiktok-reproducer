@@ -18,6 +18,7 @@ from typing import Any, AsyncIterator
 
 import spacy
 
+from .executors import heavy_executor, run_heavy
 from ..config import settings
 from ..library_types import LibraryType
 from ..models import MatchList, Project, Transcription, SceneMatch
@@ -2641,7 +2642,7 @@ class ProcessingService:
 
                 async with indexation_queue.heavy_slot("forced_alignment"):
                     alignment_future = loop.run_in_executor(
-                        None,
+                        heavy_executor(),
                         lambda: ForcedAlignmentService.align_known_script(
                             project_id=project.id,
                             script_payload=new_script,
@@ -3203,7 +3204,7 @@ class ProcessingService:
                 )
                 raw_backup = output_dir / "tts_edited.raw.wav"
                 shutil.copyfile(tts_final_path, raw_backup)
-                defingerprint_meta = await asyncio.to_thread(
+                defingerprint_meta = await run_heavy(
                     VoiceDefingerprintService.apply,
                     raw_backup,
                     tts_final_path,
