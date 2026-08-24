@@ -834,26 +834,14 @@ async def update_anime_async(request: UpdateAnimeAsyncRequest):
 
 @router.get("/jobs")
 async def list_jobs():
-    """List all indexation jobs."""
+    """List all indexation jobs.
+
+    Live updates flow over the shared ``/api/events/stream`` (topic
+    ``index_jobs``); this REST snapshot remains for tooling and tests.
+    """
     from ...services.indexation_queue import indexation_queue
 
     return {"jobs": [j.model_dump(mode="json") for j in indexation_queue.list_jobs()]}
-
-
-@router.get("/jobs/stream")
-async def stream_jobs():
-    """Stream indexation job updates via SSE."""
-    from ...services.indexation_queue import indexation_queue
-
-    async def generate():
-        async for data in indexation_queue.stream_all_jobs():
-            yield f"data: {json.dumps(data)}\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
 
 
 @router.get("/pending-publishes")

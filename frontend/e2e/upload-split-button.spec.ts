@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { installEventHubMock } from "./helpers/eventHubMock";
 
 const ACCOUNT = {
   id: "acc_a",
@@ -52,14 +53,8 @@ function installMocks(payload: {
   const testWindow = window as Window &
     typeof globalThis & {
       __uploadCalled?: boolean;
-      __uploadStreamAborted?: boolean;
-      __uploadStreamCancelled?: boolean;
-      __uploadStreamHasSignal?: boolean;
     };
   testWindow.__uploadCalled = false;
-  testWindow.__uploadStreamAborted = false;
-  testWindow.__uploadStreamCancelled = false;
-  testWindow.__uploadStreamHasSignal = false;
   const orig = window.fetch.bind(window);
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     const requestUrl =
@@ -74,15 +69,6 @@ function installMocks(payload: {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
-    const emptyStream = () =>
-      new Response(
-        new ReadableStream({
-          start(c) {
-            c.close();
-          },
-        }),
-        { status: 200, headers: { "Content-Type": "text/event-stream" } },
-      );
 
     if (url.pathname === "/api/accounts") {
       return json({ accounts: [account] });
@@ -93,33 +79,8 @@ function installMocks(payload: {
     if (url.pathname === "/api/project-manager/upload-jobs") {
       return json({ jobs: [] });
     }
-    if (url.pathname === "/api/project-manager/upload-jobs/stream") {
-      const signal = init?.signal;
-      testWindow.__uploadStreamHasSignal = signal instanceof AbortSignal;
-      signal?.addEventListener(
-        "abort",
-        () => {
-          testWindow.__uploadStreamAborted = true;
-        },
-        { once: true },
-      );
-      return new Response(
-        new ReadableStream({
-          cancel() {
-            testWindow.__uploadStreamCancelled = true;
-          },
-        }),
-        { status: 200, headers: { "Content-Type": "text/event-stream" } },
-      );
-    }
     if (url.pathname === "/api/anime/source-details") {
       return json([]);
-    }
-    if (
-      url.pathname === "/api/anime/jobs/stream" ||
-      url.pathname === "/api/projects/startup/jobs/stream"
-    ) {
-      return emptyStream();
     }
     if (url.pathname === "/api/projects/startup/jobs") {
       return json({ jobs: [] });
@@ -174,6 +135,7 @@ function installMocks(payload: {
 test("Auto upload (single click on Upload) still works as before", async ({
   page,
 }) => {
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
   await page.goto("/");
   await page.getByRole("button", { name: "Projects" }).click();
@@ -198,6 +160,7 @@ test("Auto upload (single click on Upload) still works as before", async ({
 test("failed preflight clears Checking and never queues an upload", async ({
   page,
 }) => {
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installMocks, {
     account: ACCOUNT,
     row: ROW,
@@ -221,39 +184,33 @@ test("failed preflight clears Checking and never queues an upload", async ({
   ).toBe(false);
 });
 
-test("closing Project Manager aborts and cancels its upload event stream", async ({
+test("closing Project Manager unsubscribes from upload job events", async ({
   page,
 }) => {
+  await page.addInitScript(installEventHubMock, {});
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
   await page.goto("/");
-  await page.getByRole("button", { name: "Projects" }).click();
 
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () =>
-          (window as unknown as { __uploadStreamHasSignal?: boolean })
-            .__uploadStreamHasSignal,
-      ),
-    )
-    .toBe(true);
+  const uploadSubscriptions = () =>
+    page.evaluate(
+      () =>
+        (
+          window as unknown as {
+            __atrEventHub?: {
+              debugSnapshot(): { subscriptions: Record<string, number> };
+            };
+          }
+        ).__atrEventHub?.debugSnapshot().subscriptions.upload_jobs ?? 0,
+    );
+
+  await expect.poll(uploadSubscriptions).toBe(0);
+  await page.getByRole("button", { name: "Projects" }).click();
+  // The modal subscribes while open; the browser-wide stream itself stays up.
+  await expect.poll(uploadSubscriptions).toBe(1);
 
   await page.keyboard.press("Escape");
-
-  await expect
-    .poll(() =>
-      page.evaluate(() => {
-        const testWindow = window as unknown as {
-          __uploadStreamAborted?: boolean;
-          __uploadStreamCancelled?: boolean;
-        };
-        return {
-          aborted: testWindow.__uploadStreamAborted,
-          cancelled: testWindow.__uploadStreamCancelled,
-        };
-      }),
-    )
-    .toEqual({ aborted: true, cancelled: true });
+  await expect.poll(uploadSubscriptions).toBe(0);
 });
 
 function installSchedulingMocks() {
@@ -333,7 +290,9 @@ function installSchedulingMocks() {
 }
 
 test("Schedule mode queues upload when checks resolve immediately", async ({ page }) => {
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installSchedulingMocks);
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
   await page.goto("/");
   await page.getByRole("button", { name: "Projects" }).click();
@@ -492,6 +451,7 @@ test("Urgent immediate: no collisions → apply then upload with immediate flag"
 }) => {
   // installMocks first so the urgent mocks wrap LAST (and therefore run
   // FIRST at fetch time — their /upload handler must capture the body).
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
   await page.addInitScript(installUrgentMocks, { withCollisions: false });
   await page.goto("/");
@@ -529,6 +489,7 @@ test("Urgent immediate: no collisions → apply then upload with immediate flag"
 test("Urgent immediate: collisions render both phases; movable ones gate Continue", async ({
   page,
 }) => {
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
   await page.addInitScript(installUrgentMocks, { withCollisions: true });
   await page.goto("/");
@@ -746,6 +707,7 @@ test.describe("manual custom-time + slot switching", () => {
   test.use({ timezoneId: "Europe/Paris" });
 
   test("Custom time schedules a manual reservation", async ({ page }) => {
+    await page.addInitScript(installEventHubMock, {});
     await page.addInitScript(installManualMocks);
     await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
     await page.goto("/");
@@ -788,6 +750,7 @@ test.describe("manual custom-time + slot switching", () => {
   test("Amber chip opens takeover modal and reserves with a relocate steal", async ({
     page,
   }) => {
+    await page.addInitScript(installEventHubMock, {});
     await page.addInitScript(installStealAnchorMocks);
     await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
     await page.goto("/");

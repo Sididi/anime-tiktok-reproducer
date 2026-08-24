@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { installEventHubMock } from "./helpers/eventHubMock";
 
 const SOURCE_DETAILS = [
   {
@@ -39,6 +40,12 @@ const INITIAL_PROJECT_ROWS = [
     created_at: "2026-04-12T09:00:00Z",
     scheduled_at: null,
     scheduled_account_id: null,
+    llm_preset_resolved: "default",
+    llm_preset_is_default: true,
+    min_playback_speed_resolved: 1,
+    min_playback_speed_is_default: true,
+    template_resolved: "default",
+    template_is_default: true,
   },
   {
     project_id: "project-beta",
@@ -60,6 +67,12 @@ const INITIAL_PROJECT_ROWS = [
     created_at: "2026-04-12T09:05:00Z",
     scheduled_at: null,
     scheduled_account_id: null,
+    llm_preset_resolved: "default",
+    llm_preset_is_default: true,
+    min_playback_speed_resolved: 1,
+    min_playback_speed_is_default: true,
+    template_resolved: "default",
+    template_is_default: true,
   },
 ];
 
@@ -264,27 +277,25 @@ function installProjectManagerUploadMocks({
   initialProjectRows: typeof INITIAL_PROJECT_ROWS;
   projectConfigs: Record<string, MockProjectConfig>;
 }) {
-  const encoder = new TextEncoder();
   const originalFetch = window.fetch.bind(window);
   const uploadRequestsByProject: Record<string, UploadRequestBody[]> = {};
   const testWindow = window as Window &
     typeof globalThis & {
       __projectManagerUploadRequests?: Record<string, UploadRequestBody[]>;
+      __atrHub?: { pushItem(topic: string, item: unknown): void };
     };
   let projectRows = initialProjectRows.map((row) => ({ ...row }));
-  let uploadController: ReadableStreamDefaultController<Uint8Array> | null =
-    null;
-  const pendingUploadEvents: string[] = [];
 
   testWindow.__projectManagerUploadRequests = uploadRequestsByProject;
 
-  const emitUploadJob = (payload: Record<string, unknown>) => {
-    const chunk = `data: ${JSON.stringify(payload)}\n\n`;
-    if (uploadController) {
-      uploadController.enqueue(encoder.encode(chunk));
-    } else {
-      pendingUploadEvents.push(chunk);
-    }
+  // Upload jobs report through the shared event stream (mocked by
+  // installEventHubMock, installed before this script).
+  const emitUploadJob = (payload: Record<string, unknown> & { project_id: string }) => {
+    testWindow.__atrHub?.pushItem("upload_jobs", {
+      key: payload.project_id,
+      project_id: payload.project_id,
+      data: payload,
+    });
   };
 
   const jsonResponse = (payload: unknown) =>
@@ -292,19 +303,6 @@ function installProjectManagerUploadMocks({
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
-
-  const emptyEventStream = () =>
-    new Response(
-      new ReadableStream({
-        start(controller) {
-          controller.close();
-        },
-      }),
-      {
-        status: 200,
-        headers: { "Content-Type": "text/event-stream" },
-      },
-    );
 
   const parseJsonBody = (body: RequestInit["body"]): UploadRequestBody => {
     if (typeof body !== "string") {
@@ -330,17 +328,7 @@ function installProjectManagerUploadMocks({
       return jsonResponse(sourceDetails);
     }
 
-    if (url.pathname === "/api/anime/jobs/stream") {
-      return emptyEventStream();
-    }
-
-    if (
-      url.pathname === "/api/projects/startup/jobs" ||
-      url.pathname === "/api/projects/startup/jobs/stream"
-    ) {
-      if (url.pathname.endsWith("/stream")) {
-        return emptyEventStream();
-      }
+    if (url.pathname === "/api/projects/startup/jobs") {
       return jsonResponse({ jobs: [] });
     }
 
@@ -350,23 +338,6 @@ function installProjectManagerUploadMocks({
 
     if (url.pathname === "/api/project-manager/upload-jobs") {
       return jsonResponse({ jobs: [] });
-    }
-
-    if (url.pathname === "/api/project-manager/upload-jobs/stream") {
-      return new Response(
-        new ReadableStream({
-          start(controller) {
-            uploadController = controller;
-            pendingUploadEvents.splice(0).forEach((chunk) => {
-              controller.enqueue(encoder.encode(chunk));
-            });
-          },
-        }),
-        {
-          status: 200,
-          headers: { "Content-Type": "text/event-stream" },
-        },
-      );
     }
 
     if (url.pathname === "/api/accounts") {
@@ -517,6 +488,7 @@ async function latestUploadRequest(page: Page, projectId: string) {
 test("Project Manager stacks upload prompts and keeps other uploads alive through refresh", async ({
   page,
 }) => {
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installProjectManagerUploadMocks, {
     sourceDetails: SOURCE_DETAILS,
     initialProjectRows: INITIAL_PROJECT_ROWS,
@@ -532,9 +504,9 @@ test("Project Manager stacks upload prompts and keeps other uploads alive throug
   await expect(alphaRow).toBeVisible();
   await expect(betaRow).toBeVisible();
 
-  await alphaRow.getByRole("button", { name: "Upload" }).click();
-  await expect(betaRow.getByRole("button", { name: "Upload" })).toBeEnabled();
-  await betaRow.getByRole("button", { name: "Upload" }).click();
+  await alphaRow.getByRole("button", { name: /^Upload$/ }).click();
+  await expect(betaRow.getByRole("button", { name: /^Upload$/ })).toBeEnabled();
+  await betaRow.getByRole("button", { name: /^Upload$/ }).click();
 
   await expect(page.getByText("Remplacement de la musique")).toBeVisible();
   await expect(
@@ -562,6 +534,7 @@ test("Project Manager stacks upload prompts and keeps other uploads alive throug
 test("Project Manager keeps copyright audio path through Facebook duration prompt", async ({
   page,
 }) => {
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installProjectManagerUploadMocks, {
     sourceDetails: SOURCE_DETAILS,
     initialProjectRows: [INITIAL_PROJECT_ROWS[0]],
@@ -574,7 +547,7 @@ test("Project Manager keeps copyright audio path through Facebook duration promp
   const alphaRow = page.locator("tr").filter({ hasText: "Project Alpha" });
   await expect(alphaRow).toBeVisible();
 
-  await alphaRow.getByRole("button", { name: "Upload" }).click();
+  await alphaRow.getByRole("button", { name: /^Upload$/ }).click();
   await expect(page.getByText("Remplacement de la musique")).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Utiliser cet audio" }),
@@ -597,6 +570,7 @@ test("Project Manager keeps copyright audio path through Facebook duration promp
 test("Project Manager keeps copyright audio path through YouTube duration prompt", async ({
   page,
 }) => {
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installProjectManagerUploadMocks, {
     sourceDetails: SOURCE_DETAILS,
     initialProjectRows: [INITIAL_PROJECT_ROWS[0]],
@@ -609,7 +583,7 @@ test("Project Manager keeps copyright audio path through YouTube duration prompt
   const alphaRow = page.locator("tr").filter({ hasText: "Project Alpha" });
   await expect(alphaRow).toBeVisible();
 
-  await alphaRow.getByRole("button", { name: "Upload" }).click();
+  await alphaRow.getByRole("button", { name: /^Upload$/ }).click();
   await expect(page.getByText("Remplacement de la musique")).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Utiliser cet audio" }),
@@ -630,6 +604,7 @@ test("Project Manager keeps copyright audio path through YouTube duration prompt
 });
 
 test("Project Manager applies one three-minute choice to YouTube and Instagram", async ({ page }) => {
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installProjectManagerUploadMocks, {
     sourceDetails: SOURCE_DETAILS,
     initialProjectRows: [INITIAL_PROJECT_ROWS[0]],
@@ -638,7 +613,7 @@ test("Project Manager applies one three-minute choice to YouTube and Instagram",
   await page.goto("/");
   await page.getByRole("button", { name: "Projects" }).click();
   const row = page.locator("tr").filter({ hasText: "Project Alpha" });
-  await row.getByRole("button", { name: "Upload" }).click();
+  await row.getByRole("button", { name: /^Upload$/ }).click();
   await expect(page.getByText("Vidéo trop longue pour YouTube et Instagram")).toBeVisible();
   await page.getByRole("button", { name: "Couper à 3:00" }).click();
   await expect.poll(async () => latestUploadRequest(page, "project-alpha")).toMatchObject({

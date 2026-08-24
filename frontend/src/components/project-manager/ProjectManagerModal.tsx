@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Loader2, RefreshCw, X, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { api } from "@/api/client";
-import { readSSEStream } from "@/utils/sse";
+import { getEventHub } from "@/utils/eventHub";
 import { confirmTikTokPrecedence } from "@/utils/tiktokPrecedence";
 import { AccountSelectorDropdown } from "./AccountSelectorDropdown";
 import { AccountPickerPopup } from "./AccountPickerPopup";
@@ -86,7 +86,6 @@ interface UploadSession {
 const LOAD_RETRY_DELAY_MS = 1000;
 const LOAD_RETRY_WINDOW_MS = 45000;
 const TERMINAL_RELOAD_DEBOUNCE_MS = 400;
-const SSE_RECONNECT_DELAY_MS = 3000;
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => {
@@ -319,60 +318,15 @@ export function ProjectManagerModal({
 
   useEffect(() => {
     if (!open) return;
-
-    const controller = new AbortController();
-    let reconnectTimer: number | null = null;
-
-    const scheduleReconnect = () => {
-      if (controller.signal.aborted || reconnectTimer !== null) {
-        return;
+    // Subscribe only while open: the shared event stream stays up for the
+    // whole browser, this just gates delivery into the modal.
+    return getEventHub().subscribe<ProjectUploadJob>("upload_jobs", {}, (event) => {
+      if (event.kind === "snapshot") {
+        event.items.forEach((item) => upsertUploadJob(item.data));
+      } else {
+        upsertUploadJob(event.item.data);
       }
-      reconnectTimer = window.setTimeout(() => {
-        reconnectTimer = null;
-        void connect();
-      }, SSE_RECONNECT_DELAY_MS);
-    };
-
-    const connect = async () => {
-      try {
-        const response = await api.streamProjectUploadJobs(controller.signal);
-        await readSSEStream<ProjectUploadJob>(
-          response,
-          (job) => {
-            upsertUploadJob(job);
-          },
-          { signal: controller.signal },
-        );
-      } catch {
-        // Ignore transient SSE failures and reconnect below.
-      } finally {
-        scheduleReconnect();
-      }
-    };
-
-    void api
-      .listProjectUploadJobs()
-      .then(({ jobs }) => {
-        setUploadJobs((prev) => {
-          const next = { ...prev };
-          jobs.forEach((job) => {
-            next[job.project_id] = job;
-          });
-          return next;
-        });
-      })
-      .catch(() => {
-        // SSE bootstrap below is the primary source of truth.
-      });
-
-    void connect();
-
-    return () => {
-      controller.abort();
-      if (reconnectTimer !== null) {
-        window.clearTimeout(reconnectTimer);
-      }
-    };
+    });
   }, [open, upsertUploadJob]);
 
   useEffect(() => {

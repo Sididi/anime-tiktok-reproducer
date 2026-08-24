@@ -12,6 +12,7 @@ from typing import Any
 from ..config import settings
 from ..models.project_upload import ProjectUploadJob
 from .account_service import AccountConfig, AccountService
+from .event_hub import event_hub
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
 from .upload_phase import UploadPhaseService
@@ -118,6 +119,9 @@ class UploadRequestSpec:
     immediate_platforms: list[str] | None = None
 
 
+HUB_TOPIC = "upload_jobs"
+
+
 class ProjectUploadService:
     RESTART_INTERRUPTED_ERROR = "Upload interrupted by server restart."
 
@@ -130,7 +134,6 @@ class ProjectUploadService:
         self._jobs = _load_jobs(self._jobs_path)
         max_workers = max_concurrent if max_concurrent is not None else settings.project_upload_max_concurrent
         self._semaphore = asyncio.Semaphore(max(1, max_workers))
-        self._subscribers: list[asyncio.Queue[dict[str, Any]]] = []
         self._requests: dict[str, UploadRequestSpec] = {}
 
     async def startup_cleanup(self) -> None:
@@ -251,25 +254,16 @@ class ProjectUploadService:
         )
         return job
 
-    async def stream_all_jobs(self):
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._subscribers.append(queue)
-        try:
-            for job in self.list_jobs():
-                yield job.model_dump(mode="json")
-            while True:
-                yield await queue.get()
-        finally:
-            if queue in self._subscribers:
-                self._subscribers.remove(queue)
-
     async def _publish_job(self, job: ProjectUploadJob) -> None:
         job.updated_at = _utc_now()
         self._jobs[job.project_id] = job
         await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
-        payload = job.model_dump(mode="json")
-        for queue in list(self._subscribers):
-            queue.put_nowait(payload)
+        event_hub.publish(
+            HUB_TOPIC,
+            key=job.project_id,
+            data=job.model_dump(mode="json"),
+            project_id=job.project_id,
+        )
 
     async def _set_job_state(
         self,

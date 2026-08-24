@@ -1,10 +1,9 @@
 import asyncio
-import json
 import logging
 from typing import Literal
 
 from fastapi import APIRouter, Body, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from ...services import UploadPhaseService
@@ -111,25 +110,14 @@ async def get_upload_restrictions(project_id: str):
 
 @router.get("/upload-jobs")
 async def list_project_upload_jobs():
-    """List persisted Project Manager upload jobs."""
+    """List persisted Project Manager upload jobs.
+
+    Live updates flow over the shared ``/api/events/stream`` (topic
+    ``upload_jobs``); this REST snapshot remains for tooling and tests.
+    """
     return {
         "jobs": [job.model_dump(mode="json") for job in project_upload_queue.list_jobs()],
     }
-
-
-@router.get("/upload-jobs/stream")
-async def stream_project_upload_jobs():
-    """Stream Project Manager upload jobs over SSE."""
-
-    async def generate():
-        async for data in project_upload_queue.stream_all_jobs():
-            yield f"data: {json.dumps(data)}\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
 
 
 @router.delete("/projects/{project_id}")

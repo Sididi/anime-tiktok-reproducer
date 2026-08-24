@@ -11,6 +11,7 @@ from ..library_types import LibraryType
 from ..models.torrent import IndexationJob
 from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
+from .event_hub import event_hub
 from .indexation_preflight import IndexationPreflightService
 from .library_hydration_service import LibraryHydrationService
 from .pending_publish_store import PendingPublishRecord, PendingPublishStore
@@ -21,6 +22,8 @@ from .runtime_memory import log_memory, release_unused_memory
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".webm", ".ts", ".m4v"}
 
 logger = logging.getLogger("uvicorn.error")
+
+HUB_TOPIC = "index_jobs"
 
 
 class IndexationQueueService:
@@ -43,7 +46,6 @@ class IndexationQueueService:
         self._matching_lock = asyncio.Lock()
         self._active_heavy_jobs = 0
         self._active_heavy_kinds: Counter[str] = Counter()
-        self._subscribers: list[asyncio.Queue[dict]] = []
         self._upload_semaphore = asyncio.Semaphore(1)
         self._upload_tasks: dict[str, asyncio.Task] = {}
 
@@ -747,24 +749,7 @@ class IndexationQueueService:
             await qbt.close()
 
     def _broadcast(self, job: IndexationJob) -> None:
-        data = job.model_dump(mode="json")
-        for queue in self._subscribers:
-            queue.put_nowait(data)
-
-    async def stream_all_jobs(self):
-        """Yield job state dicts for SSE streaming."""
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._subscribers.append(queue)
-        try:
-            # Send current state first
-            for job in self._jobs.values():
-                yield job.model_dump(mode="json")
-            # Then stream updates
-            while True:
-                data = await queue.get()
-                yield data
-        finally:
-            self._subscribers.remove(queue)
+        event_hub.publish(HUB_TOPIC, key=job.id, data=job.model_dump(mode="json"))
 
     def list_jobs(self) -> list[IndexationJob]:
         return list(self._jobs.values())

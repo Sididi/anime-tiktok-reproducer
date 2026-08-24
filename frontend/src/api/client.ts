@@ -221,9 +221,6 @@ export const api = {
       "/projects/startup/jobs",
     ),
 
-  streamProjectStartupJobs: (signal?: AbortSignal) =>
-    fetch(`${API_BASE}/projects/startup/jobs/stream`, { signal }),
-
   // Accounts
   listAccounts: () =>
     request<{ accounts: import("@/types").Account[] }>("/accounts"),
@@ -273,9 +270,6 @@ export const api = {
     request<{ jobs: import("@/types").ProjectUploadJob[] }>(
       "/project-manager/upload-jobs",
     ),
-
-  streamProjectUploadJobs: (signal?: AbortSignal) =>
-    fetch(`${API_BASE}/project-manager/upload-jobs/stream`, { signal }),
 
   checkFacebookDuration: (projectId: string, accountId?: string) =>
     uploadPreflightRequest<import("@/types").FacebookCheckResult>(
@@ -655,11 +649,6 @@ export const api = {
       `/projects/${projectId}/matches/zoom-search/jobs`,
     ),
 
-  streamZoomSearchJobs: (projectId: string, signal?: AbortSignal) =>
-    fetch(`${API_BASE}/projects/${projectId}/matches/zoom-search/jobs/stream`, {
-      signal,
-    }),
-
   ackZoomSearchJob: (projectId: string, jobId: string) =>
     request<{ job: import("@/types").ZoomSearchJob }>(
       `/projects/${projectId}/matches/zoom-search/jobs/${jobId}/ack`,
@@ -880,9 +869,6 @@ export const api = {
   // Library - Jobs
   listIndexationJobs: () =>
     request<{ jobs: import("@/types").IndexationJob[] }>("/anime/jobs"),
-
-  streamIndexationJobs: (signal?: AbortSignal) =>
-    fetch(`${API_BASE}/anime/jobs/stream`, { signal }),
 
   // Library - Purge
   purgeLibrary: (

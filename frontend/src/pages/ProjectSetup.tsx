@@ -16,7 +16,7 @@ import { FolderBrowserModal } from "@/components/FolderBrowserModal";
 import { ProjectManagerModal } from "@/components/project-manager";
 import { DuplicateTikTokWarning } from "@/components/DuplicateTikTokWarning";
 import { api, SeriesDeleteConflictError } from "@/api/client";
-import { readSSEStream } from "@/utils/sse";
+import { getEventHub } from "@/utils/eventHub";
 import type {
   LibraryType,
   SourceDetails,
@@ -42,7 +42,6 @@ export function ProjectSetup() {
   const [statusText, setStatusText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [startupJobs, setStartupJobs] = useState<ProjectStartupJob[]>([]);
-  const startupAbortRef = useRef<AbortController | null>(null);
   const startupTabsRef = useRef<Map<string, Window | null>>(new Map());
   const sourceLoadSeqRef = useRef(0);
 
@@ -236,59 +235,19 @@ export function ProjectSetup() {
     [renderStartupWindow],
   );
 
-  useEffect(() => {
-    startupAbortRef.current?.abort();
-    const controller = new AbortController();
-    startupAbortRef.current = controller;
-    let reconnectTimer: number | null = null;
-
-    const scheduleReconnect = () => {
-      if (controller.signal.aborted || reconnectTimer !== null) {
-        return;
-      }
-      reconnectTimer = window.setTimeout(() => {
-        reconnectTimer = null;
-        void connect();
-      }, 3000);
-    };
-
-    const connect = async () => {
-      try {
-        const response = await api.streamProjectStartupJobs(controller.signal);
-        await readSSEStream<ProjectStartupJob>(
-          response,
-          (job) => {
-            upsertStartupJob(job);
-          },
-          { signal: controller.signal },
-        );
-      } catch {
-        // Ignore transient SSE failures and reconnect below.
-      } finally {
-        scheduleReconnect();
-      }
-    };
-
-    void api
-      .listProjectStartupJobs()
-      .then(({ jobs }) => {
-        jobs.forEach((job) => {
-          upsertStartupJob(job);
-        });
-      })
-      .catch(() => {
-        // SSE bootstrap below is the primary source of truth.
-      });
-
-    void connect();
-
-    return () => {
-      controller.abort();
-      if (reconnectTimer !== null) {
-        window.clearTimeout(reconnectTimer);
-      }
-    };
-  }, [upsertStartupJob]);
+  useEffect(
+    () =>
+      // The shared event stream replays the current snapshot on subscribe
+      // and then every update; each item is the job's full state.
+      getEventHub().subscribe<ProjectStartupJob>("startup_jobs", {}, (event) => {
+        if (event.kind === "snapshot") {
+          event.items.forEach((item) => upsertStartupJob(item.data));
+        } else {
+          upsertStartupJob(event.item.data);
+        }
+      }),
+    [upsertStartupJob],
+  );
 
   const proceedWithStart = useCallback(async (popup: Window | null) => {
     if (!tiktokUrl.trim() || (!isPure && !selectedSource)) return;

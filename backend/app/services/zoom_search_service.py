@@ -17,13 +17,16 @@ import time
 import uuid
 from functools import partial
 from pathlib import Path
-from typing import AsyncIterator, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from ..library_types import LibraryType
+from .event_hub import event_hub
 
 logger = logging.getLogger("uvicorn.error")
+
+HUB_TOPIC = "zoom_jobs"
 
 TERMINAL_STATUSES = {"complete", "error", "cancelled"}
 
@@ -54,7 +57,6 @@ class ZoomSearchService:
         self._jobs: dict[str, ZoomSearchJob] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._cancel_events: dict[str, threading.Event] = {}
-        self._subscribers: list[asyncio.Queue[dict]] = []
 
     # ------------------------------------------------------------------
     # registry surface
@@ -81,19 +83,9 @@ class ZoomSearchService:
             job for job in self._jobs.values() if job.project_id == project_id
         ]
 
-    async def stream_jobs(self, project_id: str) -> AsyncIterator[dict]:
-        """Current state then live updates for one project's jobs."""
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._subscribers.append(queue)
-        try:
-            for job in self.list_jobs(project_id):
-                yield job.model_dump(mode="json")
-            while True:
-                data = await queue.get()
-                if data.get("project_id") == project_id:
-                    yield data
-        finally:
-            self._subscribers.remove(queue)
+    def list_all_jobs(self) -> list[ZoomSearchJob]:
+        """Every registered job (the shared event stream is not per-project)."""
+        return list(self._jobs.values())
 
     def ack(self, job_id: str) -> ZoomSearchJob | None:
         job = self._jobs.get(job_id)
@@ -126,9 +118,12 @@ class ZoomSearchService:
     # internals
 
     def _broadcast(self, job: ZoomSearchJob) -> None:
-        data = job.model_dump(mode="json")
-        for queue in self._subscribers:
-            queue.put_nowait(data)
+        event_hub.publish(
+            HUB_TOPIC,
+            key=job.id,
+            data=job.model_dump(mode="json"),
+            project_id=job.project_id,
+        )
 
     def _prune_terminal_jobs(self) -> None:
         terminal = [

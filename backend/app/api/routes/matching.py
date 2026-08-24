@@ -1221,33 +1221,17 @@ async def start_zoom_search(project_id: str, scene_index: int):
 
 @router.get("/matches/zoom-search/jobs")
 async def list_zoom_search_jobs(project_id: str):
-    """Snapshot of this project's zoom-search jobs."""
+    """Snapshot of this project's zoom-search jobs.
+
+    Live updates flow over the shared ``/api/events/stream`` (topic
+    ``zoom_jobs``, filtered client-side by ``project_id``).
+    """
     return {
         "jobs": [
             job.model_dump(mode="json")
             for job in zoom_search_service.list_jobs(project_id)
         ]
     }
-
-
-@router.get("/matches/zoom-search/jobs/stream")
-async def stream_zoom_search_jobs(project_id: str):
-    """SSE stream of this project's zoom-search job updates.
-
-    Events are wrapped as ``{"kind": "zoom_job", "job": {...}}`` so a job in
-    the ``error`` state never puts a top-level ``status: "error"`` on the
-    wire (the frontend's generic SSE reader throws on those).
-    """
-
-    async def generate():
-        async for data in zoom_search_service.stream_jobs(project_id):
-            yield "data: " + json.dumps({"kind": "zoom_job", "job": data}) + "\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
 
 
 @router.post("/matches/zoom-search/jobs/{job_id}/ack")

@@ -1,8 +1,10 @@
 import { expect, test } from "@playwright/test";
+import { installEventHubMock } from "./helpers/eventHubMock";
 
 test("renaming a source refreshes the list and preserves selection by series_id", async ({
   page,
 }) => {
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(() => {
     const originalFetch = window.fetch.bind(window);
     let currentName = "Old Name";
@@ -42,40 +44,12 @@ test("renaming a source refreshes the list and preserves selection by series_id"
         );
       }
 
-      if (url.pathname === "/api/anime/jobs/stream") {
-        return new Response(
-          new ReadableStream({
-            start(controller) {
-              controller.close();
-            },
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "text/event-stream" },
-          },
-        );
-      }
-
       if (url.pathname === "/api/projects/startup/jobs") {
         return new Response(
           JSON.stringify({ jobs: [] }),
           {
             status: 200,
             headers: { "Content-Type": "application/json" },
-          },
-        );
-      }
-
-      if (url.pathname === "/api/projects/startup/jobs/stream") {
-        return new Response(
-          new ReadableStream({
-            start(controller) {
-              controller.close();
-            },
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "text/event-stream" },
           },
         );
       }

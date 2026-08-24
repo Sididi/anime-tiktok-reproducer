@@ -1,9 +1,9 @@
 {
   "compilerOptions": {
-    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.worker.tsbuildinfo",
     "target": "ES2022",
     "useDefineForClassFields": true,
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "lib": ["ES2022", "WebWorker"],
     "module": "ESNext",
     "types": ["vite/client"],
     "skipLibCheck": true,
@@ -14,7 +14,6 @@
     "verbatimModuleSyntax": true,
     "moduleDetection": "force",
     "noEmit": true,
-    "jsx": "react-jsx",
 
     /* Path aliases */
     "baseUrl": ".",
@@ -30,7 +29,10 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["src"],
-  /* Worker scripts need the WebWorker lib (see tsconfig.worker.json). */
-  "exclude": ["src/**/*.worker.ts"]
+  "include": [
+    "src/utils/eventHub.worker.ts",
+    "src/utils/eventHubStream.ts",
+    "src/utils/eventHubProtocol.ts",
+    "src/utils/sse.ts"
+  ]
 }
