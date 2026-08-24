@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,6 +9,12 @@ from pathlib import Path
 
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
+
+logger = logging.getLogger("uvicorn.error")
+
+# Up to a few dozen executor threads (hydration, pins) hit this file at once;
+# without a busy timeout a writer makes concurrent readers fail after 5 s.
+_BUSY_TIMEOUT_SECONDS = 10.0
 
 
 def _utc_now_iso() -> str:
@@ -71,15 +78,29 @@ class LibraryStateDb:
 
     @classmethod
     def connect(cls) -> sqlite3.Connection:
-        conn = sqlite3.connect(cls.path())
+        conn = sqlite3.connect(cls.path(), timeout=_BUSY_TIMEOUT_SECONDS)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(f"PRAGMA busy_timeout = {int(_BUSY_TIMEOUT_SECONDS * 1000)}")
+        # With WAL, NORMAL still guarantees consistency; it only skips the
+        # per-transaction fsync of the WAL file.
+        conn.execute("PRAGMA synchronous = NORMAL")
         return conn
 
     @classmethod
     def initialize(cls) -> None:
         cls.path().parent.mkdir(parents=True, exist_ok=True)
         with cls.connect() as conn:
+            # Write-ahead logging: readers no longer block writers and vice
+            # versa. The mode persists in the database file; it needs a local
+            # filesystem (it is: backend/data), not a network share.
+            mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            if str(mode).lower() != "wal":
+                logger.warning(
+                    "library_state.db could not switch to WAL (journal_mode=%s); "
+                    "concurrent readers will block behind writers",
+                    mode,
+                )
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS series_state (
