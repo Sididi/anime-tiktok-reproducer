@@ -62,12 +62,22 @@ def test_build_tiktok_payload_none_without_pfm_id():
     assert UploadPhaseService._build_tiktok_payload(None, "d") is None
 
 
-def test_upfront_skip_tiktok_without_pfm_id():
-    skips = UploadPhaseService._compute_upfront_skips(
-        ("tiktok",), _account(AccountTikTokConfig())
-    )
-    assert skips["tiktok"].status == "skipped"
-    assert "Post for Me" in skips["tiktok"].detail
+def test_upfront_tiktok_without_pfm_id_is_manual_pending():
+    """Manual TikTok mode (2026-08): no Post for Me id → the row is seeded
+    "pending" (the VPS posts the T-5 reminder; ✅ flips it to uploaded),
+    never "skipped"."""
+    for tiktok in (AccountTikTokConfig(), None):
+        skips = UploadPhaseService._compute_upfront_skips(("tiktok",), _account(tiktok))
+        assert skips["tiktok"].status == "pending"
+        assert skips["tiktok"].detail == UploadPhaseService._TIKTOK_MANUAL_DETAIL
+
+
+def test_tiktok_manual_result_shape():
+    result = UploadPhaseService._tiktok_manual_result()
+    assert result.platform == "tiktok"
+    assert result.status == "pending"
+    assert result.url is None
+    assert "✅" in result.detail
 
 
 def test_no_upfront_skip_with_pfm_id():
@@ -115,14 +125,28 @@ def test_tiktok_enrolled_with_tiktok_slots_and_no_payload():
     assert UploadPhaseService._tiktok_enrolled(account, None) is True
 
 
-def test_tiktok_not_enrolled_with_only_top_level_slots():
-    """Top-level `slots:` alone (no explicit `tiktok:` block) must not enroll
-    the account in TikTok publishing — that requires an explicit tiktok block."""
+def test_tiktok_enrolled_with_only_top_level_slots_as_manual():
+    """Top-level `slots:` alone (no `tiktok:` block) enrolls the account in
+    MANUAL TikTok mode (owner decision 2026-08-24): the slot is reserved by
+    _platforms_to_reserve with the same rule, so the upload must carry the
+    TikTok row (reminder + ✅ ack) rather than drop it."""
     account = AccountConfig(
         id="anime_fr", name="Anime FR", language="fr", device="",
         slots=["06:00"], tiktok=None,
     )
-    assert UploadPhaseService._tiktok_enrolled(account, None) is False
+    assert account.tiktok_mode() == "manual"
+    assert UploadPhaseService._tiktok_enrolled(account, None) is True
+    platforms = UploadPhaseService._vps_platforms(("youtube",), account, None)
+    assert platforms == ["youtube", "tiktok"]
+
+
+def test_tiktok_pfm_account_is_not_manual():
+    account = AccountConfig(
+        id="anime_fr", name="Anime FR", language="fr", device="",
+        slots=["06:00"], tiktok=AccountTikTokConfig(post_for_me_account_id="spc_1"),
+    )
+    assert account.tiktok_mode() == "pfm"
+    assert UploadPhaseService._tiktok_enrolled(account, None) is True
 
 
 def test_tiktok_not_enrolled_without_block():

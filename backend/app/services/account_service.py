@@ -167,6 +167,21 @@ class AccountConfig:
             return self.instagram.max_reel_duration_seconds
         return 90
 
+    def tiktok_mode(self) -> Literal["pfm", "manual"] | None:
+        """How this account posts to TikTok.
+
+        None      — no TikTok slots: the platform is not enrolled at all.
+        "pfm"     — automatic publishing via Post for Me (post_for_me_account_id).
+        "manual"  — TikTok slots but no Post for Me id: the slot is reserved,
+                    the VPS posts a Discord reminder 5 min before the TikTok
+                    time and a ✅ reaction marks the post as done (2026-08).
+        """
+        if not self.slots_for("tiktok"):
+            return None
+        if self.tiktok is not None and self.tiktok.post_for_me_account_id:
+            return "pfm"
+        return "manual"
+
     def pool_key_for(self, platform: str) -> str | None:
         """Shared-pool identity for (this account, platform), or None if unshared.
 

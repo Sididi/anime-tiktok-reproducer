@@ -55,8 +55,17 @@ def format_french_datetime(dt: datetime) -> str:
 _format_french_datetime = format_french_datetime
 
 
-def _format_platform_line(platform: str, ps: PlatformStatus) -> str:
+def _format_platform_line(
+    platform: str, ps: PlatformStatus, *, tiktok_manual: bool = False
+) -> str:
     label = _PLATFORM_DISPLAY.get(platform, platform.title())
+    if platform == "tiktok" and tiktok_manual and not ps.url:
+        # Manual TikTok mode (no Post for Me id on the account): the operator
+        # posts from the phone and acks with a ✅ reaction.
+        if ps.status == "pending":
+            return f"🎯 {label} — Post manuel (réagis ✅ une fois posté)"
+        if ps.status == "uploaded":
+            return f"✅ {label} — Posté manuellement"
     emoji = _STATUS_EMOJI.get(ps.status, "·")
     if ps.url:
         suffix = f" — {ps.url}"
@@ -76,7 +85,11 @@ def build_embed(
     avatar_url = f"{public_base_url.rstrip('/')}/api/avatars/{account.avatar}"
 
     plat_lines = [
-        _format_platform_line(p, job.platform_statuses.get(p, PlatformStatus(status="pending")))
+        _format_platform_line(
+            p,
+            job.platform_statuses.get(p, PlatformStatus(status="pending")),
+            tiktok_manual=job.tiktok_manual,
+        )
         for p in job.platforms_requested
     ]
 

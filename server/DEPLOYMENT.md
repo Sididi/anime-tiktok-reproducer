@@ -475,15 +475,13 @@ If the gateway fails to connect, check:
    - For Instagram: `Instagram publish succeeded for <project_id>` log line. The embed's IG line transitions to `✅ Instagram — https://instagram.com/reel/...`.
    - For TikTok: see step 4 below.
 
-4. **TikTok now publishes automatically at slot_time** — the Discord reaction listener
-   described above is disabled (the code is kept in `main.py`, commented out, as a manual
-   fallback). Instead, the scheduler publishes to TikTok via Post for Me, the same as
-   Instagram: `TikTok publish succeeded for <project_id>` appears in the logs, and the
-   embed's TikTok line transitions to `✅ TikTok — <published URL>`. On failure it retries
-   up to 5 times, showing the retry detail on the embed line; after the 5th failed
-   attempt, a `@Tiktok Reproducer` role ping is sent to the former reminder channel.
+4. **TikTok** — two modes since 2026-08, decided per account by the backend:
+   - **Post for Me accounts** (`tiktok.post_for_me_account_id` set): the backend creates
+     the PFM post itself; the server only renders the embed row (`⏳ TikTok — Pending` →
+     `✅ TikTok — <published URL>` pushed by the backend). No server-side action.
+   - **Manual accounts** (TikTok slots, no PFM id): see §13 below.
 
-5. **Cascade delete still works** — `DELETE /api/internal/jobs/<pid>` removes the embed + any reminder messages.
+5. **Cascade delete still works** — `DELETE /api/internal/jobs/<pid>` removes the embed + the manual-TikTok reminder message if present.
 
 ### Instagram Meta prerequisites
 
@@ -511,3 +509,42 @@ docker compose up -d --build
 ```
 
 The previous state still works for TikTok-only flow. Instagram via n8n was working before this; if you need IG to work during a rollback window, re-enable your n8n workflow + restore `ATR_N8N_WEBHOOK_URL` + `ATR_DISCORD_WEBHOOK_URL` in your dev `.env`.
+
+---
+
+## 13. Manual TikTok mode (2026-08) — reminder + ✅ reaction ack
+
+For accounts that have TikTok slots but **no** `tiktok.post_for_me_account_id`, the
+backend creates the VPS job with `tiktok_manual: true` and a `pending` TikTok row. The
+server then:
+
+1. Renders `🎯 TikTok — Post manuel (réagis ✅ une fois posté)` on the upload-channel embed.
+2. At **TikTok time − 5 min** (`TIKTOK_MANUAL_REMINDER_LEAD_MINUTES` in
+   `reminder_scheduler.py`) posts **one** message in the reminder channel
+   (`ATR_DISCORD_REMINDER_CHANNEL_ID`): `@role` ping (`ATR_DISCORD_REMINDER_ROLE_ID`),
+   a jump link to the original post and a small embed (account, device, TikTok description,
+   video link). Nothing else is ever sent — if nobody reacts, the row stays pending.
+   Slots more than 6 h in the past never get a reminder (restart safety).
+3. The **✅ reaction listener** (`reaction_listener.py`, gateway connection started in
+   `main.py`) marks the row `✅ TikTok — Posté manuellement` on a ✅ from a non-bot user on
+   the original post **or** the reminder, mirrors ✅ on the original post, and deletes the
+   reminder. Reacting before T−5 cancels the reminder. ✅ on a Post-for-Me job is ignored.
+4. A backend cancel (`platform-status` → `skipped`) or a TikTok slot move
+   (`PATCH /jobs/<pid>/slot`) drops/re-arms the reminder automatically.
+5. The backend picks the `uploaded` status up through `GET /api/internal/jobs`
+   (planning board → `complete`).
+
+**Discord bot requirements** (upload + reminder channels): `View Channel`, `Send Messages`,
+`Embed Links`, `Read Message History`, `Add Reactions`, `Manage Messages` (to delete the
+reminder). Gateway intent `GUILD_MESSAGE_REACTIONS` is requested by `discord.py`
+(`Intents.default()` + `reactions=True`) — not privileged, no portal change needed.
+
+**Deploy**: backend and `server/` ship together (the backend sends `tiktok_manual`; an old
+server ignores the field and would treat the row as a plain pending row without reminder).
+After `docker compose up -d --build`, expect in the logs:
+```
+INFO ... Scheduler started (interval=30.0s)
+INFO ... ReactionListener gateway connection starting
+INFO ... ReactionListener ready as bot user <id>
+```
+and, when a manual job comes due: `TikTok manual reminder posted for <project_id>`.

@@ -191,6 +191,10 @@ class UploadPhaseService:
     _FACEBOOK_NATIVE_HORIZON_DAYS = 29
     _FRENCH_TZ = ZoneInfo("Europe/Paris")
     _TIKTOK_NOT_CONFIGURED_DETAIL = "No Post for Me account configured for this account"
+    # Manual TikTok mode (2026-08): account has TikTok slots but no Post for
+    # Me id. The VPS job row starts "pending"; the server posts a Discord
+    # reminder at T-5 and the ✅ reaction flips it to "uploaded".
+    _TIKTOK_MANUAL_DETAIL = "Post manuel — en attente du ✅ Discord"
     _drive_video_cache: dict[str, dict[str, Any]] = {}
     _DRIVE_VIDEO_CACHE_TTL_SECONDS = 300.0
     _DRIVE_BATCH_LOOKUP_MAX_ATTEMPTS = 3
@@ -699,11 +703,14 @@ class UploadPhaseService:
                 if account is not None and account.meta is None:
                     reason = default_detail
             elif platform == "tiktok":
-                if account is not None and (
-                    account.tiktok is None
-                    or not account.tiktok.post_for_me_account_id
+                # Explicitly requested TikTok: a Post for Me id publishes
+                # automatically; without one the account is in manual mode
+                # (Discord reminder + ✅), never silently skipped.
+                if account is not None and not (
+                    account.tiktok is not None
+                    and account.tiktok.post_for_me_account_id
                 ):
-                    reason = cls._TIKTOK_NOT_CONFIGURED_DETAIL
+                    skips[platform] = cls._tiktok_manual_result()
             if reason is not None:
                 skips[platform] = PlatformUploadResult(
                     platform=platform,
@@ -711,6 +718,13 @@ class UploadPhaseService:
                     detail=reason,
                 )
         return skips
+
+    @classmethod
+    def _tiktok_manual_result(cls) -> PlatformUploadResult:
+        """Seed row for a manual-mode account: pending until the Discord ✅."""
+        return PlatformUploadResult(
+            platform="tiktok", status="pending", detail=cls._TIKTOK_MANUAL_DETAIL
+        )
 
     @classmethod
     def _build_tiktok_payload(
@@ -789,15 +803,13 @@ class UploadPhaseService:
         the 2026-08 PFM migration the server only DISPATCHES platforms whose
         payload is present on the job: TikTok is backend-published (its
         payload is never sent — see _publish_tiktok_via_pfm), and an
-        urgent-immediate Instagram row arrives without a payload too."""
+        urgent-immediate Instagram row arrives without a payload too. A
+        manual-mode TikTok row (tiktok_manual on the job) is the one server
+        action left for TikTok: the T-5 Discord reminder."""
         platforms = list(requested_platforms)
         if "tiktok" in platforms:
             return platforms
-        if tiktok_payload is not None or (
-            account is not None
-            and account.tiktok is not None
-            and account.slots_for("tiktok")
-        ):
+        if cls._tiktok_enrolled(account, tiktok_payload):
             platforms.append("tiktok")
         return platforms
 
@@ -807,19 +819,15 @@ class UploadPhaseService:
         account: AccountConfig | None,
         tiktok_payload: dict[str, Any] | None,
     ) -> bool:
-        """Whether this upload should publish to TikTok (via PFM).
+        """Whether this upload targets TikTok (PFM publish or manual post).
 
-        Same enrollment rule as the legacy VPS join: a payload exists, or the
-        account has an explicit `tiktok:` block with slots (top-level `slots:`
-        alone does not count — `slots_for` falls back to it for every
-        platform)."""
+        Same rule as the slot reservation (project_upload_service
+        _platforms_to_reserve): a payload exists, or the account has TikTok
+        slots — with or without an explicit `tiktok:` block. Without a Post
+        for Me id the account is in manual mode (owner decision 2026-08-24)."""
         if tiktok_payload is not None:
             return True
-        return (
-            account is not None
-            and account.tiktok is not None
-            and bool(account.slots_for("tiktok"))
-        )
+        return account is not None and account.tiktok_mode() is not None
 
     @classmethod
     def _publish_tiktok_via_pfm(
@@ -1340,15 +1348,11 @@ class UploadPhaseService:
         results_by_platform: dict[str, PlatformUploadResult] = dict(
             cls._compute_upfront_skips(requested_platforms, account)
         )
-        if tiktok_enrolled and tiktok_payload is None:
-            results_by_platform.setdefault(
-                "tiktok",
-                PlatformUploadResult(
-                    platform="tiktok",
-                    status="skipped",
-                    detail=cls._TIKTOK_NOT_CONFIGURED_DETAIL,
-                ),
-            )
+        tiktok_manual = tiktok_enrolled and tiktok_payload is None
+        if tiktok_manual:
+            # Manual mode: the row stays pending on the VPS job; the server
+            # posts the reminder and the ✅ reaction marks it uploaded.
+            results_by_platform["tiktok"] = cls._tiktok_manual_result()
         discord_message_id: str | None = None
         instagram_drive_metadata: dict[str, str] = {}
         facebook_drive_metadata: dict[str, str] = {}
@@ -1821,6 +1825,8 @@ class UploadPhaseService:
                         # longer carries a tiktok payload.
                         # tiktok=tiktok_payload,
                         tiktok=None,
+                        # Manual TikTok mode: the server posts the T-5 reminder.
+                        tiktok_manual=tiktok_manual,
                         facebook=fb_payload,
                         platform_scheduled_at=platform_scheduled_at,
                         platform_statuses=seeded_statuses,

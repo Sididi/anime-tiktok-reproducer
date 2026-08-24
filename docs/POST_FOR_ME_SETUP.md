@@ -91,8 +91,11 @@ anime_fr:
     # allow_stitch: true
 ```
 
-Accounts without `post_for_me_account_id` are skipped at upload time with an explicit
-"no Post for Me account configured" status — nothing fails silently.
+Accounts without `post_for_me_account_id` (with or without a `tiktok:` block) are in
+**manual TikTok mode** (2026-08): their TikTok slot is still reserved, the upload seeds a
+"pending — Post manuel" row on the Discord embed, the VPS posts ONE reminder in the
+schedule-alerts channel 5 min before the TikTok time, and a ✅ reaction on the original
+post (or the reminder) marks it posted. See `server/DEPLOYMENT.md` §13.
 
 `post_for_me_account_id` and `post_for_me_platform` are an atomic pair: never combine
 an ID from a consumer `tiktok` connection with `tiktok_business`, or the reverse.

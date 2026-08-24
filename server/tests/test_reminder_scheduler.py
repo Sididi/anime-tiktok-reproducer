@@ -20,6 +20,7 @@ from app.models.job import (
 from app.services.job_store import JobStore
 from app.services.post_for_me_publisher import TikTokPublishResult
 from app.services.reminder_scheduler import (
+    TIKTOK_MANUAL_REMINDER_LEAD_MINUTES,
     TIKTOK_SCHEDULE_LEAD_MINUTES,
     _platform_due_time,
     dispatch_due_actions,
@@ -1209,3 +1210,157 @@ async def test_dispatch_task_exception_clears_inflight(
     await dispatch_due_actions(store=store, settings=settings, discord=discord)
     await wait_for_inflight()
     assert reminder_scheduler._IN_FLIGHT == {}
+
+
+# ---------------------------------------------------------------------------
+# Manual TikTok mode (2026-08): single reminder at sched - 5 min
+# ---------------------------------------------------------------------------
+
+def _manual_job(project_id="p1", *, tiktok_offset_minutes=-4, **overrides):
+    """A manual-mode TikTok job whose reminder is due by default (T-4 < T-5)."""
+    job = _make_job(
+        project_id=project_id,
+        slot_time=datetime.now(tz=UTC) + timedelta(minutes=tiktok_offset_minutes),
+    )
+    job.tiktok_manual = True
+    for key, value in overrides.items():
+        setattr(job, key, value)
+    return job
+
+
+async def _tick(store, settings, discord):
+    started = await dispatch_due_actions(store=store, settings=settings, discord=discord)
+    await wait_for_inflight()
+    return started
+
+
+def test_manual_due_time_is_five_minutes_before_tiktok_time():
+    sched = datetime(2026, 4, 27, 21, 0, tzinfo=UTC)
+    job = _manual_job(tiktok_offset_minutes=0)
+    job.slot_time = sched - timedelta(hours=1)
+    job.platform_scheduled_at = {"tiktok": sched}
+    assert _platform_due_time(job, "tiktok") == sched - timedelta(
+        minutes=TIKTOK_MANUAL_REMINDER_LEAD_MINUTES
+    )
+
+
+async def test_manual_reminder_not_posted_before_lead(
+    tmp_path, example_yaml, example_env, tmp_server_dir
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    await store.create(_manual_job(tiktok_offset_minutes=6))
+    discord = AsyncMock()
+
+    assert await _tick(store, settings, discord) == 0
+    discord.post_message.assert_not_called()
+
+
+async def test_manual_reminder_posted_once_and_persisted(
+    tmp_path, example_yaml, example_env, tmp_server_dir
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    await store.create(_manual_job())
+    discord = AsyncMock()
+    discord.post_message.return_value = "m_rem"
+
+    assert await _tick(store, settings, discord) == 1
+    discord.post_message.assert_awaited_once()
+    call = discord.post_message.call_args
+    assert call.args == ("333",)
+    assert "<@&444>" in call.kwargs["content"]
+    assert "https://discord.com/channels/111/222/embed_id" in call.kwargs["content"]
+    saved = await store.get("p1")
+    assert saved.reminder_message_id == "m_rem"
+    assert saved.platform_statuses["tiktok"].status == "pending"  # NOT terminal
+
+    # Second tick: single-shot.
+    assert await _tick(store, settings, discord) == 0
+    discord.post_message.assert_awaited_once()
+
+
+async def test_manual_reminder_retried_next_tick_when_post_fails(
+    tmp_path, example_yaml, example_env, tmp_server_dir
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    await store.create(_manual_job())
+    discord = AsyncMock()
+    discord.post_message.side_effect = [RuntimeError("discord down"), "m_rem"]
+
+    await _tick(store, settings, discord)
+    assert (await store.get("p1")).reminder_message_id is None
+    await _tick(store, settings, discord)
+    assert (await store.get("p1")).reminder_message_id == "m_rem"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"reminder_cancelled": True},
+        {"reminder_message_id": "already"},
+        {"platform_statuses": {"tiktok": PlatformStatus(status="uploaded")}},
+        {"platform_statuses": {"tiktok": PlatformStatus(status="skipped")}},
+        {"tiktok_manual": False},  # PFM job: no server-side TikTok action at all
+    ],
+)
+async def test_manual_reminder_skipped_when_not_applicable(
+    tmp_path, example_yaml, example_env, tmp_server_dir, overrides
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    await store.create(_manual_job(**overrides))
+    discord = AsyncMock()
+
+    assert await _tick(store, settings, discord) == 0
+    discord.post_message.assert_not_called()
+
+
+async def test_manual_reminder_skipped_for_long_past_slot(
+    tmp_path, example_yaml, example_env, tmp_server_dir, caplog
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    await store.create(_manual_job(tiktok_offset_minutes=-7 * 60))
+    discord = AsyncMock()
+
+    with caplog.at_level(logging.WARNING):
+        await _tick(store, settings, discord)
+    discord.post_message.assert_not_called()
+    assert any("in the past" in r.message for r in caplog.records)
+
+
+async def test_manual_reminder_skipped_for_unknown_account(
+    tmp_path, example_yaml, example_env, tmp_server_dir
+):
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    await store.create(_manual_job(account_id="ghost"))
+    discord = AsyncMock()
+
+    await _tick(store, settings, discord)
+    discord.post_message.assert_not_called()
+
+
+async def test_manual_reminder_rechecks_store_before_posting(
+    tmp_path, example_yaml, example_env, tmp_server_dir
+):
+    """A ✅ ack landing between the tick snapshot and the dispatch must win."""
+    settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
+    store = JobStore(tmp_path / "jobs.json")
+    await store.create(_manual_job())
+    discord = AsyncMock()
+
+    original_get = store.get
+
+    async def ack_then_get(project_id):
+        await store.merge_platform_status(
+            project_id, "tiktok", PlatformStatus(status="uploaded")
+        )
+        store.get = original_get
+        return await original_get(project_id)
+
+    store.get = ack_then_get
+    await _tick(store, settings, discord)
+    discord.post_message.assert_not_called()

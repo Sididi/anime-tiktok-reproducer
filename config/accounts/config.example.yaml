@@ -77,7 +77,14 @@ accounts:
       max_reel_duration_seconds: 90
     tiktok:
       # Post for Me social-account id (spc_...) — enables automatic TikTok
-      # publishing via the VPS server. See docs/POST_FOR_ME_SETUP.md.
+      # publishing. See docs/POST_FOR_ME_SETUP.md.
+      #
+      # MANUAL MODE: leave `post_for_me_account_id` unset (or comment it out;
+      # a `tiktok:` block is not even required) while keeping TikTok slots.
+      # The TikTok slot is still reserved; at upload time the Discord embed
+      # shows "🎯 TikTok — Post manuel", the VPS posts ONE reminder in the
+      # schedule-alerts channel 5 min before the TikTok time, and a ✅
+      # reaction on the original post (or the reminder) marks it posted.
       post_for_me_account_id: "spc_..."
       # Connector used when this spc_ id was authorized. Keep the default
       # "tiktok" for consumer connections; use "tiktok_business" only with

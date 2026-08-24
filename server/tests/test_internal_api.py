@@ -918,3 +918,97 @@ def test_status_projection_exposes_facebook_video_id(
         r = client.get("/api/internal/jobs", headers=INTERNAL_AUTH)
     assert r.status_code == 200
     assert r.json()["jobs"]["p9"]["facebook_video_id"] == "fbv_1"
+
+
+# ---------------------------------------------------------------------------
+# Manual TikTok mode (2026-08)
+# ---------------------------------------------------------------------------
+
+MANUAL_JOB_PAYLOAD = {
+    **JOB_PAYLOAD,
+    "tiktok_manual": True,
+    "platform_statuses": {"tiktok": {"status": "pending", "detail": "Post manuel"}},
+}
+
+
+def test_create_job_persists_tiktok_manual_and_renders_manual_line(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        r = client.post("/api/internal/jobs", json=MANUAL_JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        assert r.status_code == 200
+        job = asyncio.run(app.state.job_store.get("p1"))
+        assert job.tiktok_manual is True
+        assert job.tiktok_payload is None
+        embed = discord.post_message.call_args.kwargs["embed"]
+        platforms = next(f for f in embed["fields"] if f["name"] == "Plateformes")
+        assert "🎯 TikTok — Post manuel" in platforms["value"]
+
+        # Same payload again → idempotent; flipping the flag → update.
+        r2 = client.post("/api/internal/jobs", json=MANUAL_JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        assert r2.json()["discord_message_id"] == r.json()["discord_message_id"]
+        assert discord.post_message.call_count == 1
+        client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        assert asyncio.run(app.state.job_store.get("p1")).tiktok_manual is False
+        discord.edit_message.assert_called()
+
+        from app.api import internal  # noqa: PLC0415
+
+        internal._status_snapshot = {}  # bypass the 10 s snapshot cache
+        statuses = client.get("/api/internal/jobs", headers=INTERNAL_AUTH).json()
+        assert statuses["jobs"]["p1"]["tiktok_manual"] is False
+
+
+def test_status_projection_exposes_tiktok_manual(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    from app.api import internal  # noqa: PLC0415
+
+    internal._status_snapshot = {}
+    app, _ = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        client.post("/api/internal/jobs", json=MANUAL_JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        statuses = client.get("/api/internal/jobs", headers=INTERNAL_AUTH).json()
+    assert statuses["jobs"]["p1"]["tiktok_manual"] is True
+    assert statuses["jobs"]["p1"]["platform_statuses"]["tiktok"]["status"] == "pending"
+
+
+@pytest.mark.parametrize("status", ["skipped", "uploaded", "failed"])
+def test_terminal_tiktok_platform_status_cancels_and_deletes_reminder(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path, status
+):
+    """Backend cancel (skipped) / external outcome on a manual job drops the reminder."""
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        client.post("/api/internal/jobs", json=MANUAL_JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        asyncio.run(app.state.job_store.update("p1", reminder_message_id="m_rem"))
+        r = client.post(
+            "/api/internal/jobs/p1/platform-status",
+            json={"platform": "tiktok", "status": status, "detail": "Annulé"},
+            headers=INTERNAL_AUTH,
+        )
+    assert r.status_code == 200
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job.platform_statuses["tiktok"].status == status
+    assert job.reminder_cancelled is True
+    assert job.reminder_message_id is None
+    discord.delete_message.assert_called_once_with("333", "m_rem")
+
+
+def test_pending_tiktok_platform_status_keeps_reminder(
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        client.post("/api/internal/jobs", json=MANUAL_JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        asyncio.run(app.state.job_store.update("p1", reminder_message_id="m_rem"))
+        client.post(
+            "/api/internal/jobs/p1/platform-status",
+            json={"platform": "tiktok", "status": "pending", "detail": "still manual"},
+            headers=INTERNAL_AUTH,
+        )
+    job = asyncio.run(app.state.job_store.get("p1"))
+    assert job.reminder_cancelled is False
+    assert job.reminder_message_id == "m_rem"
+    discord.delete_message.assert_not_called()

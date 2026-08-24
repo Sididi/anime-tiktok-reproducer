@@ -114,5 +114,25 @@ curl -s -X DELETE "$BASE/api/internal/jobs/smoke-1" -H "Authorization: Bearer $I
 # Expected: {"ok":true, "deleted":true}
 ```
 
-In Discord: the upload-channel embed disappears (reminders are no longer created, so there
-are no reminder messages left to clean up).
+In Discord: the upload-channel embed disappears, along with the manual-TikTok reminder
+message if one was posted (manual mode only, see below).
+
+### 8. Manual TikTok mode (accounts without a Post for Me id)
+
+Create the job with `"tiktok_manual": true` and a `pending` TikTok status (this is what the
+backend sends for accounts that have TikTok slots but no `post_for_me_account_id`):
+
+```bash
+curl -s -X POST "$BASE/api/internal/jobs" -H "Authorization: Bearer $INTERNAL" \
+  -H "Content-Type: application/json" \
+  -d "{\"project_id\":\"smoke-2\",\"account_id\":\"anime_fr\",\"slot_time\":\"$SLOT\",
+       \"anime_title\":\"Smoke\",\"description\":\"d\",\"drive_video_url\":\"https://x\",
+       \"platforms_requested\":[\"tiktok\"],\"tiktok_manual\":true,
+       \"platform_statuses\":{\"tiktok\":{\"status\":\"pending\",\"detail\":\"Post manuel\"}}}"
+```
+
+The embed shows `🎯 TikTok — Post manuel (réagis ✅ une fois posté)`. Five minutes before
+`slot_time` the scheduler posts ONE reminder in the reminder channel (`@role` ping, embed,
+jump link to the original post). React ✅ on either message: the embed flips to
+`✅ TikTok — Posté manuellement`, the bot mirrors ✅ on the original post and deletes the
+reminder. Reacting before the reminder fires cancels it.

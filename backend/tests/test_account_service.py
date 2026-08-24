@@ -157,6 +157,48 @@ accounts:
     assert AccountService.get_account("a2").pool_key_for("tiktok") is None
 
 
+def test_tiktok_mode(tmp_path: Path, monkeypatch):
+    """pfm = Post for Me id; manual = TikTok slots without one (block or
+    not); None = no TikTok slots at all."""
+    cfg = _write_config(
+        tmp_path,
+        """\
+accounts:
+  pfm:
+    name: "PFM"
+    language: "fr"
+    slots: ["13:00"]
+    tiktok:
+      post_for_me_account_id: spc_123
+  manual_block:
+    name: "Manual block"
+    language: "fr"
+    slots: ["13:00"]
+    tiktok:
+      privacy_status: public
+  manual_no_block:
+    name: "Manual no block"
+    language: "fr"
+    slots: ["13:00"]
+  no_tiktok:
+    name: "No TikTok"
+    language: "fr"
+    slots: ["13:00"]
+    tiktok:
+      slots: []
+      post_for_me_account_id: spc_999
+""",
+    )
+    monkeypatch.setattr(
+        "app.services.account_service.settings.accounts_config_path", cfg
+    )
+    AccountService.invalidate()
+    assert AccountService.get_account("pfm").tiktok_mode() == "pfm"
+    assert AccountService.get_account("manual_block").tiktok_mode() == "manual"
+    assert AccountService.get_account("manual_no_block").tiktok_mode() == "manual"
+    assert AccountService.get_account("no_tiktok").tiktok_mode() is None
+
+
 def test_independent_reel_limits_and_conservative_fallback(tmp_path: Path, monkeypatch):
     cfg = _write_config(
         tmp_path,

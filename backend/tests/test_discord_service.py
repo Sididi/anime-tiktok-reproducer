@@ -241,3 +241,23 @@ def test_create_job_sends_platform_scheduled_at():
     assert b'"platform_scheduled_at":{' in sent or b'"platform_scheduled_at": {' in sent
     assert b'"instagram":"2026-04-27T06:01:00+00:00"' in sent
     assert b'"tiktok":"2026-04-27T20:17:00+00:00"' in sent
+
+
+@respx.mock
+def test_create_job_sends_tiktok_manual_only_when_true():
+    route = respx.post("https://tiktok.sididi.tv/api/internal/jobs").mock(
+        return_value=httpx.Response(200, json={"job_id": "j_x", "discord_message_id": "m_1"})
+    )
+    common = dict(
+        project_id="p1",
+        account_id="anime_fr",
+        slot_time=datetime(2026, 4, 27, 21, 0, tzinfo=timezone.utc),
+        anime_title="Title",
+        description="Desc",
+        drive_video_url="https://drive/x",
+        platforms_requested=["youtube", "tiktok"],
+    )
+    DiscordService.create_job(**common, tiktok_manual=True)
+    assert json.loads(route.calls.last.request.content)["tiktok_manual"] is True
+    DiscordService.create_job(**common)
+    assert "tiktok_manual" not in json.loads(route.calls.last.request.content)

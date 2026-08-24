@@ -239,6 +239,10 @@ class Job:
     reminder_message_id: str | None
     reminder_forward_message_id: str | None = None
     reminder_cancelled: bool = False
+    # Manual TikTok mode (2026-08): the account has TikTok slots but no Post
+    # for Me id. The scheduler posts ONE reminder at sched - 5 min in the
+    # reminder channel and the ✅ reaction listener marks the row uploaded.
+    tiktok_manual: bool = False
     instagram_payload: dict | None = None
     instagram_publish_state: InstagramPublishState | None = None
     tiktok_payload: dict | None = None
@@ -271,6 +275,7 @@ class Job:
             "reminder_message_id": self.reminder_message_id,
             "reminder_forward_message_id": self.reminder_forward_message_id,
             "reminder_cancelled": self.reminder_cancelled,
+            "tiktok_manual": self.tiktok_manual,
             "instagram_payload": self.instagram_payload,
             "instagram_publish_state": (
                 self.instagram_publish_state.to_dict()
@@ -316,6 +321,7 @@ class Job:
             reminder_message_id=d.get("reminder_message_id"),
             reminder_forward_message_id=d.get("reminder_forward_message_id"),
             reminder_cancelled=bool(d.get("reminder_cancelled", False)),
+            tiktok_manual=bool(d.get("tiktok_manual", False)),
             instagram_payload=d.get("instagram_payload"),
             instagram_publish_state=InstagramPublishState.from_dict(
                 d.get("instagram_publish_state")

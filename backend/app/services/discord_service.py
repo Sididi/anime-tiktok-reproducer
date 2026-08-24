@@ -114,6 +114,7 @@ class DiscordService:
         facebook: dict | None = None,
         platform_scheduled_at: dict[str, datetime] | None = None,
         platform_statuses: dict[str, dict[str, Any]] | None = None,
+        tiktok_manual: bool = False,
     ) -> dict[str, Any] | None:
         body = {
             "project_id": project_id,
@@ -130,6 +131,10 @@ class DiscordService:
             body["tiktok"] = tiktok
         if facebook is not None:
             body["facebook"] = facebook
+        if tiktok_manual:
+            # Manual TikTok mode (no Post for Me id): the server posts one
+            # Discord reminder at T-5 and listens for the ✅ reaction.
+            body["tiktok_manual"] = True
         if platform_scheduled_at is not None:
             body["platform_scheduled_at"] = {
                 platform: scheduled_at.isoformat()

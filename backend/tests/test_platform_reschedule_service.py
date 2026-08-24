@@ -391,12 +391,28 @@ def test_cancel_tiktok_published_post_is_skipped(monkeypatch):
     assert "published" in (result.error or "")
 
 
-def test_cancel_tiktok_legacy_project_is_skipped():
-    """Legacy VPS-relayed project (no tiktok_pfm): nothing safe to do
-    per-platform (deleting the VPS job would also cancel Instagram)."""
+def test_cancel_tiktok_without_pfm_state_and_without_vps_job_is_skipped():
+    """No tiktok_pfm and no VPS job (never uploaded): nothing to cancel."""
     project = Project(id="p1", scheduled_account_id="acc_a")
     result = PlatformRescheduleService.cancel(project, "tiktok")
     assert result.status == "skipped"
+
+
+def test_cancel_tiktok_manual_job_flips_vps_row_to_skipped(monkeypatch):
+    """Manual TikTok mode (2026-08): no PFM post; the VPS row is set to
+    "skipped" so the server cancels/deletes its Discord reminder. The whole
+    VPS job is NOT deleted (that would also cancel Instagram)."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "app.services.discord_service.DiscordService.update_job_platform",
+        classmethod(lambda cls, pid, platform, **kw: calls.append((pid, platform, kw))),
+    )
+    project = Project(
+        id="p1", scheduled_account_id="acc_a", final_upload_discord_message_id="m_1"
+    )
+    result = PlatformRescheduleService.cancel(project, "tiktok")
+    assert result.status == "ok"
+    assert calls == [("p1", "tiktok", {"status": "skipped", "detail": "Annulé"})]
 
 
 def test_notify_tiktok_updates_scheduled_pfm_post(monkeypatch):

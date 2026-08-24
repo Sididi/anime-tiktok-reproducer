@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -13,6 +13,8 @@ from app.auth.dependencies import require_internal_token
 from app.models.job import Job, PlatformStatus
 from app.services.embed_builder import build_embed
 from app.services.post_for_me_publisher import delete_tiktok_post
+from app.services.reminder_scheduler import TIKTOK_MANUAL_REMINDER_LEAD_MINUTES
+from app.services.reminder_service import cleanup_reminder
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +86,10 @@ class CreateJobRequest(BaseModel):
     instagram: InstagramPayload | None = None
     tiktok: TikTokPayload | None = None
     facebook: FacebookPayload | None = None
+    # Manual TikTok mode (2026-08): account has TikTok slots but no Post for
+    # Me id → the server posts one reminder at sched - 5 min and the ✅
+    # reaction listener marks the row posted.
+    tiktok_manual: bool = False
 
 
 class CreateJobResponse(BaseModel):
@@ -182,6 +188,7 @@ def _job_payload_changed(
         or job.description != req.description
         or job.drive_video_url != req.drive_video_url
         or job.platforms_requested != list(req.platforms_requested)
+        or job.tiktok_manual != req.tiktok_manual
         or job.instagram_payload != instagram_payload
         or job.facebook_payload != facebook_payload
         or _normalized_tiktok_payload(job.tiktok_payload)
@@ -265,6 +272,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
                 platform_scheduled_at=dict(req.platform_scheduled_at or {}),
                 platforms_requested=list(req.platforms_requested),
                 platform_statuses=platform_statuses,
+                tiktok_manual=req.tiktok_manual,
                 instagram_payload=instagram_payload,
                 instagram_publish_state=None,
                 tiktok_payload=tiktok_payload,
@@ -304,6 +312,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         discord_message_id=None,
         reminder_message_id=None,
         reminder_forward_message_id=None,
+        tiktok_manual=req.tiktok_manual,
         instagram_payload=instagram_payload,
         tiktok_payload=tiktok_payload,
         facebook_payload=facebook_payload,
@@ -321,8 +330,8 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
     except Exception as e:
         logger.warning("Embed post failed for %s: %s", job.project_id, e)
 
-    # Reminder is NOT posted here. The background scheduler
-    # (app.services.reminder_scheduler) fires it at slot_time.
+    # The manual-TikTok reminder is NOT posted here. The background scheduler
+    # (app.services.reminder_scheduler) fires it at sched - 5 min.
     await store.create(job)
     return CreateJobResponse(job_id=job.job_id, discord_message_id=embed_msg_id)
 
@@ -345,9 +354,17 @@ async def platform_status(
         return {"ok": True, "noop": True}
 
     job.platform_statuses[req.platform] = new_status
-    updated = await store.update(
-        project_id, platform_statuses=job.platform_statuses
+    fields: dict[str, object] = {"platform_statuses": job.platform_statuses}
+    tiktok_terminal = req.platform == "tiktok" and req.status in (
+        "uploaded", "skipped", "failed"
     )
+    if tiktok_terminal:
+        # Manual TikTok mode: a terminal row (backend cancel, external ack)
+        # means the reminder is moot — never fire it, drop it if posted.
+        fields["reminder_cancelled"] = True
+    updated = await store.update(project_id, **fields)
+    if tiktok_terminal and (job.reminder_message_id or job.reminder_forward_message_id):
+        await cleanup_reminder(discord, store, settings, updated)
 
     if updated.discord_message_id:
         try:
@@ -451,6 +468,22 @@ async def update_job_slot(
         fields["platform_scheduled_at"] = merged
     if req.reminder_cancelled is not None:
         fields["reminder_cancelled"] = req.reminder_cancelled
+    rearm_reminder = False
+    if (
+        job.tiktok_manual
+        and req.platform_scheduled_at is not None
+        and "tiktok" in req.platform_scheduled_at
+        and job.reminder_message_id is not None
+    ):
+        new_tiktok = req.platform_scheduled_at["tiktok"]
+        if new_tiktok.tzinfo is None:
+            new_tiktok = new_tiktok.replace(tzinfo=UTC)
+        reminder_due = new_tiktok - timedelta(minutes=TIKTOK_MANUAL_REMINDER_LEAD_MINUTES)
+        if reminder_due > datetime.now(tz=UTC):
+            # The TikTok slot moved past the already-posted reminder: drop it
+            # so the scheduler posts a fresh one at the new sched - 5 min.
+            rearm_reminder = True
+            fields.setdefault("reminder_cancelled", False)
     if not fields:
         # Nothing to change.
         return {
@@ -462,6 +495,11 @@ async def update_job_slot(
             "reminder_cancelled": job.reminder_cancelled,
         }
     updated = await store.update(project_id, **fields)
+    if rearm_reminder:
+        await cleanup_reminder(
+            request.app.state.discord, store, request.app.state.settings, updated
+        )
+        updated = await store.get(project_id) or updated
     return {
         "project_id": updated.project_id,
         "slot_time": updated.slot_time.isoformat(),
@@ -489,21 +527,7 @@ async def delete_job(project_id: str, request: Request) -> None:
             )
         except Exception as e:
             logger.warning("Embed delete failed for %s: %s", project_id, e)
-    if job.reminder_message_id:
-        try:
-            await discord.delete_message(
-                settings.discord.reminder_channel_id, job.reminder_message_id
-            )
-        except Exception as e:
-            logger.warning("Reminder delete failed for %s: %s", project_id, e)
-    if job.reminder_forward_message_id:
-        try:
-            await discord.delete_message(
-                settings.discord.reminder_channel_id,
-                job.reminder_forward_message_id,
-            )
-        except Exception as e:
-            logger.warning("Reminder forward delete failed for %s: %s", project_id, e)
+    await cleanup_reminder(discord, store, settings, job)
 
     state = job.tiktok_publish_state
     if (
@@ -585,6 +609,7 @@ def _job_status_projection(job: Job) -> dict:
             p: ps.to_dict() for p, ps in job.platform_statuses.items()
         },
         "reminder_cancelled": job.reminder_cancelled,
+        "tiktok_manual": job.tiktok_manual,
         # Long-range Facebook hold: the native post id once created/known, so
         # the backend can reschedule with a single Graph call (never expose
         # the payload itself — it carries the page access token).

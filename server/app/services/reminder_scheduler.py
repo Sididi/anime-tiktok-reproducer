@@ -3,8 +3,14 @@
 Polls every `interval` seconds; for each job, iterates `platforms_requested`
 and runs due per-platform actions:
 
-- tiktok    → RETIRED 2026-08: the main backend creates the PFM post directly
-              (native scheduled_at); the dispatcher is kept commented.
+- tiktok    → two modes (2026-08):
+              * PFM accounts: RETIRED server-side — the main backend creates
+                the Post for Me post directly (native scheduled_at); the
+                dispatcher is kept commented.
+              * MANUAL accounts (job.tiktok_manual, no Post for Me id): post
+                ONE reminder in the reminder channel at
+                sched - TIKTOK_MANUAL_REMINDER_LEAD_MINUTES; the ✅ reaction
+                listener marks the row uploaded and deletes the reminder.
 - instagram → call Instagram Graph API to publish the Reel. On success,
               update the embed. On failure, increment attempts; after
               5 attempts give up + ping the reminder channel.
@@ -46,6 +52,7 @@ from app.services.post_for_me_publisher import (
     poll_tiktok_post_result,
     stage_media_for_tiktok,
 )
+from app.services.reminder_service import post_reminder
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +73,12 @@ FACEBOOK_CONVERT_LEAD_DAYS = 28
 # job data freezes at sched-15, the post is created from it at sched-10.
 TIKTOK_SCHEDULE_LEAD_MINUTES = 10
 _TT_INSTANT_PUBLISH_CUTOFF_SECONDS = 60  # sched closer than this → publish instantly
+# Manual TikTok mode: the single reminder fires this many minutes before the
+# TikTok publish instant (owner decision 2026-08-24: one warning, 5 min).
+TIKTOK_MANUAL_REMINDER_LEAD_MINUTES = 5
+# Never post a reminder for a slot this far in the past (a redeploy/restart
+# must not spam the channel with reminders for long-gone slots).
+_MANUAL_REMINDER_MAX_LATE = timedelta(hours=6)
 _IG_DEFAULT_POLL_INTERVAL_SECONDS = 60.0
 _IG_DEFAULT_POLL_TIMEOUT_SECONDS = 4 * 60 * 60.0
 _LEGACY_IG_CONTAINER_ERROR = "container status_code = ERROR"
@@ -86,6 +99,12 @@ _IN_FLIGHT: dict[tuple[str, str], asyncio.Task] = {}
 def _dispatch_worthwhile(job: Job, platform: str) -> bool:
     """Cheap pre-checks so terminal/misconfigured jobs never spawn a task."""
     status = job.platform_statuses.get(platform, PlatformStatus(status="pending"))
+    if platform == "tiktok" and job.tiktok_manual:
+        return (
+            status.status == "pending"
+            and not job.reminder_cancelled
+            and job.reminder_message_id is None
+        )
     if platform == "tiktok":
         if status.status in ("uploaded", "failed", "skipped"):
             return False
@@ -162,7 +181,10 @@ async def dispatch_due_actions(
             # if platform == "tiktok":
             #     dispatcher = _dispatch_tiktok_publish
             # elif platform == "instagram":
-            if platform == "instagram":
+            if platform == "tiktok" and job.tiktok_manual:
+                # Manual TikTok mode: single Discord reminder at sched - 5 min.
+                dispatcher = _dispatch_tiktok_reminder
+            elif platform == "instagram":
                 dispatcher = _dispatch_instagram_publish
             elif platform == "facebook" and job.facebook_payload:
                 # Long-range hold (target beyond Meta's ~29d window).
@@ -190,7 +212,8 @@ def _tiktok_sched(job: Job) -> datetime:
 def _platform_due_time(job: Job, platform: str) -> datetime:
     """Due time of the platform's next pending action.
 
-    TikTok runs three phases: media staging is due as soon as the job exists;
+    Manual TikTok jobs are due (reminder) at sched - TIKTOK_MANUAL_REMINDER_LEAD_MINUTES.
+    PFM TikTok runs three phases: media staging is due as soon as the job exists;
     post creation at sched - TIKTOK_SCHEDULE_LEAD_MINUTES (PFM then publishes
     server-side at sched via scheduled_at); result polling from sched.
     Facebook long-range holds convert at sched - FACEBOOK_CONVERT_LEAD_DAYS.
@@ -202,6 +225,8 @@ def _platform_due_time(job: Job, platform: str) -> datetime:
         due_time = job.platform_scheduled_at.get(platform) or job.slot_time
         return _normalize_utc(due_time)
     sched = _tiktok_sched(job)
+    if job.tiktok_manual:
+        return sched - timedelta(minutes=TIKTOK_MANUAL_REMINDER_LEAD_MINUTES)
     state = job.tiktok_publish_state
     if state and state.post_id and state.stage != "failed":
         return sched                                        # poll results at slot
@@ -214,6 +239,50 @@ def _normalize_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+async def _dispatch_tiktok_reminder(  # noqa: PLR0911
+    job: Job, store: JobStore, settings: Settings, discord
+) -> bool:
+    """Manual TikTok mode: post the single reminder once it is due.
+
+    Single-shot by construction: `reminder_message_id` is persisted right after
+    posting, and `_dispatch_worthwhile` never re-dispatches a job that has one
+    (or is cancelled / no longer pending)."""
+    # Re-read: a ✅ ack or a cancel may have landed since the tick snapshot.
+    latest = await store.get(job.project_id)
+    if latest is None or not latest.tiktok_manual:
+        return False
+    job = latest
+    if job.reminder_cancelled or job.reminder_message_id is not None:
+        return False
+    tt = job.platform_statuses.get("tiktok", PlatformStatus(status="pending"))
+    if tt.status != "pending":
+        return False
+    account = settings.accounts.get(job.account_id)
+    if account is None:
+        logger.warning(
+            "Job %s references unknown account %s; skipping TikTok reminder",
+            job.project_id, job.account_id,
+        )
+        return False
+    sched = _tiktok_sched(job)
+    now = datetime.now(tz=UTC)
+    if now - sched > _MANUAL_REMINDER_MAX_LATE:
+        logger.warning(
+            "TikTok reminder for %s skipped: slot %s is more than %s in the past",
+            job.project_id, sched.isoformat(), _MANUAL_REMINDER_MAX_LATE,
+        )
+        return False
+    message_id = await post_reminder(discord, job=job, account=account, settings=settings)
+    if message_id is None:
+        return False  # logged by post_reminder; retried next tick
+    await store.update(job.project_id, reminder_message_id=message_id)
+    logger.info(
+        "TikTok manual reminder posted for %s (message=%s, slot=%s)",
+        job.project_id, message_id, sched.isoformat(),
+    )
+    return True
 
 
 async def _record_tiktok_failure(

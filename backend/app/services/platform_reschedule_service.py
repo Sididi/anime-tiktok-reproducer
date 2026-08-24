@@ -448,8 +448,18 @@ class PlatformRescheduleService:
 
         state = project.tiktok_pfm
         if state is None:
-            # Legacy pre-migration project: nothing the backend can safely do
-            # per-platform (deleting the VPS job would also cancel Instagram).
+            # No backend-owned PFM post: either a manual-mode job (2026-08 —
+            # the VPS row is pending until the Discord ✅) or a legacy
+            # pre-migration project. Flip the server row to "skipped": the
+            # server cancels/deletes its reminder on any terminal TikTok
+            # status. Deleting the whole VPS job would also cancel Instagram.
+            if project.final_upload_discord_message_id:
+                from .discord_service import DiscordService  # noqa: PLC0415
+
+                DiscordService.update_job_platform(
+                    project.id, "tiktok", status="skipped", detail="Annulé"
+                )
+                return NotificationResult(status="ok")
             return NotificationResult(status="skipped")
 
         if state.stage == "published":

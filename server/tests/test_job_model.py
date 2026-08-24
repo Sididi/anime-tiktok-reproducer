@@ -174,3 +174,13 @@ def test_tiktok_publish_state_media_attempts_defaults_to_zero_for_legacy_dicts()
     legacy = {"post_id": "sp_1", "stage": "post_created"}
     restored = TikTokPublishState.from_dict(legacy)
     assert restored.media_attempts == 0
+
+
+def test_tiktok_manual_round_trips_and_defaults_false():
+    d = _make_job(tiktok_manual=True).to_dict()
+    assert d["tiktok_manual"] is True
+    assert Job.from_dict(d).tiktok_manual is True
+    # Legacy jobs.json entries (no key) load as non-manual.
+    legacy = _make_job().to_dict()
+    del legacy["tiktok_manual"]
+    assert Job.from_dict(legacy).tiktok_manual is False

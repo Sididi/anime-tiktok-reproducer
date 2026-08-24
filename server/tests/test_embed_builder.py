@@ -150,3 +150,40 @@ def test_embed_omits_device_when_empty():
     names = [f["name"] for f in embed["fields"]]
     assert "📱 Device" not in names
     assert " ·  · " not in embed["footer"]["text"]
+
+
+def test_manual_tiktok_pending_line_asks_for_reaction():
+    line = _format_platform_line(
+        "tiktok", PlatformStatus(status="pending"), tiktok_manual=True
+    )
+    assert line == "🎯 TikTok — Post manuel (réagis ✅ une fois posté)"
+
+
+def test_manual_tiktok_uploaded_line_without_url():
+    line = _format_platform_line(
+        "tiktok",
+        PlatformStatus(status="uploaded", detail="Posté manuellement"),
+        tiktok_manual=True,
+    )
+    assert line == "✅ TikTok — Posté manuellement"
+
+
+def test_manual_flag_does_not_change_other_statuses_or_platforms():
+    assert _format_platform_line(
+        "tiktok", PlatformStatus(status="skipped", detail="Annulé"), tiktok_manual=True
+    ) == "⚠️ TikTok — Skipped (Annulé)"
+    assert _format_platform_line(
+        "instagram", PlatformStatus(status="pending"), tiktok_manual=True
+    ) == "⏳ Instagram — Pending"
+    # A PFM job (manual=False) keeps the generic line.
+    assert _format_platform_line("tiktok", PlatformStatus(status="pending")) == (
+        "⏳ TikTok — Pending"
+    )
+
+
+def test_build_embed_passes_manual_flag_from_job():
+    job = _job_fixture()
+    job.tiktok_manual = True
+    embed = build_embed(job, _accounts(), "https://tiktok.sididi.tv")
+    platforms = next(f for f in embed["fields"] if f["name"] == "Plateformes")
+    assert "🎯 TikTok — Post manuel" in platforms["value"]

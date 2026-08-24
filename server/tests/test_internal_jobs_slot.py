@@ -126,3 +126,86 @@ def test_delete_job_removes_it(monkeypatch, example_yaml, example_env, tmp_serve
             headers=INTERNAL_AUTH,
         )
         assert r.status_code == 404
+
+
+def _set_job(app, **fields):
+    import asyncio  # noqa: PLC0415
+
+    return asyncio.run(app.state.job_store.update("p1", **fields))
+
+
+def _get_job(app):
+    import asyncio  # noqa: PLC0415
+
+    return asyncio.run(app.state.job_store.get("p1"))
+
+
+def test_patch_tiktok_time_rearms_posted_manual_reminder(
+    monkeypatch, example_yaml, example_env, tmp_server_dir
+):
+    """Moving a manual job's TikTok slot into the future after the reminder was
+    posted deletes that reminder so a fresh one fires at the new T-5."""
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord = app.state.discord  # reset to None once the lifespan exits
+    with TestClient(app) as client:
+        client.post(
+            "/api/internal/jobs", json={**JOB_PAYLOAD, "tiktok_manual": True},
+            headers=INTERNAL_AUTH,
+        )
+        _set_job(app, reminder_message_id="m_old")
+        new_time = datetime.now(tz=UTC) + timedelta(hours=2)
+        r = client.patch(
+            "/api/internal/jobs/p1/slot",
+            json={"platform_scheduled_at": {"tiktok": new_time.isoformat()}},
+            headers=INTERNAL_AUTH,
+        )
+    assert r.status_code == 200
+    job = _get_job(app)
+    assert job.reminder_message_id is None
+    assert job.reminder_cancelled is False
+    discord.delete_message.assert_called_once_with("333", "m_old")
+
+
+def test_patch_tiktok_time_inside_lead_keeps_posted_reminder(
+    monkeypatch, example_yaml, example_env, tmp_server_dir
+):
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord = app.state.discord
+    with TestClient(app) as client:
+        client.post(
+            "/api/internal/jobs", json={**JOB_PAYLOAD, "tiktok_manual": True},
+            headers=INTERNAL_AUTH,
+        )
+        _set_job(app, reminder_message_id="m_old")
+        soon = datetime.now(tz=UTC) + timedelta(minutes=3)  # T-5 already passed
+        client.patch(
+            "/api/internal/jobs/p1/slot",
+            json={"platform_scheduled_at": {"tiktok": soon.isoformat()}},
+            headers=INTERNAL_AUTH,
+        )
+    assert _get_job(app).reminder_message_id == "m_old"
+    discord.delete_message.assert_not_called()
+
+
+def test_patch_tiktok_time_on_pfm_job_never_touches_reminder_fields(
+    monkeypatch, example_yaml, example_env, tmp_server_dir
+):
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    app = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord = app.state.discord
+    with TestClient(app) as client:
+        client.post("/api/internal/jobs", json=JOB_PAYLOAD, headers=INTERNAL_AUTH)
+        _set_job(app, reminder_message_id="m_old")
+        new_time = datetime.now(tz=UTC) + timedelta(hours=2)
+        client.patch(
+            "/api/internal/jobs/p1/slot",
+            json={"platform_scheduled_at": {"tiktok": new_time.isoformat()}},
+            headers=INTERNAL_AUTH,
+        )
+    assert _get_job(app).reminder_message_id == "m_old"
+    discord.delete_message.assert_not_called()
