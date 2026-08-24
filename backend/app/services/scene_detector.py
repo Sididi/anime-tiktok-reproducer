@@ -199,7 +199,7 @@ class SceneDetectorService:
         ):
             if progress.status == "complete" and progress.scenes:
                 scene_list = SceneList(scenes=progress.scenes)
-                ProjectService.save_scenes(project_id, scene_list)
+                await ProjectService.asave_scenes(project_id, scene_list)
 
                 project = ProjectService.load(project_id)
                 if project is None:

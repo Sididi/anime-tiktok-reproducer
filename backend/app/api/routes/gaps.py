@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from ...config import settings
 from ...services import ProjectService
 from ...services.gap_resolution import GapResolutionService
+from ...services.project_locks import project_edit_locked
 from ...utils.timing import compute_adjusted_scene_end_times
 
 router = APIRouter(prefix="/projects/{project_id}/gaps", tags=["gap-resolution"])
@@ -87,7 +88,7 @@ async def get_gaps(project_id: str) -> GapsResponse:
     project_dir = ProjectService.get_project_dir(project_id)
 
     # Load matches
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         return GapsResponse(
             has_gaps=False,
@@ -157,7 +158,7 @@ async def get_all_candidates(project_id: str) -> AllCandidatesResponse:
     project_dir = ProjectService.get_project_dir(project_id)
 
     # Load matches ONCE
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         return AllCandidatesResponse(candidates_by_scene={})
 
@@ -208,7 +209,7 @@ async def get_gap_candidates(project_id: str, scene_index: int) -> GapCandidates
     project_dir = ProjectService.get_project_dir(project_id)
 
     # Load matches
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
@@ -276,7 +277,7 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
     project_dir = ProjectService.get_project_dir(project_id)
 
     # Load matches
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
@@ -372,7 +373,7 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
         filled_count += 1
 
     # Save updated matches
-    ProjectService.save_matches(project_id, matches)
+    await ProjectService.asave_matches(project_id, matches)
 
     return AutoFillResponse(
         filled_count=filled_count,
@@ -397,6 +398,7 @@ async def auto_fill_and_resolve(project_id: str) -> AutoFillResponse:
 
 
 @router.put("/{scene_index}")
+@project_edit_locked
 async def update_gap_timing(
     project_id: str,
     scene_index: int,
@@ -412,7 +414,7 @@ async def update_gap_timing(
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Load matches
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
@@ -467,7 +469,7 @@ async def update_gap_timing(
         raise HTTPException(status_code=404, detail=f"Match for scene {scene_index} not found")
 
     # Save updated matches
-    ProjectService.save_matches(project_id, matches)
+    await ProjectService.asave_matches(project_id, matches)
 
     # If all gaps are resolved/skipped, we can mark ready to continue processing
     # This will be checked by the frontend

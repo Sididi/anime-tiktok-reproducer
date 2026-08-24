@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from ...models import MatchList, ProjectPhase, Scene, SceneList, SceneMatch, SceneTranscription, Transcription
 from ...models.raw_scene import RawSceneDetectionResult
 from ...services import ProjectService
+from ...services.project_locks import project_edit_locked
 
 router = APIRouter(prefix="/projects/{project_id}/raw-scenes", tags=["raw-scenes"])
 
@@ -30,7 +31,7 @@ async def get_raw_scenes(project_id: str):
         return {"detection": None, "transcription": None}
 
     detection = RawSceneDetectionResult.model_validate_json(detection_file.read_text())
-    transcription = ProjectService.load_transcription(project_id)
+    transcription = await ProjectService.aload_transcription(project_id)
 
     return {
         "detection": detection.model_dump(),
@@ -39,6 +40,7 @@ async def get_raw_scenes(project_id: str):
 
 
 @router.post("/validate")
+@project_edit_locked
 async def validate_raw_scenes(project_id: str, request: ValidateRequest):
     """Validate or invalidate detected raw scenes.
 
@@ -49,11 +51,11 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    transcription = ProjectService.load_transcription(project_id)
+    transcription = await ProjectService.aload_transcription(project_id)
     if not transcription:
         raise HTTPException(status_code=404, detail="No transcription found")
     original_scenes = [scene.model_copy(deep=True) for scene in transcription.scenes]
-    match_list = ProjectService.load_matches(project_id)
+    match_list = await ProjectService.aload_matches(project_id)
 
     # Build lookup of validations
     validation_map = {v.scene_index: v for v in request.validations}
@@ -89,11 +91,11 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
             after_scenes=transcription.scenes,
             matches=match_list.matches,
         )
-        ProjectService.save_matches(project_id, match_list)
+        await ProjectService.asave_matches(project_id, match_list)
 
     _enforce_raw_scene_invariants(transcription.scenes)
 
-    ProjectService.save_transcription(project_id, transcription)
+    await ProjectService.asave_transcription(project_id, transcription)
     _persist_detection_after_validation(
         project_id=project_id,
         invalidated_raw_indices=invalidated_raw_indices,
@@ -101,7 +103,7 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
     )
 
     # Sync scenes.json with current scene structure
-    ProjectService.save_scenes(project_id, SceneList(scenes=[
+    await ProjectService.asave_scenes(project_id, SceneList(scenes=[
         Scene(index=s.scene_index, start_time=s.start_time, end_time=s.end_time)
         for s in transcription.scenes
     ]))
@@ -110,6 +112,7 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
 
 
 @router.post("/confirm")
+@project_edit_locked
 async def confirm_raw_scenes(project_id: str):
     """Finalize raw scene validation and advance to script phase."""
     project = ProjectService.load(project_id)
@@ -118,10 +121,10 @@ async def confirm_raw_scenes(project_id: str):
 
     # Defensive cleanup for historical inconsistencies where raw scenes
     # may have been assigned text via a stale index update.
-    transcription = ProjectService.load_transcription(project_id)
+    transcription = await ProjectService.aload_transcription(project_id)
     if transcription:
         _enforce_raw_scene_invariants(transcription.scenes)
-        ProjectService.save_transcription(project_id, transcription)
+        await ProjectService.asave_transcription(project_id, transcription)
 
     project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
     ProjectService.save(project)
@@ -144,19 +147,19 @@ async def reset_raw_scenes(project_id: str):
         raise HTTPException(status_code=404, detail="No raw scene backup found — re-run transcription")
 
     transcription = Transcription.model_validate_json(backup_trans.read_text())
-    ProjectService.save_transcription(project_id, transcription)
+    await ProjectService.asave_transcription(project_id, transcription)
 
     # Restore matches from backup if available
     backup_matches = project_dir / "matches_raw_backup.json"
     if backup_matches.exists():
         match_list = MatchList.model_validate_json(backup_matches.read_text())
-        ProjectService.save_matches(project_id, match_list)
+        await ProjectService.asave_matches(project_id, match_list)
 
     # Restore scenes.json from backup if available
     backup_scenes = project_dir / "scenes_raw_backup.json"
     if backup_scenes.exists():
         scene_list = SceneList.model_validate_json(backup_scenes.read_text())
-        ProjectService.save_scenes(project_id, scene_list)
+        await ProjectService.asave_scenes(project_id, scene_list)
 
     # Set phase back to raw scene validation
     project.phase = ProjectPhase.RAW_SCENE_VALIDATION

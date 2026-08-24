@@ -99,7 +99,7 @@ async def create_project(request: CreateProjectRequest) -> ProjectResponse:
 @router.get("", response_model=list[ProjectResponse])
 async def list_projects() -> list[ProjectResponse]:
     """List all projects."""
-    projects = ProjectService.list_all()
+    projects = await ProjectService.alist_all()
     return [ProjectResponse.from_project(p) for p in projects]
 
 

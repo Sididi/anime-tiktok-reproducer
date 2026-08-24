@@ -9,9 +9,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .executors import run_heavy
 from ..config import settings
 from ..models.project_upload import ProjectUploadJob
 from .account_service import AccountConfig, AccountService
+from .atomic_files import write_text_atomic
 from .event_hub import event_hub
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
@@ -73,13 +75,10 @@ def _jobs_payload(jobs: dict[str, ProjectUploadJob]) -> dict[str, Any]:
 
 
 def _write_jobs_atomic(path: Path, jobs: dict[str, ProjectUploadJob]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-    tmp_path.write_text(
+    write_text_atomic(
+        path,
         json.dumps(_jobs_payload(jobs), ensure_ascii=True, indent=2, sort_keys=True),
-        encoding="utf-8",
     )
-    tmp_path.replace(path)
 
 
 def _load_jobs(path: Path) -> dict[str, ProjectUploadJob]:
@@ -417,7 +416,7 @@ class ProjectUploadService:
 
                 loop.call_soon_threadsafe(_schedule_update)
 
-            result = await asyncio.to_thread(
+            result = await run_heavy(
                 UploadPhaseService.execute_upload,
                 project_id,
                 account_id=request.account_id,

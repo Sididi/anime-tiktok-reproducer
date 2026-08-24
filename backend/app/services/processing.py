@@ -2764,7 +2764,7 @@ class ProcessingService:
                         for line in borrow_report:
                             logger.info("Pure gap resolution: %s", line)
 
-                        ProjectService.save_matches(project.id, MatchList(matches=matches))
+                        await ProjectService.asave_matches(project.id, MatchList(matches=matches))
                         (project_dir / "gaps_resolved.flag").touch()
 
                         yield ProcessingProgress(
@@ -2817,7 +2817,7 @@ class ProcessingService:
                                         break
 
                         # Save updated matches
-                        ProjectService.save_matches(project.id, MatchList(matches=matches))
+                        await ProjectService.asave_matches(project.id, MatchList(matches=matches))
                         (project_dir / "gaps_resolved.flag").touch()
 
                         yield ProcessingProgress(

@@ -1173,13 +1173,13 @@ class TranscriberService:
                 yield TranscriptionProgress("error", 0, "", error="Project or video not found")
                 return
 
-            scenes = ProjectService.load_scenes(project_id)
+            scenes = await ProjectService.aload_scenes(project_id)
             if not scenes or not scenes.scenes:
                 yield TranscriptionProgress("error", 0, "", error="No scenes found")
                 return
 
             video_path = Path(project.video_path)
-            pre_raw_match_snapshot = ProjectService.load_matches(project_id)
+            pre_raw_match_snapshot = await ProjectService.aload_matches(project_id)
             if pre_raw_match_snapshot is not None:
                 pre_raw_match_snapshot = pre_raw_match_snapshot.model_copy(deep=True)
 
@@ -1251,7 +1251,7 @@ class TranscriberService:
             )
 
             # Save transcription
-            ProjectService.save_transcription(project_id, transcription)
+            await ProjectService.asave_transcription(project_id, transcription)
 
             # Free WhisperX models and GPU VRAM before diarization
             cls.unload_models()
@@ -1327,20 +1327,20 @@ class TranscriberService:
                         )
                         if remapped_match_list is not None:
                             matches_for_raw_backup = remapped_match_list.model_copy(deep=True)
-                            ProjectService.save_matches(project_id, remapped_match_list)
+                            await ProjectService.asave_matches(project_id, remapped_match_list)
 
                         # Sync scenes.json with updated scene structure
                         updated_scene_list = SceneList(scenes=[
                             Scene(index=s.scene_index, start_time=s.start_time, end_time=s.end_time)
                             for s in updated_scenes
                         ])
-                        ProjectService.save_scenes(project_id, updated_scene_list)
+                        await ProjectService.asave_scenes(project_id, updated_scene_list)
                         (project_dir / "scenes_raw_backup.json").write_text(
                             updated_scene_list.model_dump_json(indent=2)
                         )
 
                     transcription.scenes = updated_scenes
-                    ProjectService.save_transcription(project_id, transcription)
+                    await ProjectService.asave_transcription(project_id, transcription)
 
                     # Save backup for reset (post-detection, pre-validation)
                     (project_dir / "transcription_raw_backup.json").write_text(

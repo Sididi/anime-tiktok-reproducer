@@ -8,6 +8,7 @@ from ...config import settings
 from ...models import ProjectPhase
 from ...services import AnimeMatcherService, ProjectService, TranscriberService
 from ...services.match_playback_service import MatchPlaybackService
+from ...services.project_locks import project_edit_locked
 
 router = APIRouter(prefix="/projects/{project_id}/transcription", tags=["transcription"])
 
@@ -102,7 +103,7 @@ async def get_transcription(project_id: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    transcription = ProjectService.load_transcription(project_id)
+    transcription = await ProjectService.aload_transcription(project_id)
     if not transcription:
         return {"transcription": None}
 
@@ -110,13 +111,14 @@ async def get_transcription(project_id: str):
 
 
 @router.put("")
+@project_edit_locked
 async def update_transcription(project_id: str, request: UpdateTranscriptionRequest):
     """Update transcription text (user edits)."""
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    transcription = ProjectService.load_transcription(project_id)
+    transcription = await ProjectService.aload_transcription(project_id)
     if not transcription:
         raise HTTPException(status_code=404, detail="No transcription found")
 
@@ -136,7 +138,7 @@ async def update_transcription(project_id: str, request: UpdateTranscriptionRequ
                     scene.text = new_text
                 break
 
-    ProjectService.save_transcription(project_id, transcription)
+    await ProjectService.asave_transcription(project_id, transcription)
     return {"status": "ok", "transcription": transcription.model_dump()}
 
 

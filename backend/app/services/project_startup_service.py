@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from ..models.project_startup import ProjectStartupJob
+from .atomic_files import write_text_atomic
 from .event_hub import event_hub
 
 
@@ -33,13 +34,12 @@ def _jobs_payload(jobs: dict[str, ProjectStartupJob]) -> dict[str, Any]:
 
 
 def _write_jobs_atomic(path: Path, jobs: dict[str, ProjectStartupJob]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(
+    # Unique temp name: two publishes running on worker threads at once used
+    # to share one ".tmp" path and could rename each other's half-written file.
+    write_text_atomic(
+        path,
         json.dumps(_jobs_payload(jobs), ensure_ascii=True, indent=2, sort_keys=True),
-        encoding="utf-8",
     )
-    tmp_path.replace(path)
 
 
 def _load_jobs(path: Path) -> dict[str, ProjectStartupJob]:

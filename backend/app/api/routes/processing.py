@@ -1104,7 +1104,7 @@ async def process_project(project_id: str):
     reference_transcription = _load_transcription_for_script(project_id)
 
     # Load matches
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
@@ -1256,7 +1256,7 @@ async def upload_to_gdrive(project_id: str, auto: bool = False):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 

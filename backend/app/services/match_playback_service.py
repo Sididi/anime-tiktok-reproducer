@@ -1509,8 +1509,8 @@ class MatchPlaybackService:
             )
             return
 
-        scenes = ProjectService.load_scenes(project_id)
-        matches = ProjectService.load_matches(project_id)
+        scenes = await ProjectService.aload_scenes(project_id)
+        matches = await ProjectService.aload_matches(project_id)
         if not scenes or not scenes.scenes:
             yield PlaybackPrepareProgress(
                 status="error",
@@ -1766,8 +1766,8 @@ class MatchPlaybackService:
             )
             return
 
-        scenes = ProjectService.load_scenes(project_id)
-        matches = ProjectService.load_matches(project_id)
+        scenes = await ProjectService.aload_scenes(project_id)
+        matches = await ProjectService.aload_matches(project_id)
         if not scenes or not matches:
             yield PlaybackPrepareProgress(
                 status="error",
@@ -2039,8 +2039,8 @@ class MatchPlaybackService:
             return cls._default_manifest()
 
         project = ProjectService.load(project_id)
-        scenes = ProjectService.load_scenes(project_id)
-        matches = ProjectService.load_matches(project_id)
+        scenes = await ProjectService.aload_scenes(project_id)
+        matches = await ProjectService.aload_matches(project_id)
         if not project or not scenes or not scenes.scenes or not matches:
             return cls._default_manifest()
 

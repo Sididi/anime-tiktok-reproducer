@@ -186,13 +186,13 @@ class ZoomSearchService:
         if project.library_type == LibraryType.PURE:
             return self._fail(job, "Zoom search is not available for pure projects")
 
-        scenes = ProjectService.load_scenes(job.project_id)
+        scenes = await ProjectService.aload_scenes(job.project_id)
         if not scenes or not scenes.scenes:
             return self._fail(job, "No scenes found")
         if not 0 <= job.scene_index < len(scenes.scenes):
             return self._fail(job, "Scene index out of range")
 
-        matches = ProjectService.load_matches(job.project_id)
+        matches = await ProjectService.aload_matches(job.project_id)
         if not matches or not matches.matches:
             return self._fail(job, "No matches found")
 
@@ -287,7 +287,7 @@ class ZoomSearchService:
         applied = False
         result_match = None
         candidates_added = 0
-        fresh_scenes = ProjectService.load_scenes(job.project_id)
+        fresh_scenes = await ProjectService.aload_scenes(job.project_id)
         if (
             fresh_scenes is None
             or self._scene_fingerprint(fresh_scenes, job.scene_index) != fingerprint
@@ -298,7 +298,7 @@ class ZoomSearchService:
             self._broadcast(job)
             return
 
-        fresh_matches = ProjectService.load_matches(job.project_id)
+        fresh_matches = await ProjectService.aload_matches(job.project_id)
         current = None
         if fresh_matches:
             current = next(
@@ -336,10 +336,10 @@ class ZoomSearchService:
                     current.alternatives,
                 )
                 candidates_added = max(0, len(current.alternatives) - before)
-                ProjectService.save_matches(job.project_id, fresh_matches)
+                await ProjectService.asave_matches(job.project_id, fresh_matches)
                 result_match = current
             elif splice_match(fresh_matches, scene.index, outcome.new_match):
-                ProjectService.save_matches(job.project_id, fresh_matches)
+                await ProjectService.asave_matches(job.project_id, fresh_matches)
                 applied = True
                 result_match = outcome.new_match
                 candidates_added = len(outcome.new_match.alternatives)
@@ -359,7 +359,7 @@ class ZoomSearchService:
             ]
             if after_dump != before_dump:
                 candidates_added = max(1, len(after_dump) - len(before_dump))
-                ProjectService.save_matches(job.project_id, fresh_matches)
+                await ProjectService.asave_matches(job.project_id, fresh_matches)
                 result_match = current
 
         job.status = "complete"

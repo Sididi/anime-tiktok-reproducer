@@ -1,11 +1,16 @@
+import asyncio
+import json
 import re
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from datetime import datetime
 
 from ..config import settings
 from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type
 from ..models import Project, ProjectPhase, SceneList
+from .atomic_files import write_text_atomic
 from .library_state_db import LibraryStateDb
+from .project_locks import ProjectLocks
 
 _PROJECT_ID_RE = re.compile(r"[a-zA-Z0-9_-]+$")
 
@@ -19,7 +24,20 @@ def _validate_project_id(project_id: str) -> None:
 
 
 class ProjectService:
-    """Service for managing projects."""
+    """Service for managing projects.
+
+    Every ``load_*`` / ``save_*`` here is synchronous disk I/O (``matches.json``
+    reaches 14 MB; ``list_all`` parses ~400 files).  From ``async`` code use
+    the ``a``-prefixed twins (``aload``, ``asave_matches``, ``alist_all``, …),
+    which run on the light thread pool, and wrap any load → mutate → save
+    sequence in ``async with ProjectService.edit_lock(project_id):`` — moving
+    the I/O off the loop introduces await points, and without the lock two
+    concurrent edits of the same project could lose one update.  Rules for
+    the lock live in :mod:`app.services.project_locks`.
+
+    Saves are atomic (temp file + rename): a crash mid-write can no longer
+    truncate a project file.
+    """
 
     @staticmethod
     def should_keep_project_pin(project: Project) -> bool:
@@ -82,7 +100,7 @@ class ProjectService:
         """Save a project to disk."""
         project.updated_at = datetime.now()
         project_file = cls.get_project_file(project.id)
-        project_file.write_text(project.model_dump_json(indent=2))
+        write_text_atomic(project_file, project.model_dump_json(indent=2))
         cls.sync_project_pin(project)
 
     @classmethod
@@ -92,6 +110,52 @@ class ProjectService:
         if not project_file.exists():
             return None
         return Project.model_validate_json(project_file.read_text())
+
+    # ------------------------------------------------------------------
+    # event-loop friendly twins (light thread pool) + per-project edit lock
+
+    @classmethod
+    def edit_lock(cls, project_id: str) -> AbstractAsyncContextManager[None]:
+        """``async with`` guard for a load → mutate → save section."""
+        return ProjectLocks.hold(project_id)
+
+    @classmethod
+    async def aload(cls, project_id: str) -> Project | None:
+        return await asyncio.to_thread(cls.load, project_id)
+
+    @classmethod
+    async def asave(cls, project: Project) -> None:
+        await asyncio.to_thread(cls.save, project)
+
+    @classmethod
+    async def alist_all(cls) -> list[Project]:
+        return await asyncio.to_thread(cls.list_all)
+
+    @classmethod
+    async def aload_scenes(cls, project_id: str) -> SceneList | None:
+        return await asyncio.to_thread(cls.load_scenes, project_id)
+
+    @classmethod
+    async def asave_scenes(cls, project_id: str, scenes: SceneList) -> None:
+        await asyncio.to_thread(cls.save_scenes, project_id, scenes)
+
+    @classmethod
+    async def aload_matches(cls, project_id: str) -> "MatchList | None":
+        return await asyncio.to_thread(cls.load_matches, project_id)
+
+    @classmethod
+    async def asave_matches(cls, project_id: str, matches: "MatchList") -> None:
+        await asyncio.to_thread(cls.save_matches, project_id, matches)
+
+    @classmethod
+    async def aload_transcription(cls, project_id: str) -> "Transcription | None":
+        return await asyncio.to_thread(cls.load_transcription, project_id)
+
+    @classmethod
+    async def asave_transcription(
+        cls, project_id: str, transcription: "Transcription"
+    ) -> None:
+        await asyncio.to_thread(cls.save_transcription, project_id, transcription)
 
     @classmethod
     def delete(cls, project_id: str) -> bool:
@@ -167,6 +231,30 @@ class ProjectService:
         return sorted(projects, key=lambda p: p.created_at, reverse=True)
 
     @classmethod
+    def list_with_reschedule_pending(cls) -> list[Project]:
+        """Only projects with a non-empty ``reschedule_pending``.
+
+        Same one pass over the project files as :meth:`list_all`, but the
+        (rare) matching projects are the only ones validated into models —
+        cheap enough to run every minute from the retry loop.
+        """
+        projects: list[Project] = []
+        for project_dir in settings.projects_dir.iterdir():
+            if not project_dir.is_dir():
+                continue
+            project_file = project_dir / "project.json"
+            if not project_file.exists():
+                continue
+            try:
+                raw = json.loads(project_file.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(raw, dict) or not raw.get("reschedule_pending"):
+                continue
+            projects.append(Project.model_validate(raw))
+        return sorted(projects, key=lambda p: p.created_at, reverse=True)
+
+    @classmethod
     def update_phase(cls, project_id: str, phase: ProjectPhase) -> Project | None:
         """Update the project phase."""
         project = cls.load(project_id)
@@ -180,7 +268,7 @@ class ProjectService:
     def save_scenes(cls, project_id: str, scenes: SceneList) -> None:
         """Save scenes for a project."""
         scenes_file = cls.get_scenes_file(project_id)
-        scenes_file.write_text(scenes.model_dump_json(indent=2))
+        write_text_atomic(scenes_file, scenes.model_dump_json(indent=2))
 
     @classmethod
     def load_scenes(cls, project_id: str) -> SceneList | None:
@@ -209,7 +297,7 @@ class ProjectService:
     def save_matches(cls, project_id: str, matches: "MatchList") -> None:
         """Save matches for a project."""
         matches_file = cls.get_matches_file(project_id)
-        matches_file.write_text(matches.model_dump_json(indent=2))
+        write_text_atomic(matches_file, matches.model_dump_json(indent=2))
 
     @classmethod
     def load_matches(cls, project_id: str) -> "MatchList | None":
@@ -229,7 +317,7 @@ class ProjectService:
     def save_transcription(cls, project_id: str, transcription: "Transcription") -> None:
         """Save transcription for a project."""
         transcription_file = cls.get_transcription_file(project_id)
-        transcription_file.write_text(transcription.model_dump_json(indent=2))
+        write_text_atomic(transcription_file, transcription.model_dump_json(indent=2))
 
     @classmethod
     def load_transcription(cls, project_id: str) -> "Transcription | None":
