@@ -38,6 +38,10 @@ class ZoomSearchJob(BaseModel):
     applied: bool | None = None
     old_match: dict | None = None
     new_match: dict | None = None
+    # Actual persisted scene state.  Unlike ``new_match`` this is populated
+    # when zoom search only enriches the primary's manual alternatives.
+    result_match: dict | None = None
+    candidates_added: int = 0
     error: str | None = None
     acknowledged: bool = False
     created_at: float = Field(default_factory=time.time)
@@ -274,6 +278,7 @@ class ZoomSearchService:
                         scene_index=job.scene_index,
                         existing_match=existing_match,
                         cancel_event=cancel_event,
+                        context_matches=matches,
                     ),
                 )
 
@@ -284,6 +289,8 @@ class ZoomSearchService:
         # (route handlers included) runs here, so load→mutate→save is atomic
         # with respect to them.
         applied = False
+        result_match = None
+        candidates_added = 0
         fresh_scenes = ProjectService.load_scenes(job.project_id)
         if (
             fresh_scenes is None
@@ -311,24 +318,53 @@ class ZoomSearchService:
         if outcome.changed and outcome.new_match and fresh_matches:
             if edited_mid_run:
                 # The owner already fixed this scene by hand; offer the
-                # result as an alternative instead of overwriting them.
+                # result and every other scored track as alternatives instead
+                # of overwriting them.
                 from ..models import AlternativeMatch
 
                 found = outcome.new_match
-                current.alternatives = [
-                    AlternativeMatch(
-                        episode=found.episode,
-                        start_time=found.start_time,
-                        end_time=found.end_time,
-                        confidence=found.confidence,
-                        speed_ratio=found.speed_ratio,
-                        algorithm="zoom_search",
-                    )
-                ] + current.alternatives
+                before = len(current.alternatives)
+                current.alternatives = ZoomRematchService.merge_alternatives(
+                    current,
+                    [
+                        AlternativeMatch(
+                            episode=found.episode,
+                            start_time=found.start_time,
+                            end_time=found.end_time,
+                            confidence=found.confidence,
+                            speed_ratio=found.speed_ratio,
+                            algorithm="zoom_search",
+                        )
+                    ],
+                    outcome.alternatives,
+                    current.alternatives,
+                )
+                candidates_added = max(0, len(current.alternatives) - before)
                 ProjectService.save_matches(job.project_id, fresh_matches)
+                result_match = current
             elif splice_match(fresh_matches, scene.index, outcome.new_match):
                 ProjectService.save_matches(job.project_id, fresh_matches)
                 applied = True
+                result_match = outcome.new_match
+                candidates_added = len(outcome.new_match.alternatives)
+        elif fresh_matches and current is not None and outcome.alternatives:
+            # Even a confirmed primary produced useful, paid-for native zoom
+            # evidence.  Persist every distinct cluster for the manual modal.
+            before_dump = [
+                candidate.model_dump() for candidate in current.alternatives
+            ]
+            current.alternatives = ZoomRematchService.merge_alternatives(
+                current,
+                outcome.alternatives,
+                current.alternatives,
+            )
+            after_dump = [
+                candidate.model_dump() for candidate in current.alternatives
+            ]
+            if after_dump != before_dump:
+                candidates_added = max(1, len(after_dump) - len(before_dump))
+                ProjectService.save_matches(job.project_id, fresh_matches)
+                result_match = current
 
         job.status = "complete"
         job.changed = outcome.changed
@@ -337,10 +373,17 @@ class ZoomSearchService:
         job.new_match = (
             outcome.new_match.model_dump() if outcome.new_match else None
         )
+        job.result_match = result_match.model_dump() if result_match else None
+        job.candidates_added = candidates_added
         if edited_mid_run and outcome.changed:
             job.message = "Result saved as an alternative (scene was edited)"
         elif outcome.changed:
             job.message = "Match updated"
+        elif candidates_added:
+            suffix = "candidate" if candidates_added == 1 else "candidates"
+            job.message = (
+                f"Existing match confirmed — {candidates_added} new AI {suffix}"
+            )
         else:
             job.message = "Existing match confirmed"
         self._broadcast(job)

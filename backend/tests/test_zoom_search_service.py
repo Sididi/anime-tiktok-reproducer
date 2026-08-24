@@ -12,7 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.library_types import LibraryType
-from app.models import MatchList, Scene, SceneList, SceneMatch
+from app.models import AlternativeMatch, MatchList, Scene, SceneList, SceneMatch
 from app.models.project import Project
 from app.services.anime_library import AnimeLibraryService
 from app.services.anime_matcher import AnimeMatcherService
@@ -36,7 +36,12 @@ def _match(i: int, episode: str, a: float, b: float) -> SceneMatch:
     )
 
 
-def _outcome(old: SceneMatch, new: SceneMatch | None, changed: bool) -> ZoomSearchOutcome:
+def _outcome(
+    old: SceneMatch,
+    new: SceneMatch | None,
+    changed: bool,
+    alternatives: tuple[AlternativeMatch, ...] = (),
+) -> ZoomSearchOutcome:
     return ZoomSearchOutcome(
         changed=changed,
         old_match=old,
@@ -46,6 +51,7 @@ def _outcome(old: SceneMatch, new: SceneMatch | None, changed: bool) -> ZoomSear
         hypotheses_scored=3,
         deadline_hit=False,
         detail="test",
+        alternatives=alternatives,
     )
 
 
@@ -161,6 +167,40 @@ async def test_unchanged_outcome_saves_nothing(monkeypatch, tmp_path) -> None:
     assert job.status == "complete"
     assert job.changed is False and job.applied is False
     assert not env.saved
+
+
+@pytest.mark.asyncio
+async def test_unchanged_outcome_persists_zoom_candidates_for_manual_modal(
+    monkeypatch, tmp_path
+) -> None:
+    env = _Env(monkeypatch, tmp_path)
+    candidate = AlternativeMatch(
+        episode="EP03",
+        start_time=400.0,
+        end_time=403.0,
+        confidence=0.9,
+        speed_ratio=1.0,
+        vote_count=4,
+        algorithm="zoom_search_registered",
+    )
+
+    def search(cls, *args, existing_match, context_matches, **kwargs):
+        assert context_matches is env.matches
+        return _outcome(existing_match, None, False, (candidate,))
+
+    monkeypatch.setattr(
+        ZoomRematchService, "search_scene_sync", classmethod(search)
+    )
+    service = ZoomSearchService()
+    job = await service.enqueue("proj-1", 1)
+    await _wait_terminal(service, job.id)
+
+    assert job.status == "complete"
+    assert job.changed is False and job.applied is False
+    assert job.candidates_added == 1
+    assert job.result_match is not None
+    assert job.result_match["alternatives"][0]["episode"] == "EP03"
+    assert env.saved
 
 
 @pytest.mark.asyncio

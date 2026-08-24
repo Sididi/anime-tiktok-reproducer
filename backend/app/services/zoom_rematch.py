@@ -53,6 +53,10 @@ class ZoomSearchOutcome:
     hypotheses_scored: int
     deadline_hit: bool
     detail: str
+    # Every distinct hypothesis that completed native zoom scoring.  The job
+    # layer persists these even when no hypothesis is strong enough to replace
+    # the primary, so manual timing selection benefits from the expensive work.
+    alternatives: tuple[AlternativeMatch, ...] = ()
 
 
 @dataclass
@@ -63,6 +67,19 @@ class _Hypothesis:
     support: int
     max_sim: float
     is_current: bool = False
+
+    def source_at(self, t_query: float) -> float:
+        return self.a * t_query + self.b
+
+
+@dataclass(frozen=True)
+class _ContextCorridor:
+    """A source interval certified by the resolved matches on both sides."""
+
+    episode: str
+    lower: float
+    upper: float
+    target: float
 
 
 class ZoomRematchService:
@@ -77,11 +94,23 @@ class ZoomRematchService:
     # _CANDIDATE_ZOOMS ceiling (1.45) because the whole point of this pass is
     # "zoomed a lot".
     EXTENDED_ZOOMS: tuple[float, ...] = (1.0, 1.3, 1.6, 1.8, 2.0)
-    # Deep-tail retrieval: bigger K and lower floor than _query_deep_recall
-    # (40 / 0.45) — arbitration below, not this ranking, decides.
-    DEEP_K = 100
-    DEEP_COS_FLOOR = 0.35
-    MAX_HYPOTHESES = 5
+    # Deep-tail retrieval is deliberately broad.  A strong center zoom can put
+    # the full source frame hundreds of places down the raw SSCD ranking; FAISS
+    # is cheap and registered native scoring below, not this ranking, decides.
+    DEEP_K = 500
+    DEEP_COS_FLOOR = 0.25
+    MAX_HYPOTHESES = 12
+    MAX_CONTEXT_HYPOTHESES = 3
+    EPISODE_DIVERSITY_SLOTS = 4
+    CONTEXT_CORRIDOR_TOLERANCE_S = 2.0
+    CONTEXT_MAX_SOURCE_GAP_S = 90.0
+    MIN_RATE_FIT_QUERY_SPAN_S = 1.0
+    ALTERNATIVE_SCORE_FLOOR = 0.25
+    # Registered crop scoring is quantized to the native 12fps verification
+    # grid.  Bias its emitted interval forward by one grid frame: a tiny loss
+    # of uncertain opening content is preferable to a previous-shot/black
+    # flash in the rendered clip.
+    REGISTERED_ALIGNMENT_GUARD_S = 1.0 / VERIFY_DECODE_FPS
     # A result is a "change" when the episode differs or an endpoint moves
     # by more than this; anything smaller is a confirmation.
     CHANGE_EPS_S = 0.5
@@ -104,6 +133,7 @@ class ZoomRematchService:
         scene_index: int,
         existing_match: SceneMatch,
         cancel_event: threading.Event,
+        context_matches: MatchList | None = None,
         budget_s: float | None = None,
     ) -> ZoomSearchOutcome:
         if AnimeMatcherService._query_processor is None:
@@ -178,7 +208,12 @@ class ZoomRematchService:
 
         hits = cls._collect_hits(samples, anchors, anime_name)
         hypotheses = cls._build_hypotheses(
-            hits, existing_match, q_start, q_end, span
+            hits,
+            existing_match,
+            q_start,
+            q_end,
+            span,
+            context_matches=context_matches,
         )
         if not hypotheses:
             return ZoomSearchOutcome(
@@ -198,6 +233,7 @@ class ZoomRematchService:
         best: dict | None = None
         current_score: float | None = None
         scored = 0
+        scored_results: list[dict] = []
         try:
             for hypothesis in hypotheses:
                 try:
@@ -210,6 +246,7 @@ class ZoomRematchService:
                 if result is None:
                     continue
                 scored += 1
+                scored_results.append(result)
                 if hypothesis.is_current:
                     current_score = result["score"]
                 if best is None or result["score"] > best["score"]:
@@ -243,6 +280,7 @@ class ZoomRematchService:
             scored,
             deadline_hit,
             run_started,
+            scored_results=scored_results,
         )
 
     # ------------------------------------------------------------------
@@ -314,6 +352,8 @@ class ZoomRematchService:
         q_start: float,
         q_end: float,
         span: float,
+        *,
+        context_matches: MatchList | None = None,
     ) -> list[_Hypothesis]:
         """Cluster hits into (episode, source-line) hypotheses, the current
         match's own line first so a confirmation gets a fair score."""
@@ -369,8 +409,124 @@ class ZoomRematchService:
         # lookalikes; singles are kept only while multi-hit lines are scarce.
         strong = [c for c in candidates if c.support >= 2]
         weak = [c for c in candidates if c.support < 2]
-        budgeted = (strong + weak)[: cls.MAX_HYPOTHESES - (1 if current else 0)]
-        return ([current] if current else []) + budgeted
+        ranked = strong + weak
+        capacity = cls.MAX_HYPOTHESES - (1 if current else 0)
+        selected: list[_Hypothesis] = []
+
+        def append_distinct(hypothesis: _Hypothesis) -> bool:
+            if len(selected) >= capacity:
+                return False
+            if any(
+                cls._same_line(hypothesis, chosen, q_start, q_end)
+                for chosen in selected
+            ):
+                return False
+            selected.append(hypothesis)
+            return True
+
+        # A scene bracketed by two resolved matches from the same episode has
+        # unusually reliable context.  Prioritise deep-tail tracks inside that
+        # source corridor, but still require support from two query positions.
+        # This is especially important for heavily zoomed static shots whose
+        # raw full-frame embeddings rank poorly.
+        corridor = cls._context_corridor(
+            context_matches, existing_match.scene_index
+        )
+        if corridor is not None:
+            contextual = [
+                candidate
+                for candidate in ranked
+                if candidate.support >= 2
+                and canonical_episode_stem(candidate.episode)
+                == canonical_episode_stem(corridor.episode)
+                and corridor.lower - cls.CONTEXT_CORRIDOR_TOLERANCE_S
+                <= candidate.source_at(0.5 * (q_start + q_end))
+                <= corridor.upper + cls.CONTEXT_CORRIDOR_TOLERANCE_S
+            ]
+            contextual.sort(
+                key=lambda candidate: (
+                    candidate.support,
+                    candidate.max_sim,
+                    -abs(
+                        candidate.source_at(0.5 * (q_start + q_end))
+                        - corridor.target
+                    ),
+                ),
+                reverse=True,
+            )
+            for candidate in contextual[: cls.MAX_CONTEXT_HYPOTHESES]:
+                append_distinct(candidate)
+
+        # Reserve a few slots for different episodes before filling by raw
+        # support.  This costs no extra retrieval and makes the manual results
+        # materially more useful on repeated openings and generic close-ups.
+        seen_episodes = {
+            canonical_episode_stem(value.episode)
+            for value in ([current] if current else []) + selected
+        }
+        for candidate in ranked:
+            episode_key = canonical_episode_stem(candidate.episode)
+            if episode_key in seen_episodes:
+                continue
+            if append_distinct(candidate):
+                seen_episodes.add(episode_key)
+            if len(seen_episodes) >= cls.EPISODE_DIVERSITY_SLOTS:
+                break
+
+        for candidate in ranked:
+            if len(selected) >= capacity:
+                break
+            append_distinct(candidate)
+
+        return ([current] if current else []) + selected
+
+    @classmethod
+    def _context_corridor(
+        cls,
+        context_matches: MatchList | None,
+        scene_index: int,
+    ) -> _ContextCorridor | None:
+        if context_matches is None:
+            return None
+        resolved = [
+            match
+            for match in context_matches.matches
+            if match.episode
+            and match.confidence > 0
+            and match.end_time > match.start_time
+        ]
+        previous = max(
+            (match for match in resolved if match.scene_index < scene_index),
+            key=lambda match: match.scene_index,
+            default=None,
+        )
+        following = min(
+            (match for match in resolved if match.scene_index > scene_index),
+            key=lambda match: match.scene_index,
+            default=None,
+        )
+        if previous is None or following is None:
+            return None
+        if canonical_episode_stem(previous.episode) != canonical_episode_stem(
+            following.episode
+        ):
+            return None
+        lower = float(previous.end_time)
+        upper = float(following.start_time)
+        gap = upper - lower
+        if (
+            gap < -cls.CONTEXT_CORRIDOR_TOLERANCE_S
+            or gap > cls.CONTEXT_MAX_SOURCE_GAP_S
+        ):
+            return None
+        if upper < lower:
+            lower, upper = upper, lower
+        return _ContextCorridor(
+            episode=previous.episode,
+            lower=lower,
+            upper=upper,
+            target=0.5 * (lower + upper),
+        )
 
     @staticmethod
     def _fit_cluster(cluster: dict) -> _Hypothesis | None:
@@ -380,7 +536,11 @@ class ZoomRematchService:
         t_q = np.array([p[0] for p in points])
         t_s = np.array([p[1] for p in points])
         a = 1.0
-        if len(points) >= 3 and float(t_q.max() - t_q.min()) > 0.5:
+        if (
+            len(points) >= 3
+            and float(t_q.max() - t_q.min())
+            >= ZoomRematchService.MIN_RATE_FIT_QUERY_SPAN_S
+        ):
             design = np.vstack([t_q, np.ones(len(points))]).T
             solution, *_ = np.linalg.lstsq(design, t_s, rcond=None)
             fitted = float(solution[0])
@@ -573,6 +733,111 @@ class ZoomRematchService:
         except Exception:
             return 0.0
 
+    @staticmethod
+    def _aligned_interval(
+        result: dict,
+        q_start: float,
+        q_end: float,
+        span: float,
+    ) -> tuple[float, float]:
+        hypothesis: _Hypothesis = result["hypothesis"]
+        b_aligned = hypothesis.b + result["delta"]
+        start_time = hypothesis.a * q_start + b_aligned
+        end_time = hypothesis.a * q_end + b_aligned
+        if end_time <= start_time:
+            end_time = start_time + max(0.2, span * 0.5)
+        if result.get("geometry") == "motion" or isinstance(
+            result.get("geometry"), tuple
+        ):
+            start_time += ZoomRematchService.REGISTERED_ALIGNMENT_GUARD_S
+            end_time += ZoomRematchService.REGISTERED_ALIGNMENT_GUARD_S
+        return float(start_time), float(end_time)
+
+    @staticmethod
+    def _alternative_algorithm(result: dict) -> str:
+        geometry = result.get("geometry")
+        if geometry == "motion":
+            return "zoom_search_motion"
+        if isinstance(geometry, tuple):
+            return "zoom_search_registered"
+        if isinstance(geometry, (float, int)):
+            return f"zoom_search_center_{float(geometry):g}x"
+        return "zoom_search"
+
+    @classmethod
+    def _alternatives_from_results(
+        cls,
+        results: list[dict],
+        q_start: float,
+        q_end: float,
+        span: float,
+    ) -> list[AlternativeMatch]:
+        alternatives: list[AlternativeMatch] = []
+        for result in sorted(
+            results,
+            key=lambda value: float(value["score"]),
+            reverse=True,
+        ):
+            hypothesis: _Hypothesis = result["hypothesis"]
+            if hypothesis.is_current or result["score"] < cls.ALTERNATIVE_SCORE_FLOOR:
+                continue
+            start_time, end_time = cls._aligned_interval(
+                result, q_start, q_end, span
+            )
+            alternatives.append(
+                AlternativeMatch(
+                    episode=hypothesis.episode,
+                    start_time=round(start_time, 3),
+                    end_time=round(end_time, 3),
+                    confidence=max(0.0, min(0.95, float(result["score"]))),
+                    speed_ratio=span / max(1e-6, end_time - start_time),
+                    vote_count=hypothesis.support,
+                    algorithm=cls._alternative_algorithm(result),
+                )
+            )
+        return alternatives
+
+    @classmethod
+    def merge_alternatives(
+        cls,
+        primary: SceneMatch,
+        *groups: list[AlternativeMatch] | tuple[AlternativeMatch, ...],
+    ) -> list[AlternativeMatch]:
+        """Keep every distinct candidate cluster, without an arbitrary cap."""
+        source_duration = max(0.0, primary.end_time - primary.start_time)
+        query_duration = source_duration * max(0.0, primary.speed_ratio)
+        separation = max(2.0, query_duration)
+
+        def same_cluster(left: AlternativeMatch, right: AlternativeMatch) -> bool:
+            if canonical_episode_stem(left.episode) != canonical_episode_stem(
+                right.episode
+            ):
+                return False
+            left_mid = 0.5 * (left.start_time + left.end_time)
+            right_mid = 0.5 * (right.start_time + right.end_time)
+            return abs(left_mid - right_mid) < separation
+
+        primary_as_alternative = AlternativeMatch(
+            episode=primary.episode,
+            start_time=primary.start_time,
+            end_time=primary.end_time,
+            confidence=primary.confidence,
+            speed_ratio=primary.speed_ratio,
+            algorithm="primary",
+        )
+        merged: list[AlternativeMatch] = []
+        for group in groups:
+            for candidate in group:
+                if (
+                    not candidate.episode
+                    or candidate.end_time <= candidate.start_time
+                    or same_cluster(candidate, primary_as_alternative)
+                    or any(same_cluster(candidate, kept) for kept in merged)
+                ):
+                    continue
+                merged.append(candidate)
+        return merged
+
     # ------------------------------------------------------------------
     # decision
 
@@ -589,7 +854,16 @@ class ZoomRematchService:
         scored: int,
         deadline_hit: bool,
         run_started: float,
+        *,
+        scored_results: list[dict] | None = None,
     ) -> ZoomSearchOutcome:
+        zoom_alternatives = cls.merge_alternatives(
+            existing_match,
+            cls._alternatives_from_results(
+                scored_results or [], q_start, q_end, span
+            ),
+        )
+
         def outcome(
             changed: bool, new_match: SceneMatch | None, detail: str
         ) -> ZoomSearchOutcome:
@@ -617,6 +891,7 @@ class ZoomRematchService:
                 hypotheses_scored=scored,
                 deadline_hit=deadline_hit,
                 detail=detail,
+                alternatives=tuple(zoom_alternatives),
             )
 
         if best is None:
@@ -634,11 +909,7 @@ class ZoomRematchService:
                     "no alternative beat the current match under zoom scoring",
                 )
         # Endpoints follow the fitted line shifted by the sweep's alignment.
-        b_aligned = hypothesis.b + best["delta"]
-        start_time = hypothesis.a * q_start + b_aligned
-        end_time = hypothesis.a * q_end + b_aligned
-        if end_time <= start_time:
-            end_time = start_time + max(0.2, span * 0.5)
+        start_time, end_time = cls._aligned_interval(best, q_start, q_end, span)
 
         changed = (
             canonical_episode_stem(hypothesis.episode)
@@ -649,9 +920,12 @@ class ZoomRematchService:
         if hypothesis.is_current or not changed:
             return outcome(False, None, "existing match confirmed")
 
-        alternatives: list[AlternativeMatch] = []
-        if existing_match.episode and existing_match.end_time > existing_match.start_time:
-            alternatives.append(
+        previous_primary: list[AlternativeMatch] = []
+        if (
+            existing_match.episode
+            and existing_match.end_time > existing_match.start_time
+        ):
+            previous_primary.append(
                 AlternativeMatch(
                     episode=existing_match.episode,
                     start_time=existing_match.start_time,
@@ -661,7 +935,6 @@ class ZoomRematchService:
                     algorithm="pre_zoom_search",
                 )
             )
-        alternatives.extend(existing_match.alternatives[:2])
 
         new_match = SceneMatch(
             scene_index=existing_match.scene_index,
@@ -673,7 +946,12 @@ class ZoomRematchService:
             confirmed=False,
             merged_from=existing_match.merged_from,
             doubt_reasons=sorted({"zoom_search", *best["doubt"]}),
-            alternatives=alternatives,
+        )
+        new_match.alternatives = cls.merge_alternatives(
+            new_match,
+            zoom_alternatives,
+            previous_primary,
+            existing_match.alternatives,
         )
         return outcome(True, new_match, "found a better zoom-consistent match")
 

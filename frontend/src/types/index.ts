@@ -389,8 +389,8 @@ export interface AlternativeMatch {
   confidence: number;
   speed_ratio: number;
   vote_count: number;
-  // Includes retrieval and post-processing sources such as weighted_avg,
-  // best_frame, union_topk, direct, crop, crop_projected, refined, continuity.
+  // Includes retrieval/post-processing sources and zoom_search_registered,
+  // zoom_search_motion, zoom_search_center_<scale>x, or zoom_search.
   algorithm?: string;
 }
 
@@ -421,6 +421,8 @@ export interface ZoomSearchJob {
   applied: boolean | null;
   old_match: SceneMatch | null;
   new_match: SceneMatch | null;
+  result_match?: SceneMatch | null;
+  candidates_added?: number;
   error: string | null;
   acknowledged: boolean;
   created_at: number;

@@ -33,6 +33,8 @@ function installZoomMocks(
       applied: boolean | null;
       old_match: null;
       new_match: null;
+      result_match: Record<string, unknown> | null;
+      candidates_added: number;
       error: null;
       acknowledged: boolean;
       created_at: number;
@@ -222,6 +224,8 @@ function installZoomMocks(
         applied: null,
         old_match: null,
         new_match: null,
+        result_match: null,
+        candidates_added: 0,
         error: null,
         acknowledged: false,
         created_at: 0,
@@ -244,6 +248,26 @@ function installZoomMocks(
           job.status = "complete";
           job.changed = true;
           job.applied = true;
+          const prior = matches.find(
+            (match) => match.scene_index === job.scene_index,
+          );
+          job.result_match = prior
+            ? {
+                ...prior,
+                alternatives: [
+                  {
+                    episode: "Episode-03.mkv",
+                    start_time: 100,
+                    end_time: 102,
+                    confidence: 0.95,
+                    speed_ratio: 1,
+                    vote_count: 4,
+                    algorithm: "zoom_search_registered",
+                  },
+                ],
+              }
+            : null;
+          job.candidates_added = 1;
           job.message = "Match updated";
           events.push({ kind: "zoom_job", job: { ...job } });
         } else {
@@ -344,6 +368,29 @@ test("clicking the alert acks, dismisses, unglows and activates the scene", asyn
     .toEqual(["job-1"]);
   // Teleport: the scene card is now the active (ring-highlighted) one.
   await expect(mainCard(page, 1)).toHaveClass(/ring-2/);
+});
+
+test("completed zoom candidates appear in the manual modal without a reload", async ({
+  page,
+}) => {
+  const projectId = "zoom-search-candidates";
+  await page.addInitScript(installZoomMocks, {
+    projectId,
+    libraryType: "anime",
+    playbackReady: true,
+  });
+  await page.goto(`/project/${projectId}/matches`);
+
+  await page.locator('[data-zoom-search-scene-index="1"]').click();
+  await expect(page.locator("[data-zoom-search-alert-card]")).toBeVisible({
+    timeout: 15000,
+  });
+  await mainCard(page, 1)
+    .getByRole("button", { name: "Edit match timing" })
+    .click();
+
+  await expect(page.getByText("Episode-03.mkv")).toBeVisible();
+  await expect(page.getByText("[zoom_search_registered]")).toBeVisible();
 });
 
 test("Play Both dismisses the scene's alert", async ({ page }) => {

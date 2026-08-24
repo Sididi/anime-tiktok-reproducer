@@ -41,7 +41,9 @@ class SceneMatch(BaseModel):
     # Empty for confidently arbitrated scenes.
     doubt_reasons: list[str] = []
 
-    # Top 5 alternative matches for quick selection (Weighted Voting algorithm)
+    # Distinct alternative tracks for quick manual selection.  Most matching
+    # paths keep a small shortlist; an explicit zoom search may append every
+    # native-scored temporal cluster that carries useful evidence.
     alternatives: list[AlternativeMatch] = []
 
     # Candidates used for matching (for debugging/manual override)

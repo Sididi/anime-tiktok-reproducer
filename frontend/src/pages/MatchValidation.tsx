@@ -1205,6 +1205,19 @@ export function MatchValidation() {
     [projectId, upsertZoomJob, showToast],
   );
 
+  const handleZoomResultMatch = useCallback((result: SceneMatch) => {
+    setMatches((previous) =>
+      previous.map((match) =>
+        match.scene_index === result.scene_index
+          ? {
+              ...result,
+              was_no_match: match.was_no_match ?? result.was_no_match,
+            }
+          : match,
+      ),
+    );
+  }, []);
+
   const handleZoomAlertJump = useCallback(
     (sceneIndex: number) => {
       setActiveSceneIndex(sceneIndex);
@@ -3056,7 +3069,10 @@ export function MatchValidation() {
       {/* Extensive zoom search: job stream subscription + completion alerts */}
       {projectId && project?.library_type !== "pure" && (
         <>
-          <ZoomSearchJobsBridge projectId={projectId} />
+          <ZoomSearchJobsBridge
+            projectId={projectId}
+            onResultMatch={handleZoomResultMatch}
+          />
           <ZoomSearchAlertStack
             projectId={projectId}
             onAlertClick={handleZoomAlertJump}

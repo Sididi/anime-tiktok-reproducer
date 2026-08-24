@@ -13,7 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.library_types import LibraryType
-from app.models import Scene, SceneList, SceneMatch
+from app.models import AlternativeMatch, MatchList, Scene, SceneList, SceneMatch
 from app.services import zoom_rematch
 from app.services.anime_matcher import AnimeMatcherService
 from app.services.hierarchical_matcher import (
@@ -86,6 +86,50 @@ def test_build_hypotheses_without_existing_match() -> None:
     assert not hypotheses[0].is_current
 
 
+def test_build_hypotheses_prioritizes_supported_track_inside_neighbor_corridor(
+) -> None:
+    existing = _match("EP01", 500.0, 501.0)
+    context = MatchList(
+        matches=[
+            _match("EP04", 220.0, 224.0, scene_index=0),
+            existing,
+            _match("EP04", 249.0, 251.0, scene_index=2),
+        ]
+    )
+    hits: list[tuple[float, str, float, float]] = []
+    for t_query in (10.0, 10.25, 10.5, 10.75, 11.0):
+        # Stronger raw duplicate clusters would exhaust the old top-five
+        # budget before native scoring ever saw the zoomed contextual track.
+        hits.append((t_query, "EP01", 500.0 + t_query, 0.42))
+        hits.append((t_query, "EP09", 800.0 + t_query, 0.41))
+    for t_query, t_source in ((10.0, 229.0), (10.5, 229.5), (11.0, 230.0)):
+        hits.append((t_query, "EP04", t_source, 0.28))
+
+    hypotheses = ZoomRematchService._build_hypotheses(
+        hits,
+        existing,
+        q_start=10.0,
+        q_end=11.0,
+        span=1.0,
+        context_matches=context,
+    )
+
+    assert hypotheses[0].is_current
+    assert hypotheses[1].episode == "EP04"
+    assert hypotheses[1].source_at(10.5) == pytest.approx(229.5)
+
+
+def test_context_corridor_requires_matching_resolved_neighbors() -> None:
+    context = MatchList(
+        matches=[
+            _match("EP04", 220.0, 224.0, scene_index=0),
+            _match("EP01", 500.0, 501.0, scene_index=1),
+            _match("EP05", 249.0, 251.0, scene_index=2),
+        ]
+    )
+    assert ZoomRematchService._context_corridor(context, 1) is None
+
+
 def test_fit_cluster_clamps_absurd_slopes() -> None:
     # Nearly-vertical evidence would fit a slope far outside any plausible
     # speed ratio; the fit must fall back to a=1 with a median intercept.
@@ -94,6 +138,18 @@ def test_fit_cluster_clamps_absurd_slopes() -> None:
         "points": [(10.0, 100.0), (10.2, 300.0), (10.4, 500.0)],
         "hits": {10.0, 10.2, 10.4},
         "max_sim": 0.5,
+    }
+    hypothesis = ZoomRematchService._fit_cluster(cluster)
+    assert hypothesis is not None
+    assert hypothesis.a == 1.0
+
+
+def test_fit_cluster_does_not_infer_rate_from_sub_second_static_shot() -> None:
+    cluster = {
+        "episode": "EP04",
+        "points": [(10.0, 229.0), (10.4, 229.0), (10.8, 229.5)],
+        "hits": {10.0, 10.4, 10.8},
+        "max_sim": 0.31,
     }
     hypothesis = ZoomRematchService._fit_cluster(cluster)
     assert hypothesis is not None
@@ -115,7 +171,7 @@ def _best(episode: str, a: float, b: float, score: float, is_current=False) -> d
     }
 
 
-def _decide(best, current_score, existing):
+def _decide(best, current_score, existing, *, scored_results=None):
     return ZoomRematchService._decide(
         best,
         current_score,
@@ -127,6 +183,7 @@ def _decide(best, current_score, existing):
         scored=2,
         deadline_hit=False,
         run_started=0.0,
+        scored_results=scored_results,
     )
 
 
@@ -172,6 +229,60 @@ def test_decide_current_hypothesis_never_reports_change() -> None:
         _best("EP01", 1.0, 90.0, score=0.7, is_current=True), 0.7, existing
     )
     assert not outcome.changed
+
+
+def test_decide_exposes_scored_candidate_even_when_primary_is_confirmed() -> None:
+    existing = _match("EP01", 100.0, 103.0)
+    alternative = _best("EP08", 1.0, 300.0, score=0.40)
+    outcome = _decide(
+        _best("EP01", 1.0, 90.0, score=0.70, is_current=True),
+        0.70,
+        existing,
+        scored_results=[alternative],
+    )
+    assert not outcome.changed
+    assert len(outcome.alternatives) == 1
+    assert outcome.alternatives[0].episode == "EP08"
+    assert outcome.alternatives[0].algorithm == "zoom_search_center_1.6x"
+
+
+def test_registered_result_biases_one_native_frame_past_uncertain_leadin() -> None:
+    result = _best("EP04", 1.0, 200.0, score=0.80)
+    result["geometry"] = (0.2, 0.2, 0.8, 0.8)
+    start, end = ZoomRematchService._aligned_interval(
+        result, q_start=10.0, q_end=13.0, span=3.0
+    )
+    guard = ZoomRematchService.REGISTERED_ALIGNMENT_GUARD_S
+    assert start == pytest.approx(210.0 + guard)
+    assert end == pytest.approx(213.0 + guard)
+
+
+def test_merge_alternatives_has_no_count_cap_but_dedupes_temporal_clusters() -> None:
+    primary = _match("EP01", 100.0, 101.0)
+    candidates = [
+        AlternativeMatch(
+            episode=f"EP{i:02d}",
+            start_time=float(i * 10),
+            end_time=float(i * 10 + 1),
+            confidence=0.5,
+            speed_ratio=1.0,
+            algorithm="zoom_search",
+        )
+        for i in range(2, 12)
+    ]
+    candidates.append(
+        AlternativeMatch(
+            episode="EP02",
+            start_time=20.5,
+            end_time=21.5,
+            confidence=0.9,
+            speed_ratio=1.0,
+            algorithm="zoom_search_registered",
+        )
+    )
+    merged = ZoomRematchService.merge_alternatives(primary, candidates)
+    assert len(merged) == 10
+    assert sum(candidate.episode == "EP02" for candidate in merged) == 1
 
 
 # ----------------------------------------------------------------------

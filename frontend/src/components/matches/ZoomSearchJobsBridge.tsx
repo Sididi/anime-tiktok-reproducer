@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
 import { useZoomSearchAlertStore } from "@/stores/zoomSearchAlertStore";
-import type { ZoomSearchJob } from "@/types";
+import type { SceneMatch, ZoomSearchJob } from "@/types";
 
 // SSE events are wrapped so a job in the "error" state never puts a
 // top-level `status: "error"` on the wire (readSSEStream throws on those).
@@ -17,6 +17,7 @@ interface ZoomJobEnvelope {
 
 interface ZoomSearchJobsBridgeProps {
   projectId: string;
+  onResultMatch?: (match: SceneMatch) => void;
 }
 
 /**
@@ -27,7 +28,10 @@ interface ZoomSearchJobsBridgeProps {
  * Deliberately NOT registered in MatchValidation's activeStreamControllers:
  * a Recompute aborts those, and this subscription must outlive it.
  */
-export function ZoomSearchJobsBridge({ projectId }: ZoomSearchJobsBridgeProps) {
+export function ZoomSearchJobsBridge({
+  projectId,
+  onResultMatch,
+}: ZoomSearchJobsBridgeProps) {
   const upsertJob = useZoomSearchAlertStore((state) => state.upsertJob);
   const resetLiveJobs = useZoomSearchAlertStore((state) => state.resetLiveJobs);
   const abortRef = useRef<AbortController | null>(null);
@@ -35,6 +39,16 @@ export function ZoomSearchJobsBridge({ projectId }: ZoomSearchJobsBridgeProps) {
 
   useEffect(() => {
     let disposed = false;
+    const ingestJob = (job: ZoomSearchJob) => {
+      upsertJob(projectId, job);
+      if (
+        job.status === "complete" &&
+        !job.acknowledged &&
+        job.result_match
+      ) {
+        onResultMatch?.(job.result_match);
+      }
+    };
     // The live-job map is per-project; drop entries from a previous project.
     resetLiveJobs();
 
@@ -42,6 +56,8 @@ export function ZoomSearchJobsBridge({ projectId }: ZoomSearchJobsBridgeProps) {
       .listZoomSearchJobs(projectId)
       .then(({ jobs }) => {
         if (disposed) return;
+        // Project loading reads the persisted matches and remains the source
+        // of truth on refresh; the snapshot is only for restoring alerts.
         jobs.forEach((job) => upsertJob(projectId, job));
       })
       .catch(() => {
@@ -74,7 +90,7 @@ export function ZoomSearchJobsBridge({ projectId }: ZoomSearchJobsBridgeProps) {
             resp,
             (event) => {
               if (event.kind === "zoom_job" && event.job) {
-                upsertJob(projectId, event.job);
+                ingestJob(event.job);
               }
             },
             { signal: controller.signal },
@@ -94,7 +110,7 @@ export function ZoomSearchJobsBridge({ projectId }: ZoomSearchJobsBridgeProps) {
         reconnectTimerRef.current = null;
       }
     };
-  }, [projectId, upsertJob, resetLiveJobs]);
+  }, [projectId, upsertJob, resetLiveJobs, onResultMatch]);
 
   return null;
 }
