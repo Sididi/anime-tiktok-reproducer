@@ -7,7 +7,7 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-08-24-premiere-link-v16";
+var ATR_HOST_BUILD_ID = "2026-08-25-cleanup-project-cycle-v17";
 // Separates runScript()'s status from the non-fatal warnings the executed
 // script published. Must stay in sync with HOST_RUN_WARNING_SEPARATOR in
 // client/main.js.
@@ -19,11 +19,20 @@ var __atrTempAudioSequenceByJob = {};
 var __atrProxyAttachAttemptMap = {};
 var __atrImportedProjectRefs = [];
 var __atrCleanupTargetProjectRefs = [];
+var __atrCleanupClosingProjectIdentities = [];
 var __atrEncoderCallbacksBound = false;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
 var __atrProjectPurgeBinName = "__ATR_PURGE__";
 var __atrProxyOutputSuffix = "__atr_proxy.mp4";
 var __atrProxyRepairOutputSuffix = "__atr_proxy_projectitem.mp4";
+
+// Cleanup closes the now-empty ATR project to release Premiere's internal
+// media/proxy records. Keep the panel host alive while no project is open.
+try {
+  if (app && app.setExtensionPersistent) {
+    app.setExtensionPersistent(ATR_EXTENSION_ID, 1);
+  }
+} catch (ePersistentExtension) {}
 
 /**
  * JSON.stringify polyfill for ExtendScript (ES3).
@@ -2646,6 +2655,233 @@ function cleanupImportedProjectsForLocalRoots(localRootsJson) {
       }
     } catch (eCleanupGc) {}
     return JSON.stringify(purgeSummary);
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
+function closeImportedProjectsAfterCleanup(localRootsJson) {
+  try {
+    var roots = [];
+    try {
+      roots =
+        typeof localRootsJson === "string"
+          ? JSON.parse(localRootsJson || "[]")
+          : localRootsJson;
+    } catch (eParse) {
+      roots = [];
+    }
+    var normalizedRoots = [];
+    for (var i = 0; roots && i < roots.length; i += 1) {
+      var normalizedRoot = __atrNormalizeComparePath(roots[i]);
+      if (normalizedRoot) {
+        normalizedRoots.push(normalizedRoot);
+      }
+    }
+    if (normalizedRoots.length === 0) {
+      return "ERROR: No local project roots were provided for project release";
+    }
+
+    var targetProjects = __atrResolveCleanupTargetProjects(
+      normalizedRoots,
+      false,
+    );
+    var result = {
+      ok: true,
+      target_project_count: targetProjects.length,
+      close_attempted_count: 0,
+      closed_project_count: 0,
+      project_identities: [],
+      project_paths: [],
+      warnings: [],
+    };
+    __atrCleanupClosingProjectIdentities = [];
+
+    for (var p = 0; p < targetProjects.length; p += 1) {
+      var targetProject = targetProjects[p];
+      if (!targetProject) {
+        continue;
+      }
+      var identity = __atrGetProjectIdentity(targetProject);
+      var projectPath = "";
+      try {
+        projectPath = __atrSafeString(targetProject.path || "");
+      } catch (eProjectPath) {}
+      result.project_identities.push(identity);
+      result.project_paths.push(projectPath);
+      __atrCleanupClosingProjectIdentities.push(identity);
+
+      if (!targetProject.closeDocument) {
+        result.ok = false;
+        result.warnings.push(
+          "Project.closeDocument is unavailable for " +
+            (identity || "cleanup project"),
+        );
+        continue;
+      }
+
+      result.close_attempted_count += 1;
+      try {
+        // Do not save the generated/imported project contents. Reopening a
+        // dedicated scratch project after this call provides a hard lifetime
+        // boundary for proxy records retained outside the live project tree.
+        var closeResult = targetProject.closeDocument(0, 0);
+        var stillOpen = __atrProjectIsOpen(
+          targetProject,
+          __atrGetOpenProjects(),
+        );
+        if (
+          closeResult === 0 ||
+          closeResult === "0" ||
+          closeResult === true ||
+          !stillOpen
+        ) {
+          result.closed_project_count += 1;
+        } else {
+          result.ok = false;
+          result.warnings.push(
+            "Premiere did not close " + (identity || "cleanup project"),
+          );
+        }
+      } catch (eCloseProject) {
+        result.ok = false;
+        result.warnings.push(
+          "Could not close " +
+            (identity || "cleanup project") +
+            ": " +
+            __atrSafeString(eCloseProject.message || eCloseProject),
+        );
+      }
+    }
+
+    result.ok =
+      result.ok &&
+      result.closed_project_count === result.target_project_count;
+    if (!result.ok) {
+      result.error = "Premiere cleanup project did not close completely";
+    }
+    return JSON.stringify(result);
+  } catch (e) {
+    return "ERROR: " + e.message + " (line " + e.line + ")";
+  }
+}
+
+function openCleanupScratchProject(scratchProjectPath) {
+  try {
+    var result = {
+      ok: true,
+      scratch_project_path: __atrSafeString(scratchProjectPath),
+      pending_cleanup_project_count: 0,
+      closed_existing_scratch_count: 0,
+      opened_existing_scratch: false,
+      created_scratch: false,
+      warnings: [],
+    };
+    var openProjects = __atrGetOpenProjects();
+    for (var i = 0; i < openProjects.length; i += 1) {
+      var openIdentity = __atrGetProjectIdentity(openProjects[i]);
+      for (
+        var closing = 0;
+        closing < __atrCleanupClosingProjectIdentities.length;
+        closing += 1
+      ) {
+        if (
+          openIdentity &&
+          openIdentity === __atrCleanupClosingProjectIdentities[closing]
+        ) {
+          result.pending_cleanup_project_count += 1;
+          break;
+        }
+      }
+    }
+    if (result.pending_cleanup_project_count > 0) {
+      result.ok = false;
+      result.error = "Premiere still has a cleanup project open";
+      return JSON.stringify(result);
+    }
+
+    var normalizedScratchPath = __atrNormalizePath(scratchProjectPath);
+    if (!normalizedScratchPath) {
+      return "ERROR: Cleanup scratch project path is empty";
+    }
+    var scratchComparePath = __atrNormalizeComparePath(normalizedScratchPath);
+
+    // The stable scratch can already be open after an interrupted cleanup.
+    // Close it without saving and reopen it so it becomes the active, pristine
+    // destination for the next automated import.
+    openProjects = __atrGetOpenProjects();
+    for (var p = 0; p < openProjects.length; p += 1) {
+      var candidatePath = "";
+      try {
+        candidatePath = __atrNormalizeComparePath(openProjects[p].path || "");
+      } catch (eCandidatePath) {}
+      if (candidatePath !== scratchComparePath) {
+        continue;
+      }
+      try {
+        if (openProjects[p].closeDocument) {
+          openProjects[p].closeDocument(0, 0);
+          result.closed_existing_scratch_count += 1;
+        }
+      } catch (eCloseScratch) {
+        result.warnings.push(
+          "Could not recycle the existing ATR scratch project: " +
+            __atrSafeString(eCloseScratch.message || eCloseScratch),
+        );
+      }
+    }
+
+    var scratchFile = new File(normalizedScratchPath);
+    var opened = false;
+    if (scratchFile.exists && app.openDocument) {
+      try {
+        opened = !!app.openDocument(
+          scratchFile.fsName,
+          true,
+          true,
+          true,
+          true,
+        );
+        result.opened_existing_scratch = opened;
+      } catch (eOpenScratch) {
+        result.warnings.push(
+          "Could not open the ATR scratch project: " +
+            __atrSafeString(eOpenScratch.message || eOpenScratch),
+        );
+      }
+    }
+
+    if (!opened && app.newProject) {
+      try {
+        if (!scratchFile.parent.exists) {
+          scratchFile.parent.create();
+        }
+        opened = !!app.newProject(scratchFile.fsName);
+        result.created_scratch = opened;
+      } catch (eNewScratch) {
+        result.warnings.push(
+          "Could not create the ATR scratch project: " +
+            __atrSafeString(eNewScratch.message || eNewScratch),
+        );
+      }
+    }
+
+    var activeProjectPath = "";
+    try {
+      activeProjectPath = __atrNormalizeComparePath(
+        app && app.project ? app.project.path || "" : "",
+      );
+    } catch (eActiveScratchPath) {}
+    result.active_project_path = activeProjectPath;
+    result.ok = opened && activeProjectPath === scratchComparePath;
+    if (!result.ok) {
+      result.error = "Premiere could not activate the ATR cleanup scratch project";
+    } else {
+      __atrCleanupClosingProjectIdentities = [];
+      __atrCleanupTargetProjectRefs = [];
+      __atrImportedProjectRefs = [];
+    }
+    return JSON.stringify(result);
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }

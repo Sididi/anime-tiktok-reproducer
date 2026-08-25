@@ -2702,6 +2702,11 @@
 
     var sequenceEndSec = ttsEndSec;
 
+    // Give Premiere an early chance to materialize the packaged border before
+    // the heavier preset and subtitle graphics work. The final call after
+    // subtitles is idempotent and repairs the placement only when V2 is empty.
+    ensureWhiteBorderMogrt(sequence, v2, sequenceEndSec);
+
     validateAndRepairRawSceneVideoPlacement(v1, v3, scenes);
     clearRawAudioZone(sequence, RAW_AUDIO_TRACK_START_INDEX, rawAudioZoneWidth);
     duplicateRawSceneAudioToTrack(
@@ -2842,9 +2847,8 @@
     );
     perfEnd("subtitles", "Subtitles");
 
-    // Import the border after subtitle MOGRT processing. This avoids making
-    // the border the first importMGT call against a cold Motion Graphics
-    // engine, and gives us one final, verified repair point before completion.
+    // Verify the early border after the Motion Graphics work has settled. If
+    // the first import never materialized, this makes one fresh direct attempt.
     ensureWhiteBorderMogrt(sequence, v2, sequenceEndSec);
     refreshSequenceUI(sequence);
     perfEnd("total");

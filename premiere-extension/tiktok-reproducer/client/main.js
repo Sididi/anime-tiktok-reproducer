@@ -70,6 +70,8 @@
   var CLEANUP_PROXY_SETTLE_MS = 1000;
   var CLEANUP_MEDIA_SETTLE_MS = 1000;
   var CLEANUP_PURGE_SETTLE_MS = 2500;
+  var CLEANUP_PROJECT_CLOSE_SETTLE_MS = 2000;
+  var CLEANUP_SCRATCH_OPEN_SETTLE_MS = 2500;
   var CLEANUP_PROXY_DETACH_MAX_PASSES = 5;
   var PROXY_RECONCILE_MAX_ATTACH_ATTEMPTS = 120;
   var MAX_LOG_ENTRIES = 200;
@@ -2095,6 +2097,9 @@
       offline: null,
       media_encoder_release: null,
     };
+    var scratchProjectPath = normalizeSlashes(
+      path.join(STATE_DIR, "ATR_Automation_Scratch.prproj"),
+    );
     return prepareMediaEncoderForExportInHost()
       .then(
         function (mediaEncoderSummary) {
@@ -2143,33 +2148,102 @@
       .then(function (result) {
         var summary = parseCleanupHostResult(result, "project purge");
         summary.preparation = preparation;
-        // Project-item deletion and setOffline() release handles
-        // asynchronously on Windows. Yield, then inspect every open project;
-        // local deletion is forbidden while any source/proxy link survives.
+        summary.purge_ok = summary.ok;
+        // The live project tree can be empty while Premiere still retains
+        // proxy records internally. Closing the generated project without
+        // saving is the supported lifetime boundary for those records. A
+        // dedicated blank scratch project is then opened for the next import.
         return sleep(CLEANUP_PURGE_SETTLE_MS).then(function () {
-          var verifyCall =
-            'verifyImportedProjectsCleanup("' +
+          var closeCall =
+            'closeImportedProjectsAfterCleanup("' +
             escapeForEval(JSON.stringify(cleanupRoots)) +
             '")';
-          return evalHost(verifyCall).then(function (verifyResult) {
-            var releaseVerification = parseCleanupHostResult(
-              verifyResult,
-              "post-purge release verification",
+          return evalHost(closeCall).then(function (closeResult) {
+            var projectRelease = parseCleanupHostResult(
+              closeResult,
+              "project close",
             );
-            summary.release_verification = releaseVerification;
-            if (!releaseVerification.ok) {
+            summary.project_release = projectRelease;
+            if (!projectRelease.ok) {
               summary.ok = false;
               summary.error =
-                "Premiere still has linked source/proxy media after purge";
-              summary.remaining_media_references = Number(
-                releaseVerification.remaining_media_references || 0,
-              );
-              summary.remaining_proxy_references = Number(
-                releaseVerification.remaining_proxy_references || 0,
-              );
+                projectRelease.error ||
+                "Premiere did not release the cleanup project";
+              return summary;
             }
-            return summary;
+
+            if (Number(projectRelease.closed_project_count || 0) <= 0) {
+              return summary;
+            }
+
+            return sleep(CLEANUP_PROJECT_CLOSE_SETTLE_MS)
+              .then(function () {
+                var scratchCall =
+                  'openCleanupScratchProject("' +
+                  escapeForEval(scratchProjectPath) +
+                  '")';
+                return evalHost(scratchCall);
+              })
+              .then(function (scratchResult) {
+                var scratchSummary = parseCleanupHostResult(
+                  scratchResult,
+                  "scratch project open",
+                );
+                summary.scratch_project = scratchSummary;
+                if (!scratchSummary.ok) {
+                  summary.ok = false;
+                  summary.error =
+                    scratchSummary.error ||
+                    "Premiere could not open the ATR scratch project";
+                  return summary;
+                }
+                return sleep(CLEANUP_SCRATCH_OPEN_SETTLE_MS).then(function () {
+                  return summary;
+                });
+              });
           });
+        });
+      })
+      .then(function (summary) {
+        if (
+          !summary.project_release ||
+          !summary.project_release.ok ||
+          (summary.scratch_project && !summary.scratch_project.ok)
+        ) {
+          return summary;
+        }
+        var verifyCall =
+          'verifyImportedProjectsCleanup("' +
+          escapeForEval(JSON.stringify(cleanupRoots)) +
+          '")';
+        return evalHost(verifyCall).then(function (verifyResult) {
+          var releaseVerification = parseCleanupHostResult(
+            verifyResult,
+            "post-close release verification",
+          );
+          summary.release_verification = releaseVerification;
+          if (!releaseVerification.ok) {
+            summary.ok = false;
+            summary.error =
+              "Premiere still has linked source/proxy media after project close";
+            summary.remaining_media_references = Number(
+              releaseVerification.remaining_media_references || 0,
+            );
+            summary.remaining_proxy_references = Number(
+              releaseVerification.remaining_proxy_references || 0,
+            );
+          } else if (
+            Number(summary.project_release.closed_project_count || 0) > 0 &&
+            summary.scratch_project &&
+            summary.scratch_project.ok
+          ) {
+            // Closing the transient project is stronger than an incomplete
+            // item-by-item purge: no live or retained project object can refer
+            // to the files after this point.
+            summary.ok = true;
+            summary.error = null;
+          }
+          return summary;
         });
       })
       .then(function (summary) {
@@ -2215,6 +2289,14 @@
               remainingRootItems +
               ", targetProjects=" +
               Number(summary.target_project_count || 0) +
+              ", closedProjects=" +
+              Number(
+                summary.project_release &&
+                  summary.project_release.closed_project_count ||
+                  0,
+              ) +
+              ", scratchReady=" +
+              !!(summary.scratch_project && summary.scratch_project.ok) +
               ", detachedProxies=" +
               detachedProxyCount +
               ", detachFailed=" +
@@ -3024,7 +3106,11 @@
 
       try {
         child = childProcess.fork(workerPath, [], {
-          stdio: ["ignore", "ignore", "ignore", "ipc"],
+          // CEP's renderer can populate process.execArgv with Chromium flags.
+          // Passing those to the Node helper makes it exit with code 1 on
+          // affected Windows installations before drive_worker.js executes.
+          execArgv: [],
+          stdio: ["ignore", "ignore", "pipe", "ipc"],
         });
       } catch (forkErr) {
         log("Worker unavailable, using in-process fallback", "warn");
@@ -3037,6 +3123,13 @@
 
       trackWorkerChild(child);
       var settled = false;
+      var workerStderr = "";
+
+      if (child.stderr) {
+        child.stderr.on("data", function (chunk) {
+          workerStderr = (workerStderr + String(chunk || "")).slice(-1200);
+        });
+      }
 
       function completeWithError(err) {
         if (settled) {
@@ -3097,7 +3190,10 @@
 
         exitingWithFallback = true;
         log(
-          "Worker exited with code " + code + ", retrying in-process fallback",
+          "Worker exited with code " +
+            code +
+            ", retrying in-process fallback" +
+            (workerStderr ? ": " + workerStderr.trim() : ""),
           "warn",
         );
         runDriveTaskFallback(taskName, payload, onProgress).then(

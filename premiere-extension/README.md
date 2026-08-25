@@ -98,6 +98,8 @@ Deletion happens only after:
 - a confirmed successful Drive upload,
 - proxy generation/reconciliation is stopped and managed proxies are detached,
 - every open Premiere project containing the downloaded source/proxy paths is purged,
+- the emptied automation project is closed without saving transient imports,
+- a clean `%APPDATA%\Adobe\TiktokReproducer\state\ATR_Automation_Scratch.prproj` project is opened for the next batch,
 - Premiere verifies that no source or proxy links to those paths remain,
 - the local downloaded folder is fully removed.
 

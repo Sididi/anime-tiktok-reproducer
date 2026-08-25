@@ -130,18 +130,20 @@ def test_jsx_tries_native_fondu_additif_then_opacity_fallback():
     assert "effect component did not appear" not in jsx
 
 
-def test_jsx_verifies_white_border_after_subtitle_mogrt_warmup():
+def test_jsx_places_white_border_early_and_verifies_after_subtitles():
     jsx = _render(title=True, category=True)
     border_fn = jsx[
         jsx.index("function ensureWhiteBorderMogrt")
         : jsx.index("function getMotionComponent")
     ]
 
-    subtitle_import = jsx.index("importUnifiedSubtitles(")
-    border_import = jsx.index(
-        "ensureWhiteBorderMogrt(sequence, v2, sequenceEndSec);"
-    )
-    assert subtitle_import < border_import
+    border_call = "ensureWhiteBorderMogrt(sequence, v2, sequenceEndSec);"
+    sequence_end = jsx.index("var sequenceEndSec = ttsEndSec;")
+    early_border = jsx.index(border_call, sequence_end)
+    subtitle_import = jsx.index("importUnifiedSubtitles(", early_border)
+    final_border = jsx.index(border_call, subtitle_import)
+    assert jsx.count(border_call) == 2
+    assert sequence_end < early_border < subtitle_import < final_border
 
     assert border_fn.count("importedBorderCandidate = sequence.importMGT(") == 1
     assert 'BORDER_MOGRT_PATH,\n          "0",\n          1,\n          0,' in jsx
