@@ -12,13 +12,29 @@ function installZoomMocks(
     projectId,
     libraryType,
     playbackReady,
-  }: { projectId: string; libraryType: string; playbackReady: boolean },
+    completionFingerprint = "match",
+    refetchEpisode,
+  }: {
+    projectId: string;
+    libraryType: string;
+    playbackReady: boolean;
+    // Scene layout stamped on the fake completion: the real one, or one
+    // that no longer describes the page's scenes.
+    completionFingerprint?: "match" | "mismatch";
+    // Once `window.__refetchArmed` is set, GET /matches reports scene 1 on
+    // this episode — emulates matches.json having moved on.
+    refetchEpisode?: string;
+  },
 ) {
   const testWindow = window as typeof window & {
     __zoomStarted?: number[];
     __zoomAcks?: string[];
     __zoomJobs?: Record<string, Record<string, unknown>>;
-    __atrHub?: { pushItem(topic: string, item: unknown): void };
+    __refetchArmed?: boolean;
+    __atrHub?: {
+      push(frame: unknown): void;
+      pushItem(topic: string, item: unknown): void;
+    };
   };
   testWindow.__zoomStarted = [];
   testWindow.__zoomAcks = [];
@@ -36,6 +52,7 @@ function installZoomMocks(
       new_match: null;
       result_match: Record<string, unknown> | null;
       candidates_added: number;
+      scene_fingerprint: { count: number; start: number; end: number } | null;
       error: null;
       acknowledged: boolean;
       created_at: number;
@@ -151,6 +168,15 @@ function installZoomMocks(
       return json({ scenes });
     }
     if (url.pathname === `${prefix}/matches` && init?.method !== "POST") {
+      if (refetchEpisode && testWindow.__refetchArmed) {
+        return json({
+          matches: matches.map((match) =>
+            match.scene_index === 1
+              ? { ...match, episode: refetchEpisode }
+              : match,
+          ),
+        });
+      }
       return json({ matches });
     }
     if (url.pathname === `${prefix}/sources/episodes`) {
@@ -172,6 +198,20 @@ function installZoomMocks(
       return json(manifest);
     }
     if (url.pathname === `${prefix}/matches/find` && init?.method === "POST") {
+      // Like the backend's invalidate_project: a recompute cancels the
+      // project's unseen completed jobs and broadcasts them.
+      for (const job of Object.values(jobs)) {
+        if (job.status === "complete" && !job.acknowledged) {
+          job.status = "cancelled";
+          job.acknowledged = true;
+          job.message = "Cancelled: recompute";
+          testWindow.__atrHub?.pushItem("zoom_jobs", {
+            key: job.id,
+            project_id: job.project_id,
+            data: { ...job },
+          });
+        }
+      }
       return sse([
         {
           status: "complete",
@@ -234,6 +274,7 @@ function installZoomMocks(
         new_match: null,
         result_match: null,
         candidates_added: 0,
+        scene_fingerprint: null,
         error: null,
         acknowledged: false,
         created_at: 0,
@@ -243,6 +284,10 @@ function installZoomMocks(
       // The fake background job runs and completes shortly after.
       window.setTimeout(() => {
         job.status = "running";
+        job.scene_fingerprint =
+          completionFingerprint === "match"
+            ? { count: 3, start: sceneIndex * 2, end: sceneIndex * 2 + 2 }
+            : { count: 5, start: 0, end: 1 };
         publishJob(job);
         job.status = "complete";
         job.changed = true;
@@ -470,6 +515,23 @@ test("recompute clears alerts and the job subscription stays alive", async ({
   await expect(page.locator("[data-zoom-search-alert-card]")).toHaveCount(0);
   await expect(page.locator('[data-zoom-search-alert="true"]')).toHaveCount(0);
 
+  // The server cancelled the unseen completion; a later snapshot replay
+  // (reconnect) carries it as cancelled and must not resurrect the alert.
+  await expect
+    .poll(async () =>
+      page.evaluate(() => window.__zoomJobs?.["job-1"]?.status ?? null),
+    )
+    .toBe("cancelled");
+  await page.evaluate(() => {
+    const job = window.__zoomJobs?.["job-1"];
+    window.__atrHub?.push({
+      kind: "snapshot",
+      topic: "zoom_jobs",
+      items: [{ key: "job-1", project_id: job?.project_id, data: job }],
+    });
+  });
+  await expect(page.locator("[data-zoom-search-alert-card]")).toHaveCount(0);
+
   // The bridge's subscription is not registered in the page's abortable
   // stream set: it survives the recompute and keeps delivering job events.
   await expect
@@ -502,11 +564,165 @@ test("pure projects show no zoom search button", async ({ page }) => {
   await expect(page.locator("[data-zoom-search-button]")).toHaveCount(0);
 });
 
+// A completed, unacknowledged job as the hub would replay it after a
+// refresh or reconnect: its frozen result points at episodes the page's
+// persisted matches never mention.
+const seededCompletion = (projectId: string) => ({
+  key: "job-seeded",
+  project_id: projectId,
+  data: {
+    id: "job-seeded",
+    project_id: projectId,
+    scene_index: 1,
+    status: "complete",
+    message: "Existing match confirmed — 1 new AI candidate",
+    changed: false,
+    applied: false,
+    old_match: null,
+    new_match: null,
+    result_match: {
+      scene_index: 1,
+      episode: "Episode-99.mkv",
+      start_time: 500,
+      end_time: 502,
+      confidence: 0.9,
+      speed_ratio: 1,
+      confirmed: false,
+      alternatives: [
+        {
+          episode: "Episode-98.mkv",
+          start_time: 700,
+          end_time: 702,
+          confidence: 0.8,
+          speed_ratio: 1,
+          vote_count: 3,
+          algorithm: "zoom_search_motion",
+        },
+      ],
+      start_candidates: [],
+      middle_candidates: [],
+      end_candidates: [],
+    },
+    candidates_added: 1,
+    scene_fingerprint: { count: 3, start: 2, end: 4 },
+    error: null,
+    acknowledged: false,
+    created_at: 0,
+  },
+});
+
+test("snapshot replay restores the alert but does not rewrite the match", async ({
+  page,
+}) => {
+  const projectId = "zoom-search-snapshot-replay";
+  await page.addInitScript(installEventHubMock, {
+    topics: { zoom_jobs: [seededCompletion(projectId)] },
+  });
+  await page.addInitScript(installZoomMocks, {
+    projectId,
+    libraryType: "anime",
+    playbackReady: true,
+  });
+  await page.goto(`/project/${projectId}/matches`);
+
+  // The alert survives the refresh, with the backend's own summary text.
+  const alert = page.locator("[data-zoom-search-alert-card]");
+  await expect(alert).toBeVisible({ timeout: 15000 });
+  await expect(alert).toContainText("Scene 2");
+  await expect(alert).toContainText("1 new AI candidate");
+
+  // Persisted matches stay the source of truth: the replayed frozen result
+  // is not spliced into the page.
+  await expect(mainCard(page, 1)).toContainText("Episode-02.mkv");
+  await expect(mainCard(page, 1)).not.toContainText("Episode-99.mkv");
+  await mainCard(page, 1)
+    .getByRole("button", { name: "Edit match timing" })
+    .click();
+  await expect(page.getByText("Manual Match Selection - Scene 2")).toBeVisible();
+  await expect(page.getByText("Episode-98.mkv")).toHaveCount(0);
+
+  // A reconnect replays the same snapshot: still nothing applied.
+  await page.evaluate(
+    (job) =>
+      window.__atrHub?.push({ kind: "snapshot", topic: "zoom_jobs", items: [job] }),
+    seededCompletion(projectId),
+  );
+  await expect(mainCard(page, 1)).toContainText("Episode-02.mkv");
+  await expect(page.getByText("Episode-98.mkv")).toHaveCount(0);
+
+  // A LIVE completion for the same job is applied (the gate is
+  // snapshot-vs-event, not a broken pipe).
+  await page.evaluate(
+    (job) => window.__atrHub?.pushItem("zoom_jobs", job),
+    seededCompletion(projectId),
+  );
+  await expect(page.getByText("Episode-98.mkv")).toBeVisible();
+});
+
+test("snapshot with a completed job refetches persisted matches", async ({
+  page,
+}) => {
+  const projectId = "zoom-search-snapshot-refetch";
+  await page.addInitScript(installEventHubMock, {
+    topics: { zoom_jobs: [seededCompletion(projectId)] },
+  });
+  await page.addInitScript(installZoomMocks, {
+    projectId,
+    libraryType: "anime",
+    playbackReady: true,
+    refetchEpisode: "Episode-07.mkv",
+  });
+  await page.goto(`/project/${projectId}/matches`);
+  await expect(page.locator("[data-zoom-search-alert-card]")).toBeVisible({
+    timeout: 15000,
+  });
+  await expect(mainCard(page, 1)).toContainText("Episode-02.mkv");
+
+  // matches.json moved on (e.g. a completion landed while this tab was
+  // disconnected); the replayed snapshot triggers a re-read of it instead
+  // of applying the job's frozen result.
+  await page.evaluate((job) => {
+    window.__refetchArmed = true;
+    window.__atrHub?.push({ kind: "snapshot", topic: "zoom_jobs", items: [job] });
+  }, seededCompletion(projectId));
+  await expect(mainCard(page, 1)).toContainText("Episode-07.mkv");
+  await expect(mainCard(page, 1)).not.toContainText("Episode-99.mkv");
+});
+
+test("a completion whose scene fingerprint no longer matches is ignored", async ({
+  page,
+}) => {
+  const projectId = "zoom-search-fingerprint";
+  await page.addInitScript(installEventHubMock, {});
+  await page.addInitScript(installZoomMocks, {
+    projectId,
+    libraryType: "anime",
+    playbackReady: true,
+    completionFingerprint: "mismatch",
+  });
+  await page.goto(`/project/${projectId}/matches`);
+
+  await page.locator('[data-zoom-search-scene-index="1"]').click();
+  await expect(page.locator("[data-zoom-search-alert-card]")).toBeVisible({
+    timeout: 15000,
+  });
+  await mainCard(page, 1)
+    .getByRole("button", { name: "Edit match timing" })
+    .click();
+  await expect(page.getByText("Manual Match Selection - Scene 2")).toBeVisible();
+  await expect(page.getByText("Episode-03.mkv")).toHaveCount(0);
+});
+
 declare global {
   interface Window {
     __zoomStarted?: number[];
     __zoomAcks?: string[];
     __zoomJobs?: Record<string, Record<string, unknown>>;
+    __refetchArmed?: boolean;
+    __atrHub?: {
+      push(frame: unknown): void;
+      pushItem(topic: string, item: unknown): void;
+    };
     __atrEventHub?: {
       debugSnapshot(): { subscriptions: Record<string, number> };
     };

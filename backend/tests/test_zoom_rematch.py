@@ -285,6 +285,76 @@ def test_merge_alternatives_has_no_count_cap_but_dedupes_temporal_clusters() -> 
     assert sum(candidate.episode == "EP02" for candidate in merged) == 1
 
 
+def _alt(
+    episode: str, start: float, end: float, algorithm: str = "zoom_search"
+) -> AlternativeMatch:
+    return AlternativeMatch(
+        episode=episode,
+        start_time=start,
+        end_time=end,
+        confidence=0.5,
+        speed_ratio=1.0,
+        algorithm=algorithm,
+    )
+
+
+def test_merge_alternatives_evidence_is_exact_dedup_only() -> None:
+    primary = _match("EP01", 100.0, 101.0)
+    evidence = [
+        _alt("EP01", 100.2, 101.2, "zoom_search_center_1.6x"),  # primary's cluster
+        _alt("EP01", 100.25, 101.25, "zoom_search_registered"),  # exact dup
+        _alt("EP01", 100.0, 101.0, "zoom_search"),  # the primary itself
+        _alt("EP02", 20.0, 21.0, "zoom_search_motion"),
+    ]
+    groups = [_alt("EP02", 20.4, 21.4, "timeline_cluster"), _alt("EP05", 50.0, 51.0)]
+    merged = ZoomRematchService.merge_alternatives(primary, groups, evidence=evidence)
+    assert [(c.episode, c.start_time) for c in merged] == [
+        ("EP01", 100.2),
+        ("EP02", 20.0),
+        ("EP05", 50.0),
+    ]
+    # Without evidence the behaviour is the historical cluster dedup.
+    assert ZoomRematchService.merge_alternatives(primary, groups) == [
+        groups[0],
+        groups[1],
+    ]
+
+
+def test_decide_keeps_same_cluster_zoom_evidence_when_primary_confirmed() -> None:
+    existing = _match("EP01", 209.8, 212.9)
+    outcome = _decide(
+        _best("EP01", 1.0, 90.0, score=0.70, is_current=True),
+        0.70,
+        existing,
+        scored_results=[_best("EP01", 1.0, 200.0, score=0.40)],
+    )
+    assert not outcome.changed
+    assert len(outcome.alternatives) == 1
+    assert outcome.alternatives[0].start_time == pytest.approx(210.0)
+    assert outcome.alternatives[0].algorithm == "zoom_search_center_1.6x"
+
+
+def test_decide_changed_keeps_previous_primary_over_same_cluster_evidence() -> None:
+    existing = _match("EP01", 100.0, 103.0)
+    existing.alternatives = [_alt("EP01", 100.6, 103.6, "zoom_search_motion")]
+    best = _best("EP02", 1.0, 200.0, score=0.62)
+    outcome = _decide(
+        best,
+        0.35,
+        existing,
+        scored_results=[best, _best("EP01", 1.0, 90.3, score=0.35)],
+    )
+    assert outcome.changed and outcome.new_match is not None
+    alternatives = outcome.new_match.alternatives
+    assert alternatives[0].algorithm == "pre_zoom_search"
+    assert alternatives[0].start_time == pytest.approx(100.0)
+    # The earlier run's same-track evidence and this run's are both kept.
+    assert [c.algorithm for c in alternatives[1:]] == [
+        "zoom_search_motion",
+        "zoom_search_center_1.6x",
+    ]
+
+
 # ----------------------------------------------------------------------
 # end-to-end (all heavy primitives faked)
 

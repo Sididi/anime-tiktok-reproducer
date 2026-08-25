@@ -42,6 +42,10 @@ const NOISE_FLOOR_RATIO = 0.05;
  * matching results. Pure function over already-loaded state — O(scenes ×
  * alternatives), instant even for very large projects.
  *
+ * Episodes that appear in no match and no alternative at all (typically
+ * ones indexed after the last run) are always proposed on top of the scored
+ * picks: the previous run could not have voted for them.
+ *
  * Returns a subset of `episodes` (same values); [] when nothing can be
  * proposed (no matches yet, or none map onto the current episode list).
  */
@@ -67,6 +71,18 @@ export function proposeEpisodes(
     if (!byStem.has(stem)) return;
     scores.set(stem, (scores.get(stem) ?? 0) + value);
   };
+  // Every episode the previous run considered at all, however weakly.
+  const seenStems = new Set<string>();
+  for (const match of matches) {
+    if (match.episode) seenStems.add(episodeStem(match.episode));
+    for (const alternative of match.alternatives ?? []) {
+      seenStems.add(episodeStem(alternative.episode));
+    }
+  }
+  const unseen = episodes.filter((episode) => {
+    const stem = episodeStem(episode);
+    return stem && !seenStems.has(stem) && byStem.get(stem) === episode;
+  });
 
   for (const match of matches) {
     const scene = sceneByIndex.get(match.scene_index);
@@ -102,7 +118,7 @@ export function proposeEpisodes(
     }
   }
 
-  if (!scores.size) return [];
+  if (!scores.size) return unseen;
 
   const ordered = [...scores.entries()].sort(
     (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
@@ -121,5 +137,6 @@ export function proposeEpisodes(
   if (!selected.length) selected.push(ordered[0][0]);
 
   const proposedStems = new Set(selected);
+  for (const episode of unseen) proposedStems.add(episodeStem(episode));
   return episodes.filter((episode) => proposedStems.has(episodeStem(episode)));
 }

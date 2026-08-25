@@ -423,6 +423,9 @@ export interface ZoomSearchJob {
   new_match: SceneMatch | null;
   result_match?: SceneMatch | null;
   candidates_added?: number;
+  // Scene layout the job ran against (scene count + this scene's bounds);
+  // null on frames emitted before the run started or by older backends.
+  scene_fingerprint?: { count: number; start: number; end: number } | null;
   error: string | null;
   acknowledged: boolean;
   created_at: number;

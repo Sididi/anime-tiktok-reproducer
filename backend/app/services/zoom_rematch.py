@@ -797,13 +797,77 @@ class ZoomRematchService:
             )
         return alternatives
 
+    # Two candidates closer than this on both ends are the same interval
+    # rediscovered (about one verification frame at 12 fps).
+    EXACT_DUPLICATE_EPS_S = 0.1
+
+    @staticmethod
+    def is_zoom_evidence(candidate: AlternativeMatch) -> bool:
+        """Candidates produced by a zoom search (any run), incl. the displaced primary."""
+        algorithm = candidate.algorithm or ""
+        return algorithm.startswith("zoom_search") or algorithm == "pre_zoom_search"
+
+    @classmethod
+    def _same_interval(cls, left: AlternativeMatch, right: AlternativeMatch) -> bool:
+        return (
+            canonical_episode_stem(left.episode) == canonical_episode_stem(right.episode)
+            and abs(left.start_time - right.start_time) <= cls.EXACT_DUPLICATE_EPS_S
+            and abs(left.end_time - right.end_time) <= cls.EXACT_DUPLICATE_EPS_S
+        )
+
+    @staticmethod
+    def _primary_as_alternative(primary: SceneMatch) -> AlternativeMatch:
+        return AlternativeMatch(
+            episode=primary.episode,
+            start_time=primary.start_time,
+            end_time=primary.end_time,
+            confidence=primary.confidence,
+            speed_ratio=primary.speed_ratio,
+            algorithm="primary",
+        )
+
+    @classmethod
+    def append_zoom_evidence(
+        cls,
+        kept: list[AlternativeMatch],
+        zoom: list[AlternativeMatch] | tuple[AlternativeMatch, ...],
+        primary: SceneMatch | None = None,
+    ) -> list[AlternativeMatch]:
+        """Append zoom results, dropping only exact duplicates.
+
+        Zoom results are paid-for evidence the owner wants to see in the
+        manual modal even when they sit in the same cluster as the current
+        match (a refined timing on the same track is still information), so
+        they are never cluster-deduped: only an exact (episode, start, end)
+        duplicate of something already kept — or of the primary itself — is
+        skipped. Input order is preserved (score-descending from the search).
+        """
+        merged = list(kept)
+        primary_alt = cls._primary_as_alternative(primary) if primary else None
+        for candidate in zoom:
+            if (
+                not candidate.episode
+                or candidate.end_time <= candidate.start_time
+                or (primary_alt is not None and cls._same_interval(candidate, primary_alt))
+                or any(cls._same_interval(candidate, other) for other in merged)
+            ):
+                continue
+            merged.append(candidate)
+        return merged
+
     @classmethod
     def merge_alternatives(
         cls,
         primary: SceneMatch,
         *groups: list[AlternativeMatch] | tuple[AlternativeMatch, ...],
+        evidence: list[AlternativeMatch] | tuple[AlternativeMatch, ...] = (),
     ) -> list[AlternativeMatch]:
-        """Keep every distinct candidate cluster, without an arbitrary cap."""
+        """Keep every distinct candidate cluster, without an arbitrary cap.
+
+        ``evidence`` (zoom-search results) is pinned first and only
+        exact-deduped (see :meth:`append_zoom_evidence`); ``groups`` are then
+        cluster-deduped against the primary, the pinned evidence and each other.
+        """
         source_duration = max(0.0, primary.end_time - primary.start_time)
         query_duration = source_duration * max(0.0, primary.speed_ratio)
         separation = max(2.0, query_duration)
@@ -817,15 +881,8 @@ class ZoomRematchService:
             right_mid = 0.5 * (right.start_time + right.end_time)
             return abs(left_mid - right_mid) < separation
 
-        primary_as_alternative = AlternativeMatch(
-            episode=primary.episode,
-            start_time=primary.start_time,
-            end_time=primary.end_time,
-            confidence=primary.confidence,
-            speed_ratio=primary.speed_ratio,
-            algorithm="primary",
-        )
-        merged: list[AlternativeMatch] = []
+        primary_as_alternative = cls._primary_as_alternative(primary)
+        merged = cls.append_zoom_evidence([], evidence, primary)
         for group in groups:
             for candidate in group:
                 if (
@@ -857,11 +914,14 @@ class ZoomRematchService:
         *,
         scored_results: list[dict] | None = None,
     ) -> ZoomSearchOutcome:
-        zoom_alternatives = cls.merge_alternatives(
-            existing_match,
+        # Every scored hypothesis is kept as evidence, even inside the current
+        # match's cluster: the owner reviews them in the manual modal.
+        zoom_alternatives = cls.append_zoom_evidence(
+            [],
             cls._alternatives_from_results(
                 scored_results or [], q_start, q_end, span
             ),
+            existing_match,
         )
 
         def outcome(
@@ -947,11 +1007,23 @@ class ZoomRematchService:
             merged_from=existing_match.merged_from,
             doubt_reasons=sorted({"zoom_search", *best["doubt"]}),
         )
+        existing_evidence = [
+            candidate
+            for candidate in existing_match.alternatives
+            if cls.is_zoom_evidence(candidate)
+        ]
+        existing_other = [
+            candidate
+            for candidate in existing_match.alternatives
+            if not cls.is_zoom_evidence(candidate)
+        ]
+        # The displaced primary leads so it stays the first alternative; zoom
+        # evidence is only exact-deduped, earlier runs' entries first so a
+        # rediscovered interval keeps its stored tag.
         new_match.alternatives = cls.merge_alternatives(
             new_match,
-            zoom_alternatives,
-            previous_primary,
-            existing_match.alternatives,
+            existing_other,
+            evidence=[*previous_primary, *existing_evidence, *zoom_alternatives],
         )
         return outcome(True, new_match, "found a better zoom-consistent match")
 

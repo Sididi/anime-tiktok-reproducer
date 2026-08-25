@@ -366,3 +366,196 @@ async def test_pure_project_rejected(monkeypatch, tmp_path) -> None:
     await _wait_terminal(service, job.id)
     assert job.status == "error"
     assert "pure" in (job.error or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_project_drops_unacknowledged_completed_jobs(
+    monkeypatch, tmp_path
+) -> None:
+    _Env(monkeypatch, tmp_path)
+    service = ZoomSearchService()
+    from app.services.zoom_search_service import ZoomSearchJob
+
+    unseen = ZoomSearchJob(
+        project_id="proj-1", scene_index=1, status="complete", acknowledged=False,
+        result_match={"scene_index": 1},
+    )
+    seen = ZoomSearchJob(
+        project_id="proj-1", scene_index=2, status="complete", acknowledged=True
+    )
+    failed = ZoomSearchJob(
+        project_id="proj-1", scene_index=3, status="error", acknowledged=False
+    )
+    other_project = ZoomSearchJob(
+        project_id="proj-2", scene_index=1, status="complete", acknowledged=False
+    )
+    for job in (unseen, seen, failed, other_project):
+        service._jobs[job.id] = job
+
+    sub = event_hub.subscribe()
+    try:
+        service.invalidate_project("proj-1", reason="recompute")
+        frames = [f["data"] for f in sub.drain()]
+    finally:
+        event_hub.unsubscribe(sub)
+
+    # The unseen completed alert describes the old scene layout: dropped.
+    assert unseen.status == "cancelled"
+    assert unseen.acknowledged is True
+    assert unseen.message == "Cancelled: recompute"
+    # Already-acknowledged, failed and other projects' jobs are untouched.
+    assert seen.status == "complete" and seen.acknowledged is True
+    assert failed.status == "error" and failed.acknowledged is False
+    assert other_project.status == "complete"
+    assert other_project.acknowledged is False
+    assert [f["id"] for f in frames] == [unseen.id]
+    assert frames[0]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_completed_job_carries_scene_fingerprint(monkeypatch, tmp_path) -> None:
+    from app.services.zoom_search_service import SceneFingerprint
+
+    _Env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        ZoomRematchService,
+        "search_scene_sync",
+        classmethod(
+            lambda cls, *a, existing_match, **k: _outcome(existing_match, None, False)
+        ),
+    )
+    service = ZoomSearchService()
+    sub = event_hub.subscribe()
+    try:
+        job = await service.enqueue("proj-1", 1)
+        queued = [f["data"] for f in sub.drain()]
+        await _wait_terminal(service, job.id)
+    finally:
+        event_hub.unsubscribe(sub)
+
+    assert queued and queued[0]["scene_fingerprint"] is None
+    assert job.scene_fingerprint == SceneFingerprint(count=2, start=2.0, end=5.0)
+    assert job.model_dump(mode="json")["scene_fingerprint"] == {
+        "count": 2,
+        "start": 2.0,
+        "end": 5.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_unchanged_outcome_persists_same_cluster_zoom_candidate(
+    monkeypatch, tmp_path
+) -> None:
+    """Zoom evidence on the current track (same cluster as the primary) is
+    kept for the manual modal instead of being cluster-deduped away."""
+    env = _Env(monkeypatch, tmp_path)
+    candidate = AlternativeMatch(
+        episode="EP01",
+        start_time=20.3,
+        end_time=23.3,
+        confidence=0.4,
+        speed_ratio=1.0,
+        vote_count=3,
+        algorithm="zoom_search_center_1.6x",
+    )
+    monkeypatch.setattr(
+        ZoomRematchService,
+        "search_scene_sync",
+        classmethod(
+            lambda cls, *a, existing_match, **k: _outcome(
+                existing_match, None, False, (candidate,)
+            )
+        ),
+    )
+    service = ZoomSearchService()
+    job = await service.enqueue("proj-1", 1)
+    await _wait_terminal(service, job.id)
+
+    assert job.status == "complete"
+    assert job.changed is False and job.applied is False
+    assert job.candidates_added == 1
+    assert job.result_match is not None
+    assert job.result_match["alternatives"][0]["start_time"] == 20.3
+    assert job.result_match["alternatives"][0]["algorithm"] == "zoom_search_center_1.6x"
+    assert env.saved
+    assert job.message == "Existing match confirmed — 1 new AI candidate"
+
+
+@pytest.mark.asyncio
+async def test_exact_duplicate_zoom_candidate_saves_nothing(
+    monkeypatch, tmp_path
+) -> None:
+    env = _Env(monkeypatch, tmp_path)
+    existing = AlternativeMatch(
+        episode="EP03",
+        start_time=400.0,
+        end_time=403.0,
+        confidence=0.9,
+        speed_ratio=1.0,
+        vote_count=4,
+        algorithm="zoom_search_registered",
+    )
+    env.matches.matches[1].alternatives = [existing]
+    rediscovered = existing.model_copy(
+        update={"start_time": 400.05, "end_time": 403.05, "algorithm": "zoom_search"}
+    )
+    monkeypatch.setattr(
+        ZoomRematchService,
+        "search_scene_sync",
+        classmethod(
+            lambda cls, *a, existing_match, **k: _outcome(
+                existing_match, None, False, (rediscovered,)
+            )
+        ),
+    )
+    service = ZoomSearchService()
+    job = await service.enqueue("proj-1", 1)
+    await _wait_terminal(service, job.id)
+
+    assert job.status == "complete"
+    assert job.candidates_added == 0
+    assert job.result_match is None
+    assert not env.saved
+    assert job.message == "Existing match confirmed"
+
+
+@pytest.mark.asyncio
+async def test_previous_zoom_candidates_survive_next_run(monkeypatch, tmp_path) -> None:
+    """A same-cluster zoom candidate saved by an earlier run is not deleted
+    when the next run brings distinct evidence."""
+    env = _Env(monkeypatch, tmp_path)
+    earlier = AlternativeMatch(
+        episode="EP01",
+        start_time=20.4,
+        end_time=23.4,
+        confidence=0.4,
+        speed_ratio=1.0,
+        vote_count=3,
+        algorithm="zoom_search_motion",
+    )
+    env.matches.matches[1].alternatives = [earlier]
+    fresh = AlternativeMatch(
+        episode="EP05",
+        start_time=700.0,
+        end_time=703.0,
+        confidence=0.5,
+        speed_ratio=1.0,
+        vote_count=3,
+        algorithm="zoom_search_registered",
+    )
+    monkeypatch.setattr(
+        ZoomRematchService,
+        "search_scene_sync",
+        classmethod(
+            lambda cls, *a, existing_match, **k: _outcome(
+                existing_match, None, False, (fresh,)
+            )
+        ),
+    )
+    service = ZoomSearchService()
+    job = await service.enqueue("proj-1", 1)
+    await _wait_terminal(service, job.id)
+
+    assert job.candidates_added == 1
+    kept = next(m for m in env.saved[-1].matches if m.scene_index == 1)
+    assert [c.episode for c in kept.alternatives] == ["EP01", "EP05"]

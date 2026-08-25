@@ -37,6 +37,7 @@ import { TorrentManagementModal } from "@/components/library";
 import { RecomputeEpisodesSplitButton } from "@/components/matches/RecomputeEpisodesSplitButton";
 import { EpisodeSelectModal } from "@/components/matches/EpisodeSelectModal";
 import { ZoomSearchJobsBridge } from "@/components/matches/ZoomSearchJobsBridge";
+import { zoomJobMatchesSceneLayout } from "@/utils/zoomSearchLayout";
 import { ZoomSearchAlertStack } from "@/components/matches/ZoomSearchAlertStack";
 import { useZoomSearchAlertStore } from "@/stores/zoomSearchAlertStore";
 import { proposeEpisodes } from "@/utils/proposeEpisodes";
@@ -63,6 +64,7 @@ import type {
   SceneMatch,
   Scene,
   ScenePlaybackSceneAsset,
+  ZoomSearchJob,
 } from "@/types";
 
 interface MatchProgress {
@@ -899,6 +901,18 @@ export function MatchValidation() {
 
   const [matches, setMatches] = useState<SceneMatch[]>([]);
   const [episodes, setEpisodes] = useState<string[]>([]);
+  // The episode list feeds the manual-match dropdown and the recompute
+  // proposal; it changes whenever the series is re-indexed, so it is
+  // re-read around every recompute rather than once at mount.
+  const refreshEpisodes = useCallback(async () => {
+    if (!projectId) return;
+    try {
+      const { episodes: loadedEpisodes } = await api.getEpisodes(projectId);
+      setEpisodes(loadedEpisodes);
+    } catch {
+      // Keep the previous list; the modal self-fetches when it is empty.
+    }
+  }, [projectId]);
   const [loading, setLoading] = useState(true);
   const [matching, setMatching] = useState(false);
   const [matchProgress, setMatchProgress] = useState<MatchProgress | null>(
@@ -1205,18 +1219,52 @@ export function MatchValidation() {
     [projectId, upsertZoomJob, showToast],
   );
 
-  const handleZoomResultMatch = useCallback((result: SceneMatch) => {
-    setMatches((previous) =>
-      previous.map((match) =>
-        match.scene_index === result.scene_index
-          ? {
-              ...result,
-              was_no_match: match.was_no_match ?? result.was_no_match,
-            }
-          : match,
-      ),
-    );
-  }, []);
+  const handleZoomResultMatch = useCallback(
+    (result: SceneMatch, job: ZoomSearchJob) => {
+      // The job ran against a scene layout; if a recompute/merge renumbered
+      // scenes since, its result belongs to nothing on screen.
+      if (!zoomJobMatchesSceneLayout(job, useSceneStore.getState().scenes)) {
+        return;
+      }
+      setMatches((previous) =>
+        previous.map((match) =>
+          match.scene_index === result.scene_index
+            ? {
+                ...result,
+                was_no_match: match.was_no_match ?? result.was_no_match,
+              }
+            : match,
+        ),
+      );
+    },
+    [],
+  );
+
+  // A snapshot replay (reconnect, second tab, refresh) carried a completed
+  // zoom job: re-read the persisted matches instead of applying the job's
+  // frozen result. Skipped while a match run or the initial load owns state.
+  const handleReplayedZoomCompletions = useCallback(() => {
+    if (!projectId || matching || loading) return;
+    void api
+      .getMatches(projectId)
+      .then(({ matches: persisted }) => {
+        setMatches((previous) => {
+          const wasNoMatch = new Map(
+            previous.map((match) => [match.scene_index, match.was_no_match]),
+          );
+          return persisted.map((match) => ({
+            ...match,
+            was_no_match:
+              wasNoMatch.get(match.scene_index) ??
+              match.was_no_match ??
+              (match.confidence === 0 && !match.episode),
+          }));
+        });
+      })
+      .catch(() => {
+        // Best-effort refresh; the page keeps its current state.
+      });
+  }, [projectId, matching, loading]);
 
   const handleZoomAlertJump = useCallback(
     (sceneIndex: number) => {
@@ -1621,8 +1669,7 @@ export function MatchValidation() {
           setPlaybackError(null);
         }
         // Load available episodes for manual matching
-        const { episodes: loadedEpisodes } = await api.getEpisodes(projectId);
-        setEpisodes(loadedEpisodes);
+        await refreshEpisodes();
         // Check if scene UI skip is enabled (auto-match only)
         try {
           const scenesConfig = await api.getScenesConfig(projectId);
@@ -1648,7 +1695,14 @@ export function MatchValidation() {
     };
 
     loadData();
-  }, [projectId, loadProject, loadScenes, handleDeferredDownload, preparePlaybackClips]);
+  }, [
+    projectId,
+    loadProject,
+    loadScenes,
+    handleDeferredDownload,
+    preparePlaybackClips,
+    refreshEpisodes,
+  ]);
 
   useEffect(() => {
     if (scenes.length === 0) {
@@ -1857,6 +1911,9 @@ export function MatchValidation() {
       setMatches(completedMatches);
       await loadScenes(projectId);
       if (signal.aborted) return;
+      // A recompute usually follows a series re-index: pick up new episodes.
+      await refreshEpisodes();
+      if (signal.aborted) return;
 
       if (completedMatches.length > 0) {
         // The download and playback streams belong to this match run. Keeping
@@ -1897,6 +1954,7 @@ export function MatchValidation() {
     createStreamController,
     releaseStreamController,
     clearZoomProject,
+    refreshEpisodes,
   ]);
 
   // Auto-start matching when skipUiEnabled and no matches exist
@@ -2645,7 +2703,10 @@ export function MatchValidation() {
                     onRecomputeProposed={() =>
                       handleRecomputeMatches(proposedEpisodes)
                     }
-                    onOpenModal={() => setEpisodeModalOpen(true)}
+                    onOpenModal={() => {
+                      void refreshEpisodes();
+                      setEpisodeModalOpen(true);
+                    }}
                   />
                 )}
                 <label className="flex items-center gap-1.5 text-xs text-[hsl(var(--muted-foreground))]">
@@ -3072,6 +3133,7 @@ export function MatchValidation() {
           <ZoomSearchJobsBridge
             projectId={projectId}
             onResultMatch={handleZoomResultMatch}
+            onReplayedCompletions={handleReplayedZoomCompletions}
           />
           <ZoomSearchAlertStack
             projectId={projectId}

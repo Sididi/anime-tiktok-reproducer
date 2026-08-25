@@ -74,25 +74,28 @@ function evaluateSelection(
   };
 }
 
+function findEpisode(
+  episodes: string[],
+  episodeHint: string,
+): string | undefined {
+  return episodes.find(
+    (episode) =>
+      episode.includes(episodeHint) ||
+      episodeHint.includes(episode.split("/").pop() || ""),
+  );
+}
+
 function resolveEpisode(
   episodes: string[],
   episodeHint: string | null | undefined,
 ): string {
-  if (!episodes.length) {
-    return "";
-  }
   if (!episodeHint) {
     return episodes[0] || "";
   }
-  return (
-    episodes.find(
-      (episode) =>
-        episode.includes(episodeHint) ||
-        episodeHint.includes(episode.split("/").pop() || ""),
-    ) ||
-    episodes[0] ||
-    ""
-  );
+  // A hint that is not in the list (e.g. an episode indexed after the page
+  // loaded its dropdown) is still the right file to show: never silently
+  // substitute the first episode of the list for it.
+  return findEpisode(episodes, episodeHint) || episodeHint;
 }
 
 function ManualMatchModalContent({
@@ -110,7 +113,15 @@ function ManualMatchModalContent({
   const lastTimingResetKeyRef = useRef<string | null>(null);
   const [fallbackEpisodes, setFallbackEpisodes] = useState<string[]>([]);
 
-  const availableEpisodes = episodes.length > 0 ? episodes : fallbackEpisodes;
+  const matchedEpisodeHint =
+    match?.episode && match.confidence > 0 ? match.episode : null;
+  const availableEpisodes = useMemo(() => {
+    const base = episodes.length > 0 ? episodes : fallbackEpisodes;
+    if (matchedEpisodeHint && !findEpisode(base, matchedEpisodeHint)) {
+      return [...base, matchedEpisodeHint];
+    }
+    return base;
+  }, [episodes, fallbackEpisodes, matchedEpisodeHint]);
 
   const initialEpisode = resolveEpisode(
     availableEpisodes,

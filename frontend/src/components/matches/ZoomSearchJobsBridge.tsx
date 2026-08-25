@@ -1,11 +1,20 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { getEventHub } from "@/utils/eventHub";
 import { useZoomSearchAlertStore } from "@/stores/zoomSearchAlertStore";
 import type { SceneMatch, ZoomSearchJob } from "@/types";
 
 interface ZoomSearchJobsBridgeProps {
   projectId: string;
-  onResultMatch?: (match: SceneMatch) => void;
+  // Live completion (not a replay): the job's persisted result for its scene.
+  onResultMatch?: (match: SceneMatch, job: ZoomSearchJob) => void;
+  // A snapshot replay carried at least one completed, unacknowledged job for
+  // this project: the page should refetch persisted matches rather than
+  // trust the job's frozen result.
+  onReplayedCompletions?: () => void;
+}
+
+function isUnseenCompletion(job: ZoomSearchJob): boolean {
+  return job.status === "complete" && !job.acknowledged;
 }
 
 /**
@@ -14,25 +23,35 @@ interface ZoomSearchJobsBridgeProps {
  * current snapshot on subscribe (so unacknowledged alerts survive a refresh)
  * and then delivers live updates, filtered to this project.
  *
+ * Only LIVE completions apply a job's `result_match` to the page. Snapshot
+ * replays (subscribe, SharedWorker hand-over, every stream reconnect) restore
+ * alerts only: a replayed `result_match` is a frozen copy that may predate a
+ * recompute or a manual edit, and persisted matches are the source of truth.
+ *
  * Deliberately NOT registered in MatchValidation's activeStreamControllers:
  * a Recompute aborts those, and this subscription must outlive it.
  */
 export function ZoomSearchJobsBridge({
   projectId,
   onResultMatch,
+  onReplayedCompletions,
 }: ZoomSearchJobsBridgeProps) {
   const upsertJob = useZoomSearchAlertStore((state) => state.upsertJob);
   const resetLiveJobs = useZoomSearchAlertStore((state) => state.resetLiveJobs);
+  // Latest-callback refs: the page's handlers may change identity with its
+  // state, and re-subscribing would replay the snapshot each time.
+  const onResultMatchRef = useRef(onResultMatch);
+  const onReplayedCompletionsRef = useRef(onReplayedCompletions);
+  useEffect(() => {
+    onResultMatchRef.current = onResultMatch;
+    onReplayedCompletionsRef.current = onReplayedCompletions;
+  });
 
   useEffect(() => {
-    const ingestJob = (job: ZoomSearchJob) => {
+    const ingestJob = (job: ZoomSearchJob, live: boolean) => {
       upsertJob(projectId, job);
-      if (
-        job.status === "complete" &&
-        !job.acknowledged &&
-        job.result_match
-      ) {
-        onResultMatch?.(job.result_match);
+      if (live && isUnseenCompletion(job) && job.result_match) {
+        onResultMatchRef.current?.(job.result_match, job);
       }
     };
     // The live-job map is per-project; drop entries from a previous project.
@@ -43,15 +62,23 @@ export function ZoomSearchJobsBridge({
       { projectId },
       (event) => {
         if (event.kind === "snapshot") {
-          // Project loading reads the persisted matches and remains the
-          // source of truth on refresh; the snapshot restores alerts.
-          event.items.forEach((item) => ingestJob(item.data));
+          let replayedCompletion = false;
+          for (const item of event.items) {
+            ingestJob(item.data, false);
+            if (
+              item.data.project_id === projectId &&
+              isUnseenCompletion(item.data)
+            ) {
+              replayedCompletion = true;
+            }
+          }
+          if (replayedCompletion) onReplayedCompletionsRef.current?.();
         } else {
-          ingestJob(event.item.data);
+          ingestJob(event.item.data, true);
         }
       },
     );
-  }, [projectId, upsertJob, resetLiveJobs, onResultMatch]);
+  }, [projectId, upsertJob, resetLiveJobs]);
 
   return null;
 }

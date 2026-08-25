@@ -2,13 +2,19 @@ import { expect, test } from "@playwright/test";
 
 // The episode option list is extensionless while match episodes carry the
 // container extension — the proposal must bridge the two via stems.
+//
+// Episode-03 is "seen" only through a weak alternative (not proposed);
+// Episode-04 appears nowhere in the previous run — it was indexed after it —
+// and must always be proposed.
 function installSubsetMocks(
   { projectId, libraryType }: { projectId: string; libraryType: string },
 ) {
   const testWindow = window as typeof window & {
     __findBodies?: unknown[];
+    __episodeFetches?: number;
   };
   testWindow.__findBodies = [];
+  testWindow.__episodeFetches = 0;
 
   const originalFetch = window.fetch.bind(window);
   const json = (body: unknown) =>
@@ -60,6 +66,17 @@ function installSubsetMocks(
       start_time: 100,
       end_time: 102,
       confidence: 0.85,
+      alternatives: [
+        {
+          episode: "Episode-03.mkv",
+          start_time: 300,
+          end_time: 302,
+          confidence: 0.2,
+          speed_ratio: 1,
+          vote_count: 1,
+          algorithm: "timeline_cluster",
+        },
+      ],
     },
   ];
 
@@ -94,8 +111,9 @@ function installSubsetMocks(
       return json({ matches });
     }
     if (url.pathname === `${prefix}/sources/episodes`) {
+      testWindow.__episodeFetches = (testWindow.__episodeFetches ?? 0) + 1;
       return json({
-        episodes: ["Episode-01", "Episode-02", "Episode-03"],
+        episodes: ["Episode-01", "Episode-02", "Episode-03", "Episode-04"],
       });
     }
     if (url.pathname === `${prefix}/scenes/config`) {
@@ -152,8 +170,9 @@ test("primary click recomputes with the AI-proposed episode subset", async ({
   });
   await page.goto(`/project/${projectId}/matches`);
 
-  const splitButton = page.getByRole("button", { name: "Recompute (2 ep.)" });
+  const splitButton = page.getByRole("button", { name: "Recompute (3 ep.)" });
   await expect(splitButton).toBeVisible();
+  const fetchesBefore = await page.evaluate(() => window.__episodeFetches ?? 0);
   await splitButton.click();
 
   await expect
@@ -164,7 +183,13 @@ test("primary click recomputes with the AI-proposed episode subset", async ({
   const body = await page.evaluate(
     () => (window.__findBodies ?? [])[0] as { episodes?: string[] },
   );
-  expect(body.episodes).toEqual(["Episode-01", "Episode-02"]);
+  // Scored picks plus the never-matched Episode-04.
+  expect(body.episodes).toEqual(["Episode-01", "Episode-02", "Episode-04"]);
+  // The episode list is re-read once the recompute completes (a recompute
+  // usually follows a series re-index).
+  await expect
+    .poll(async () => page.evaluate(() => window.__episodeFetches ?? 0))
+    .toBeGreaterThan(fetchesBefore);
 });
 
 test("modal allows manual episode selection before recompute", async ({
@@ -177,18 +202,25 @@ test("modal allows manual episode selection before recompute", async ({
   });
   await page.goto(`/project/${projectId}/matches`);
 
+  const fetchesBefore = await page.evaluate(() => window.__episodeFetches ?? 0);
   await page.getByRole("button", { name: "Choose episodes" }).click();
   const dialog = page.getByRole("dialog");
   await expect(dialog).toBeVisible();
+  // Opening the chooser re-reads the episode list.
+  await expect
+    .poll(async () => page.evaluate(() => window.__episodeFetches ?? 0))
+    .toBeGreaterThan(fetchesBefore);
 
-  // AI-proposed rows are pre-checked and badged; the third episode is not.
-  await expect(dialog.locator('[aria-label="AI proposed"]')).toHaveCount(2);
+  // AI-proposed rows are pre-checked and badged (incl. the never-matched
+  // Episode-04); the weakly-seen third episode is not.
+  await expect(dialog.locator('[aria-label="AI proposed"]')).toHaveCount(3);
   const checkboxes = dialog.locator('input[type="checkbox"]');
   await expect(checkboxes.nth(0)).toBeChecked();
   await expect(checkboxes.nth(1)).toBeChecked();
   await expect(checkboxes.nth(2)).not.toBeChecked();
+  await expect(checkboxes.nth(3)).toBeChecked();
 
-  // Unticking one launches with a single episode.
+  // Unticking one launches without it.
   await checkboxes.nth(1).uncheck();
   await dialog.getByRole("button", { name: "Recompute" }).click();
   await expect
@@ -199,7 +231,7 @@ test("modal allows manual episode selection before recompute", async ({
   const body = await page.evaluate(
     () => (window.__findBodies ?? [])[0] as { episodes?: string[] },
   );
-  expect(body.episodes).toEqual(["Episode-01"]);
+  expect(body.episodes).toEqual(["Episode-01", "Episode-04"]);
 });
 
 test("selecting no episodes disables the modal launch button", async ({
@@ -241,5 +273,6 @@ test("pure projects do not show the episode-subset button", async ({
 declare global {
   interface Window {
     __findBodies?: unknown[];
+    __episodeFetches?: number;
   }
 }

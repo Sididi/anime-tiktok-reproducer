@@ -36,11 +36,12 @@ export function ZoomSearchAlertStack({
               Extensive zoom search finished — Scene {alert.sceneIndex + 1}
             </span>
             <span className="block text-xs text-[hsl(var(--muted-foreground))]">
-              {alert.changed
-                ? alert.applied
-                  ? "Match updated — click to review"
-                  : "Result saved as alternative (scene was edited)"
-                : "Existing match confirmed"}
+              {alert.message ||
+                (alert.changed
+                  ? alert.applied
+                    ? "Match updated — click to review"
+                    : "Result saved as alternative (scene was edited)"
+                  : "Existing match confirmed")}
             </span>
           </span>
         </button>

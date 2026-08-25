@@ -7,7 +7,10 @@ export interface ZoomSearchAlert {
   sceneIndex: number;
   changed: boolean;
   applied: boolean;
+  // Backend-authored summary ("Match updated", "Existing match confirmed —
+  // 2 new AI candidates", …); the stack renders it verbatim.
   message: string;
+  candidatesAdded: number;
 }
 
 export type ZoomSearchSceneStatus = "queued" | "running";
@@ -47,18 +50,26 @@ export const useZoomSearchAlertStore = create<ZoomSearchState>((set, get) => ({
 
       let alerts = state.alerts;
       if (job.status === "complete" && !job.acknowledged) {
-        if (!alerts.some((alert) => alert.jobId === job.id)) {
-          alerts = [
-            ...alerts,
-            {
-              jobId: job.id,
-              projectId: job.project_id,
-              sceneIndex: job.scene_index,
-              changed: job.changed === true,
-              applied: job.applied === true,
-              message: job.message,
-            },
-          ];
+        const next: ZoomSearchAlert = {
+          jobId: job.id,
+          projectId: job.project_id,
+          sceneIndex: job.scene_index,
+          changed: job.changed === true,
+          applied: job.applied === true,
+          message: job.message,
+          candidatesAdded: job.candidates_added ?? 0,
+        };
+        const existing = alerts.findIndex((alert) => alert.jobId === job.id);
+        if (existing === -1) {
+          alerts = [...alerts, next];
+        } else if (
+          alerts[existing].message !== next.message ||
+          alerts[existing].candidatesAdded !== next.candidatesAdded
+        ) {
+          // A later frame may carry a better summary for the same job.
+          alerts = alerts.map((alert, index) =>
+            index === existing ? next : alert,
+          );
         }
       } else if (
         job.status === "cancelled" ||

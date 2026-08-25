@@ -32,6 +32,16 @@ HUB_TOPIC = "zoom_jobs"
 TERMINAL_STATUSES = {"complete", "error", "cancelled"}
 
 
+class SceneFingerprint(BaseModel, frozen=True):
+    """Layout of the scene a job was computed for: scene count plus the
+    scene's own bounds. A recompute/merge renumbers scenes, so a result whose
+    fingerprint no longer matches must not be spliced onto the new layout."""
+
+    count: int
+    start: float
+    end: float
+
+
 class ZoomSearchJob(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:16])
     project_id: str
@@ -46,6 +56,9 @@ class ZoomSearchJob(BaseModel):
     # when zoom search only enriches the primary's manual alternatives.
     result_match: dict | None = None
     candidates_added: int = 0
+    # Set when the run starts; lets the client ignore a result whose scene
+    # layout has changed since (pre-recompute jobs replayed from the hub).
+    scene_fingerprint: SceneFingerprint | None = None
     error: str | None = None
     acknowledged: bool = False
     created_at: float = Field(default_factory=time.time)
@@ -98,17 +111,28 @@ class ZoomSearchService:
         return job
 
     def invalidate_project(self, project_id: str, reason: str) -> None:
-        """Cancel every live job of a project (scene indices are about to
-        renumber, so their results would land on the wrong scene)."""
+        """Cancel every live job of a project and drop its unseen completed
+        ones (scene indices are about to renumber, so their results would
+        land on the wrong scene).
+
+        Completed-but-unacknowledged jobs are cancelled too: their alert and
+        frozen ``result_match`` describe the previous scene layout, and the
+        hub replays them on every snapshot until they are acknowledged.
+        """
         for job in self._jobs.values():
-            if job.project_id != project_id or job.status not in {"queued", "running"}:
+            if job.project_id != project_id:
                 continue
-            event = self._cancel_events.get(job.id)
-            if event is not None:
-                event.set()
-            task = self._tasks.get(job.id)
-            if task is not None:
-                task.cancel()
+            live = job.status in {"queued", "running"}
+            stale_alert = job.status == "complete" and not job.acknowledged
+            if not (live or stale_alert):
+                continue
+            if live:
+                event = self._cancel_events.get(job.id)
+                if event is not None:
+                    event.set()
+                task = self._tasks.get(job.id)
+                if task is not None:
+                    task.cancel()
             job.status = "cancelled"
             job.acknowledged = True
             job.message = f"Cancelled: {reason}"
@@ -202,6 +226,7 @@ class ZoomSearchService:
 
         scene = scenes.scenes[job.scene_index]
         fingerprint = self._scene_fingerprint(scenes, job.scene_index)
+        job.scene_fingerprint = fingerprint
         existing_match = next(
             (m for m in matches.matches if m.scene_index == scene.index), None
         )
@@ -345,14 +370,27 @@ class ZoomSearchService:
                 candidates_added = len(outcome.new_match.alternatives)
         elif fresh_matches and current is not None and outcome.alternatives:
             # Even a confirmed primary produced useful, paid-for native zoom
-            # evidence.  Persist every distinct cluster for the manual modal.
+            # evidence.  Persist it for the manual modal: zoom results are
+            # only exact-deduped (earlier runs' entries first, so a
+            # rediscovered interval changes nothing), the other alternatives
+            # keep their cluster dedup.
             before_dump = [
                 candidate.model_dump() for candidate in current.alternatives
             ]
+            existing_evidence = [
+                candidate
+                for candidate in current.alternatives
+                if ZoomRematchService.is_zoom_evidence(candidate)
+            ]
+            existing_other = [
+                candidate
+                for candidate in current.alternatives
+                if not ZoomRematchService.is_zoom_evidence(candidate)
+            ]
             current.alternatives = ZoomRematchService.merge_alternatives(
                 current,
-                outcome.alternatives,
-                current.alternatives,
+                existing_other,
+                evidence=[*existing_evidence, *outcome.alternatives],
             )
             after_dump = [
                 candidate.model_dump() for candidate in current.alternatives
@@ -386,14 +424,14 @@ class ZoomSearchService:
         self._prune_terminal_jobs()
 
     @staticmethod
-    def _scene_fingerprint(scenes, scene_index: int) -> tuple | None:
+    def _scene_fingerprint(scenes, scene_index: int) -> SceneFingerprint | None:
         if not 0 <= scene_index < len(scenes.scenes):
             return None
         scene = scenes.scenes[scene_index]
-        return (
-            len(scenes.scenes),
-            round(scene.start_time, 3),
-            round(scene.end_time, 3),
+        return SceneFingerprint(
+            count=len(scenes.scenes),
+            start=round(scene.start_time, 3),
+            end=round(scene.end_time, 3),
         )
 
 
