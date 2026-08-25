@@ -974,11 +974,11 @@ class ScriptAutomationService:
             if not settings.script_automate_enabled:
                 raise RuntimeError("Script automation is disabled (ATR_SCRIPT_AUTOMATE_ENABLED=false)")
 
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if not project:
                 raise RuntimeError("Project not found")
 
-            transcription = ProjectService.load_transcription(project_id)
+            transcription = await ProjectService.aload_transcription(project_id)
             if not transcription or not transcription.scenes:
                 raise RuntimeError("No transcription found for this project")
 

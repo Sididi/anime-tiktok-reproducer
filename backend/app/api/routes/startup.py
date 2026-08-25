@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ...library_types import DEFAULT_LIBRARY_TYPE, LibraryType
@@ -49,22 +46,11 @@ async def retry_project_startup(project_id: str):
 
 @router.get("/startup/jobs")
 async def list_project_startup_jobs():
-    """List persisted project startup jobs."""
+    """List persisted project startup jobs.
+
+    Live updates flow over the shared ``/api/events/stream`` (topic
+    ``startup_jobs``); this REST snapshot remains for tooling and tests.
+    """
     return {
         "jobs": [job.model_dump(mode="json") for job in project_startup_queue.list_jobs()],
     }
-
-
-@router.get("/startup/jobs/stream")
-async def stream_project_startup_jobs():
-    """Stream project startup jobs over SSE."""
-
-    async def generate():
-        async for data in project_startup_queue.stream_all_jobs():
-            yield f"data: {json.dumps(data)}\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )

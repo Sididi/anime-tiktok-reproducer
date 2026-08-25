@@ -141,7 +141,7 @@ class CepLinkService:
                     project.id, entry.get("requested_at"),
                 )
                 project.cep_launch_request = None
-                ProjectService.save(project)
+                await ProjectService.asave(project)
                 continue
 
             last_attempt = RescheduleRetryService._coerce_dt(entry.get("last_attempt_at")) or now
@@ -158,7 +158,7 @@ class CepLinkService:
                 entry["last_error"] = str(exc)
                 entry["last_attempt_at"] = now.isoformat()
                 project.cep_launch_request = entry
-                ProjectService.save(project)
+                await ProjectService.asave(project)
                 if retries == _MAX_RETRIES_BEFORE_ALERT:
                     await _post_discord_alert(
                         f"[premiere-link] project={project.id} launch request "
@@ -167,7 +167,7 @@ class CepLinkService:
                 continue
 
             project.cep_launch_request = None
-            ProjectService.save(project)
+            await ProjectService.asave(project)
             logger.info(
                 "Premiere Link launch queued after retry for %s: launch_id=%s",
                 project.id, result.get("launch_id"),

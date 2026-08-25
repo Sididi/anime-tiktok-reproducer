@@ -11,9 +11,13 @@ from typing import Any, Awaitable, Callable
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from ..models.project_startup import ProjectStartupJob
+from .atomic_files import write_text_atomic
+from .event_hub import event_hub
 
 
 logger = logging.getLogger("uvicorn.error")
+
+HUB_TOPIC = "startup_jobs"
 
 
 ProgressCallback = Callable[[float, str], Awaitable[None] | None]
@@ -30,13 +34,12 @@ def _jobs_payload(jobs: dict[str, ProjectStartupJob]) -> dict[str, Any]:
 
 
 def _write_jobs_atomic(path: Path, jobs: dict[str, ProjectStartupJob]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(
+    # Unique temp name: two publishes running on worker threads at once used
+    # to share one ".tmp" path and could rename each other's half-written file.
+    write_text_atomic(
+        path,
         json.dumps(_jobs_payload(jobs), ensure_ascii=True, indent=2, sort_keys=True),
-        encoding="utf-8",
     )
-    tmp_path.replace(path)
 
 
 def _load_jobs(path: Path) -> dict[str, ProjectStartupJob]:
@@ -66,7 +69,6 @@ class ProjectStartupService:
         self._jobs_path = jobs_path or (settings.data_dir / "project_startup_jobs.json")
         self._jobs = _load_jobs(self._jobs_path)
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
-        self._subscribers: list[asyncio.Queue[dict[str, Any]]] = []
 
     async def startup_cleanup(self) -> None:
         from .project_service import ProjectService
@@ -84,7 +86,7 @@ class ProjectStartupService:
         stale_ids = [
             project_id
             for project_id in self._jobs
-            if ProjectService.load(project_id) is None
+            if await ProjectService.aload(project_id) is None
         ]
         for project_id in stale_ids:
             del self._jobs[project_id]
@@ -127,7 +129,7 @@ class ProjectStartupService:
     async def enqueue_project(self, project_id: str) -> ProjectStartupJob:
         from .project_service import ProjectService
 
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise RuntimeError("Project not found")
 
@@ -156,7 +158,7 @@ class ProjectStartupService:
     async def retry_project(self, project_id: str) -> ProjectStartupJob:
         from .project_service import ProjectService
 
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise RuntimeError("Project not found")
 
@@ -166,18 +168,6 @@ class ProjectStartupService:
 
         await self._reset_project_startup_state(project_id)
         return await self.enqueue_project(project_id)
-
-    async def stream_all_jobs(self):
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._subscribers.append(queue)
-        try:
-            for job in self.list_jobs():
-                yield job.model_dump(mode="json")
-            while True:
-                yield await queue.get()
-        finally:
-            if queue in self._subscribers:
-                self._subscribers.remove(queue)
 
     async def rename_series_references(
         self,
@@ -203,9 +193,7 @@ class ProjectStartupService:
 
         await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
         for job in renamed_jobs:
-            payload = job.model_dump(mode="json")
-            for queue in list(self._subscribers):
-                queue.put_nowait(payload)
+            self._publish_to_hub(job)
         return renamed_jobs
 
     @staticmethod
@@ -216,13 +204,20 @@ class ProjectStartupService:
         job.library_type = project.library_type
         job.tiktok_url = project.tiktok_url
 
+    @staticmethod
+    def _publish_to_hub(job: ProjectStartupJob) -> None:
+        event_hub.publish(
+            HUB_TOPIC,
+            key=job.project_id,
+            data=job.model_dump(mode="json"),
+            project_id=job.project_id,
+        )
+
     async def _publish_job(self, job: ProjectStartupJob) -> None:
         job.updated_at = _utc_now()
         self._jobs[job.project_id] = job
         await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
-        payload = job.model_dump(mode="json")
-        for queue in list(self._subscribers):
-            queue.put_nowait(payload)
+        self._publish_to_hub(job)
 
     async def _set_job_state(
         self,
@@ -262,7 +257,7 @@ class ProjectStartupService:
         from .project_service import ProjectService
         from ..models.project import ProjectPhase
 
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise RuntimeError("Project not found")
 
@@ -293,7 +288,7 @@ class ProjectStartupService:
         project.video_height = None
         project.original_video_path = None
         project.cleanup = None
-        ProjectService.save(project)
+        await ProjectService.asave(project)
 
     async def _run_job(self, project_id: str, job_id: str) -> None:
         from .downloader import DownloaderService
@@ -307,7 +302,7 @@ class ProjectStartupService:
             if job is None or job.job_id != job_id:
                 return
 
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if project is None:
                 raise RuntimeError("Project not found")
             self._sync_job_from_project(job, project)
@@ -337,7 +332,7 @@ class ProjectStartupService:
                     message=progress.message or "Downloading TikTok video...",
                 )
 
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if project is None:
                 raise RuntimeError("Project not found")
 
@@ -349,7 +344,7 @@ class ProjectStartupService:
 
                 project.phase = ProjectPhase.CLEANUP
                 project.original_video_path = project.video_path
-                ProjectService.save(project)
+                await ProjectService.asave(project)
                 await self._set_job_state(
                     job,
                     status="complete",
@@ -385,7 +380,7 @@ class ProjectStartupService:
                     message=progress.message or "Detecting scenes...",
                 )
 
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if project is None:
                 raise RuntimeError("Project not found")
 

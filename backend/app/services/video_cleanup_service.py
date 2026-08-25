@@ -36,6 +36,7 @@ from typing import AsyncIterator, Callable
 import cv2
 import numpy as np
 
+from .executors import heavy_executor
 from ..config import settings
 from ..library_types import LibraryType
 from ..models import ProjectPhase
@@ -269,7 +270,7 @@ class VideoCleanupService:
                     "cleanup", slots=indexation_queue.MAX_CONCURRENT
                 ):
                     await asyncio.get_running_loop().run_in_executor(
-                        None,
+                        heavy_executor(),
                         cls._run_full_cleanup_sync,
                         project_id,
                         Path(source),
@@ -339,7 +340,7 @@ class VideoCleanupService:
             "cleanup_preview", slots=indexation_queue.MAX_CONCURRENT
         ):
             await asyncio.get_running_loop().run_in_executor(
-                None,
+                heavy_executor(),
                 cls._render_preview_sync,
                 project_id,
                 Path(source),

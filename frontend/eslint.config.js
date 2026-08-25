@@ -20,4 +20,10 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
+  {
+    files: ['src/**/*.worker.ts'],
+    languageOptions: {
+      globals: globals.worker,
+    },
+  },
 ])

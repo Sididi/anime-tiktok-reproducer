@@ -16,6 +16,7 @@ from app.models import AlternativeMatch, MatchList, Scene, SceneList, SceneMatch
 from app.models.project import Project
 from app.services.anime_library import AnimeLibraryService
 from app.services.anime_matcher import AnimeMatcherService
+from app.services.event_hub import event_hub
 from app.services.project_service import ProjectService
 from app.services.zoom_rematch import ZoomRematchService, ZoomSearchOutcome
 from app.services.zoom_search_service import ZoomSearchService
@@ -126,12 +127,18 @@ async def test_lifecycle_applies_changed_match(monkeypatch, tmp_path) -> None:
     )
     service = ZoomSearchService()
 
-    events: list[dict] = []
-    queue: asyncio.Queue = asyncio.Queue()
-    service._subscribers.append(queue)
-
-    job = await service.enqueue("proj-1", 1)
-    await _wait_terminal(service, job.id)
+    # Job state fans out through the shared event hub (coalescing per job:
+    # an unread update is replaced by the next one), so drain right after
+    # enqueue for the guaranteed "queued" frame and again at the end for
+    # the terminal one. "running" may be coalesced away and is not asserted.
+    sub = event_hub.subscribe()
+    try:
+        job = await service.enqueue("proj-1", 1)
+        events: list[dict] = [f["data"] for f in sub.drain()]
+        await _wait_terminal(service, job.id)
+        events.extend(f["data"] for f in sub.drain())
+    finally:
+        event_hub.unsubscribe(sub)
 
     assert job.status == "complete"
     assert job.changed is True
@@ -143,11 +150,9 @@ async def test_lifecycle_applies_changed_match(monkeypatch, tmp_path) -> None:
     )
     assert applied.episode == "EP03"
 
-    while not queue.empty():
-        events.append(queue.get_nowait())
+    assert all(e["id"] == job.id for e in events)
     statuses = [e["status"] for e in events]
     assert statuses[0] == "queued"
-    assert "running" in statuses
     assert statuses[-1] == "complete"
 
 

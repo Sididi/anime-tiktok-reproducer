@@ -12,6 +12,7 @@ from pathlib import Path
 
 import cv2
 
+from .executors import heavy_executor
 from ..library_types import LibraryType
 from ..models.torrent import TorrentEntry, TorrentFileMapping, VerificationResult
 from .anime_library import AnimeLibraryService
@@ -271,7 +272,7 @@ class TorrentVerificationService:
 
         # Initialize FAISS searcher
         init_ok = await loop.run_in_executor(
-            None,
+            heavy_executor(),
             AnimeMatcherService._init_searcher,
             library_path,
             library_type,
@@ -315,7 +316,7 @@ class TorrentVerificationService:
         if on_progress:
             await on_progress(0.55, "Extraction des frames...")
         frames = await loop.run_in_executor(
-            None,
+            heavy_executor(),
             AnimeMatcherService.extract_frames,
             video_path,
             timestamps,
@@ -352,7 +353,7 @@ class TorrentVerificationService:
             flip=False,
             series=series_name,
         )
-        all_results = await loop.run_in_executor(None, search_fn)
+        all_results = await loop.run_in_executor(heavy_executor(), search_fn)
 
         # Compute metrics
         # expected_episode is the episode stem (filename without extension) from the mapping

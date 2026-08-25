@@ -13,6 +13,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from .executors import heavy_executor, run_heavy
 from ..models import Word, SceneTranscription, Transcription, Scene, SceneList, SceneMatch, MatchList
 from ..models.raw_scene import RawSceneDetectionResult
 from ..services import ProjectService
@@ -1167,18 +1168,18 @@ class TranscriberService:
         native_futures: list[asyncio.Future[Any]] = []
         try:
             # Load project and scenes
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if not project or not project.video_path:
                 yield TranscriptionProgress("error", 0, "", error="Project or video not found")
                 return
 
-            scenes = ProjectService.load_scenes(project_id)
+            scenes = await ProjectService.aload_scenes(project_id)
             if not scenes or not scenes.scenes:
                 yield TranscriptionProgress("error", 0, "", error="No scenes found")
                 return
 
             video_path = Path(project.video_path)
-            pre_raw_match_snapshot = ProjectService.load_matches(project_id)
+            pre_raw_match_snapshot = await ProjectService.aload_matches(project_id)
             if pre_raw_match_snapshot is not None:
                 pre_raw_match_snapshot = pre_raw_match_snapshot.model_copy(deep=True)
 
@@ -1192,7 +1193,7 @@ class TranscriberService:
                     "Extracting audio track for transcription...",
                 )
                 extraction_task = asyncio.create_task(
-                    asyncio.to_thread(cls._extract_audio_for_whisper, video_path, wav_path)
+                    run_heavy(cls._extract_audio_for_whisper, video_path, wav_path)
                 )
                 native_futures.append(extraction_task)
                 while True:
@@ -1220,7 +1221,7 @@ class TranscriberService:
             # Pass the pre-extracted WAV directly so WhisperX doesn't create a temp copy
             loop = asyncio.get_running_loop()
             transcription_future = loop.run_in_executor(
-                None,
+                heavy_executor(),
                 lambda: cls._transcribe_sync(wav_path, lang_code, "large-v3"),
             )
             native_futures.append(transcription_future)
@@ -1250,7 +1251,7 @@ class TranscriberService:
             )
 
             # Save transcription
-            ProjectService.save_transcription(project_id, transcription)
+            await ProjectService.asave_transcription(project_id, transcription)
 
             # Free WhisperX models and GPU VRAM before diarization
             cls.unload_models()
@@ -1272,7 +1273,7 @@ class TranscriberService:
 
                 is_pure = project.library_type == LibraryType.PURE
                 diarization_future = loop.run_in_executor(
-                    None,
+                    heavy_executor(),
                     lambda: RawSceneDetectorService.detect(
                         wav_path,
                         [scene.model_copy(deep=True) for scene in original_scenes],
@@ -1326,20 +1327,20 @@ class TranscriberService:
                         )
                         if remapped_match_list is not None:
                             matches_for_raw_backup = remapped_match_list.model_copy(deep=True)
-                            ProjectService.save_matches(project_id, remapped_match_list)
+                            await ProjectService.asave_matches(project_id, remapped_match_list)
 
                         # Sync scenes.json with updated scene structure
                         updated_scene_list = SceneList(scenes=[
                             Scene(index=s.scene_index, start_time=s.start_time, end_time=s.end_time)
                             for s in updated_scenes
                         ])
-                        ProjectService.save_scenes(project_id, updated_scene_list)
+                        await ProjectService.asave_scenes(project_id, updated_scene_list)
                         (project_dir / "scenes_raw_backup.json").write_text(
                             updated_scene_list.model_dump_json(indent=2)
                         )
 
                     transcription.scenes = updated_scenes
-                    ProjectService.save_transcription(project_id, transcription)
+                    await ProjectService.asave_transcription(project_id, transcription)
 
                     # Save backup for reset (post-detection, pre-validation)
                     (project_dir / "transcription_raw_backup.json").write_text(

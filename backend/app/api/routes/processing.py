@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from pydub import AudioSegment
 
+from ...services.executors import run_heavy
 from ...config import settings
 from ...library_types import resolve_static_overlay_title
 from ...models import ProjectPhase
@@ -37,6 +38,7 @@ from ...services import (
 from ...services.cep_link_service import CepLinkService
 from ...services.forced_alignment import ForcedAlignmentService
 from ...services.llm_config_service import LLMConfigService
+from ...services.project_locks import project_edit_locked
 from ...services.template_service import TemplateService
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
@@ -292,7 +294,7 @@ def _build_preview_audio_sync(
 @router.get("/script/automation/config")
 async def get_script_automation_config(project_id: str):
     """Return automation config and integration readiness for /script page."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -434,7 +436,7 @@ async def get_latest_generation(project_id: str):
 @router.get("/script/prompt")
 async def get_script_prompt(project_id: str, target_language: str = "fr"):
     """Build the canonical script prompt from the project's transcription."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -450,7 +452,7 @@ async def get_script_prompt(project_id: str, target_language: str = "fr"):
 @router.get("/config")
 async def get_processing_config(project_id: str):
     """Get processing page feature flags."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -460,7 +462,7 @@ async def get_processing_config(project_id: str):
 @router.post("/script/automate")
 async def automate_script(project_id: str, request: ScriptAutomateRequest):
     """Automate /script generation: Gemini script -> optional metadata -> ElevenLabs parts."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -493,7 +495,7 @@ async def automate_script(project_id: str, request: ScriptAutomateRequest):
 @router.post("/script/tts/prepare")
 async def prepare_script_tts(project_id: str, request: ScriptTtsPrepareRequest):
     """Prepare normalized TTS text segments from a script JSON payload."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     normalized = _normalize_script_payload_or_400(
@@ -519,7 +521,7 @@ async def prepare_script_tts(project_id: str, request: ScriptTtsPrepareRequest):
 @router.get("/script/automate/runs/{run_id}/parts/{part_id}")
 async def download_automation_part(project_id: str, run_id: str, part_id: str):
     """Download one generated TTS part from an automation run."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -550,7 +552,7 @@ async def upload_restructured_script(
     - A single 'audio' file
     - Multiple 'audio_parts' files (will be concatenated in order)
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -595,7 +597,7 @@ async def upload_restructured_script(
             uploaded_audio_path = tmp_path / f"upload{suffix}"
             await _write_upload_to_path(audio, uploaded_audio_path)
             try:
-                await asyncio.to_thread(
+                await run_heavy(
                     _normalize_audio_file_to_wav,
                     uploaded_audio_path,
                     audio_path,
@@ -638,7 +640,7 @@ async def upload_restructured_script(
                 await _write_upload_to_path(part, uploaded_path)
                 normalized_part_path = parts_dir / f"part_{i + 1:04d}.wav"
                 try:
-                    await asyncio.to_thread(
+                    await run_heavy(
                         _normalize_audio_file_to_wav,
                         uploaded_path,
                         normalized_part_path,
@@ -663,7 +665,7 @@ async def upload_restructured_script(
                 combined_audio.export(str(audio_path), format="wav")
 
             try:
-                await asyncio.to_thread(_concat_parts_to_wav)
+                await run_heavy(_concat_parts_to_wav)
             except Exception:
                 raise HTTPException(
                     status_code=400,
@@ -711,7 +713,7 @@ async def upload_restructured_script(
 
     # Update phase
     project.phase = ProjectPhase.PROCESSING
-    ProjectService.save(project)
+    await ProjectService.asave(project)
 
     return {
         "status": "ok",
@@ -738,9 +740,10 @@ async def preview_music(music_key: str):
 
 
 @router.patch("/script/settings")
+@project_edit_locked
 async def update_script_settings(project_id: str, request: ScriptSettingsRequest):
     """Update script phase settings (TTS speed, music key)."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -772,7 +775,7 @@ async def update_script_settings(project_id: str, request: ScriptSettingsRequest
                 raise HTTPException(status_code=400, detail=str(exc))
         project.voice_key = request.voice_key
 
-    ProjectService.save(project)
+    await ProjectService.asave(project)
     return {
         "status": "ok",
         "tts_speed": project.tts_speed,
@@ -783,7 +786,7 @@ async def update_script_settings(project_id: str, request: ScriptSettingsRequest
 @router.get("/script/settings")
 async def get_script_settings(project_id: str):
     """Get script phase settings (TTS speed, music key, video overlay)."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -811,6 +814,7 @@ class ScriptPhaseSettingsResponse(BaseModel):
 
 
 @router.post("/script/phase-settings")
+@project_edit_locked
 async def update_script_phase_settings(
     project_id: str, request: ScriptPhaseSettingsRequest
 ) -> ScriptPhaseSettingsResponse:
@@ -819,7 +823,7 @@ async def update_script_phase_settings(
     When min_playback_speed changes for a project past SCRIPT_RESTRUCTURE,
     the response signals that gap state should be recomputed by the client.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -856,7 +860,7 @@ async def update_script_phase_settings(
         prior_speed - project.resolved_min_playback_speed()
     ) > 1e-9
 
-    ProjectService.save(project)
+    await ProjectService.asave(project)
 
     gaps_recomputing = bool(
         speed_changed
@@ -877,7 +881,7 @@ async def update_script_phase_settings(
 @router.post("/script/overlay/generate")
 async def generate_overlay(project_id: str, request: OverlayGenerateRequest):
     """Generate the active template's non-fixed overlay fields via its light model."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -901,7 +905,7 @@ async def generate_overlay(project_id: str, request: OverlayGenerateRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
     project.video_overlay = overlay
-    ProjectService.save(project)
+    await ProjectService.asave(project)
     return {"status": "ok", "overlay": overlay}
 
 
@@ -912,7 +916,7 @@ async def stage_preview_audio(
     audio_parts: Optional[list[UploadFile]] = File(None),
 ):
     """Stage uploaded audio files for preview playback before final submission."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -929,7 +933,7 @@ async def stage_preview_audio(
             uploaded_audio_path = tmp_path / f"preview_upload{suffix}"
             await _write_upload_to_path(audio, uploaded_audio_path)
             try:
-                await asyncio.to_thread(
+                await run_heavy(
                     _normalize_audio_file_to_wav,
                     uploaded_audio_path,
                     staged_path,
@@ -946,7 +950,7 @@ async def stage_preview_audio(
                 part_paths.append(part_path)
 
             try:
-                await asyncio.to_thread(_concat_audio_parts_to_wav, part_paths, staged_path)
+                await run_heavy(_concat_audio_parts_to_wav, part_paths, staged_path)
             except Exception:
                 raise HTTPException(status_code=400, detail="Failed to process audio parts")
 
@@ -956,7 +960,7 @@ async def stage_preview_audio(
 @router.post("/script/preview/build")
 async def build_preview(project_id: str, request: PreviewBuildRequest):
     """Build a preview audio file with optional speed + music mixing."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -999,7 +1003,7 @@ async def build_preview(project_id: str, request: PreviewBuildRequest):
         preview_source = source_audio
 
     try:
-        duration = await asyncio.to_thread(
+        duration = await run_heavy(
             _build_preview_audio_sync,
             source_audio=preview_source,
             preview_path=preview_path,
@@ -1018,7 +1022,7 @@ async def build_preview(project_id: str, request: PreviewBuildRequest):
 @router.get("/script/preview/audio")
 async def get_preview_audio(project_id: str):
     """Serve the built preview audio file."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1032,7 +1036,7 @@ async def get_preview_audio(project_id: str):
 @router.get("/metadata")
 async def get_metadata(project_id: str):
     """Get persisted metadata for a project."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1053,7 +1057,7 @@ async def get_metadata(project_id: str):
 @router.post("/metadata/prompt")
 async def build_metadata_prompt(project_id: str, request: MetadataPromptRequest):
     """Build a metadata-generation prompt from script JSON."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1083,7 +1087,7 @@ async def build_metadata_prompt(project_id: str, request: MetadataPromptRequest)
 @router.post("/process")
 async def process_project(project_id: str):
     """Run the full processing pipeline (auto-editor, JSX generation, subtitles)."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1103,7 +1107,7 @@ async def process_project(project_id: str):
     reference_transcription = _load_transcription_for_script(project_id)
 
     # Load matches
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
@@ -1119,7 +1123,7 @@ async def process_project(project_id: str):
 
             if progress.status == "complete":
                 project.phase = ProjectPhase.COMPLETE
-                ProjectService.save(project)
+                await ProjectService.asave(project)
             elif progress.status == "error":
                 # Keep phase as processing so user can retry
                 pass
@@ -1137,7 +1141,7 @@ async def process_project(project_id: str):
 @router.post("/duration-warning/acknowledge")
 async def acknowledge_duration_warning(project_id: str):
     """Acknowledge the duration warning, allowing processing to continue."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1150,7 +1154,7 @@ async def acknowledge_duration_warning(project_id: str):
 @router.get("/download/bundle")
 async def download_bundle(project_id: str):
     """Download the generated project bundle."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1169,18 +1173,18 @@ async def download_bundle(project_id: str):
 @router.post("/exports/bundle")
 async def create_bundle(project_id: str):
     """Create a project bundle on demand and stream progress updates."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
     async def stream_progress():
         yield f"data: {json.dumps({'status': 'processing', 'step': 'bundle', 'progress': 0.1, 'message': 'Building ZIP bundle...'})}\n\n"
         try:
-            await asyncio.to_thread(ExportService.build_bundle, project, matches.matches)
+            await run_heavy(ExportService.build_bundle, project, matches.matches)
             yield f"data: {json.dumps({'status': 'complete', 'step': 'bundle', 'progress': 1.0, 'message': 'Bundle ready', 'download_url': f'/api/projects/{project_id}/download/bundle'})}\n\n"
         except Exception as exc:
             yield f"data: {json.dumps({'status': 'error', 'step': 'bundle', 'progress': 0.0, 'error': str(exc), 'message': 'Bundle generation failed'})}\n\n"
@@ -1236,7 +1240,7 @@ def _gdrive_progress_to_sse_payload(payload: dict[str, Any]) -> dict[str, Any]:
 @router.post("/exports/gdrive")
 async def upload_to_gdrive(project_id: str, auto: bool = False):
     """Upload the project export tree to Google Drive and notify via Discord webhook."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1255,7 +1259,7 @@ async def upload_to_gdrive(project_id: str, auto: bool = False):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .executors import run_heavy
 from ..config import settings
 from .llm_config_service import LLMConfigService
 from .openrouter_service import OpenRouterService
@@ -306,7 +307,7 @@ class SubtitleTranslationService:
         if not texts:
             return SubtitleTranslationOutcome(texts=[], failed_count=0)
         try:
-            return await asyncio.to_thread(
+            return await run_heavy(
                 cls._translate_texts_sync,
                 project_id,
                 list(texts),

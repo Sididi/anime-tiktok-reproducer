@@ -8,8 +8,7 @@ import {
   Clock,
   AlertTriangle,
 } from "lucide-react";
-import { api } from "@/api/client";
-import { readSSEStream } from "@/utils/sse";
+import { getEventHub } from "@/utils/eventHub";
 import { formatNetworkProgressLine } from "@/utils/networkProgress";
 import type { IndexationJob } from "@/types";
 
@@ -20,82 +19,62 @@ interface IndexJobsPanelProps {
 export function IndexJobsPanel({ onJobComplete }: IndexJobsPanelProps) {
   const [jobs, setJobs] = useState<IndexationJob[]>([]);
   const [expanded, setExpanded] = useState(true);
-  const abortRef = useRef<AbortController | null>(null);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const completedTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
   );
 
   useEffect(() => {
-    let disposed = false;
     const completionTimers = completedTimers.current;
+    // Jobs already removed by their completion timer must not reappear (nor
+    // re-fire onJobComplete) when a later snapshot replays them.
+    const dismissed = new Set<string>();
 
-    const connectSSE = () => {
-      abortRef.current?.abort();
-      const controller = new AbortController();
-      abortRef.current = controller;
-
-      const scheduleReconnect = () => {
-        if (
-          disposed ||
-          controller.signal.aborted ||
-          reconnectTimerRef.current !== null
-        ) {
-          return;
-        }
-        reconnectTimerRef.current = setTimeout(() => {
-          reconnectTimerRef.current = null;
-          connectSSE();
-        }, 3000);
-      };
-
-      api
-        .streamIndexationJobs(controller.signal)
-        .then((resp) => {
-          readSSEStream<IndexationJob>(
-            resp,
-            (job) => {
-              setJobs((prev) => {
-                const idx = prev.findIndex((item) => item.id === job.id);
-                if (idx >= 0) {
-                  const next = [...prev];
-                  next[idx] = job;
-                  return next;
-                }
-                return [...prev, job];
-              });
-
-              if (job.status === "complete" && !completionTimers.has(job.id)) {
-                completionTimers.set(
-                  job.id,
-                  setTimeout(() => {
-                    setJobs((prev) =>
-                      prev.filter((item) => item.id !== job.id),
-                    );
-                    completionTimers.delete(job.id);
-                  }, 5000),
-                );
-                onJobComplete?.(job);
-              }
-            },
-            { signal: controller.signal },
-          ).catch(scheduleReconnect);
-        })
-        .catch(scheduleReconnect);
+    const scheduleCompletion = (job: IndexationJob) => {
+      if (job.status !== "complete" || completionTimers.has(job.id)) return;
+      completionTimers.set(
+        job.id,
+        setTimeout(() => {
+          setJobs((prev) => prev.filter((item) => item.id !== job.id));
+          completionTimers.delete(job.id);
+          dismissed.add(job.id);
+        }, 5000),
+      );
+      onJobComplete?.(job);
     };
 
-    connectSSE();
-    return () => {
-      disposed = true;
-      abortRef.current?.abort();
-      if (reconnectTimerRef.current !== null) {
-        clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
+    return getEventHub().subscribe<IndexationJob>("index_jobs", {}, (event) => {
+      if (event.kind === "snapshot") {
+        // A snapshot is the registry's whole state: it also drops jobs that
+        // vanished across a backend restart.
+        const live = event.items
+          .map((item) => item.data)
+          .filter((job) => !dismissed.has(job.id));
+        setJobs(live);
+        live.forEach(scheduleCompletion);
+        return;
       }
+      const job = event.item.data;
+      if (dismissed.has(job.id)) return;
+      setJobs((prev) => {
+        const idx = prev.findIndex((item) => item.id === job.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = job;
+          return next;
+        }
+        return [...prev, job];
+      });
+      scheduleCompletion(job);
+    });
+  }, [onJobComplete]);
+
+  useEffect(() => {
+    const completionTimers = completedTimers.current;
+    return () => {
       completionTimers.forEach((timer) => clearTimeout(timer));
       completionTimers.clear();
     };
-  }, [onJobComplete]);
+  }, []);
 
   const activeJobs = jobs.filter(
     (j) => j.status === "queued" || j.status === "indexing",

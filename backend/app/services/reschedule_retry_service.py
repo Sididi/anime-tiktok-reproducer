@@ -58,7 +58,10 @@ class RescheduleRetryService:
     @classmethod
     async def run_once(cls) -> None:
         now_utc = datetime.now(timezone.utc)
-        for project in ProjectService.list_all():
+        # Off the event loop (this runs every minute over ~400 project files)
+        # and pre-filtered to the few projects with something pending.
+        projects = await asyncio.to_thread(ProjectService.list_with_reschedule_pending)
+        for project in projects:
             pending = dict(project.reschedule_pending or {})
             if not pending:
                 continue
@@ -105,8 +108,15 @@ class RescheduleRetryService:
                     )
 
             if updated:
-                project.reschedule_pending = pending
-                ProjectService.save(project)
+                # The notify calls above awaited: reload under the project's
+                # edit lock so a scheduling edit made meanwhile is not
+                # overwritten with this loop's stale copy.
+                async with ProjectService.edit_lock(project.id):
+                    fresh = await ProjectService.aload(project.id)
+                    if fresh is None:
+                        continue
+                    fresh.reschedule_pending = pending
+                    await ProjectService.asave(fresh)
 
     @classmethod
     async def run_loop(cls, stop_event: asyncio.Event) -> None:

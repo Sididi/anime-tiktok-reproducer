@@ -17,13 +17,17 @@ import time
 import uuid
 from functools import partial
 from pathlib import Path
-from typing import AsyncIterator, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .executors import heavy_executor
 from ..library_types import LibraryType
+from .event_hub import event_hub
 
 logger = logging.getLogger("uvicorn.error")
+
+HUB_TOPIC = "zoom_jobs"
 
 TERMINAL_STATUSES = {"complete", "error", "cancelled"}
 
@@ -54,7 +58,6 @@ class ZoomSearchService:
         self._jobs: dict[str, ZoomSearchJob] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._cancel_events: dict[str, threading.Event] = {}
-        self._subscribers: list[asyncio.Queue[dict]] = []
 
     # ------------------------------------------------------------------
     # registry surface
@@ -81,19 +84,9 @@ class ZoomSearchService:
             job for job in self._jobs.values() if job.project_id == project_id
         ]
 
-    async def stream_jobs(self, project_id: str) -> AsyncIterator[dict]:
-        """Current state then live updates for one project's jobs."""
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._subscribers.append(queue)
-        try:
-            for job in self.list_jobs(project_id):
-                yield job.model_dump(mode="json")
-            while True:
-                data = await queue.get()
-                if data.get("project_id") == project_id:
-                    yield data
-        finally:
-            self._subscribers.remove(queue)
+    def list_all_jobs(self) -> list[ZoomSearchJob]:
+        """Every registered job (the shared event stream is not per-project)."""
+        return list(self._jobs.values())
 
     def ack(self, job_id: str) -> ZoomSearchJob | None:
         job = self._jobs.get(job_id)
@@ -126,9 +119,12 @@ class ZoomSearchService:
     # internals
 
     def _broadcast(self, job: ZoomSearchJob) -> None:
-        data = job.model_dump(mode="json")
-        for queue in self._subscribers:
-            queue.put_nowait(data)
+        event_hub.publish(
+            HUB_TOPIC,
+            key=job.id,
+            data=job.model_dump(mode="json"),
+            project_id=job.project_id,
+        )
 
     def _prune_terminal_jobs(self) -> None:
         terminal = [
@@ -184,19 +180,19 @@ class ZoomSearchService:
         from .project_service import ProjectService
         from .zoom_rematch import ZoomRematchService, splice_match
 
-        project = ProjectService.load(job.project_id)
+        project = await ProjectService.aload(job.project_id)
         if not project:
             return self._fail(job, "Project not found")
         if project.library_type == LibraryType.PURE:
             return self._fail(job, "Zoom search is not available for pure projects")
 
-        scenes = ProjectService.load_scenes(job.project_id)
+        scenes = await ProjectService.aload_scenes(job.project_id)
         if not scenes or not scenes.scenes:
             return self._fail(job, "No scenes found")
         if not 0 <= job.scene_index < len(scenes.scenes):
             return self._fail(job, "Scene index out of range")
 
-        matches = ProjectService.load_matches(job.project_id)
+        matches = await ProjectService.aload_matches(job.project_id)
         if not matches or not matches.matches:
             return self._fail(job, "No matches found")
 
@@ -258,7 +254,7 @@ class ZoomSearchService:
                 self._broadcast(job)
 
                 init_success = await loop.run_in_executor(
-                    None,
+                    heavy_executor(),
                     AnimeMatcherService._init_searcher,
                     source_path,
                     project.library_type,
@@ -268,7 +264,7 @@ class ZoomSearchService:
                     return self._fail(job, "Failed to initialize anime_searcher")
 
                 outcome = await loop.run_in_executor(
-                    None,
+                    heavy_executor(),
                     partial(
                         ZoomRematchService.search_scene_sync,
                         video_path,
@@ -291,7 +287,7 @@ class ZoomSearchService:
         applied = False
         result_match = None
         candidates_added = 0
-        fresh_scenes = ProjectService.load_scenes(job.project_id)
+        fresh_scenes = await ProjectService.aload_scenes(job.project_id)
         if (
             fresh_scenes is None
             or self._scene_fingerprint(fresh_scenes, job.scene_index) != fingerprint
@@ -302,7 +298,7 @@ class ZoomSearchService:
             self._broadcast(job)
             return
 
-        fresh_matches = ProjectService.load_matches(job.project_id)
+        fresh_matches = await ProjectService.aload_matches(job.project_id)
         current = None
         if fresh_matches:
             current = next(
@@ -340,10 +336,10 @@ class ZoomSearchService:
                     current.alternatives,
                 )
                 candidates_added = max(0, len(current.alternatives) - before)
-                ProjectService.save_matches(job.project_id, fresh_matches)
+                await ProjectService.asave_matches(job.project_id, fresh_matches)
                 result_match = current
             elif splice_match(fresh_matches, scene.index, outcome.new_match):
-                ProjectService.save_matches(job.project_id, fresh_matches)
+                await ProjectService.asave_matches(job.project_id, fresh_matches)
                 applied = True
                 result_match = outcome.new_match
                 candidates_added = len(outcome.new_match.alternatives)
@@ -363,7 +359,7 @@ class ZoomSearchService:
             ]
             if after_dump != before_dump:
                 candidates_added = max(1, len(after_dump) - len(before_dump))
-                ProjectService.save_matches(job.project_id, fresh_matches)
+                await ProjectService.asave_matches(job.project_id, fresh_matches)
                 result_match = current
 
         job.status = "complete"

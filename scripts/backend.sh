@@ -15,4 +15,6 @@ export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-4}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-4}"
 export JOBLIB_MULTIPROCESSING="${JOBLIB_MULTIPROCESSING:-0}"
 
-exec uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+# --reload-dir app: without it uvicorn's watcher walks the whole cwd, which
+# includes backend/data (~100 GB of projects). Only source edits restart.
+exec uvicorn app.main:app --reload --reload-dir app --host 127.0.0.1 --port 8000

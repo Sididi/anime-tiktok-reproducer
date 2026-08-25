@@ -58,6 +58,37 @@ def test_retry_clears_entry_on_success(project_dir):
     assert project.reschedule_pending == {}
 
 
+def test_retry_only_reads_pending_projects_and_merges_concurrent_edits(project_dir):
+    target = datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
+    _seed("p1", target, retries=0,
+          last_attempt=datetime.now(timezone.utc) - timedelta(minutes=10))
+    idle = Project(id="idle", anime_name="Untouched")
+    ProjectService.get_project_dir(idle.id).mkdir(parents=True, exist_ok=True)
+    ProjectService.save(idle)
+    idle_mtime = ProjectService.get_project_file("idle").stat().st_mtime_ns
+
+    def notify_and_edit_meanwhile(project, platform, when):
+        # Simulates a scheduling route saving the project while the loop is
+        # awaiting the platform call: the loop must not clobber this edit.
+        current = ProjectService.load(project.id)
+        current.anime_name = "Edited while notifying"
+        ProjectService.save(current)
+        return NotificationResult(status="ok")
+
+    with patch(
+        "app.services.reschedule_retry_service.PlatformRescheduleService.notify",
+        side_effect=notify_and_edit_meanwhile,
+    ), patch.object(
+        ProjectService, "list_all", side_effect=AssertionError("list_all must not run")
+    ):
+        asyncio.run(RescheduleRetryService.run_once())
+
+    project = ProjectService.load("p1")
+    assert project.reschedule_pending == {}
+    assert project.anime_name == "Edited while notifying"
+    assert ProjectService.get_project_file("idle").stat().st_mtime_ns == idle_mtime
+
+
 def test_retry_increments_retries_on_failure(project_dir):
     target = datetime(2026, 5, 7, 14, 0, tzinfo=timezone.utc)
     _seed("p1", target, retries=0,

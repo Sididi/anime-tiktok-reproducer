@@ -9,9 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .executors import run_heavy
 from ..config import settings
 from ..models.project_upload import ProjectUploadJob
 from .account_service import AccountConfig, AccountService
+from .atomic_files import write_text_atomic
+from .event_hub import event_hub
 from .project_service import ProjectService
 from .scheduling_service import SchedulingService
 from .upload_phase import UploadPhaseService
@@ -72,13 +75,10 @@ def _jobs_payload(jobs: dict[str, ProjectUploadJob]) -> dict[str, Any]:
 
 
 def _write_jobs_atomic(path: Path, jobs: dict[str, ProjectUploadJob]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + f".{uuid.uuid4().hex}.tmp")
-    tmp_path.write_text(
+    write_text_atomic(
+        path,
         json.dumps(_jobs_payload(jobs), ensure_ascii=True, indent=2, sort_keys=True),
-        encoding="utf-8",
     )
-    tmp_path.replace(path)
 
 
 def _load_jobs(path: Path) -> dict[str, ProjectUploadJob]:
@@ -118,6 +118,9 @@ class UploadRequestSpec:
     immediate_platforms: list[str] | None = None
 
 
+HUB_TOPIC = "upload_jobs"
+
+
 class ProjectUploadService:
     RESTART_INTERRUPTED_ERROR = "Upload interrupted by server restart."
 
@@ -130,7 +133,6 @@ class ProjectUploadService:
         self._jobs = _load_jobs(self._jobs_path)
         max_workers = max_concurrent if max_concurrent is not None else settings.project_upload_max_concurrent
         self._semaphore = asyncio.Semaphore(max(1, max_workers))
-        self._subscribers: list[asyncio.Queue[dict[str, Any]]] = []
         self._requests: dict[str, UploadRequestSpec] = {}
 
     async def startup_cleanup(self) -> None:
@@ -147,7 +149,7 @@ class ProjectUploadService:
         stale_ids = [
             project_id
             for project_id in self._jobs
-            if ProjectService.load(project_id) is None
+            if await ProjectService.aload(project_id) is None
         ]
         for project_id in stale_ids:
             del self._jobs[project_id]
@@ -205,7 +207,7 @@ class ProjectUploadService:
         immediate: bool = False,
         immediate_platforms: list[str] | None = None,
     ) -> ProjectUploadJob:
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise ValueError("Project not found")
 
@@ -251,25 +253,16 @@ class ProjectUploadService:
         )
         return job
 
-    async def stream_all_jobs(self):
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._subscribers.append(queue)
-        try:
-            for job in self.list_jobs():
-                yield job.model_dump(mode="json")
-            while True:
-                yield await queue.get()
-        finally:
-            if queue in self._subscribers:
-                self._subscribers.remove(queue)
-
     async def _publish_job(self, job: ProjectUploadJob) -> None:
         job.updated_at = _utc_now()
         self._jobs[job.project_id] = job
         await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
-        payload = job.model_dump(mode="json")
-        for queue in list(self._subscribers):
-            queue.put_nowait(payload)
+        event_hub.publish(
+            HUB_TOPIC,
+            key=job.project_id,
+            data=job.model_dump(mode="json"),
+            project_id=job.project_id,
+        )
 
     async def _set_job_state(
         self,
@@ -423,7 +416,7 @@ class ProjectUploadService:
 
                 loop.call_soon_threadsafe(_schedule_update)
 
-            result = await asyncio.to_thread(
+            result = await run_heavy(
                 UploadPhaseService.execute_upload,
                 project_id,
                 account_id=request.account_id,

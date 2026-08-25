@@ -12,6 +12,7 @@ import re
 
 logger = logging.getLogger("uvicorn.error")
 
+from ...services.executors import heavy_executor
 from ...config import settings
 from ...library_types import LibraryType
 from ...models import ProjectPhase, MatchList, SceneMatch, SceneList
@@ -25,6 +26,7 @@ from ...services import (
 )
 from ...services.match_playback_service import MatchPlaybackService
 from ...services.fast_matching import bounded_matcher_enabled
+from ...services.project_locks import project_edit_locked
 from ...services.zoom_search_service import zoom_search_service
 from ...services.episode_names import (
     KNOWN_MEDIA_EXTENSIONS,
@@ -136,7 +138,7 @@ def _serialize_scenes(scenes: SceneList) -> list[dict[str, float | int]]:
 @router.get("/matches/config")
 async def get_matches_config(project_id: str):
     """Get matches feature flags."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return {"full_auto_enabled": settings.matches_full_auto_enabled}
@@ -215,9 +217,10 @@ def _build_episode_source_dirs(project) -> list[Path]:
 
 
 @router.post("/sources")
+@project_edit_locked
 async def set_sources(project_id: str, request: SetSourcesRequest):
     """Set source episode paths for the project."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -227,7 +230,7 @@ async def set_sources(project_id: str, request: SetSourcesRequest):
             raise HTTPException(status_code=400, detail=f"Path not found: {path}")
 
     project.source_paths = request.paths
-    ProjectService.save(project)
+    await ProjectService.asave(project)
 
     return {"status": "ok", "source_paths": project.source_paths}
 
@@ -235,7 +238,7 @@ async def set_sources(project_id: str, request: SetSourcesRequest):
 @router.get("/sources")
 async def get_sources(project_id: str):
     """Get source episode paths."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -252,7 +255,7 @@ async def list_episodes(project_id: str):
     episode keys as selectable values even if the episode is not hydrated yet;
     saving that match can hydrate the selected episode before clip prep.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -349,7 +352,7 @@ async def list_episodes(project_id: str):
 @router.post("/matches/find")
 async def find_matches(project_id: str, request: FindMatchesRequest):
     """Find anime source matches for all scenes with optional continuous scene merging."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -376,7 +379,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
         raise HTTPException(status_code=400, detail="Source path not found")
 
     # Load scenes
-    scenes = ProjectService.load_scenes(project_id)
+    scenes = await ProjectService.aload_scenes(project_id)
     if not scenes or not scenes.scenes:
         raise HTTPException(status_code=400, detail="No scenes detected yet")
 
@@ -408,11 +411,11 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
             TINY_SCENE_THRESHOLD,
         )
         scenes = merged_scenes
-        ProjectService.save_scenes(project_id, scenes)
+        await ProjectService.asave_scenes(project_id, scenes)
 
     # Update phase
     project.phase = ProjectPhase.MATCHING
-    ProjectService.save(project)
+    await ProjectService.asave(project)
 
     # Get anime name for filtering (if set on project)
     anime_name = project.anime_name
@@ -441,9 +444,9 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
             final_matches = PureMatcherService.build_identity_matches(
                 video_path, scenes
             )
-            ProjectService.save_matches(project_id, final_matches)
+            await ProjectService.asave_matches(project_id, final_matches)
             project.phase = ProjectPhase.MATCH_VALIDATION
-            ProjectService.save(project)
+            await ProjectService.asave(project)
             yield (
                 "data: "
                 + json.dumps(
@@ -509,7 +512,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                     yield f"data: {json.dumps(progress.to_dict())}\n\n"
                 if progress.status == "error":
                     project.phase = ProjectPhase.SCENE_VALIDATION
-                    ProjectService.save(project)
+                    await ProjectService.asave(project)
                     return
 
         align_result = SceneAlignerService.get_last_result()
@@ -529,15 +532,15 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                 + "\n\n"
             )
             project.phase = ProjectPhase.SCENE_VALIDATION
-            ProjectService.save(project)
+            await ProjectService.asave(project)
             return
 
         final_scenes = align_result.scenes
         final_matches = align_result.matches
-        ProjectService.save_scenes(project_id, final_scenes)
-        ProjectService.save_matches(project_id, final_matches)
+        await ProjectService.asave_scenes(project_id, final_scenes)
+        await ProjectService.asave_matches(project_id, final_matches)
         project.phase = ProjectPhase.MATCH_VALIDATION
-        ProjectService.save(project)
+        await ProjectService.asave(project)
 
         yield (
             "data: "
@@ -571,11 +574,11 @@ async def deferred_download(project_id: str):
 
     Always returns an SSE stream so the frontend can track progress phases.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
@@ -697,7 +700,7 @@ async def deferred_download(project_id: str):
 @router.post("/matches/playback/prepare")
 async def prepare_matches_playback(project_id: str, request: PreparePlaybackRequest):
     """Prepare browser-safe clips for /matches playback and Fast Watch."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -725,7 +728,7 @@ async def prepare_matches_playback_scene(
     request: PrepareScenePlaybackRequest,
 ):
     """Prepare playback clip assets for one scene after manual match updates."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -750,7 +753,7 @@ async def prepare_matches_playback_scene(
 @router.get("/matches/playback/manifest")
 async def get_matches_playback_manifest(project_id: str):
     """Get the current prepared playback manifest for /matches."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -765,7 +768,7 @@ async def get_matches_playback_clip(
     fingerprint: str | None = Query(default=None),
 ):
     """Serve one prepared playback clip."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -796,7 +799,7 @@ async def get_matches_playback_clip(
 @router.get("/matches/playback/clips/{clip_id}")
 async def get_matches_playback_clip_by_id(project_id: str, clip_id: str):
     """Serve one prepared playback clip by stable content-addressed clip id."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -818,11 +821,11 @@ async def get_matches_playback_clip_by_id(project_id: str, clip_id: str):
 @router.get("/matches")
 async def get_matches(project_id: str):
     """Get all matches for a project."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         return {"matches": []}
 
@@ -832,15 +835,15 @@ async def get_matches(project_id: str):
 @router.post("/matches/merge-with-previous/{scene_index}")
 async def merge_with_previous(project_id: str, scene_index: int):
     """Manually merge one scene into the previous scene and re-match only it."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    scenes = ProjectService.load_scenes(project_id)
+    scenes = await ProjectService.aload_scenes(project_id)
     if not scenes or not scenes.scenes:
         raise HTTPException(status_code=404, detail="No scenes found")
 
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches or not matches.matches:
         raise HTTPException(status_code=404, detail="No matches found")
 
@@ -900,11 +903,11 @@ async def merge_with_previous(project_id: str, scene_index: int):
                 merged_matches.matches[merged_scene_index].merged_from
             )
 
-        ProjectService.save_scenes(project_id, merged_scenes)
-        ProjectService.save_matches(project_id, rematched_matches)
+        await ProjectService.asave_scenes(project_id, merged_scenes)
+        await ProjectService.asave_matches(project_id, rematched_matches)
 
         project.phase = ProjectPhase.MATCH_VALIDATION
-        ProjectService.save(project)
+        await ProjectService.asave(project)
 
         return {
             "scenes": _serialize_scenes(merged_scenes),
@@ -963,7 +966,7 @@ async def merge_with_previous(project_id: str, scene_index: int):
                 # match_scenes initializes the searcher itself; the bounded
                 # partial path requires it to be live already.
                 init_success = await loop.run_in_executor(
-                    None,
+                    heavy_executor(),
                     AnimeMatcherService._init_searcher,
                     source_path,
                     project.library_type,
@@ -976,7 +979,7 @@ async def merge_with_previous(project_id: str, scene_index: int):
                     )
                 try:
                     rematched_matches = await loop.run_in_executor(
-                        None,
+                        heavy_executor(),
                         partial(
                             HierarchicalMatcherService.rematch_scene_sync,
                             video_path,
@@ -1026,11 +1029,11 @@ async def merge_with_previous(project_id: str, scene_index: int):
             merged_matches.matches[merged_scene_index].merged_from
         )
 
-    ProjectService.save_scenes(project_id, merged_scenes)
-    ProjectService.save_matches(project_id, rematched_matches)
+    await ProjectService.asave_scenes(project_id, merged_scenes)
+    await ProjectService.asave_matches(project_id, rematched_matches)
 
     project.phase = ProjectPhase.MATCH_VALIDATION
-    ProjectService.save(project)
+    await ProjectService.asave(project)
 
     return {
         "scenes": _serialize_scenes(merged_scenes),
@@ -1058,6 +1061,7 @@ class BatchUpdateMatchesRequest(BaseModel):
 
 
 @router.put("/matches/{scene_index}")
+@project_edit_locked
 async def update_match(project_id: str, scene_index: int, request: UpdateMatchRequest):
     """Update or confirm a match for a scene."""
     _validate_match_timing(
@@ -1066,11 +1070,11 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
         scene_index=scene_index,
     )
 
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=404, detail="No matches found")
 
@@ -1095,7 +1099,7 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
         # was_no_match should already be set, but ensure it's preserved
 
     # Recalculate speed ratio using scene index mapping (not positional offset).
-    scenes = ProjectService.load_scenes(project_id)
+    scenes = await ProjectService.aload_scenes(project_id)
     if scenes:
         scene = next((s for s in scenes.scenes if s.index == scene_index), None)
         if scene is not None:
@@ -1104,23 +1108,24 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
             if source_duration > 0:
                 match.speed_ratio = scene_duration / source_duration
 
-    ProjectService.save_matches(project_id, matches)
+    await ProjectService.asave_matches(project_id, matches)
 
     return {"status": "ok", "match": match.model_dump()}
 
 
 @router.put("/matches")
+@project_edit_locked
 async def update_matches_batch(project_id: str, request: BatchUpdateMatchesRequest):
     """Batch update multiple scene matches and persist once."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    matches = ProjectService.load_matches(project_id)
+    matches = await ProjectService.aload_matches(project_id)
     if not matches:
         raise HTTPException(status_code=404, detail="No matches found")
 
-    scenes = ProjectService.load_scenes(project_id)
+    scenes = await ProjectService.aload_scenes(project_id)
     scene_by_index = {scene.index: scene for scene in scenes.scenes} if scenes else {}
     match_by_scene_index = {match.scene_index: match for match in matches.matches}
 
@@ -1164,14 +1169,14 @@ async def update_matches_batch(project_id: str, request: BatchUpdateMatchesReque
             if source_duration > 0:
                 match.speed_ratio = scene_duration / source_duration
 
-    ProjectService.save_matches(project_id, matches)
+    await ProjectService.asave_matches(project_id, matches)
     return {"status": "ok", "matches": [m.model_dump() for m in matches.matches]}
 
 
 @router.post("/matches/undo-merge/{scene_index}")
 async def undo_merge(project_id: str, scene_index: int):
     """Undo a merge for a specific scene, restoring original sub-scenes."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -1196,7 +1201,7 @@ async def undo_merge(project_id: str, scene_index: int):
 @router.post("/matches/zoom-search/{scene_index}", status_code=202)
 async def start_zoom_search(project_id: str, scene_index: int):
     """Queue an extensive zoom search for one scene (async background job)."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     if project.library_type == LibraryType.PURE:
@@ -1205,7 +1210,7 @@ async def start_zoom_search(project_id: str, scene_index: int):
             detail="Zoom search is not available for pure projects",
         )
 
-    scenes = ProjectService.load_scenes(project_id)
+    scenes = await ProjectService.aload_scenes(project_id)
     if not scenes or not scenes.scenes:
         raise HTTPException(status_code=404, detail="No scenes found")
     if not 0 <= scene_index < len(scenes.scenes):
@@ -1221,33 +1226,17 @@ async def start_zoom_search(project_id: str, scene_index: int):
 
 @router.get("/matches/zoom-search/jobs")
 async def list_zoom_search_jobs(project_id: str):
-    """Snapshot of this project's zoom-search jobs."""
+    """Snapshot of this project's zoom-search jobs.
+
+    Live updates flow over the shared ``/api/events/stream`` (topic
+    ``zoom_jobs``, filtered client-side by ``project_id``).
+    """
     return {
         "jobs": [
             job.model_dump(mode="json")
             for job in zoom_search_service.list_jobs(project_id)
         ]
     }
-
-
-@router.get("/matches/zoom-search/jobs/stream")
-async def stream_zoom_search_jobs(project_id: str):
-    """SSE stream of this project's zoom-search job updates.
-
-    Events are wrapped as ``{"kind": "zoom_job", "job": {...}}`` so a job in
-    the ``error`` state never puts a top-level ``status: "error"`` on the
-    wire (the frontend's generic SSE reader throws on those).
-    """
-
-    async def generate():
-        async for data in zoom_search_service.stream_jobs(project_id):
-            yield "data: " + json.dumps({"kind": "zoom_job", "job": data}) + "\n\n"
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
 
 
 @router.post("/matches/zoom-search/jobs/{job_id}/ack")

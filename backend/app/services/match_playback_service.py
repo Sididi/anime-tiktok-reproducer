@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator, Literal
 
+from .executors import run_heavy
 from ..config import settings
 from ..models import MatchList, Project, SceneList
 from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
@@ -1338,14 +1339,14 @@ class MatchPlaybackService:
 
                 try:
                     if output_path.exists() and output_path.stat().st_size > 0:
-                        duration = await asyncio.to_thread(
+                        duration = await run_heavy(
                             cls._get_clip_duration_sync,
                             project_id,
                             plan.clip_id,
                         )
                         return _ClipJobResult(plan=plan, encoded=False, duration=duration)
 
-                    duration = await asyncio.to_thread(
+                    duration = await run_heavy(
                         cls._encode_clip_sync,
                         project_id=project_id,
                         plan=plan,
@@ -1364,8 +1365,8 @@ class MatchPlaybackService:
         # read checked=True/available=False, permanently skipping the NVENC
         # or full-GPU rung for clips that get cached.
         if ordered_plans:
-            await asyncio.to_thread(cls._is_nvenc_available_sync)
-            await asyncio.to_thread(cls._is_full_gpu_available_sync)
+            await run_heavy(cls._is_nvenc_available_sync)
+            await run_heavy(cls._is_full_gpu_available_sync)
 
         tasks = [asyncio.create_task(run_one(plan)) for plan in ordered_plans]
         for completed in asyncio.as_completed(tasks):
@@ -1498,7 +1499,7 @@ class MatchPlaybackService:
         *,
         force: bool = False,
     ) -> AsyncIterator[PlaybackPrepareProgress]:
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if not project:
             yield PlaybackPrepareProgress(
                 status="error",
@@ -1508,8 +1509,8 @@ class MatchPlaybackService:
             )
             return
 
-        scenes = ProjectService.load_scenes(project_id)
-        matches = ProjectService.load_matches(project_id)
+        scenes = await ProjectService.aload_scenes(project_id)
+        matches = await ProjectService.aload_matches(project_id)
         if not scenes or not scenes.scenes:
             yield PlaybackPrepareProgress(
                 status="error",
@@ -1754,7 +1755,7 @@ class MatchPlaybackService:
         scene_index: int,
         force: bool,
     ) -> AsyncIterator[PlaybackPrepareProgress]:
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if not project:
             yield PlaybackPrepareProgress(
                 status="error",
@@ -1765,8 +1766,8 @@ class MatchPlaybackService:
             )
             return
 
-        scenes = ProjectService.load_scenes(project_id)
-        matches = ProjectService.load_matches(project_id)
+        scenes = await ProjectService.aload_scenes(project_id)
+        matches = await ProjectService.aload_matches(project_id)
         if not scenes or not matches:
             yield PlaybackPrepareProgress(
                 status="error",
@@ -2037,9 +2038,9 @@ class MatchPlaybackService:
         if not cls._validate_manifest_sync(project_id, manifest):
             return cls._default_manifest()
 
-        project = ProjectService.load(project_id)
-        scenes = ProjectService.load_scenes(project_id)
-        matches = ProjectService.load_matches(project_id)
+        project = await ProjectService.aload(project_id)
+        scenes = await ProjectService.aload_scenes(project_id)
+        matches = await ProjectService.aload_matches(project_id)
         if not project or not scenes or not scenes.scenes or not matches:
             return cls._default_manifest()
 

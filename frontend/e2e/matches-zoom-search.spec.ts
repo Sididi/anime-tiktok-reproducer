@@ -1,10 +1,12 @@
 import { expect, test } from "@playwright/test";
+import { installEventHubMock } from "./helpers/eventHubMock";
 
 // Per-scene extensive zoom search: async job trigger, stacked completion
 // alerts, card glow, and the three dismissal paths (alert click, Play Both,
-// committed timing change). The jobs stream mock is finite — the bridge
-// reconnects every 3s, and each reconnect advances queued jobs to complete,
-// emulating the server-side background job.
+// committed timing change). Job state arrives through the shared event
+// stream (mocked by installEventHubMock): a started job is pushed as queued,
+// then advanced to running and complete shortly after, emulating the
+// server-side background job.
 function installZoomMocks(
   {
     projectId,
@@ -15,12 +17,11 @@ function installZoomMocks(
   const testWindow = window as typeof window & {
     __zoomStarted?: number[];
     __zoomAcks?: string[];
-    __zoomStreamConnects?: number;
     __zoomJobs?: Record<string, Record<string, unknown>>;
+    __atrHub?: { pushItem(topic: string, item: unknown): void };
   };
   testWindow.__zoomStarted = [];
   testWindow.__zoomAcks = [];
-  testWindow.__zoomStreamConnects = 0;
   const jobs: Record<
     string,
     {
@@ -211,6 +212,13 @@ function installZoomMocks(
     const zoomStartMatch = url.pathname.match(
       new RegExp(`^${zoomBase}/(\\d+)$`),
     );
+    const publishJob = (job: (typeof jobs)[string]) => {
+      testWindow.__atrHub?.pushItem("zoom_jobs", {
+        key: job.id,
+        project_id: job.project_id,
+        data: { ...job },
+      });
+    };
     if (zoomStartMatch && init?.method === "POST") {
       const sceneIndex = Number(zoomStartMatch[1]);
       testWindow.__zoomStarted?.push(sceneIndex);
@@ -231,50 +239,41 @@ function installZoomMocks(
         created_at: 0,
       };
       jobs[job.id] = job;
+      publishJob(job);
+      // The fake background job runs and completes shortly after.
+      window.setTimeout(() => {
+        job.status = "running";
+        publishJob(job);
+        job.status = "complete";
+        job.changed = true;
+        job.applied = true;
+        const prior = matches.find(
+          (match) => match.scene_index === job.scene_index,
+        );
+        job.result_match = prior
+          ? {
+              ...prior,
+              alternatives: [
+                {
+                  episode: "Episode-03.mkv",
+                  start_time: 100,
+                  end_time: 102,
+                  confidence: 0.95,
+                  speed_ratio: 1,
+                  vote_count: 4,
+                  algorithm: "zoom_search_registered",
+                },
+              ],
+            }
+          : null;
+        job.candidates_added = 1;
+        job.message = "Match updated";
+        publishJob(job);
+      }, 150);
       return json({ job });
     }
     if (url.pathname === `${zoomBase}/jobs`) {
       return json({ jobs: Object.values(jobs) });
-    }
-    if (url.pathname === `${zoomBase}/jobs/stream`) {
-      testWindow.__zoomStreamConnects =
-        (testWindow.__zoomStreamConnects ?? 0) + 1;
-      const events: unknown[] = [];
-      for (const job of Object.values(jobs)) {
-        if (job.status === "queued") {
-          // Each reconnect advances the fake background job to completion.
-          job.status = "running";
-          events.push({ kind: "zoom_job", job: { ...job } });
-          job.status = "complete";
-          job.changed = true;
-          job.applied = true;
-          const prior = matches.find(
-            (match) => match.scene_index === job.scene_index,
-          );
-          job.result_match = prior
-            ? {
-                ...prior,
-                alternatives: [
-                  {
-                    episode: "Episode-03.mkv",
-                    start_time: 100,
-                    end_time: 102,
-                    confidence: 0.95,
-                    speed_ratio: 1,
-                    vote_count: 4,
-                    algorithm: "zoom_search_registered",
-                  },
-                ],
-              }
-            : null;
-          job.candidates_added = 1;
-          job.message = "Match updated";
-          events.push({ kind: "zoom_job", job: { ...job } });
-        } else {
-          events.push({ kind: "zoom_job", job: { ...job } });
-        }
-      }
-      return sse(events);
     }
     const ackMatch = url.pathname.match(
       new RegExp(`^${zoomBase}/jobs/([^/]+)/ack$`),
@@ -319,6 +318,7 @@ test("trigger shows job state then a clickable alert with card glow", async ({
   page,
 }) => {
   const projectId = "zoom-search-basic";
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installZoomMocks, {
     projectId,
     libraryType: "anime",
@@ -336,7 +336,7 @@ test("trigger shows job state then a clickable alert with card glow", async ({
   // Optimistic queued state disables the button immediately.
   await expect(button).toBeDisabled();
 
-  // The next stream reconnect (≤3s) completes the job: alert + glow.
+  // The pushed completion event produces the alert + glow.
   const alert = page.locator("[data-zoom-search-alert-card]");
   await expect(alert).toBeVisible({ timeout: 15000 });
   await expect(alert).toContainText("Scene 2");
@@ -349,6 +349,7 @@ test("clicking the alert acks, dismisses, unglows and activates the scene", asyn
   page,
 }) => {
   const projectId = "zoom-search-alert-click";
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installZoomMocks, {
     projectId,
     libraryType: "anime",
@@ -374,6 +375,7 @@ test("completed zoom candidates appear in the manual modal without a reload", as
   page,
 }) => {
   const projectId = "zoom-search-candidates";
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installZoomMocks, {
     projectId,
     libraryType: "anime",
@@ -395,6 +397,7 @@ test("completed zoom candidates appear in the manual modal without a reload", as
 
 test("Play Both dismisses the scene's alert", async ({ page }) => {
   const projectId = "zoom-search-play-both";
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installZoomMocks, {
     projectId,
     libraryType: "anime",
@@ -418,6 +421,7 @@ test("saving a timing change in the modal dismisses the alert", async ({
   page,
 }) => {
   const projectId = "zoom-search-manual-save";
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installZoomMocks, {
     projectId,
     libraryType: "anime",
@@ -445,10 +449,11 @@ test("saving a timing change in the modal dismisses the alert", async ({
     .toEqual(["job-0"]);
 });
 
-test("recompute clears alerts and the job stream stays alive", async ({
+test("recompute clears alerts and the job subscription stays alive", async ({
   page,
 }) => {
   const projectId = "zoom-search-recompute";
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installZoomMocks, {
     projectId,
     libraryType: "anime",
@@ -461,25 +466,29 @@ test("recompute clears alerts and the job stream stays alive", async ({
     timeout: 15000,
   });
 
-  const connectsBefore = await page.evaluate(
-    () => window.__zoomStreamConnects ?? 0,
-  );
   await page.getByRole("button", { name: "Recompute", exact: true }).click();
   await expect(page.locator("[data-zoom-search-alert-card]")).toHaveCount(0);
   await expect(page.locator('[data-zoom-search-alert="true"]')).toHaveCount(0);
 
   // The bridge's subscription is not registered in the page's abortable
-  // stream set: reconnects continue after the recompute.
+  // stream set: it survives the recompute and keeps delivering job events.
   await expect
-    .poll(
-      async () => page.evaluate(() => window.__zoomStreamConnects ?? 0),
-      { timeout: 15000 },
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__atrEventHub?.debugSnapshot().subscriptions.zoom_jobs ?? 0,
+      ),
     )
-    .toBeGreaterThan(connectsBefore);
+    .toBe(1);
+  await page.locator('[data-zoom-search-scene-index="0"]').click();
+  const alert = page.locator("[data-zoom-search-alert-card]");
+  await expect(alert).toBeVisible({ timeout: 15000 });
+  await expect(alert).toContainText("Scene 1");
 });
 
 test("pure projects show no zoom search button", async ({ page }) => {
   const projectId = "zoom-search-pure";
+  await page.addInitScript(installEventHubMock, {});
   await page.addInitScript(installZoomMocks, {
     projectId,
     libraryType: "pure",
@@ -497,7 +506,9 @@ declare global {
   interface Window {
     __zoomStarted?: number[];
     __zoomAcks?: string[];
-    __zoomStreamConnects?: number;
     __zoomJobs?: Record<string, Record<string, unknown>>;
+    __atrEventHub?: {
+      debugSnapshot(): { subscriptions: Record<string, number> };
+    };
   }
 }

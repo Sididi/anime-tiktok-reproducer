@@ -1,5 +1,12 @@
 import { defineConfig, devices } from "@playwright/test";
 
+// Override both to run the suite against a second dev stack on other ports
+// (e.g. a worktree's Vite on 5174 proxying to its backend on 8001) without
+// touching the servers a developer already has running on 5173/8000.
+const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:5173";
+const backendHealthURL =
+  process.env.PLAYWRIGHT_BACKEND_HEALTH_URL ?? "http://localhost:8000/health";
+
 /**
  * Playwright configuration for E2E tests
  * @see https://playwright.dev/docs/test-configuration
@@ -19,7 +26,7 @@ export default defineConfig({
   /* Shared settings for all the projects below. */
   use: {
     /* Base URL to use in actions like `await page.goto('/')`. */
-    baseURL: "http://localhost:5173",
+    baseURL,
 
     /* Collect trace when retrying the failed test. */
     trace: "on-first-retry",
@@ -43,13 +50,13 @@ export default defineConfig({
   webServer: [
     {
       command: "npm run dev",
-      url: "http://localhost:5173",
+      url: baseURL,
       reuseExistingServer: !process.env.CI,
       timeout: 120000,
     },
     {
       command: "cd .. && pixi run backend",
-      url: "http://localhost:8000/health",
+      url: backendHealthURL,
       reuseExistingServer: !process.env.CI,
       timeout: 120000,
     },

@@ -18,6 +18,7 @@ from typing import Any, AsyncIterator
 
 import spacy
 
+from .executors import heavy_executor, run_heavy
 from ..config import settings
 from ..library_types import LibraryType
 from ..models import MatchList, Project, Transcription, SceneMatch
@@ -2641,7 +2642,7 @@ class ProcessingService:
 
                 async with indexation_queue.heavy_slot("forced_alignment"):
                     alignment_future = loop.run_in_executor(
-                        None,
+                        heavy_executor(),
                         lambda: ForcedAlignmentService.align_known_script(
                             project_id=project.id,
                             script_payload=new_script,
@@ -2763,7 +2764,7 @@ class ProcessingService:
                         for line in borrow_report:
                             logger.info("Pure gap resolution: %s", line)
 
-                        ProjectService.save_matches(project.id, MatchList(matches=matches))
+                        await ProjectService.asave_matches(project.id, MatchList(matches=matches))
                         (project_dir / "gaps_resolved.flag").touch()
 
                         yield ProcessingProgress(
@@ -2816,7 +2817,7 @@ class ProcessingService:
                                         break
 
                         # Save updated matches
-                        ProjectService.save_matches(project.id, MatchList(matches=matches))
+                        await ProjectService.asave_matches(project.id, MatchList(matches=matches))
                         (project_dir / "gaps_resolved.flag").touch()
 
                         yield ProcessingProgress(
@@ -3173,7 +3174,7 @@ class ProcessingService:
                     else:
                         overlay.pop("category_image", None)
                     project.video_overlay = overlay
-                ProjectService.save(project)
+                await ProjectService.asave(project)
             else:
                 for stale_overlay_name in ("title_overlay.png", "category_overlay.png"):
                     stale_overlay_path = output_dir / stale_overlay_name
@@ -3183,7 +3184,7 @@ class ProcessingService:
                     overlay.pop("title_image", None)
                     overlay.pop("category_image", None)
                     project.video_overlay = overlay
-                    ProjectService.save(project)
+                    await ProjectService.asave(project)
                 yield ProcessingProgress(
                     "processing",
                     "overlay_image_generation",
@@ -3203,7 +3204,7 @@ class ProcessingService:
                 )
                 raw_backup = output_dir / "tts_edited.raw.wav"
                 shutil.copyfile(tts_final_path, raw_backup)
-                defingerprint_meta = await asyncio.to_thread(
+                defingerprint_meta = await run_heavy(
                     VoiceDefingerprintService.apply,
                     raw_backup,
                     tts_final_path,

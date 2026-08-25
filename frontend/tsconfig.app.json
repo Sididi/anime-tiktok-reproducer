@@ -30,5 +30,7 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  /* Worker scripts need the WebWorker lib (see tsconfig.worker.json). */
+  "exclude": ["src/**/*.worker.ts"]
 }

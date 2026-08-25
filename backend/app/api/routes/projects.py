@@ -7,6 +7,7 @@ from typing import Any
 from ...library_types import DEFAULT_LIBRARY_TYPE, LibraryType
 from ...models import Project, ProjectPhase
 from ...services import LibraryHydrationService, ProjectService
+from ...services.project_locks import project_edit_locked
 from ...services.project_duplication_service import (
     DuplicationVariant,
     ProjectDuplicationService,
@@ -99,14 +100,14 @@ async def create_project(request: CreateProjectRequest) -> ProjectResponse:
 @router.get("", response_model=list[ProjectResponse])
 async def list_projects() -> list[ProjectResponse]:
     """List all projects."""
-    projects = ProjectService.list_all()
+    projects = await ProjectService.alist_all()
     return [ProjectResponse.from_project(p) for p in projects]
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
 async def get_project(project_id: str) -> ProjectResponse:
     """Get a project by ID."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return ProjectResponse.from_project(project)
@@ -126,7 +127,7 @@ async def duplicate_project(
     project_id: str, request: DuplicateProjectRequest
 ) -> dict[str, Any]:
     """Duplicate a project into template/language variants (script phase)."""
-    if ProjectService.load(project_id) is None:
+    if await ProjectService.aload(project_id) is None:
         raise HTTPException(status_code=404, detail="Project not found")
     try:
         created = await asyncio.to_thread(
@@ -156,9 +157,10 @@ async def delete_project(project_id: str) -> dict:
 
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
+@project_edit_locked
 async def update_project(project_id: str, request: UpdateProjectRequest) -> ProjectResponse:
     """Update a project's settings."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -169,7 +171,7 @@ async def update_project(project_id: str, request: UpdateProjectRequest) -> Proj
     if request.library_type is not None:
         project.library_type = request.library_type
 
-    ProjectService.save(project)
+    await ProjectService.asave(project)
     ProjectService.sync_project_pin(project)
     return ProjectResponse.from_project(project)
 
@@ -177,7 +179,7 @@ async def update_project(project_id: str, request: UpdateProjectRequest) -> Proj
 @router.post("/{project_id}/library/activate")
 async def activate_project_library(project_id: str) -> dict[str, Any]:
     """Activate the selected series locally before matching."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     if not project.series_id:
@@ -196,7 +198,7 @@ async def activate_project_library(project_id: str) -> dict[str, Any]:
 @router.get("/{project_id}/library/activation")
 async def get_project_library_activation(project_id: str) -> dict[str, Any]:
     """Get current activation/hydration state for the project's selected series."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     if not project.series_id:

@@ -14,6 +14,7 @@ from typing import Any, AsyncIterator
 import numpy as np
 from PIL import Image, ImageOps
 
+from .executors import heavy_executor
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from ..models import AlternativeMatch, MatchCandidate, MatchList, Scene, SceneMatch, SceneList
@@ -3401,7 +3402,7 @@ class AnimeMatcherService:
         # Initialize searcher in thread pool
         loop = asyncio.get_event_loop()
         init_success = await loop.run_in_executor(
-            None, cls._init_searcher, library_path, library_type, anime_name
+            heavy_executor(), cls._init_searcher, library_path, library_type, anime_name
         )
 
         if not init_success:
@@ -3432,13 +3433,13 @@ class AnimeMatcherService:
             total_scenes,
         )
         probe_frames, probe_frame_indices = await loop.run_in_executor(
-            None,
+            heavy_executor(),
             cls._extract_scene_probe_frames_with_indices,
             video_path,
             target_scene_items,
         )
         direct_candidates = await loop.run_in_executor(
-            None,
+            heavy_executor(),
             partial(
                 cls._search_scene_probe_candidates_batch,
                 probe_frames,
@@ -3572,7 +3573,7 @@ class AnimeMatcherService:
                 if selected_before_refine is not None:
                     if selected_before_refine.source != "merged_seed":
                         refined = await loop.run_in_executor(
-                            None,
+                            heavy_executor(),
                             cls._refine_boundaries,
                             video_path,
                             scene,

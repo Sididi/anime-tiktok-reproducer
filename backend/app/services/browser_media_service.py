@@ -8,6 +8,7 @@ import threading
 from contextlib import suppress
 from pathlib import Path
 
+from .executors import run_heavy
 from ..config import settings
 from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from .anime_library import AnimeLibraryService
@@ -339,7 +340,7 @@ class BrowserMediaService:
         allow_generate: bool = True,
     ) -> Path:
         if allow_generate:
-            resolved = await asyncio.to_thread(
+            resolved = await run_heavy(
                 cls.ensure_preview_proxy_sync,
                 source_path,
                 profile=profile,
@@ -347,7 +348,7 @@ class BrowserMediaService:
             )
             return resolved if resolved is not None else source_path
 
-        compatible = await asyncio.to_thread(
+        compatible = await run_heavy(
             cls.is_browser_preview_compatible_sync,
             source_path,
             include_audio=include_audio,
@@ -385,7 +386,7 @@ class BrowserMediaService:
 
         async def _run() -> None:
             try:
-                await asyncio.to_thread(
+                await run_heavy(
                     cls.ensure_preview_proxy_sync,
                     source_path,
                     profile=profile,
