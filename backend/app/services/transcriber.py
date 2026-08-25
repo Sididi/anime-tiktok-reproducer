@@ -1168,7 +1168,7 @@ class TranscriberService:
         native_futures: list[asyncio.Future[Any]] = []
         try:
             # Load project and scenes
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if not project or not project.video_path:
                 yield TranscriptionProgress("error", 0, "", error="Project or video not found")
                 return

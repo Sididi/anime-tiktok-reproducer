@@ -22,7 +22,7 @@ class ValidateRequest(BaseModel):
 @router.get("")
 async def get_raw_scenes(project_id: str):
     """Get raw scene detection result and current transcription."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -47,7 +47,7 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
     For invalidated scenes (is_raw=False): merge back into adjacent TTS scene.
     For validated scenes: keep as raw.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -115,7 +115,7 @@ async def validate_raw_scenes(project_id: str, request: ValidateRequest):
 @project_edit_locked
 async def confirm_raw_scenes(project_id: str):
     """Finalize raw scene validation and advance to script phase."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -127,15 +127,16 @@ async def confirm_raw_scenes(project_id: str):
         await ProjectService.asave_transcription(project_id, transcription)
 
     project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
-    ProjectService.save(project)
+    await ProjectService.asave(project)
 
     return {"status": "ok"}
 
 
 @router.post("/reset")
+@project_edit_locked
 async def reset_raw_scenes(project_id: str):
     """Reset raw scene validation to the post-detection state (before user edits)."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -163,7 +164,7 @@ async def reset_raw_scenes(project_id: str):
 
     # Set phase back to raw scene validation
     project.phase = ProjectPhase.RAW_SCENE_VALIDATION
-    ProjectService.save(project)
+    await ProjectService.asave(project)
 
     return {"status": "ok"}
 

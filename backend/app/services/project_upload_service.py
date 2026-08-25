@@ -149,7 +149,7 @@ class ProjectUploadService:
         stale_ids = [
             project_id
             for project_id in self._jobs
-            if ProjectService.load(project_id) is None
+            if await ProjectService.aload(project_id) is None
         ]
         for project_id in stale_ids:
             del self._jobs[project_id]
@@ -207,7 +207,7 @@ class ProjectUploadService:
         immediate: bool = False,
         immediate_platforms: list[str] | None = None,
     ) -> ProjectUploadJob:
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise ValueError("Project not found")
 

@@ -974,7 +974,7 @@ class ScriptAutomationService:
             if not settings.script_automate_enabled:
                 raise RuntimeError("Script automation is disabled (ATR_SCRIPT_AUTOMATE_ENABLED=false)")
 
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if not project:
                 raise RuntimeError("Project not found")
 

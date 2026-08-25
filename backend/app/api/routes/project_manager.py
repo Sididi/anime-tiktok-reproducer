@@ -103,7 +103,7 @@ async def run_upload_phase(
 @router.get("/projects/{project_id}/upload-restrictions")
 async def get_upload_restrictions(project_id: str):
     """Restrictions from linked duplicated projects (blocked accounts/dates)."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return await asyncio.to_thread(UploadRestrictionService.describe, project)

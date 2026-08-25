@@ -3174,7 +3174,7 @@ class ProcessingService:
                     else:
                         overlay.pop("category_image", None)
                     project.video_overlay = overlay
-                ProjectService.save(project)
+                await ProjectService.asave(project)
             else:
                 for stale_overlay_name in ("title_overlay.png", "category_overlay.png"):
                     stale_overlay_path = output_dir / stale_overlay_name
@@ -3184,7 +3184,7 @@ class ProcessingService:
                     overlay.pop("title_image", None)
                     overlay.pop("category_image", None)
                     project.video_overlay = overlay
-                    ProjectService.save(project)
+                    await ProjectService.asave(project)
                 yield ProcessingProgress(
                     "processing",
                     "overlay_image_generation",

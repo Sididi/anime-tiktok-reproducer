@@ -1499,7 +1499,7 @@ class MatchPlaybackService:
         *,
         force: bool = False,
     ) -> AsyncIterator[PlaybackPrepareProgress]:
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if not project:
             yield PlaybackPrepareProgress(
                 status="error",
@@ -1755,7 +1755,7 @@ class MatchPlaybackService:
         scene_index: int,
         force: bool,
     ) -> AsyncIterator[PlaybackPrepareProgress]:
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if not project:
             yield PlaybackPrepareProgress(
                 status="error",
@@ -2038,7 +2038,7 @@ class MatchPlaybackService:
         if not cls._validate_manifest_sync(project_id, manifest):
             return cls._default_manifest()
 
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         scenes = await ProjectService.aload_scenes(project_id)
         matches = await ProjectService.aload_matches(project_id)
         if not project or not scenes or not scenes.scenes or not matches:

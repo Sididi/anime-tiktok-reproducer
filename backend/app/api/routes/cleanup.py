@@ -120,5 +120,5 @@ async def skip_cleanup(project_id: str) -> dict:
             status_code=400, detail="Cleanup is running; cancel it first"
         )
     project.phase = ProjectPhase.SCENE_DETECTION
-    ProjectService.save(project)
+    await ProjectService.asave(project)
     return {"status": "skipped"}

@@ -86,7 +86,7 @@ class ProjectStartupService:
         stale_ids = [
             project_id
             for project_id in self._jobs
-            if ProjectService.load(project_id) is None
+            if await ProjectService.aload(project_id) is None
         ]
         for project_id in stale_ids:
             del self._jobs[project_id]
@@ -129,7 +129,7 @@ class ProjectStartupService:
     async def enqueue_project(self, project_id: str) -> ProjectStartupJob:
         from .project_service import ProjectService
 
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise RuntimeError("Project not found")
 
@@ -158,7 +158,7 @@ class ProjectStartupService:
     async def retry_project(self, project_id: str) -> ProjectStartupJob:
         from .project_service import ProjectService
 
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise RuntimeError("Project not found")
 
@@ -257,7 +257,7 @@ class ProjectStartupService:
         from .project_service import ProjectService
         from ..models.project import ProjectPhase
 
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise RuntimeError("Project not found")
 
@@ -288,7 +288,7 @@ class ProjectStartupService:
         project.video_height = None
         project.original_video_path = None
         project.cleanup = None
-        ProjectService.save(project)
+        await ProjectService.asave(project)
 
     async def _run_job(self, project_id: str, job_id: str) -> None:
         from .downloader import DownloaderService
@@ -302,7 +302,7 @@ class ProjectStartupService:
             if job is None or job.job_id != job_id:
                 return
 
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if project is None:
                 raise RuntimeError("Project not found")
             self._sync_job_from_project(job, project)
@@ -332,7 +332,7 @@ class ProjectStartupService:
                     message=progress.message or "Downloading TikTok video...",
                 )
 
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if project is None:
                 raise RuntimeError("Project not found")
 
@@ -344,7 +344,7 @@ class ProjectStartupService:
 
                 project.phase = ProjectPhase.CLEANUP
                 project.original_video_path = project.video_path
-                ProjectService.save(project)
+                await ProjectService.asave(project)
                 await self._set_job_state(
                     job,
                     status="complete",
@@ -380,7 +380,7 @@ class ProjectStartupService:
                     message=progress.message or "Detecting scenes...",
                 )
 
-            project = ProjectService.load(project_id)
+            project = await ProjectService.aload(project_id)
             if project is None:
                 raise RuntimeError("Project not found")
 

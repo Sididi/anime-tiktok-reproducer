@@ -26,6 +26,13 @@ LOCKED_HANDLERS = {
     "update_transcription",
     "split_scene",
     "merge_scenes",
+    # project.json read-modify-write handlers (no heavy work inside)
+    "set_sources",
+    "update_script_settings",
+    "update_script_phase_settings",
+    "update_project",
+    "reset_raw_scenes",
+    "confirm_transcription",
 }
 
 
@@ -99,7 +106,15 @@ async def test_handler_without_project_id_is_rejected():
 
 
 def test_the_eight_read_modify_write_routes_are_locked():
-    from app.api.routes import gaps, matching, raw_scenes, scenes, transcription
+    from app.api.routes import (
+        gaps,
+        matching,
+        processing,
+        projects,
+        raw_scenes,
+        scenes,
+        transcription,
+    )
 
     modules = {
         "update_match": matching,
@@ -110,6 +125,12 @@ def test_the_eight_read_modify_write_routes_are_locked():
         "update_transcription": transcription,
         "split_scene": scenes,
         "merge_scenes": scenes,
+        "set_sources": matching,
+        "update_script_settings": processing,
+        "update_script_phase_settings": processing,
+        "update_project": projects,
+        "reset_raw_scenes": raw_scenes,
+        "confirm_transcription": transcription,
     }
     assert set(modules) == LOCKED_HANDLERS
     for name, module in modules.items():

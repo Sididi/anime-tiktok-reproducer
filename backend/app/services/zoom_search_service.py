@@ -180,7 +180,7 @@ class ZoomSearchService:
         from .project_service import ProjectService
         from .zoom_rematch import ZoomRematchService, splice_match
 
-        project = ProjectService.load(job.project_id)
+        project = await ProjectService.aload(job.project_id)
         if not project:
             return self._fail(job, "Project not found")
         if project.library_type == LibraryType.PURE:

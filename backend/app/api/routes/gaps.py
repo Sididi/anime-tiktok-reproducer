@@ -23,7 +23,7 @@ class GapsConfigResponse(BaseModel):
 @router.get("/config")
 async def get_gaps_config(project_id: str) -> GapsConfigResponse:
     """Get gaps feature flags."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -81,7 +81,7 @@ async def get_gaps(project_id: str) -> GapsResponse:
     This should be called after the transcription step in processing
     to detect which scenes have gaps.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -151,7 +151,7 @@ async def get_all_candidates(project_id: str) -> AllCandidatesResponse:
     Loads matches/transcription once, calculates gaps once, then generates
     candidates sequentially to avoid subprocess storms (ffprobe, pyscenedetect).
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -202,7 +202,7 @@ async def get_gap_candidates(project_id: str, scene_index: int) -> GapCandidates
     candidates ranked to avoid same-episode overlap first, then minimize
     extra source while preferring cut-aligned extensions.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -270,7 +270,7 @@ async def auto_fill_all_gaps(project_id: str) -> AutoFillResponse:
     For each gap, generates candidates and applies the overlap-aware best choice.
     Gaps without valid candidates are skipped.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -409,7 +409,7 @@ async def update_gap_timing(
     This updates the match data with the new extended timing.
     If skipped=True, we mark the scene as having an intentional gap.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -515,7 +515,7 @@ async def mark_gaps_resolved(project_id: str):
 
     This updates the project phase and creates a flag file.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -535,7 +535,7 @@ async def reset_gaps(project_id: str):
     original timings (before any gap resolution was applied).
     The original matches are stored when gap detection first runs.
     """
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 

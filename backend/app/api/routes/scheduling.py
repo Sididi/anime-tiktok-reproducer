@@ -449,7 +449,7 @@ async def _notify_switch_displacements(switches, steals) -> dict[str, dict[str, 
         for displaced in plan.displaced:
             # Relocate follow moves carry their own platform.
             item_platform = displaced.platform or platform
-            moved = ProjectService.load(displaced.project_id)
+            moved = await ProjectService.aload(displaced.project_id)
             sched = (moved.platform_schedules or {}).get(item_platform) if moved else None
             if sched is None:
                 continue
@@ -643,7 +643,7 @@ async def cascade_apply(project_id: str, req: CascadeRequest):
                 displaced.project_id,
                 plat.platform,
                 # use the recomputed scheduled_at written by apply_cascade
-                ProjectService.load(displaced.project_id)
+                (await ProjectService.aload(displaced.project_id))
                     .platform_schedules[plat.platform].scheduled_at,
             )
             notification_status[plat.platform][displaced.project_id] = ts
@@ -719,7 +719,7 @@ async def switch_apply(project_id: str, req: SwitchApplyRequest):
     notification_status: dict[str, str] = {}
     for displaced in plan.displaced:
         item_platform = displaced.platform or req.platform
-        moved = ProjectService.load(displaced.project_id)
+        moved = await ProjectService.aload(displaced.project_id)
         if moved is None:
             continue
         sched = (moved.platform_schedules or {}).get(item_platform)

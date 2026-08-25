@@ -15,7 +15,7 @@ class DownloadRequest(BaseModel):
 @router.post("/download")
 async def download_video(project_id: str, request: DownloadRequest):
     """Download a TikTok video and stream progress updates."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 

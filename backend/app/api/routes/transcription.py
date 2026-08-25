@@ -24,7 +24,7 @@ class UpdateTranscriptionRequest(BaseModel):
 @router.get("/config")
 async def get_transcription_config(project_id: str):
     """Get transcription page feature flags."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -34,7 +34,7 @@ async def get_transcription_config(project_id: str):
 @router.post("/start")
 async def start_transcription(project_id: str, request: StartTranscriptionRequest):
     """Start transcription with WhisperX."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -60,7 +60,7 @@ async def start_transcription(project_id: str, request: StartTranscriptionReques
 
     # Update phase
     project.phase = ProjectPhase.TRANSCRIPTION
-    ProjectService.save(project)
+    await ProjectService.asave(project)
 
     async def stream_progress():
         async for progress in TranscriberService.transcribe(project_id, request.language):
@@ -76,15 +76,15 @@ async def start_transcription(project_id: str, request: StartTranscriptionReques
                     )
                     if detection.has_raw_scenes:
                         project.phase = ProjectPhase.RAW_SCENE_VALIDATION
-                        ProjectService.save(project)
+                        await ProjectService.asave(project)
                         continue
 
                 project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
-                ProjectService.save(project)
+                await ProjectService.asave(project)
 
             elif progress.status == "error":
                 project.phase = ProjectPhase.MATCH_VALIDATION
-                ProjectService.save(project)
+                await ProjectService.asave(project)
 
     return StreamingResponse(
         stream_progress(),
@@ -99,7 +99,7 @@ async def start_transcription(project_id: str, request: StartTranscriptionReques
 @router.get("")
 async def get_transcription(project_id: str):
     """Get transcription for a project."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -114,7 +114,7 @@ async def get_transcription(project_id: str):
 @project_edit_locked
 async def update_transcription(project_id: str, request: UpdateTranscriptionRequest):
     """Update transcription text (user edits)."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -143,9 +143,10 @@ async def update_transcription(project_id: str, request: UpdateTranscriptionRequ
 
 
 @router.post("/confirm")
+@project_edit_locked
 async def confirm_transcription(project_id: str):
     """Confirm transcription is valid and proceed."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -156,10 +157,10 @@ async def confirm_transcription(project_id: str):
         detection = RawSceneDetectionResult.model_validate_json(detection_file.read_text())
         if detection.has_raw_scenes:
             project.phase = ProjectPhase.RAW_SCENE_VALIDATION
-            ProjectService.save(project)
+            await ProjectService.asave(project)
             return {"status": "ok", "next_phase": "raw_scene_validation"}
 
     project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
-    ProjectService.save(project)
+    await ProjectService.asave(project)
 
     return {"status": "ok", "next_phase": "script_restructure"}

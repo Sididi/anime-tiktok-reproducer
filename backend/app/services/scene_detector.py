@@ -161,7 +161,7 @@ class SceneDetectorService:
         from ..models import ProjectPhase, SceneList
         from .project_service import ProjectService
 
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise RuntimeError("Project not found")
         if not project.video_path:
@@ -187,7 +187,7 @@ class SceneDetectorService:
             anime_name = project.anime_name
 
         project.phase = ProjectPhase.SCENE_DETECTION
-        ProjectService.save(project)
+        await ProjectService.asave(project)
 
         async for progress in cls.detect_scenes(
             video_path,
@@ -201,16 +201,16 @@ class SceneDetectorService:
                 scene_list = SceneList(scenes=progress.scenes)
                 await ProjectService.asave_scenes(project_id, scene_list)
 
-                project = ProjectService.load(project_id)
+                project = await ProjectService.aload(project_id)
                 if project is None:
                     raise RuntimeError("Project not found")
                 project.phase = ProjectPhase.SCENE_VALIDATION
-                ProjectService.save(project)
+                await ProjectService.asave(project)
             elif progress.status == "error":
-                project = ProjectService.load(project_id)
+                project = await ProjectService.aload(project_id)
                 if project is not None:
                     project.phase = ProjectPhase.SETUP
-                    ProjectService.save(project)
+                    await ProjectService.asave(project)
 
             yield progress
 

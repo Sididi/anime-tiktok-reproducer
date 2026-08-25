@@ -51,7 +51,7 @@ def to_response(scenes: SceneList) -> ScenesResponse:
 @router.get("/config")
 async def get_scenes_config(project_id: str):
     """Get scenes validation feature flags."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -61,7 +61,7 @@ async def get_scenes_config(project_id: str):
 @router.get("", response_model=ScenesResponse)
 async def get_scenes(project_id: str) -> ScenesResponse:
     """Get all scenes for a project."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -75,7 +75,7 @@ async def get_scenes(project_id: str) -> ScenesResponse:
 @router.put("", response_model=ScenesResponse)
 async def update_scenes(project_id: str, request: UpdateScenesRequest) -> ScenesResponse:
     """Update all scenes (bulk update)."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -93,7 +93,7 @@ async def update_scenes(project_id: str, request: UpdateScenesRequest) -> Scenes
 @project_edit_locked
 async def split_scene(project_id: str, scene_index: int, request: SplitSceneRequest) -> ScenesResponse:
     """Split a scene at the given timestamp."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -124,7 +124,7 @@ async def split_scene(project_id: str, scene_index: int, request: SplitSceneRequ
 @project_edit_locked
 async def merge_scenes(project_id: str, request: MergeScenesRequest) -> ScenesResponse:
     """Merge adjacent scenes."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -168,7 +168,7 @@ class DetectScenesRequest(BaseModel):
 @router.post("/detect")
 async def detect_scenes(project_id: str, request: DetectScenesRequest | None = None):
     """Auto-detect scenes using PySceneDetect and stream progress."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 

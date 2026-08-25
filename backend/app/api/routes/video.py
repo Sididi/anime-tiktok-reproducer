@@ -210,7 +210,7 @@ def _probe_source_metadata_sync(source_path: Path) -> dict[str, object]:
 @router.get("/video")
 async def get_video(project_id: str) -> FileResponse:
     """Stream the project's video file."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -234,7 +234,7 @@ async def get_video(project_id: str) -> FileResponse:
 @router.post("/video/preview/warmup")
 async def warm_project_video_preview(project_id: str) -> dict[str, object]:
     """Trigger project video preview proxy generation."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -263,7 +263,7 @@ async def warm_project_video_preview(project_id: str) -> dict[str, object]:
 @router.get("/video/preview")
 async def get_project_video_preview(project_id: str) -> FileResponse:
     """Serve the browser-oriented project preview video."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -290,7 +290,7 @@ async def get_project_video_preview(project_id: str) -> FileResponse:
 @router.get("/video/info")
 async def get_video_info(project_id: str) -> dict:
     """Get video metadata."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -309,7 +309,7 @@ async def get_source_video_descriptor(
     path: str = Query(..., description="Path to the source episode file"),
 ) -> dict[str, object]:
     """Return basic metadata for a source episode (duration, codec, pix_fmt)."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -323,7 +323,7 @@ async def warm_source_video_preview(
     path: str = Query(..., description="Path to the source episode file"),
 ) -> dict[str, object]:
     """Trigger source preview proxy generation."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -349,7 +349,7 @@ async def get_source_video_preview(
     path: str = Query(..., description="Path to the source episode file"),
 ) -> FileResponse:
     """Serve the browser-oriented source preview video when ready."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -406,7 +406,7 @@ async def get_source_video(
     path: str = Query(..., description="Path to the source episode file"),
 ) -> FileResponse:
     """Stream a source anime episode directly to the browser."""
-    project = ProjectService.load(project_id)
+    project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 

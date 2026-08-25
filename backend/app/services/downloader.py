@@ -677,20 +677,20 @@ class DownloaderService:
         from .project_service import ProjectService
         from .tiktok_url_db_service import TikTokUrlDbService
 
-        project = ProjectService.load(project_id)
+        project = await ProjectService.aload(project_id)
         if project is None:
             raise RuntimeError("Project not found")
 
         project.tiktok_url = url
         project.phase = ProjectPhase.DOWNLOADING
-        ProjectService.save(project)
+        await ProjectService.asave(project)
 
         async for progress in cls.download(url, project_id):
             if progress.status == "complete":
                 video_path = cls.get_output_path(project_id)
                 video_info = await cls.get_video_info(video_path)
 
-                project = ProjectService.load(project_id)
+                project = await ProjectService.aload(project_id)
                 if project is None:
                     raise RuntimeError("Project not found")
 
@@ -700,14 +700,14 @@ class DownloaderService:
                 project.video_width = video_info.get("width")
                 project.video_height = video_info.get("height")
                 project.phase = ProjectPhase.SCENE_DETECTION
-                ProjectService.save(project)
+                await ProjectService.asave(project)
 
                 await TikTokUrlDbService.register(url)
             elif progress.status == "error":
-                project = ProjectService.load(project_id)
+                project = await ProjectService.aload(project_id)
                 if project is not None:
                     project.phase = ProjectPhase.SETUP
-                    ProjectService.save(project)
+                    await ProjectService.asave(project)
             yield progress
 
     @staticmethod
