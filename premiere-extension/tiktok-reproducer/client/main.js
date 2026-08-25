@@ -45,8 +45,8 @@
   var PANEL_BUILD_ID = atrConstants.ATR_BUILD_ID;
   var PROJECT_CONTEXT_FILENAME = atrConstants.PROJECT_CONTEXT_FILENAME;
   var PROXY_OUTPUT_SUFFIX = atrConstants.PROXY_OUTPUT_SUFFIX;
-  var PROXY_MARKER_SUFFIX = ".atr_proxy.json";
-  var PROXY_MARKER_VERSION = 1;
+  var PROXY_MARKER_SUFFIX = atrConstants.PROXY_MARKER_SUFFIX;
+  var PROXY_MARKER_VERSION = atrConstants.PROXY_MARKER_VERSION;
   var ATR_OUTPUT_PATTERN = /^ATR_.*\.mp4$/i;
   var KNOWN_VIDEO_EXTENSIONS = {
     ".avi": true,
@@ -600,6 +600,31 @@
       fallback.push(String(state.audio_output_path));
     }
     return normalizeOutputPathList(fallback);
+  }
+
+  function parseNoMusicExportRequirement(jsxText) {
+    // The backend stamps ATR_NEEDS_NO_MUSIC_EXPORT into import_project.jsx
+    // (0 = music absent or not copyrighted, so the copyright-replacement
+    // flow can never need the wav). Older bundles lack the var: fall back
+    // to skipping only when MUSIC_FILENAME is empty (the wav would be
+    // content-identical to the main mix), else render.
+    var text = String(jsxText || "");
+    var flagMatch = text.match(/var\s+ATR_NEEDS_NO_MUSIC_EXPORT\s*=\s*(\d+)\s*;/);
+    if (flagMatch) {
+      return { required: flagMatch[1] === "1", source: "flag" };
+    }
+    var musicMatch = text.match(/var\s+MUSIC_FILENAME\s*=\s*"([^"]*)"\s*;/);
+    if (musicMatch && !String(musicMatch[1]).trim()) {
+      return { required: false, source: "music-empty" };
+    }
+    return { required: true, source: "default" };
+  }
+
+  function isAudioExportEnabledForProject(state) {
+    // Project-level requirement (legacy states without the field => true),
+    // gated by the master switch in settings.
+    var projectFlag = !state || state.audio_export_enabled !== false;
+    return projectFlag && !!settings.export_audio_no_music_default;
   }
 
   function hasOutputUploadFinished(state, outputPath) {
@@ -3273,6 +3298,22 @@
             String(progress.message || "Download progress for " + projectId),
             "info",
           );
+        } else if (progress.stage === "sibling_reuse_complete") {
+          var reusedMb =
+            Number(progress.reused_bytes || 0) / (1024 * 1024);
+          log(
+            "Reused " +
+              Number(progress.reused_count || 0) +
+              "/" +
+              Number(progress.candidate_count || 0) +
+              " source(s) (" +
+              reusedMb.toFixed(1) +
+              " MB) and " +
+              Number(progress.proxies_reused_count || 0) +
+              " prox(ies) from sibling projects for " +
+              projectId,
+            Number(progress.reused_count || 0) > 0 ? "success" : "info",
+          );
         } else if (progress.stage === "subtitle_archive_extract_start") {
           log("Extracting subtitle archive for " + projectId, "info");
         } else if (progress.stage === "subtitle_archive_extract_complete") {
@@ -3331,6 +3372,29 @@
 
     function continueImportWithProxyPlan(result, importPath, proxyPlan) {
       var proxySummary = summarizeProxyPlan(proxyPlan);
+      var noMusicReq = { required: true, source: "default" };
+      try {
+        noMusicReq = parseNoMusicExportRequirement(
+          fs.readFileSync(importPath, "utf8"),
+        );
+      } catch (jsxReadErr) {
+        log(
+          "Could not read import_project.jsx for the no-music decision (" +
+            jsxReadErr.message +
+            "); defaulting to render",
+          "warn",
+        );
+      }
+      log(
+        "No-music WAV for " +
+          projectId +
+          ": " +
+          (noMusicReq.required ? "required" : "skipped") +
+          " (" +
+          noMusicReq.source +
+          ")",
+        "info",
+      );
 
       upsertProjectState(projectId, {
           status: "importing",
@@ -3343,6 +3407,11 @@
           download_avg_mb_per_sec: result.download_avg_mb_per_sec || null,
           download_file_count: result.download_file_count || null,
           download_total_bytes: result.download_total_bytes || null,
+          shared_manifest_present: !!result.shared_manifest_present,
+          shared_download_count: result.shared_download_count || 0,
+          sources_reused_count: result.sources_reused_count || 0,
+          sources_reused_bytes: result.sources_reused_bytes || 0,
+          proxies_reused_count: result.proxies_reused_count || 0,
           last_error: null,
           orchestration_metrics: result.orchestration_metrics || {},
           proxy_status:
@@ -3443,11 +3512,12 @@
             path.dirname(String(result.output_path || "")),
             AUDIO_NO_MUSIC_OUTPUT_FILENAME,
           );
+          var includeAudioOutput =
+            noMusicReq.required && !!settings.export_audio_no_music_default;
           var expectedOutputs = normalizeOutputPathList(
-            [
-              String(result.output_path || ""),
-              String(audioOutputPath || ""),
-            ],
+            includeAudioOutput
+              ? [String(result.output_path || ""), String(audioOutputPath || "")]
+              : [String(result.output_path || "")],
           );
           var orchestrationMetrics =
             getOrchestrationMetricsHelper().finalizeReadyMetrics(
@@ -3475,7 +3545,7 @@
             imported_at: readyAtIso,
             upload_pending: false,
             pending_cleanup_choice: false,
-            audio_export_enabled: true,
+            audio_export_enabled: noMusicReq.required,
             audio_output_path: audioOutputPath,
             expected_outputs: expectedOutputs,
             uploaded_outputs: {},
@@ -5613,18 +5683,25 @@
     }
 
     var audioPresetPath = String(settings.audio_preset_epr_path || "").trim();
-    if (!audioPresetPath) {
-      log("Missing audio preset path for no-music export", "error");
-      setSettingsStatus(
-        "Audio preset .epr path is required for audio export",
-        true,
-      );
-      return;
-    }
-    if (!fs.existsSync(audioPresetPath)) {
-      log("Audio preset file not found: " + audioPresetPath, "error");
-      setSettingsStatus("Audio preset path is invalid", true);
-      return;
+    var batchNeedsAudio = exportReadiness.current_batch_ids.some(
+      function (batchProjectId) {
+        return isAudioExportEnabledForProject(getProjectState(batchProjectId));
+      },
+    );
+    if (batchNeedsAudio) {
+      if (!audioPresetPath) {
+        log("Missing audio preset path for no-music export", "error");
+        setSettingsStatus(
+          "Audio preset .epr path is required for audio export",
+          true,
+        );
+        return;
+      }
+      if (!fs.existsSync(audioPresetPath)) {
+        log("Audio preset file not found: " + audioPresetPath, "error");
+        setSettingsStatus("Audio preset path is invalid", true);
+        return;
+      }
     }
 
     setStatus("running");
@@ -5743,7 +5820,6 @@
           upsertProjectState(projectId, {
             status: "uploaded",
             pending_cleanup_choice: false,
-            audio_export_enabled: true,
             last_error: null,
           });
           log(
@@ -5757,10 +5833,14 @@
           path.dirname(String(state.output_path)),
           AUDIO_NO_MUSIC_OUTPUT_FILENAME,
         );
-        var expectedOutputs = normalizeOutputPathList([
-          String(state.output_path),
-          String(audioOutputPath),
-        ]);
+        // Recomputed at export time so master-switch toggles made after the
+        // import take effect (and stale import-time lists self-correct).
+        var audioEnabled = isAudioExportEnabledForProject(state);
+        var expectedOutputs = normalizeOutputPathList(
+          audioEnabled
+            ? [String(state.output_path), String(audioOutputPath)]
+            : [String(state.output_path)],
+        );
         var sequenceName = String(
           state.sequence_name || buildProjectSequenceName(projectId),
         );
@@ -5778,7 +5858,7 @@
           '"',
           escapeForEval(String(presetPath).replace(/\\/g, "/")),
           '",',
-          "1,",
+          audioEnabled ? "1," : "0,",
           '"',
           escapeForEval(String(audioOutputPath).replace(/\\/g, "/")),
           '",',
@@ -5863,7 +5943,7 @@
             audio_export_job_id: audioJobId || null,
             encoder_progress: 0,
             pending_cleanup_choice: false,
-            audio_export_enabled: true,
+            audio_export_enabled: state.audio_export_enabled !== false,
             audio_output_path: audioOutputPath,
             expected_outputs: expectedOutputs,
             uploaded_outputs: state && state.status === "uploaded"

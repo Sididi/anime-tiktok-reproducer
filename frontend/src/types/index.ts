@@ -109,6 +109,7 @@ export interface ScriptAutomationVoice {
 export interface ScriptAutomationMusic {
   key: string;
   display_name: string;
+  copyright?: boolean;
 }
 
 export interface VideoOverlay {

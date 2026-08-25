@@ -100,6 +100,45 @@ def test_jsx_enables_only_category_overlay_for_category_only():
     assert "overlayFadeTrackIndexes.push(4);" in jsx
 
 
+def _render_music(*, music_filename: str, **kwargs) -> str:
+    return ProcessingService._render_jsx_from_template(
+        project_id="test_project",
+        scenes=[],
+        source_audio_policies={},
+        source_fps_num=24000,
+        source_fps_den=1001,
+        subtitle_timing_relative_path="subtitles/subtitle_timings.srt",
+        raw_scene_subtitle_timing_relative_path="raw_scene_subtitles/text_subtitles.srt",
+        raw_scene_subtitle_mogrt_relative_dir="raw_scene_subtitles/text_mogrts",
+        music_filename=music_filename,
+        music_gain_db=-23.0,
+        template=_template(),
+        overlay_title_enabled=True,
+        overlay_category_enabled=True,
+        **kwargs,
+    )
+
+
+def test_jsx_needs_no_music_export_for_copyrighted_music():
+    jsx = _render_music(music_filename="track.wav", music_copyright=True)
+    assert "var ATR_NEEDS_NO_MUSIC_EXPORT = 1;" in jsx
+
+
+def test_jsx_skips_no_music_export_for_non_copyrighted_music():
+    jsx = _render_music(music_filename="track.wav", music_copyright=False)
+    assert "var ATR_NEEDS_NO_MUSIC_EXPORT = 0;" in jsx
+
+
+def test_jsx_skips_no_music_export_without_music_even_if_copyrighted():
+    jsx = _render_music(music_filename="", music_copyright=True)
+    assert "var ATR_NEEDS_NO_MUSIC_EXPORT = 0;" in jsx
+
+
+def test_jsx_skips_no_music_export_by_default_kwarg():
+    jsx = _render_music(music_filename="track.wav")
+    assert "var ATR_NEEDS_NO_MUSIC_EXPORT = 0;" in jsx
+
+
 def test_jsx_enables_both_overlays_until_sequence_end_and_fades_each_overlay():
     jsx = _render(title=True, category=True)
     assert "var OVERLAY_ENABLED = true;" in jsx

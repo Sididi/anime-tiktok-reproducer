@@ -326,7 +326,11 @@ async def get_script_automation_config(project_id: str):
     try:
         music_config = MusicConfigService.get_config()
         musics = [
-            {"key": entry.key, "display_name": entry.display_name}
+            {
+                "key": entry.key,
+                "display_name": entry.display_name,
+                "copyright": entry.copyright,
+            }
             for entry in music_config.musics.values()
         ]
         default_music_key = project.resolved_music_key()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+import json
 import logging
 import os
 import re
@@ -19,11 +20,17 @@ from ..config import settings
 from ..library_types import LibraryType
 from ..models import Project, SceneMatch
 from .anime_library import AnimeLibraryService
+from .drive_shared_sources import (
+    REMOTE_MANIFEST_FILENAME,
+    DriveSharedSources,
+    SharedFileRecord,
+)
 from .google_drive_rclone import GoogleDriveRclone
 from .google_drive_service import GoogleDriveService
 from .music_config_service import MusicConfigService
 from .project_service import ProjectService
 from .rclone_runner import RcloneStats
+from .source_hash_service import SourceHashService
 
 logger = logging.getLogger("uvicorn.error")
 DriveUploadProgressCallback = Callable[[dict[str, Any]], None]
@@ -662,11 +669,74 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             total_bytes=total_bytes,
         )
         adapter.emit_manifest()
+
+        shared_enabled = DriveSharedSources.is_enabled()
+        if shared_enabled:
+            entries, externalized = DriveSharedSources.partition_entries(entries)
+        else:
+            externalized = []
+
         folder_id, folder_url = await run_heavy(
             GoogleDriveService.ensure_project_folder,
             folder_name,
             project.drive_folder_id,
         )
+
+        shared_records: list[SharedFileRecord] = []
+        shared_stats: dict[str, Any] | None = None
+        if shared_enabled and externalized:
+            hashes = await run_heavy(
+                SourceHashService.sha256_for_many,
+                [entry.source_path for entry in externalized],
+            )
+            pairs = [(entry, hashes[entry.source_path]) for entry in externalized]
+            pending_records = [
+                SharedFileRecord(
+                    path_in_folder=DriveSharedSources.path_in_folder(entry),
+                    size=entry.source_path.stat().st_size,
+                    sha256=sha256,
+                    md5=None,
+                    drive_file_id="",
+                    shared_name=DriveSharedSources.shared_name(
+                        sha256, entry.source_path.name
+                    ),
+                )
+                for entry, sha256 in pairs
+            ]
+            # GC race guard: our references must be on disk before any shared
+            # Drive mutation, so a concurrent teardown's GC scan sees them.
+            await run_heavy(
+                DriveSharedSources.persist_local_manifest,
+                project.id,
+                status="pending",
+                records=pending_records,
+            )
+            shared_folder_id = await run_heavy(
+                DriveSharedSources.ensure_shared_folder
+            )
+            shared_records = await DriveSharedSources.ensure_uploaded(
+                pairs,
+                shared_folder_id=shared_folder_id,
+                stats_callback=adapter.on_stats,
+            )
+            remote_manifest = DriveSharedSources.build_remote_manifest(
+                project, shared_records, shared_folder_id=shared_folder_id
+            )
+            entries.append(
+                ManifestEntry(
+                    relative_path=f"{folder_name}/{REMOTE_MANIFEST_FILENAME}",
+                    inline_content=json.dumps(
+                        remote_manifest, ensure_ascii=True, indent=2
+                    ).encode("utf-8"),
+                    mime_type="application/json",
+                )
+            )
+            shared_stats = {
+                "externalized_count": len(externalized),
+                "externalized_bytes": sum(
+                    record.size for record in shared_records
+                ),
+            }
         logger.info(
             "Drive manifest sync starting: project_id=%s folder_id=%s files=%d "
             "total_bytes=%d transfers=%d bytes_by_root=%s largest_files=%s",
@@ -692,6 +762,25 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             )
         finally:
             await run_heavy(shutil.rmtree, stage_dir, True)
+
+        if shared_enabled:
+            await run_heavy(
+                DriveSharedSources.persist_local_manifest,
+                project.id,
+                status="uploaded",
+                records=shared_records,
+                drive_folder_id=folder_id,
+            )
+        elif await run_heavy(DriveSharedSources.load_local_manifest, project.id):
+            # Flag-off re-export just re-inlined everything: release this
+            # project's shared references so GC/audit can reclaim the files.
+            await run_heavy(
+                DriveSharedSources.persist_local_manifest,
+                project.id,
+                status="uploaded",
+                records=[],
+                drive_folder_id=folder_id,
+            )
         adapter.emit_persist()
 
         sync_duration = time.perf_counter() - sync_started_at
@@ -719,12 +808,15 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             mb_per_second,
         )
 
-        return {
+        result = {
             "folder_id": folder_id,
             "folder_url": folder_url,
             "file_count": len(entries),
             "total_bytes": total_bytes,
         }
+        if shared_stats is not None:
+            result["shared"] = shared_stats
+        return result
 
     @classmethod
     def detect_upload_video_in_drive_root(cls, folder_id: str) -> list[dict[str, Any]]:

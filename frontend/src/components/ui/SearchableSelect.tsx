@@ -5,6 +5,7 @@ export interface SearchableSelectOption {
   key: string;
   label: string;
   previewUrl?: string;
+  badge?: string;
 }
 
 interface SearchableSelectProps {
@@ -157,6 +158,11 @@ export function SearchableSelect({
                 onClick={() => handleSelect(option.key)}
               >
                 <span className="flex-1 text-sm truncate">{option.label}</span>
+                {option.badge && (
+                  <span className="shrink-0 text-[10px] px-1 rounded bg-amber-500/15 text-amber-500">
+                    {option.badge}
+                  </span>
+                )}
                 {option.previewUrl && onPreview && (
                   <button
                     type="button"

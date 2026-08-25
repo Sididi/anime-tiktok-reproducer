@@ -53,19 +53,13 @@ class GoogleDriveRclone:
             raise GoogleDriveRcloneError(_INSTALL_HINT)
 
     @classmethod
-    async def sync_tree(
-        cls,
-        stage_dir: Path,
-        *,
-        folder_id: str,
-        stats_callback: StatsCallback | None = None,
-    ) -> None:
+    def _build_cmd(cls, verb: str, stage_dir: Path, *, delete: bool) -> list[str]:
         cls.ensure_available()
         binary = cls.binary() or ""
 
         cmd = [
             binary,
-            "sync",
+            verb,
             str(stage_dir),
             ":drive:",
             "--copy-links",
@@ -75,7 +69,10 @@ class GoogleDriveRclone:
             # googleapiclient path too.
             "--checksum",
             "--drive-skip-gdocs",
-            "--delete-during",
+        ]
+        if delete:
+            cmd.append("--delete-during")
+        cmd += [
             "--config",
             "/dev/null",
             "--transfers",
@@ -108,7 +105,10 @@ class GoogleDriveRclone:
             "--log-level",
             "NOTICE",
         ]
+        return cmd
 
+    @classmethod
+    async def _build_env(cls, folder_id: str) -> dict[str, str]:
         env = dict(os.environ)
         env["RCLONE_DRIVE_CLIENT_ID"] = str(settings.drive_google_client_id or "")
         env["RCLONE_DRIVE_CLIENT_SECRET"] = str(
@@ -121,15 +121,64 @@ class GoogleDriveRclone:
         env["RCLONE_DRIVE_ROOT_FOLDER_ID"] = folder_id
         if settings.google_drive_team_drive_id:
             env["RCLONE_DRIVE_TEAM_DRIVE"] = settings.google_drive_team_drive_id
+        return env
 
+    @classmethod
+    async def _run(
+        cls,
+        cmd: list[str],
+        folder_id: str,
+        *,
+        stats_callback: StatsCallback | None,
+        error_prefix: str,
+    ) -> None:
+        env = await cls._build_env(folder_id)
         try:
             await run_rclone(
                 cmd,
                 env=env,
                 stats_callback=stats_callback,
-                error_prefix="rclone drive sync",
+                error_prefix=error_prefix,
             )
         except GoogleDriveRcloneError:
             raise
         except RcloneError as exc:
             raise GoogleDriveRcloneError(str(exc)) from exc
+
+    @classmethod
+    async def sync_tree(
+        cls,
+        stage_dir: Path,
+        *,
+        folder_id: str,
+        stats_callback: StatsCallback | None = None,
+    ) -> None:
+        cmd = cls._build_cmd("sync", stage_dir, delete=True)
+        await cls._run(
+            cmd,
+            folder_id,
+            stats_callback=stats_callback,
+            error_prefix="rclone drive sync",
+        )
+
+    @classmethod
+    async def copy_tree(
+        cls,
+        stage_dir: Path,
+        *,
+        folder_id: str,
+        stats_callback: StatsCallback | None = None,
+    ) -> None:
+        """Additive copy into a folder shared with other writers.
+
+        ``copy`` never deletes remote siblings — required for the shared
+        sources folder, where a ``sync`` scoped to it would wipe every file
+        the staged tree doesn't contain.
+        """
+        cmd = cls._build_cmd("copy", stage_dir, delete=False)
+        await cls._run(
+            cmd,
+            folder_id,
+            stats_callback=stats_callback,
+            error_prefix="rclone drive copy",
+        )

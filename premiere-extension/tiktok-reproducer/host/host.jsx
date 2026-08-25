@@ -7,7 +7,7 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-08-25-cleanup-project-cycle-v17";
+var ATR_HOST_BUILD_ID = "2026-08-25-shared-sources-v18";
 // Separates runScript()'s status from the non-fatal warnings the executed
 // script published. Must stay in sync with HOST_RUN_WARNING_SEPARATOR in
 // client/main.js.

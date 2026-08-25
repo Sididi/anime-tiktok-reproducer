@@ -11,6 +11,7 @@ var childProcess = require("child_process");
 var constants = require("./constants");
 var subtitleArchive = require("./subtitle_archive");
 var downloadProgress = require("./download_progress");
+var sharedSources = require("./shared_sources");
 
 var DRIVE_API_HOST = "www.googleapis.com";
 var OAUTH_HOST = "oauth2.googleapis.com";
@@ -878,11 +879,129 @@ function buildPhaseMetricsPatch(values) {
     list_tree_elapsed_ms: Number(
       (values && values.list_tree_elapsed_ms) || 0,
     ),
+    sibling_reuse_elapsed_ms: Number(
+      (values && values.sibling_reuse_elapsed_ms) || 0,
+    ),
     download_elapsed_ms: Number((values && values.download_elapsed_ms) || 0),
     subtitle_extract_elapsed_ms: Number(
       (values && values.subtitle_extract_elapsed_ms) || 0,
     ),
   };
+}
+
+/**
+ * New-layout support: downloads/parses atr_remote_sources.json when the
+ * project folder carries one, merges its shared Drive files into the download
+ * list, and pre-seeds the destination from sibling project folders (hardlink,
+ * copy fallback) so those files never hit the network. Mutates `files` in
+ * place; old-layout folders (no manifest) still get the sibling pre-seed for
+ * their large sources/ files.
+ */
+function prepareSharedSources(options) {
+  var auth = options.auth;
+  var files = options.files;
+  var partialRoot = options.partialRoot;
+  var projectId = options.projectId;
+  var emitProgress = options.emitProgress;
+
+  var manifestFile = null;
+  for (var i = 0; i < files.length; i += 1) {
+    if (
+      files[i].relativePath === sharedSources.REMOTE_SOURCES_MANIFEST_FILENAME
+    ) {
+      manifestFile = files[i];
+      break;
+    }
+  }
+
+  var manifestPromise = Promise.resolve(null);
+  if (manifestFile) {
+    var manifestDestination = path.join(
+      partialRoot,
+      manifestFile.relativePath,
+    );
+    manifestPromise = downloadFileWithResume(
+      auth,
+      manifestFile.id,
+      manifestDestination,
+      manifestFile.size,
+      null,
+    ).then(function () {
+      return sharedSources.parseRemoteSourcesManifest(
+        fs.readFileSync(manifestDestination, "utf8"),
+      );
+    });
+  }
+
+  return manifestPromise.then(function (manifest) {
+    var manifestFiles = manifest && manifest.files ? manifest.files : [];
+
+    var knownPaths = {};
+    files.forEach(function (file) {
+      knownPaths[file.relativePath] = true;
+    });
+    var sharedFileCount = 0;
+    manifestFiles.forEach(function (entry) {
+      var relativePath = sharedSources.sanitizeRelativePosixPath(
+        entry.path,
+        sanitizeWindowsSegment,
+      );
+      if (!relativePath || knownPaths[relativePath]) {
+        // A crash between the shared upload and the project sync can leave
+        // the inline copy on Drive too; the inline copy wins.
+        return;
+      }
+      knownPaths[relativePath] = true;
+      sharedFileCount += 1;
+      files.push({
+        id: entry.drive_file_id,
+        name: path.basename(relativePath),
+        relativePath: relativePath,
+        size: Number(entry.size || 0),
+        mimeType: null,
+        shared: true,
+      });
+    });
+
+    var preSeedStartedAt = Date.now();
+    var siblingRoots = sharedSources.buildSiblingRootIndex(
+      options.appDataPath,
+      options.targetRoot,
+    );
+    var candidates = sharedSources.selectPreSeedCandidates(
+      files,
+      manifestFiles,
+      sanitizeWindowsSegment,
+    );
+    var preSeedStats = sharedSources.preSeedFromSiblings({
+      partialRoot: partialRoot,
+      candidates: candidates,
+      siblingRoots: siblingRoots,
+      sanitizeSegment: sanitizeWindowsSegment,
+    });
+    var siblingReuseElapsedMs = Math.max(1, Date.now() - preSeedStartedAt);
+
+    if (candidates.length > 0) {
+      emitProgress({
+        stage: "sibling_reuse_complete",
+        project_id: projectId,
+        candidate_count: preSeedStats.candidate_count,
+        sibling_root_count: preSeedStats.sibling_root_count,
+        reused_count: preSeedStats.reused_count,
+        reused_bytes: preSeedStats.reused_bytes,
+        proxies_reused_count: preSeedStats.proxies_reused_count,
+        hardlink_fallback_copy_count:
+          preSeedStats.hardlink_fallback_copy_count,
+      });
+    }
+
+    return {
+      manifest_present: !!manifest,
+      shared_file_count: sharedFileCount,
+      pre_seed: preSeedStats,
+      sibling_reuse_elapsed_ms: siblingReuseElapsedMs,
+    };
+  });
 }
 
 function buildDownloadSummaryProgress(
@@ -938,6 +1057,15 @@ function performDownloadProject(payload, emitProgress) {
 
         ensureDir(partialRoot);
 
+        return prepareSharedSources({
+          auth: auth,
+          files: files,
+          partialRoot: partialRoot,
+          targetRoot: targetRoot,
+          appDataPath: payload.app_data_path,
+          projectId: projectId,
+          emitProgress: emitProgress,
+        }).then(function (sharedPrep) {
         var totalBytes = 0;
         files.forEach(function (file) {
           totalBytes += Number(file.size || 0);
@@ -945,6 +1073,7 @@ function performDownloadProject(payload, emitProgress) {
 
         var downloadConcurrency = pickDownloadConcurrency(settings, files);
         var globalDownloaded = 0;
+        var sharedDownloadCount = 0;
         var activeProgressByFileId = {};
         var activeProgressTotal = 0;
         var progressState = downloadProgress.createProgressState();
@@ -995,7 +1124,29 @@ function performDownloadProject(payload, emitProgress) {
                   emitProgress(summaryProgress);
                 }
               },
-            ).then(function (result) {
+            ).catch(function (err) {
+              if (
+                file.shared &&
+                /Download failed \(404\)/.test(
+                  String((err && err.message) || ""),
+                )
+              ) {
+                throw new Error(
+                  "Shared source '" +
+                    file.relativePath +
+                    "' is missing on Google Drive (file id " +
+                    file.id +
+                    "). Re-run the Drive export for project " +
+                    projectId +
+                    " on the backend (it re-uploads missing shared sources), " +
+                    "then retry this download.",
+                );
+              }
+              throw err;
+            }).then(function (result) {
+              if (file.shared && !result.reused) {
+                sharedDownloadCount += 1;
+              }
               var lastTrackedBytes = Number(
                 activeProgressByFileId[file.id] || 0,
               );
@@ -1039,13 +1190,20 @@ function performDownloadProject(payload, emitProgress) {
             1,
             Date.now() - extractStartedAt,
           );
+          // Pre-seeded bytes never touched the network; keep the speed
+          // figure honest by excluding them.
+          var networkBytes = Math.max(
+            0,
+            totalBytes - Number(sharedPrep.pre_seed.reused_bytes || 0),
+          );
           var avgMbPerSec =
-            totalBytes > 0
-              ? totalBytes / (1024 * 1024) / (downloadElapsedMs / 1000)
+            networkBytes > 0
+              ? networkBytes / (1024 * 1024) / (downloadElapsedMs / 1000)
               : 0;
           var orchestrationMetrics = buildPhaseMetricsPatch({
             resolve_folder_elapsed_ms: resolveElapsedMs,
             list_tree_elapsed_ms: listTreeElapsedMs,
+            sibling_reuse_elapsed_ms: sharedPrep.sibling_reuse_elapsed_ms,
             download_elapsed_ms: downloadElapsedMs,
             subtitle_extract_elapsed_ms: subtitleExtractElapsedMs,
           });
@@ -1061,6 +1219,13 @@ function performDownloadProject(payload, emitProgress) {
             download_avg_mb_per_sec: avgMbPerSec,
             download_file_count: files.length,
             subtitle_archive_extracted: !!(extraction && extraction.extracted),
+            shared_manifest_present: !!sharedPrep.manifest_present,
+            shared_download_count: sharedDownloadCount,
+            sources_reused_count: sharedPrep.pre_seed.reused_count,
+            sources_reused_bytes: sharedPrep.pre_seed.reused_bytes,
+            proxies_reused_count: sharedPrep.pre_seed.proxies_reused_count,
+            hardlink_fallback_copy_count:
+              sharedPrep.pre_seed.hardlink_fallback_copy_count,
             orchestration_metrics: orchestrationMetrics,
           });
 
@@ -1073,6 +1238,7 @@ function performDownloadProject(payload, emitProgress) {
             avg_mb_per_sec: avgMbPerSec,
             file_count: files.length,
             total_bytes: totalBytes,
+            reused_bytes: sharedPrep.pre_seed.reused_bytes,
           });
 
           return {
@@ -1087,8 +1253,16 @@ function performDownloadProject(payload, emitProgress) {
             download_file_count: files.length,
             download_total_bytes: totalBytes,
             subtitle_archive_extracted: !!(extraction && extraction.extracted),
+            shared_manifest_present: !!sharedPrep.manifest_present,
+            shared_download_count: sharedDownloadCount,
+            sources_reused_count: sharedPrep.pre_seed.reused_count,
+            sources_reused_bytes: sharedPrep.pre_seed.reused_bytes,
+            proxies_reused_count: sharedPrep.pre_seed.proxies_reused_count,
+            hardlink_fallback_copy_count:
+              sharedPrep.pre_seed.hardlink_fallback_copy_count,
             orchestration_metrics: orchestrationMetrics,
           };
+        });
         });
       });
     },

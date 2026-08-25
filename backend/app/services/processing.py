@@ -1066,6 +1066,7 @@ class ProcessingService:
         raw_scene_subtitle_mogrt_relative_dir: str = "raw_scene_subtitles/text_mogrts",
         music_filename: str = "",
         music_gain_db: float = -24.0,
+        music_copyright: bool = False,
     ) -> str:
         """
         Generate a production-ready Premiere Pro 2025 ExtendScript (.jsx) file.
@@ -1094,6 +1095,9 @@ class ProcessingService:
             raw_scene_subtitle_mogrt_relative_dir: Relative path to baked raw-scene subtitle MOGRT files.
             music_filename: Optional music filename placed in /sources
             music_gain_db: Music gain in dB (used only when music_filename is set)
+            music_copyright: Whether the selected music is copyrighted (stamps
+                ATR_NEEDS_NO_MUSIC_EXPORT so the CEP panel can skip the
+                no-music WAV render when the copyright flow can't need it)
 
         Returns:
             The generated JSX script content (ES3 compatible)
@@ -1254,6 +1258,7 @@ class ProcessingService:
             raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,
             music_filename=music_filename,
             music_gain_db=music_gain_db,
+            music_copyright=music_copyright,
         )
 
     @classmethod
@@ -1294,6 +1299,7 @@ class ProcessingService:
         raw_scene_subtitle_mogrt_relative_dir: str,
         music_filename: str,
         music_gain_db: float,
+        music_copyright: bool = False,
         template,  # type: ignore[no-untyped-def]
         overlay_title_enabled: bool,
         overlay_category_enabled: bool,
@@ -1453,6 +1459,13 @@ class ProcessingService:
             r"var MUSIC_GAIN_DB = -?\d+(?:\.\d+)?;",
             f"var MUSIC_GAIN_DB = {music_gain_db};",
             label="MUSIC_GAIN_DB",
+        )
+        needs_no_music_export = 1 if (music_filename and music_copyright) else 0
+        content = cls._replace_template_once(
+            content,
+            r"var ATR_NEEDS_NO_MUSIC_EXPORT = \d;",
+            f"var ATR_NEEDS_NO_MUSIC_EXPORT = {needs_no_music_export};",
+            label="ATR_NEEDS_NO_MUSIC_EXPORT",
         )
         content = cls._replace_template_once(
             content,
@@ -3023,6 +3036,7 @@ class ProcessingService:
             # Resolve optional music settings for Premiere automation.
             music_filename = ""
             music_gain_db = -24.0
+            music_copyright = False
             resolved_music_key = project.resolved_music_key()
             if resolved_music_key:
                 try:
@@ -3034,6 +3048,7 @@ class ProcessingService:
                     if music_path.exists():
                         music_filename = music_path.name
                         music_gain_db = float(music.volume_db)
+                        music_copyright = bool(music.copyright)
                     else:
                         logger.warning(
                             "Configured music file is missing on disk: %s",
@@ -3059,6 +3074,7 @@ class ProcessingService:
                 raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,
                 music_filename=music_filename,
                 music_gain_db=music_gain_db,
+                music_copyright=music_copyright,
             )
             jsx_path = output_dir / "import_project.jsx"
             jsx_path.write_text(jsx_content, encoding="utf-8")

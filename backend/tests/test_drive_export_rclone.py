@@ -127,6 +127,103 @@ async def test_upload_manifest_syncs_staged_tree_and_cleans_up(
 
 
 @pytest.mark.asyncio
+async def test_upload_manifest_externalizes_shared_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from app.services import drive_shared_sources as dss_module
+    from app.services.drive_shared_sources import DriveSharedSources
+
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    monkeypatch.setattr(settings, "projects_dir", projects_dir)
+    monkeypatch.setattr(settings, "drive_shared_sources_enabled", True)
+    monkeypatch.setattr(settings, "drive_shared_sources_min_bytes", 4)
+    monkeypatch.setattr(dss_module, "_shared_folder_id_cache", None)
+    monkeypatch.setattr(
+        GoogleDriveService,
+        "ensure_child_folder_id",
+        classmethod(lambda cls, name, parent_id=None, drive=None: "shared-1"),
+    )
+
+    entries = _entries(tmp_path)
+    project = Project(anime_name="Test Anime")
+
+    monkeypatch.setattr(
+        ExportService,
+        "build_manifest",
+        classmethod(lambda cls, p, m: ("SPM_folder", entries)),
+    )
+    monkeypatch.setattr(
+        GoogleDriveService,
+        "ensure_project_folder",
+        classmethod(
+            lambda cls, name, existing_folder_id=None, drive=None: ("f-1", "url")
+        ),
+    )
+
+    drive_children: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        GoogleDriveService,
+        "list_children_with_hashes",
+        classmethod(lambda cls, folder_id, drive=None: list(drive_children)),
+    )
+
+    copied: list[dict[str, Any]] = []
+
+    async def _fake_copy(cls, stage_dir: Path, *, folder_id, stats_callback=None):
+        # GC race guard: the pending manifest must be on disk before any
+        # shared upload runs.
+        pending = DriveSharedSources.load_local_manifest(project.id)
+        assert pending is not None and pending["status"] == "pending"
+        for staged in stage_dir.iterdir():
+            copied.append({"name": staged.name, "folder_id": folder_id})
+            drive_children.append(
+                {
+                    "id": f"d-{staged.name[:6]}",
+                    "name": staged.name,
+                    "size": str(staged.stat().st_size),
+                    "md5Checksum": "md5-x",
+                }
+            )
+
+    monkeypatch.setattr(GoogleDriveRclone, "copy_tree", classmethod(_fake_copy))
+
+    synced_files: list[list[str]] = []
+
+    async def _fake_sync(cls, stage_dir: Path, *, folder_id, stats_callback=None):
+        synced_files.append(
+            sorted(
+                str(p.relative_to(stage_dir))
+                for p in stage_dir.rglob("*")
+                if p.is_file() or p.is_symlink()
+            )
+        )
+
+    monkeypatch.setattr(GoogleDriveRclone, "sync_tree", classmethod(_fake_sync))
+
+    result = await ExportService.upload_manifest_to_drive(project, [])
+
+    # The episode left the project sync and went through the shared copy.
+    assert len(copied) == 1
+    assert copied[0]["folder_id"] == "shared-1"
+    assert copied[0]["name"].endswith("__Episode 01.mkv")
+    assert synced_files == [
+        [
+            "atr_remote_sources.json",
+            "import_project.jsx",
+            "subtitles/atr_subtitles.zip",
+        ]
+    ]
+
+    manifest = DriveSharedSources.load_local_manifest(project.id)
+    assert manifest["status"] == "uploaded"
+    assert manifest["drive_folder_id"] == "f-1"
+    assert manifest["shared_files"][0]["path"] == "sources/Episode 01.mkv"
+    assert manifest["shared_files"][0]["md5"] == "md5-x"
+    assert result["shared"] == {"externalized_count": 1, "externalized_bytes": 13}
+
+
+@pytest.mark.asyncio
 async def test_stage_dir_cleaned_up_on_sync_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

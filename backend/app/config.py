@@ -200,6 +200,12 @@ class Settings(BaseSettings):
     drive_rclone_chunk_mb: int = 128
     # Set when google_drive_parent_folder_id lives inside a Shared Drive.
     google_drive_team_drive_id: str | None = None
+    # Shared-sources Drive dedup: large sources/ files (episodes, music) are
+    # uploaded once to a shared _SPM_SHARED_SOURCES folder and referenced from
+    # a per-project atr_remote_sources.json manifest instead of being copied
+    # into every project folder. Flag off = legacy self-contained folders.
+    drive_shared_sources_enabled: bool = False
+    drive_shared_sources_min_bytes: int = 20 * 1024 * 1024
     # Retry settings for transient SFTP/network errors (VPN flaps, NAT timeouts,
     # brief Hetzner reachability dips). Per-operation retry — the retried
     # operation re-acquires a fresh SSH session, so a half-dead pooled

@@ -126,6 +126,29 @@ async def test_sync_command_flags_and_env_auth(
 
 
 @pytest.mark.asyncio
+async def test_copy_command_is_additive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_rclone: Path
+) -> None:
+    capture_path = tmp_path / "capture.json"
+    monkeypatch.setenv("FAKE_RCLONE_CAPTURE", str(capture_path))
+    stage_dir = tmp_path / "stage"
+    stage_dir.mkdir()
+
+    await GoogleDriveRclone.copy_tree(stage_dir, folder_id="shared-1")
+
+    captured = json.loads(capture_path.read_text(encoding="utf-8"))
+    argv = captured["argv"]
+    assert argv[0] == "copy"
+    assert argv[1] == str(stage_dir)
+    assert argv[2] == ":drive:"
+    assert "--checksum" in argv
+    assert "--copy-links" in argv
+    # The shared folder has other writers' files: copy must never delete.
+    assert "--delete-during" not in argv
+    assert captured["env"]["RCLONE_DRIVE_ROOT_FOLDER_ID"] == "shared-1"
+
+
+@pytest.mark.asyncio
 async def test_sync_team_drive_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_rclone: Path
 ) -> None:

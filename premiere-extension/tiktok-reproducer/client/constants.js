@@ -10,7 +10,7 @@
  */
 
 module.exports = {
-  ATR_BUILD_ID: "2026-08-25-cleanup-project-cycle-v17",
+  ATR_BUILD_ID: "2026-08-25-shared-sources-v18",
 
   OUTPUT_FILENAME: "output.mp4",
   AUDIO_NO_MUSIC_OUTPUT_FILENAME: "output_no_music.wav",
@@ -21,4 +21,10 @@ module.exports = {
   SUBTITLE_TIMING_FILENAME: "subtitle_timings.srt",
 
   PROXY_OUTPUT_SUFFIX: "__atr_proxy.mp4",
+  PROXY_MARKER_SUFFIX: ".atr_proxy.json",
+  PROXY_MARKER_VERSION: 1,
+
+  // Mirrors the backend's shared-sources Drive export (drive_shared_sources.py).
+  REMOTE_SOURCES_MANIFEST_FILENAME: "atr_remote_sources.json",
+  SHARED_SOURCE_MIN_BYTES: 20 * 1024 * 1024,
 };

@@ -24,6 +24,9 @@
   var PROJECT_ID = "project_id";
   var BATCH_SEQUENCE_NAME = "ATR_BATCH__project_id";
   var MUSIC_GAIN_DB = -23.0;
+  // Panel-only metadata (not used by this script): 0 tells the CEP panel the
+  // no-music WAV export is unnecessary (music absent or not copyrighted).
+  var ATR_NEEDS_NO_MUSIC_EXPORT = 1;
   var PROJECT_PURGE_BIN_NAME = "__ATR_PURGE__";
   var PROJECT_BIN_NAME = "__ATR_PROJECT__" + PROJECT_ID;
   var BACKGROUND_PRESET_NAME = "SPM Anime Background";

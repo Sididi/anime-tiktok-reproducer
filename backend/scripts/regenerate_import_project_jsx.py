@@ -23,6 +23,7 @@ from typing import Any
 from app.models import Transcription
 from app.services.export_service import ExportService
 from app.services.google_drive_service import GoogleDriveService
+from app.services.music_config_service import MusicConfigService
 from app.services.otio_timing import FrameRateInfo
 from app.services.processing import ProcessingService
 from app.services.project_service import ProjectService
@@ -34,6 +35,7 @@ _FPS_NUM_RE = re.compile(r"var SOURCE_FPS_NUM\s*=\s*(\d+);")
 _FPS_DEN_RE = re.compile(r"var SOURCE_FPS_DEN\s*=\s*(\d+);")
 _MUSIC_FILE_RE = re.compile(r'var MUSIC_FILENAME\s*=\s*"([^"]*)";')
 _MUSIC_GAIN_RE = re.compile(r"var MUSIC_GAIN_DB\s*=\s*(-?\d+(?:\.\d+)?);")
+_NEEDS_NO_MUSIC_RE = re.compile(r"var ATR_NEEDS_NO_MUSIC_EXPORT\s*=\s*(\d);")
 _AUDIO_POLICIES_RE = re.compile(
     r"var SOURCE_AUDIO_POLICIES\s*=\s*(\{[\s\S]*?\});", re.MULTILINE
 )
@@ -50,13 +52,37 @@ def _extract_jsx_constants(jsx_text: str) -> dict[str, Any]:
         raise RuntimeError("Could not locate SOURCE_FPS_NUM/DEN in existing JSX")
     if not policies_match:
         raise RuntimeError("Could not locate SOURCE_AUDIO_POLICIES block in existing JSX")
+    music_filename = music_file_match.group(1) if music_file_match else ""
     return {
         "source_fps_num": int(fps_num_match.group(1)),
         "source_fps_den": int(fps_den_match.group(1)),
-        "music_filename": music_file_match.group(1) if music_file_match else "",
+        "music_filename": music_filename,
         "music_gain_db": float(music_gain_match.group(1)) if music_gain_match else -24.0,
+        "music_copyright": _resolve_music_copyright(jsx_text, music_filename),
         "source_audio_policies": json.loads(policies_match.group(1)),
     }
+
+
+def _resolve_music_copyright(jsx_text: str, music_filename: str) -> bool:
+    """Copyright flag for the regenerated JSX's ATR_NEEDS_NO_MUSIC_EXPORT.
+
+    Round-trips the existing var when present; for pre-feature JSX, looks the
+    filename up in the music config. A non-empty filename unknown to the
+    config defaults to True (render the wav = safe).
+    """
+    needs_match = _NEEDS_NO_MUSIC_RE.search(jsx_text)
+    if needs_match:
+        return needs_match.group(1) == "1"
+    if not music_filename:
+        return False
+    matches = [
+        entry
+        for entry in MusicConfigService.get_config().musics.values()
+        if Path(entry.file_path).name == music_filename
+    ]
+    if not matches:
+        return True
+    return any(entry.copyright for entry in matches)
 
 
 def _frame_rate_from_num_den(num: int, den: int) -> FrameRateInfo:
@@ -121,6 +147,7 @@ def regenerate_jsx_for_project(project_id: str, *, write: bool) -> Path:
         raw_scene_subtitle_mogrt_relative_dir=ProcessingService.RAW_SCENE_TEXT_SUBTITLE_MOGRT_RELATIVE_DIR,
         music_filename=constants["music_filename"],
         music_gain_db=constants["music_gain_db"],
+        music_copyright=constants["music_copyright"],
     )
 
     if write:

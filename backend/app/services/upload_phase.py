@@ -20,6 +20,7 @@ from ..utils.video_color import ensure_bt709_tags
 from ..models import Project
 from .account_service import AccountConfig, AccountService
 from .discord_service import DiscordService
+from .drive_shared_sources import DriveSharedSources
 from .export_service import ExportService
 from .google_drive_service import (
     DriveVideoMetadataLookupError,
@@ -40,6 +41,10 @@ from .social_upload_service import PlatformUploadResult, SocialUploadService
 from .thumbnail_service import ThumbnailService
 
 logger = logging.getLogger("uvicorn.error")
+
+# Rendered by the CEP panel next to output.mp4 (only for projects whose music
+# is copyrighted) and consumed solely by the copyright-replacement flow below.
+NO_MUSIC_WAV_FILENAME = "output_no_music.wav"
 
 
 class PendingProjectDeletionRequiresConfirmation(ValueError):
@@ -2548,6 +2553,19 @@ class UploadPhaseService:
             GoogleDriveService.delete_folder(drive_folder_id)
             drive_deleted = True
 
+        # Shared-source GC: this project's dir (and its export manifest) is
+        # about to disappear, so release its shared Drive files while the
+        # manifest is still readable. Never blocks the deletion itself.
+        shared_gc: dict[str, Any] | None = None
+        released_manifest = DriveSharedSources.load_local_manifest(project.id)
+        if released_manifest and GoogleDriveService.is_configured():
+            try:
+                shared_gc = DriveSharedSources.collect_garbage(
+                    released_manifest, exclude_project_id=project.id
+                )
+            except Exception as exc:
+                cleanup_warnings.append(f"shared-source GC failed: {exc}")
+
         local_deleted = ProjectService.delete(project.id)
         result = {
             "status": "deleted" if local_deleted else "not_found",
@@ -2556,6 +2574,8 @@ class UploadPhaseService:
             "archive": archive_result,
             "unscheduled": cancellation_status,
         }
+        if shared_gc is not None:
+            result["shared_gc"] = shared_gc
         if cleanup_warnings:
             result["cleanup_warnings"] = cleanup_warnings
         return result
@@ -2580,20 +2600,18 @@ class UploadPhaseService:
         if not music.copyright:
             return {"copyrighted": False}
 
-        # Look for output_no_music.wav in GDrive folder
+        # Look for the no-music wav in the GDrive folder. Drive is the only
+        # source: build_copyright_audio downloads by file id, and the modal
+        # requires no_music_available and no_music_file_id to agree.
         readiness = cls.compute_readiness(project)
         no_music_file_id = None
         no_music_available = False
-
-        local_no_music = ExportService.get_output_dir(project_id) / "output_no_music.wav"
-        if local_no_music.exists():
-            no_music_available = True
 
         if readiness.drive_folder_id:
             try:
                 children = GoogleDriveService.list_children(readiness.drive_folder_id)
                 for child in children:
-                    if child.get("name") == "output_no_music.wav":
+                    if child.get("name") == NO_MUSIC_WAV_FILENAME:
                         no_music_file_id = child["id"]
                         no_music_available = True
                         break
@@ -2621,15 +2639,15 @@ class UploadPhaseService:
 
         prep_dir = cls._copyright_audio_dir(project_id)
 
-        no_music_path = prep_dir / "output_no_music.wav"
+        no_music_path = prep_dir / NO_MUSIC_WAV_FILENAME
         if not no_music_path.exists():
             if no_music_file_id:
                 GoogleDriveService.download_file(no_music_file_id, no_music_path)
             else:
-                raise ValueError("output_no_music.wav not found on Drive")
+                raise ValueError(f"{NO_MUSIC_WAV_FILENAME} not found on Drive")
 
         if music_key is None:
-            # No music - use output_no_music.wav as-is
+            # No music - use the no-music wav as-is
             output_path = prep_dir / "copyright_replacement_no_music.wav"
             if not output_path.exists():
                 shutil.copy2(no_music_path, output_path)

@@ -2879,6 +2879,7 @@ export function ScriptRestructurePage() {
                           ({
                             key: m.key,
                             label: m.display_name,
+                            badge: m.copyright ? "copyright" : undefined,
                             previewUrl: projectId
                               ? api.previewMusicUrl(projectId, m.key)
                               : undefined,

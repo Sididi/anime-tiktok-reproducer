@@ -637,6 +637,32 @@ class GoogleDriveService:
         return cls._query_files(q, drive=drive)
 
     @classmethod
+    def list_children_with_hashes(
+        cls, folder_id: str, *, drive=None
+    ) -> list[dict[str, Any]]:
+        """Children including size and Drive's server-side MD5 (files only)."""
+        q = f"trashed=false and '{_escape_query_value(folder_id)}' in parents"
+        return cls._query_files(
+            q,
+            fields="files(id,name,mimeType,size,md5Checksum)",
+            drive=drive,
+        )
+
+    @classmethod
+    def ensure_child_folder_id(
+        cls,
+        folder_name: str,
+        *,
+        parent_id: str | None = None,
+        drive=None,
+    ) -> str:
+        """Find-or-create a child folder under the configured parent by name."""
+        parent = parent_id or settings.google_drive_parent_folder_id
+        if parent is None:
+            raise RuntimeError("Google Drive parent folder not configured")
+        return str(cls._ensure_child_folder(folder_name, parent, drive=drive)["id"])
+
+    @classmethod
     def list_children_named(
         cls,
         folder_id: str,

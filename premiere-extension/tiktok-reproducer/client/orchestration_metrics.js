@@ -7,6 +7,7 @@ var METRIC_KEYS = [
   "host_import_elapsed_ms",
   "resolve_folder_elapsed_ms",
   "list_tree_elapsed_ms",
+  "sibling_reuse_elapsed_ms",
   "download_elapsed_ms",
   "subtitle_extract_elapsed_ms",
 ];
@@ -27,6 +28,7 @@ function createInitialMetrics(httpReceivedAt) {
     host_import_elapsed_ms: null,
     resolve_folder_elapsed_ms: null,
     list_tree_elapsed_ms: null,
+    sibling_reuse_elapsed_ms: null,
     download_elapsed_ms: null,
     subtitle_extract_elapsed_ms: null,
   };
