@@ -28,6 +28,10 @@ class InstagramPayload(BaseModel):
     ig_user_id: str
     ig_access_token: str
     caption: str
+    # Public direct-download URL of the video Instagram must ingest. Either a
+    # dedicated artifact (cut / sped-up output_instagram.mp4) or the final
+    # video itself when the backend found nothing to change; None only on
+    # legacy jobs (the scheduler then downloads job.drive_video_url).
     prepared_video_url: str | None = None
     graph_api_version: str = "v25.0"
     poll_interval_seconds: float | None = None

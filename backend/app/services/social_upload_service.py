@@ -63,6 +63,9 @@ class LimitedDurationVideoPreparation:
     transcoded: bool = False
     original_duration_seconds: float | None = None
     speed_factor: float | None = None
+    # True when ``video_path`` IS the untouched source: nothing was cut,
+    # retimed or remuxed, so the caller may publish the source as-is.
+    passthrough: bool = False
 
 
 def _extract_http_error_detail(exc: HttpError) -> str:
@@ -1432,6 +1435,47 @@ class SocialUploadService:
             max_duration_seconds=cls._YOUTUBE_UPLOAD_TARGET_DURATION_SECONDS,
         )
 
+    @staticmethod
+    def _is_faststart_mp4(path: Path) -> bool:
+        """True when the MP4's ``moov`` box precedes ``mdat`` (streamable).
+
+        Walks top-level boxes by declared size; a ``moov`` seen before any
+        ``mdat`` means the file can be ingested by URL without a remux. Any
+        parse problem returns False so the caller takes the remux path.
+        """
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as f:
+                offset = 0
+                for _ in range(64):
+                    if offset + 8 > size:
+                        return False
+                    f.seek(offset)
+                    header = f.read(8)
+                    if len(header) < 8:
+                        return False
+                    box_size = int.from_bytes(header[:4], "big")
+                    box_type = header[4:8]
+                    header_size = 8
+                    if box_size == 1:
+                        large = f.read(8)
+                        if len(large) < 8:
+                            return False
+                        box_size = int.from_bytes(large, "big")
+                        header_size = 16
+                    elif box_size == 0:
+                        box_size = size - offset  # box extends to EOF
+                    if box_type == b"moov":
+                        return True
+                    if box_type == b"mdat":
+                        return False
+                    if box_size < header_size:
+                        return False
+                    offset += box_size
+        except OSError:
+            return False
+        return False
+
     @classmethod
     def _remux_video_faststart(
         cls,
@@ -1594,8 +1638,18 @@ class SocialUploadService:
         instagram_strategy: str | None = None,
         facebook_prep_dir: Path | None = None,
         max_duration_seconds: float = 90.0,
+        allow_source_passthrough: bool = False,
     ) -> LimitedDurationVideoPreparation:
-        """Prepare the retained Google Drive artifact used by the VPS IG scheduler."""
+        """Prepare the retained Google Drive artifact used by the VPS IG scheduler.
+
+        With ``allow_source_passthrough`` a source that needs no cut/retime and
+        already has its ``moov`` atom up front is validated and returned as-is
+        (``passthrough=True``, no ``output_path`` written). Instagram accepts
+        the Premiere container unchanged (A/B on 2026-08-27: original
+        FINISHED in 58s vs 74s for the remux); the historical "silent" IG
+        failures were URL delivery, not the container. Skipping the remux
+        lets the caller skip the Drive re-upload of an identical video.
+        """
         strategy = (instagram_strategy or "auto").strip().lower()
         if strategy == "skip":
             return LimitedDurationVideoPreparation(
@@ -1662,6 +1716,29 @@ class SocialUploadService:
             original_duration_seconds = prep.original_duration_seconds
             speed_factor = prep.speed_factor
             transcoded = prep.transcoded
+
+        if (
+            allow_source_passthrough
+            and not transcoded
+            and candidate == source_video_path
+            and cls._is_faststart_mp4(candidate)
+        ):
+            media_validation_error = cls._validate_facebook_reel_media(
+                video_path=candidate,
+                max_duration_seconds=max_duration_seconds,
+            )
+            if media_validation_error is None:
+                return LimitedDurationVideoPreparation(
+                    status="ready",
+                    video_path=candidate,
+                    detail=None,
+                    transcoded=False,
+                    original_duration_seconds=original_duration_seconds,
+                    speed_factor=speed_factor,
+                    passthrough=True,
+                )
+            # Validation disliked the source as-is: fall through and let the
+            # remux path produce (and validate) the usual artifact.
 
         remux_error = cls._remux_video_faststart(
             input_path=candidate,

@@ -527,9 +527,21 @@ async def _dispatch_instagram_publish(
     async def persist_instagram_state(state: InstagramPublishState) -> None:
         await store.set_instagram_publish_state(job.project_id, state)
 
-    prepared_video_url = payload.get("prepared_video_url") or ""
-    instagram_video_url = str(prepared_video_url).strip() or _instagram_video_url(job, settings)
-    instagram_download_url = str(prepared_video_url).strip() or job.drive_video_url
+    # `prepared_video_url` is whatever the backend decided Instagram must
+    # ingest: a dedicated cut/sped-up artifact (output_instagram.mp4) or, since
+    # 2026-08-27, the final video itself when nothing had to change. Either
+    # way this server downloads it, validates it and re-hosts it for Meta, so
+    # the two cases are indistinguishable here. Jobs created without any
+    # prepared URL fall back to the job's Drive video for the download and to
+    # this server's /api/videos proxy for Meta-side ingestion.
+    prepared_video_url = str(payload.get("prepared_video_url") or "").strip()
+    instagram_video_url = prepared_video_url or _instagram_video_url(job, settings)
+    instagram_download_url = prepared_video_url or job.drive_video_url
+    logger.info(
+        "Instagram publish for %s: source=%s",
+        job.project_id,
+        "prepared_video_url" if prepared_video_url else "job.drive_video_url (no prepared media)",
+    )
 
     result = await publish_to_instagram(
         ig_user_id=payload["ig_user_id"],

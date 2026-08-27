@@ -115,6 +115,7 @@ def test_upload_phase_prepares_instagram_artifact_and_returns_drive_metadata(
         "instagram_drive_video_url": "https://drive.usercontent.google.com/download?id=ig_file",
         "instagram_drive_web_url": "https://drive.google.com/file/d/ig_file",
         "instagram_drive_filename": "output_instagram.mp4",
+        "instagram_drive_source": "prepared",
         "instagram_speed_factor": "1.0",
         "instagram_prepared_local_path": str(prepared),
     }

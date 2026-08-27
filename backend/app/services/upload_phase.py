@@ -935,7 +935,18 @@ class UploadPhaseService:
         instagram_strategy: str | None,
         max_duration_seconds: float,
         work_dir: Path,
+        source_drive_video: dict[str, str] | None = None,
     ) -> tuple[PlatformUploadResult | None, dict[str, str]]:
+        """Produce what the VPS Instagram scheduler should ingest.
+
+        ``source_drive_video`` (``file_id``/``direct_url``/``web_url``/
+        ``filename`` of the final video on Drive) is passed only when the local
+        ``source_video_path`` is that very file. When the preparation turns
+        out to be a no-op (no cut/retime, container already streamable) the
+        metadata then points straight at the original and NO
+        ``output_instagram.mp4`` is uploaded — the dedicated artifact is
+        optional; it exists only when Instagram must receive different bytes.
+        """
         output_path = work_dir / cls._INSTAGRAM_DRIVE_FILENAME
         prep = SocialUploadService.prepare_instagram_video_for_drive(
             source_video_path=source_video_path,
@@ -943,6 +954,9 @@ class UploadPhaseService:
             instagram_strategy=instagram_strategy,
             facebook_prep_dir=cls._facebook_prep_dir(project_id),
             max_duration_seconds=max_duration_seconds,
+            allow_source_passthrough=bool(
+                source_drive_video and source_drive_video.get("file_id")
+            ),
         )
         if prep.status == "skip":
             return (
@@ -964,6 +978,29 @@ class UploadPhaseService:
             )
 
         drive = GoogleDriveService.client()
+        if prep.passthrough and source_drive_video and source_drive_video.get("file_id"):
+            # Nothing to re-host: Instagram gets the final video itself. Drop a
+            # stale artifact from an earlier run so nobody mistakes it for the
+            # current one (best-effort; the payload below never references it).
+            cls._delete_stale_instagram_artifact(drive_folder_id, drive=drive)
+            logger.info(
+                "Instagram prep passthrough: project=%s reuses Drive final video %s (no %s upload)",
+                project_id,
+                source_drive_video["file_id"],
+                cls._INSTAGRAM_DRIVE_FILENAME,
+            )
+            return (
+                None,
+                {
+                    "instagram_drive_file_id": source_drive_video["file_id"],
+                    "instagram_drive_video_url": source_drive_video["direct_url"],
+                    "instagram_drive_web_url": source_drive_video.get("web_url") or "",
+                    "instagram_drive_filename": source_drive_video.get("filename") or "",
+                    "instagram_drive_source": "original",
+                    "instagram_speed_factor": "1.0",
+                    "instagram_prepared_local_path": str(prep.video_path),
+                },
+            )
         uploaded = GoogleDriveService.upsert_local_file(
             parent_id=drive_folder_id,
             filename=cls._INSTAGRAM_DRIVE_FILENAME,
@@ -991,6 +1028,7 @@ class UploadPhaseService:
                 "instagram_drive_video_url": direct_url,
                 "instagram_drive_web_url": web_url,
                 "instagram_drive_filename": cls._INSTAGRAM_DRIVE_FILENAME,
+                "instagram_drive_source": "prepared",
                 "instagram_speed_factor": (
                     f"{prep.speed_factor}" if prep.transcoded and prep.speed_factor else "1.0"
                 ),
@@ -999,6 +1037,23 @@ class UploadPhaseService:
                 "instagram_prepared_local_path": str(prep.video_path),
             },
         )
+
+    @classmethod
+    def _delete_stale_instagram_artifact(cls, drive_folder_id: str, *, drive=None) -> None:
+        try:
+            for entry in GoogleDriveService.list_children_named(
+                drive_folder_id, cls._INSTAGRAM_DRIVE_FILENAME, drive=drive
+            ):
+                file_id = str(entry.get("id") or "")
+                if file_id:
+                    GoogleDriveService.delete_file(file_id, drive=drive)
+        except Exception:
+            logger.warning(
+                "Could not remove stale %s from Drive folder %s",
+                cls._INSTAGRAM_DRIVE_FILENAME,
+                drive_folder_id,
+                exc_info=True,
+            )
 
     @classmethod
     def _prepare_facebook_drive_video(
@@ -1609,6 +1664,23 @@ class UploadPhaseService:
                 # the YouTube/Facebook uploads; only the Discord/VPS job created
                 # below needs its prepared URL.
                 if ig_prep_needed:
+                    # The local source is the Drive final video itself unless
+                    # the copyright audio swap re-muxed it. Only then may the
+                    # Instagram prep point the VPS at that Drive file instead
+                    # of re-uploading identical bytes as output_instagram.mp4.
+                    # (The cached local copy may carry BT.709 VUI tags the
+                    # Drive original lacks — Facebook's URL ingestion and
+                    # TikTok already publish the untagged original.)
+                    ig_source_drive_video = (
+                        {
+                            "file_id": drive_video_id,
+                            "direct_url": direct_drive_download,
+                            "web_url": drive_video_url,
+                            "filename": video_name,
+                        }
+                        if drive_video_id and not force_local_upload
+                        else None
+                    )
                     ig_prep_future = executor.submit(
                         cls._prepare_instagram_drive_video,
                         project_id=project_id,
@@ -1617,6 +1689,7 @@ class UploadPhaseService:
                         instagram_strategy=instagram_strategy,
                         max_duration_seconds=instagram_max_duration,
                         work_dir=Path(tmp_dir),
+                        source_drive_video=ig_source_drive_video,
                     )
                     try:
                         ig_result, instagram_drive_metadata = ig_prep_future.result()
