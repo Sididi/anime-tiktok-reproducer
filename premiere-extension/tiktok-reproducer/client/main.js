@@ -3331,13 +3331,19 @@
             Number(progress.elapsed_ms || 0) / 1000,
           );
           var totalMb = Number(progress.total_bytes || 0) / (1024 * 1024);
-          var speed = totalMb / elapsedSec;
+          var reusedMbDone = Number(progress.reused_bytes || 0) / (1024 * 1024);
+          var networkMb = Math.max(0, totalMb - reusedMbDone);
+          var speed = networkMb / elapsedSec;
           log(
             "Download completed for " +
               projectId +
               " (" +
-              totalMb.toFixed(1) +
-              " MB in " +
+              networkMb.toFixed(1) +
+              " MB downloaded" +
+              (reusedMbDone > 0
+                ? " + " + reusedMbDone.toFixed(1) + " MB reused from siblings"
+                : "") +
+              " in " +
               elapsedSec.toFixed(1) +
               "s, " +
               speed.toFixed(2) +

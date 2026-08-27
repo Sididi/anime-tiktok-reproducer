@@ -92,6 +92,19 @@ class _RcloneDriveProgressAdapter:
             throughput_mb_per_sec=0.0,
         )
 
+    def emit_status(self, message: str) -> None:
+        """Informational frame before the rclone sync (stays in the manifest phase)."""
+        self._emit(
+            phase="manifest",
+            message=message,
+            file_count=self.manifest_file_count,
+            files_completed=0,
+            total_bytes=self.manifest_total_bytes,
+            uploaded_bytes=0,
+            current_file=None,
+            throughput_mb_per_sec=0.0,
+        )
+
     def on_stats(self, stats: RcloneStats) -> None:
         self.last_stats = stats
         current_file = stats.transferring_names[0] if stats.transferring_names else None
@@ -685,6 +698,10 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
         shared_records: list[SharedFileRecord] = []
         shared_stats: dict[str, Any] | None = None
         if shared_enabled and externalized:
+            adapter.emit_status(
+                f"Hashing {len(externalized)} shared source(s) "
+                f"({_format_bytes(sum(e.source_path.stat().st_size for e in externalized))})"
+            )
             hashes = await run_heavy(
                 SourceHashService.sha256_for_many,
                 [entry.source_path for entry in externalized],
@@ -718,6 +735,12 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
                 pairs,
                 shared_folder_id=shared_folder_id,
                 stats_callback=adapter.on_stats,
+                on_wait=lambda: adapter.emit_status(
+                    "Waiting for shared sources being uploaded by another export..."
+                ),
+                on_plan=lambda reused, missing: adapter.emit_status(
+                    f"Shared sources: {reused} already on Drive, {missing} to upload"
+                ),
             )
             remote_manifest = DriveSharedSources.build_remote_manifest(
                 project, shared_records, shared_folder_id=shared_folder_id
