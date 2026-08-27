@@ -100,9 +100,14 @@ class GoogleDriveService:
     _video_duration_cache_lock = Lock()
     _video_duration_cache: dict[str, tuple[float, float]] = {}
 
-    # The normal Drive client deliberately keeps Google's generous socket
-    # timeout for large transfers. Preflight metadata requests need a separate,
-    # bounded client so a broken route to Google cannot strand the UI.
+    # googleapiclient's default socket timeout is 60s (DEFAULT_HTTP_TIMEOUT_SEC).
+    # That is too short for the transfer client: the last chunk of a resumable
+    # upload is only acknowledged once Drive has assembled the whole file, and
+    # with two 200 MB exports in flight on one uplink that ack took >60s
+    # (2026-08-27 "The read operation timed out" upload crash). Preflight
+    # metadata requests use a separate, tightly bounded client below so a
+    # broken route to Google cannot strand the UI.
+    _TRANSFER_HTTP_TIMEOUT_SECONDS = 300
     _VIDEO_METADATA_HTTP_TIMEOUT_SECONDS = 10
     _VIDEO_METADATA_MAX_ATTEMPTS = 2
     _VIDEO_DURATION_CACHE_TTL_SECONDS = 60.0
@@ -201,7 +206,13 @@ class GoogleDriveService:
         # googleapiclient uses httplib2 under the hood; sharing one service object
         # across threads can crash the interpreter in concurrent network calls.
         if cached_client is None or cached_creds_ref is not creds:
-            cached_client = build("drive", "v3", credentials=creds, cache_discovery=False)
+            authorized_http = AuthorizedHttp(
+                creds,
+                http=httplib2.Http(timeout=cls._TRANSFER_HTTP_TIMEOUT_SECONDS),
+            )
+            cached_client = build(
+                "drive", "v3", http=authorized_http, cache_discovery=False
+            )
             cls._client_local.client = cached_client
             cls._client_local.creds_ref = creds
         return cached_client
@@ -320,6 +331,21 @@ class GoogleDriveService:
             except Exception:
                 pass
         cls.reset_client()
+
+    @staticmethod
+    def _recycle_request_connection(request) -> None:
+        """Close the pooled socket behind a media request.
+
+        Resumable uploads/downloads keep talking through ``request.http``, not
+        the thread-local client, so that is the connection to drop after a
+        transport error; httplib2 dials a fresh one on the next chunk.
+        """
+        http_client = getattr(request, "http", None)
+        if http_client is not None and hasattr(http_client, "close"):
+            try:
+                http_client.close()
+            except Exception:
+                pass
 
     @classmethod
     def _is_retryable_http_error(cls, exc: Exception) -> bool:
@@ -794,9 +820,28 @@ class GoogleDriveService:
                 attempt = 1
             except Exception as exc:
                 status_code = cls._http_error_status_code(exc)
-                should_retry = cls._is_retryable_http_error(exc)
+                transport_failure = cls._is_transport_error(exc)
+                should_retry = transport_failure or cls._is_retryable_http_error(exc)
                 if not should_retry or attempt >= max_attempts:
                     raise
+                if transport_failure:
+                    # A dead socket does not kill a resumable session: after an
+                    # exception googleapiclient's next_chunk() first asks Drive
+                    # which byte range it holds (Content-Range: bytes */size)
+                    # and resumes from there, so re-calling it is safe.
+                    cls._recycle_request_connection(request)
+                    backoff_seconds = min(8.0, float(attempt)) + random.uniform(0.0, 0.25)
+                    logger.warning(
+                        "Drive upload chunk connection lost; reconnecting and retrying: operation=%s attempt=%d/%d backoff_seconds=%.2f error=%s",
+                        operation,
+                        attempt,
+                        max_attempts,
+                        backoff_seconds,
+                        exc,
+                    )
+                    time.sleep(backoff_seconds)
+                    attempt += 1
+                    continue
                 backoff_seconds = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
                 logger.warning(
                     "Transient Drive upload chunk error; retrying request: operation=%s status=%s reasons=%s attempt=%d/%d backoff_seconds=%.2f",
@@ -1309,15 +1354,40 @@ class GoogleDriveService:
             return None
 
     @classmethod
-    def download_file(cls, file_id: str, destination: Path) -> None:
+    def download_file(
+        cls, file_id: str, destination: Path, *, max_attempts: int = 5
+    ) -> None:
         drive = cls._client()
         request = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("wb") as f:
             downloader = MediaIoBaseDownload(f, request)
             done = False
+            attempt = 1
             while not done:
-                _, done = downloader.next_chunk()
+                try:
+                    _, done = downloader.next_chunk()
+                    attempt = 1
+                except Exception as exc:
+                    # A failed chunk writes nothing and leaves the downloader's
+                    # offset untouched, so retrying re-requests the same range.
+                    transport_failure = cls._is_transport_error(exc)
+                    should_retry = transport_failure or cls._is_retryable_http_error(exc)
+                    if not should_retry or attempt >= max_attempts:
+                        raise
+                    if transport_failure:
+                        cls._recycle_request_connection(request)
+                    backoff_seconds = min(8.0, 0.5 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.25)
+                    logger.warning(
+                        "Drive download chunk error; retrying: file_id=%s attempt=%d/%d backoff_seconds=%.2f error=%s",
+                        file_id,
+                        attempt,
+                        max_attempts,
+                        backoff_seconds,
+                        exc,
+                    )
+                    time.sleep(backoff_seconds)
+                    attempt += 1
 
     @classmethod
     def delete_folder(cls, folder_id: str) -> None:

@@ -46,6 +46,18 @@ def _swallow(label: str):
                 return None
             try:
                 return fn(*args, **kwargs)
+            except httpx.HTTPStatusError as e:
+                # The status line alone hid a 400 "Unknown account" for a
+                # whole afternoon (2026-08-27): always show the server's body.
+                body = ""
+                try:
+                    body = (e.response.text or "").strip()[:300]
+                except Exception:
+                    pass
+                logger.warning(
+                    "%s failed: %s%s", label, e, f" — response: {body}" if body else ""
+                )
+                return None
             except httpx.HTTPError as e:
                 logger.warning("%s failed: %s", label, e)
                 return None

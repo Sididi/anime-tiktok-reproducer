@@ -14,6 +14,8 @@ import threading
 import os
 import time
 
+import httpx
+
 from ..config import settings
 from ..library_types import coerce_library_type
 from ..utils.video_color import ensure_bt709_tags
@@ -1579,6 +1581,7 @@ class UploadPhaseService:
             executor = ThreadPoolExecutor(max_workers=max_parallel)
             timed_out_platforms = False
             abort_platform_jobs = False
+            future_to_platform: dict[Any, str] = {}
             try:
                 # All platform jobs run in parallel — including in the
                 # urgent-immediate mode (owner decision 2026-08-20: no
@@ -1819,6 +1822,21 @@ class UploadPhaseService:
                             ),
                         )
                         emit_platform_result(results_by_platform[platform])
+            except Exception:
+                if abort_platform_jobs:
+                    # A prep step failed after the platform jobs were already
+                    # submitted. shutdown(cancel_futures=True) only drops the
+                    # ones still queued: a RUNNING Facebook/YouTube upload
+                    # keeps going in its thread and schedules a post nobody
+                    # records (orphan reel, 2026-08-27). Settle them instead:
+                    # cancel the queued ones, wait for the running ones and
+                    # undo whatever they published.
+                    cls._settle_aborted_platform_jobs(
+                        future_to_platform,
+                        account_id=account_id or project.scheduled_account_id,
+                        emit_platform_result=emit_platform_result,
+                    )
+                raise
             finally:
                 abandon_jobs = timed_out_platforms or abort_platform_jobs
                 executor.shutdown(
@@ -1953,6 +1971,138 @@ class UploadPhaseService:
             pass
 
         return cache_dir
+
+    # How long an aborted upload waits for platform jobs that were already
+    # running before giving up on undoing them (a reel upload is minutes).
+    _ABORT_SETTLE_TIMEOUT_SECONDS = 600
+
+    @classmethod
+    def _settle_aborted_platform_jobs(
+        cls,
+        future_to_platform: dict[Any, str],
+        *,
+        account_id: str | None,
+        emit_platform_result: Callable[..., None],
+    ) -> list[str]:
+        """Leave no stray posts behind when the upload aborts mid-phase.
+
+        Queued jobs are cancelled outright. Jobs already running are waited
+        for; every ``uploaded`` result they return is rolled back (the post is
+        deleted on the platform) and reported as a failed platform row so the
+        operator sees what happened. Returns the posts that could NOT be
+        undone, as display strings (also surfaced as failed rows).
+        """
+        leftovers: list[str] = []
+        running: dict[Any, str] = {}
+        for future, platform in future_to_platform.items():
+            if future.cancel():
+                continue  # never started — nothing to undo
+            running[future] = platform
+        if not running:
+            return leftovers
+
+        logger.warning(
+            "Upload aborted with %d platform job(s) still running (%s); waiting for them to settle",
+            len(running),
+            ", ".join(sorted(running.values())),
+        )
+        done, pending = wait(
+            set(running), timeout=cls._ABORT_SETTLE_TIMEOUT_SECONDS
+        )
+        for future in pending:
+            platform = running[future]
+            leftovers.append(f"{platform}: job still running after abort")
+            logger.error(
+                "Aborted upload: %s job still running after %ss — check the platform for a stray post",
+                platform,
+                cls._ABORT_SETTLE_TIMEOUT_SECONDS,
+            )
+
+        for future in done:
+            platform = running[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                logger.info("Aborted upload: %s job failed on its own: %s", platform, exc)
+                continue
+            if not isinstance(result, PlatformUploadResult) or result.status != "uploaded":
+                continue
+            reference = result.url or result.resource_id or "?"
+            undone = cls._rollback_platform_upload(account_id, result)
+            if undone:
+                detail = f"Upload aborted — {platform} post {reference} was removed again"
+                logger.warning("Aborted upload: removed %s post %s", platform, reference)
+            else:
+                leftovers.append(f"{platform}: {reference}")
+                detail = (
+                    f"Upload aborted — {platform} post {reference} could NOT be removed "
+                    "automatically; delete it manually before retrying"
+                )
+            try:
+                emit_platform_result(
+                    PlatformUploadResult(
+                        platform=platform,
+                        status="failed",
+                        url=None if undone else result.url,
+                        resource_id=None if undone else result.resource_id,
+                        detail=detail,
+                    ),
+                    update_discord=False,
+                )
+            except Exception:
+                logger.debug("Aborted-upload platform row emit failed", exc_info=True)
+
+        if leftovers:
+            logger.error(
+                "Aborted upload left remote posts in place: %s", "; ".join(leftovers)
+            )
+        return leftovers
+
+    @classmethod
+    def _rollback_platform_upload(
+        cls, account_id: str | None, result: PlatformUploadResult
+    ) -> bool:
+        """Delete a post created by a platform job whose upload run aborted.
+
+        Facebook reels and YouTube videos can be deleted through their APIs;
+        other platforms return False so the caller reports them as leftovers.
+        """
+        resource_id = result.resource_id
+        if not resource_id or not account_id:
+            return False
+        try:
+            if result.platform == "facebook":
+                creds = AccountService.get_meta_credentials(account_id)
+                resp = httpx.delete(
+                    f"https://graph.facebook.com/{settings.meta_graph_api_version}/{resource_id}",
+                    params={"access_token": creds.facebook_page_access_token},
+                    timeout=30.0,
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "Facebook rollback of %s returned %s: %s",
+                        resource_id,
+                        resp.status_code,
+                        resp.text[:200],
+                    )
+                    return False
+                try:
+                    return bool(resp.json().get("success"))
+                except Exception:
+                    return False
+            if result.platform == "youtube":
+                creds = AccountService.get_youtube_credentials(account_id)
+                youtube = SocialUploadService._build_youtube_client(
+                    credentials=creds, deadline=None
+                )
+                youtube.videos().delete(id=resource_id).execute()
+                return True
+        except Exception:
+            logger.warning(
+                "Rollback of %s post %s failed", result.platform, resource_id, exc_info=True
+            )
+            return False
+        return False
 
     @classmethod
     def _facebook_prep_dir(cls, project_id: str) -> Path:
