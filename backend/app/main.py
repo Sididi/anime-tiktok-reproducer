@@ -186,6 +186,19 @@ async def lifespan(app: FastAPI):
         ),
     )
 
+    # Shared-source pre-warm: projects that reached the script phase before a
+    # restart get their episodes shipped to the shared Drive folder now, so
+    # their export stays cheap (no-op when everything is already present).
+    from .services.drive_prewarm_service import DrivePrewarmService
+
+    _track_app_task(
+        app,
+        asyncio.create_task(
+            DrivePrewarmService.resume_pending(),
+            name="drive-prewarm-resume",
+        ),
+    )
+
     app.state.integrations_health = IntegrationHealthService.initialize_startup_state(
         integration_enabled=settings.integration_startup_health_check_enabled,
         storage_box_enabled=settings.storage_box_enabled,

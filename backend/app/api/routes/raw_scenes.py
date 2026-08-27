@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from ...models import MatchList, ProjectPhase, Scene, SceneList, SceneMatch, SceneTranscription, Transcription
 from ...models.raw_scene import RawSceneDetectionResult
 from ...services import ProjectService
+from ...services.drive_prewarm_service import DrivePrewarmService
 from ...services.project_locks import project_edit_locked
 
 router = APIRouter(prefix="/projects/{project_id}/raw-scenes", tags=["raw-scenes"])
@@ -128,6 +129,7 @@ async def confirm_raw_scenes(project_id: str):
 
     project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
     await ProjectService.asave(project)
+    DrivePrewarmService.schedule(project_id, reason="raw-scenes-confirm")
 
     return {"status": "ok"}
 

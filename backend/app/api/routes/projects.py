@@ -8,6 +8,7 @@ from ...library_types import DEFAULT_LIBRARY_TYPE, LibraryType
 from ...models import Project, ProjectPhase
 from ...services import LibraryHydrationService, ProjectService
 from ...services.project_locks import project_edit_locked
+from ...services.drive_prewarm_service import DrivePrewarmService
 from ...services.project_duplication_service import (
     DuplicationVariant,
     ProjectDuplicationService,
@@ -140,6 +141,11 @@ async def duplicate_project(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Duplicates start in the script phase with the mother's matches: their
+    # episodes are (almost always) already in flight or present — the
+    # pre-warm reuses per file, so this costs one listing when nothing is new.
+    for duplicate in created:
+        DrivePrewarmService.schedule(duplicate.id, reason="duplicate")
     return {"projects": [ProjectResponse.from_project(p) for p in created]}
 
 

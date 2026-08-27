@@ -27,10 +27,11 @@ import logging
 import re
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Callable, Iterable, Iterator
 
 from ..config import settings
 from ..models import Project
@@ -50,10 +51,38 @@ SCHEMA_VERSION = 1
 # against wiping anything a human (or another tool) put in the folder.
 SHARED_NAME_RE = re.compile(r"^[0-9a-f]{16}__.+")
 
-# Serializes the shared folder's list→upload→verify phase across concurrent
-# exports in this single-process backend.
-_shared_upload_lock = asyncio.Lock()
+# One lock per shared name (``{sha16}__basename``), held for the whole
+# list→upload→verify span of any job that needs that file. Two jobs wanting
+# the same bytes — duplicate projects exported at once, or an export starting
+# while the script-phase pre-warm is still uploading — serialize on exactly
+# those names: the first uploads, the second re-lists and reuses. Jobs with
+# disjoint sets run concurrently. Locks are always taken in sorted-name
+# order, which makes overlapping sets deadlock-free.
+_shared_name_locks: dict[str, asyncio.Lock] = {}
 _shared_folder_id_cache: str | None = None
+
+
+def _name_lock(name: str) -> asyncio.Lock:
+    lock = _shared_name_locks.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _shared_name_locks[name] = lock
+    return lock
+
+
+@asynccontextmanager
+async def _hold_name_locks(names: Iterable[str]) -> AsyncIterator[None]:
+    ordered = sorted(set(names))
+    held: list[asyncio.Lock] = []
+    try:
+        for name in ordered:
+            lock = _name_lock(name)
+            await lock.acquire()
+            held.append(lock)
+        yield
+    finally:
+        for lock in reversed(held):
+            lock.release()
 
 
 @dataclass
@@ -75,6 +104,17 @@ class SharedFileRecord:
             "shared_name": self.shared_name,
         }
 
+    @classmethod
+    def from_dict(cls, item: dict[str, Any]) -> "SharedFileRecord":
+        return cls(
+            path_in_folder=str(item.get("path") or ""),
+            size=int(item.get("size") or 0),
+            sha256=str(item.get("sha256") or ""),
+            md5=str(item.get("md5") or "") or None,
+            drive_file_id=str(item.get("drive_file_id") or ""),
+            shared_name=str(item.get("shared_name") or ""),
+        )
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -88,6 +128,15 @@ class DriveSharedSources:
     @staticmethod
     def shared_name(sha256: str, basename: str) -> str:
         return f"{sha256[:16].lower()}__{basename}"
+
+    @staticmethod
+    def names_in_flight(names: Iterable[str]) -> list[str]:
+        """Shared names currently locked by another upload job."""
+        return sorted(
+            name
+            for name in set(names)
+            if (lock := _shared_name_locks.get(name)) is not None and lock.locked()
+        )
 
     # ------------------------------------------------------------------ #
     # Manifest entry partitioning                                        #
@@ -144,13 +193,26 @@ class DriveSharedSources:
         *,
         shared_folder_id: str,
         stats_callback: StatsCallback | None = None,
+        on_wait: Callable[[], None] | None = None,
+        on_plan: Callable[[int, int], None] | None = None,
     ) -> list[SharedFileRecord]:
         """Make sure every (entry, sha256) exists in the shared folder.
 
         Reuses present files (by deterministic name + size), uploads missing
         ones with one rclone ``copy`` batch, then verifies by re-listing.
+        Jobs needing the same shared names (duplicate exports, or an export
+        overlapping the script-phase pre-warm) serialize per name: the first
+        uploads, the others wait then reuse. ``on_wait`` fires when that wait
+        is about to happen; ``on_plan(reused, missing)`` once the reuse/upload
+        split is known.
         """
-        async with _shared_upload_lock:
+        names = [
+            cls.shared_name(sha256, entry.source_path.name)
+            for entry, sha256 in externalized
+        ]
+        if on_wait is not None and cls.names_in_flight(names):
+            on_wait()
+        async with _hold_name_locks(names):
             children = await run_heavy(
                 GoogleDriveService.list_children_with_hashes, shared_folder_id
             )
@@ -180,6 +242,9 @@ class DriveSharedSources:
                         GoogleDriveService.delete_file, str(present.get("id") or "")
                     )
                 missing.append((entry, sha256, name))
+
+            if on_plan is not None:
+                on_plan(len(externalized) - len(missing), len(missing))
 
             if missing:
                 stage_dir = Path(
@@ -330,6 +395,24 @@ class DriveSharedSources:
                 yield project_id, None
                 continue
             yield project_id, payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def merge_records(
+        cls, manifest: dict[str, Any] | None, records: list[SharedFileRecord]
+    ) -> list[SharedFileRecord]:
+        """Union of a manifest's records and ``records`` (new wins per name).
+
+        Used by the pre-warm so its writes never drop references another
+        writer (an in-flight export) has already put on disk.
+        """
+        merged: dict[str, SharedFileRecord] = {}
+        for item in (manifest or {}).get("shared_files") or []:
+            if isinstance(item, dict) and item.get("shared_name"):
+                record = SharedFileRecord.from_dict(item)
+                merged[record.shared_name] = record
+        for record in records:
+            merged[record.shared_name] = record
+        return [merged[name] for name in sorted(merged)]
 
     @staticmethod
     def _manifest_shared_names(manifest: dict[str, Any]) -> set[str]:

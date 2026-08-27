@@ -206,6 +206,15 @@ class Settings(BaseSettings):
     # into every project folder. Flag off = legacy self-contained folders.
     drive_shared_sources_enabled: bool = False
     drive_shared_sources_min_bytes: int = 20 * 1024 * 1024
+    # Pre-warm: the moment a project enters the script phase (matches are
+    # locked) its large sources are uploaded to the shared folder in the
+    # background, so the later /processing export only ships small files.
+    # Requires drive_shared_sources_enabled. Per-file locks guarantee a
+    # pre-warm and an export never upload the same bytes twice.
+    drive_prewarm_enabled: bool = True
+    # Startup resume only re-queues script/processing-phase projects touched
+    # within this window: abandoned projects must not eat the link at boot.
+    drive_prewarm_resume_max_age_days: int = 14
     # Retry settings for transient SFTP/network errors (VPN flaps, NAT timeouts,
     # brief Hetzner reachability dips). Per-operation retry — the retried
     # operation re-acquires a fresh SSH session, so a half-dead pooled

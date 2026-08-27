@@ -369,3 +369,45 @@ async def test_ensure_uploaded_fails_when_verify_finds_nothing(
         await DriveSharedSources.ensure_uploaded(
             [(entry, "aa" * 32)], shared_folder_id="shared-1"
         )
+
+
+@pytest.mark.asyncio
+async def test_ensure_uploaded_reports_wait_and_plan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import asyncio
+
+    source = tmp_path / "Ep.mkv"
+    source.write_bytes(b"x" * 50)
+    entry = ManifestEntry(relative_path="SPM_f/sources/Ep.mkv", source_path=source)
+    name = DriveSharedSources.shared_name("aa" * 32, "Ep.mkv")
+    monkeypatch.setattr(
+        GoogleDriveService,
+        "list_children_with_hashes",
+        classmethod(
+            lambda cls, folder_id, drive=None: [
+                {"id": "d-1", "name": name, "size": "50", "md5Checksum": "m"}
+            ]
+        ),
+    )
+
+    # Simulate another job (export or pre-warm) uploading this very file.
+    lock = dss_module._name_lock(name)
+    await lock.acquire()
+    events: list[str] = []
+
+    async def _release_soon() -> None:
+        await asyncio.sleep(0.05)
+        lock.release()
+
+    releaser = asyncio.create_task(_release_soon())
+    records = await DriveSharedSources.ensure_uploaded(
+        [(entry, "aa" * 32)],
+        shared_folder_id="shared-1",
+        on_wait=lambda: events.append("wait"),
+        on_plan=lambda reused, missing: events.append(f"plan:{reused}/{missing}"),
+    )
+    await releaser
+
+    assert events == ["wait", "plan:1/0"]
+    assert records[0].drive_file_id == "d-1"

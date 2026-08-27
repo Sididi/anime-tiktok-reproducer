@@ -7,6 +7,7 @@ import json
 from ...config import settings
 from ...models import ProjectPhase
 from ...services import AnimeMatcherService, ProjectService, TranscriberService
+from ...services.drive_prewarm_service import DrivePrewarmService
 from ...services.match_playback_service import MatchPlaybackService
 from ...services.project_locks import project_edit_locked
 
@@ -81,6 +82,9 @@ async def start_transcription(project_id: str, request: StartTranscriptionReques
 
                 project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
                 await ProjectService.asave(project)
+                # Matches are locked from here on: start shipping the
+                # episodes to the shared Drive folder in the background.
+                DrivePrewarmService.schedule(project_id, reason="transcription-complete")
 
             elif progress.status == "error":
                 project.phase = ProjectPhase.MATCH_VALIDATION
@@ -162,5 +166,6 @@ async def confirm_transcription(project_id: str):
 
     project.phase = ProjectPhase.SCRIPT_RESTRUCTURE
     await ProjectService.asave(project)
+    DrivePrewarmService.schedule(project_id, reason="transcription-confirm")
 
     return {"status": "ok", "next_phase": "script_restructure"}

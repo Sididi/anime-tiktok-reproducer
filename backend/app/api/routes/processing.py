@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from pydub import AudioSegment
 
+from ...services.drive_prewarm_service import DrivePrewarmService
 from ...services.executors import run_heavy
 from ...config import settings
 from ...library_types import resolve_static_overlay_title
@@ -451,6 +452,12 @@ async def get_script_prompt(project_id: str, target_language: str = "fr"):
         target_language=target_language,
     )
     return {"prompt": prompt}
+
+
+@router.get("/drive-prewarm")
+async def get_drive_prewarm_status(project_id: str) -> dict[str, Any]:
+    """Progress of the background shared-source pre-warm for this project."""
+    return DrivePrewarmService.status(project_id)
 
 
 @router.get("/config")

@@ -20,6 +20,7 @@ from ..utils.video_color import ensure_bt709_tags
 from ..models import Project
 from .account_service import AccountConfig, AccountService
 from .discord_service import DiscordService
+from .drive_prewarm_service import DrivePrewarmService
 from .drive_shared_sources import DriveSharedSources
 from .export_service import ExportService
 from .google_drive_service import (
@@ -2557,6 +2558,10 @@ class UploadPhaseService:
         # about to disappear, so release its shared Drive files while the
         # manifest is still readable. Never blocks the deletion itself.
         shared_gc: dict[str, Any] | None = None
+        # A pre-warm still uploading this project's episodes would keep
+        # writing references after we release them: stop it first (its own
+        # cancel path re-runs GC once the project dir is gone).
+        DrivePrewarmService.request_cancel(project.id)
         released_manifest = DriveSharedSources.load_local_manifest(project.id)
         if released_manifest and GoogleDriveService.is_configured():
             try:
