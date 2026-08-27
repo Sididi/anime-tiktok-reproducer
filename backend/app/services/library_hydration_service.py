@@ -484,6 +484,45 @@ class LibraryHydrationService:
         )
 
     @classmethod
+    async def _resolve_release_manifest(
+        cls,
+        library_type: LibraryType | str,
+        series_id: str,
+    ) -> tuple[dict[str, Any], PendingPublishRecord | None]:
+        """Return the manifest that should drive activation/hydration.
+
+        A series whose publish is still pending (finalized locally, upload
+        queued or in flight) has no remote ``current.json`` yet: its durable
+        pending record carries the authoritative manifest, and every artifact
+        it references already lives in the local library. Only published
+        series go to the Storage Box.
+        """
+        scoped_type = coerce_library_type(library_type)
+        pending = await asyncio.to_thread(
+            PendingPublishStore.find_by_series,
+            scoped_type.value,
+            series_id,
+        )
+        if pending is not None and pending.manifest:
+            return dict(pending.manifest), pending
+        current = await StorageBoxRepository.get_current_release(scoped_type, series_id)
+        manifest = await StorageBoxRepository.get_series_manifest(
+            scoped_type,
+            series_id,
+            str(current["release_id"]),
+        )
+        return manifest, None
+
+    @staticmethod
+    def _pending_release_unusable_error(pending: PendingPublishRecord) -> RuntimeError:
+        return RuntimeError(
+            f"Series '{pending.display_name}' has a pending publish "
+            f"({pending.publish_id}) but its local matcher cache is missing or "
+            "stale, and the release is not on the Storage Box yet. Re-index "
+            "the series to rebuild it."
+        )
+
+    @classmethod
     async def ensure_series_index_hydrated(
         cls,
         *,
@@ -499,12 +538,7 @@ class LibraryHydrationService:
             else cls._series_lock(scoped_type, series_id)
         )
         async with lock_ctx:
-            current = await StorageBoxRepository.get_current_release(scoped_type, series_id)
-            manifest = await StorageBoxRepository.get_series_manifest(
-                scoped_type,
-                series_id,
-                str(current["release_id"]),
-            )
+            manifest, pending = await cls._resolve_release_manifest(scoped_type, series_id)
             expected_episode_count = int(
                 manifest.get("episode_count", len(manifest.get("episodes", [])))
             )
@@ -518,6 +552,9 @@ class LibraryHydrationService:
                 scoped_type,
                 manifest,
             )
+            if pending is not None and not local_index_ready:
+                # Nothing to download from: the release only exists locally.
+                raise cls._pending_release_unusable_error(pending)
             if (
                 state is not None
                 and state.release_id == str(manifest["release_id"])
@@ -635,13 +672,9 @@ class LibraryHydrationService:
                 progress=0.0,
                 error=None,
             )
+            pending: PendingPublishRecord | None = None
             try:
-                current = await StorageBoxRepository.get_current_release(scoped_type, series_id)
-                manifest = await StorageBoxRepository.get_series_manifest(
-                    scoped_type,
-                    series_id,
-                    str(current["release_id"]),
-                )
+                manifest, pending = await cls._resolve_release_manifest(scoped_type, series_id)
                 expected_episode_count = int(manifest.get("episode_count", len(manifest.get("episodes", []))))
                 await cls._cache_manifest(scoped_type, manifest)
                 await _call_progress_callback(progress_callback, 0.05, "Loaded release manifest.")
@@ -655,6 +688,10 @@ class LibraryHydrationService:
                     scoped_type,
                     manifest,
                 )
+                if pending is not None and not local_index_ready:
+                    # The release is not on the Storage Box yet, so there is
+                    # nothing to hydrate from; the local cache must be intact.
+                    raise cls._pending_release_unusable_error(pending)
 
                 if not local_index_ready:
                     await asyncio.to_thread(
@@ -771,16 +808,21 @@ class LibraryHydrationService:
                     series_id=series_id,
                 )
             except Exception as exc:
-                await asyncio.to_thread(
-                    LibraryStateDb.upsert_series_state,
-                    library_type=scoped_type,
-                    series_id=series_id,
-                    release_id=None,
-                    hydration_status=HYDRATION_STATUS_ERROR,
-                    local_episode_count=0,
-                    expected_episode_count=0,
-                    last_error=str(exc),
-                )
+                if pending is None:
+                    # Failed against the remote release: the local row is
+                    # rebuilt by the next sync/activation. With a pending
+                    # publish the row written at finalize time is the only
+                    # thing keeping the series matchable — never blank it.
+                    await asyncio.to_thread(
+                        LibraryStateDb.upsert_series_state,
+                        library_type=scoped_type,
+                        series_id=series_id,
+                        release_id=None,
+                        hydration_status=HYDRATION_STATUS_ERROR,
+                        local_episode_count=0,
+                        expected_episode_count=0,
+                        last_error=str(exc),
+                    )
                 await asyncio.to_thread(
                     LibraryStateDb.upsert_operation,
                     library_type=scoped_type,

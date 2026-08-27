@@ -303,3 +303,161 @@ async def test_list_source_details_marks_catalog_series_with_pending_update(
     assert row["pending_upload"] is True
     assert row["storage_release_id"] == record.release_id
     assert sync_calls == []
+
+
+class _RemoteUnavailable(RuntimeError):
+    """Stand-in for asyncssh's SFTPNoSuchFile on a not-yet-uploaded series."""
+
+
+async def _no_remote(*_args, **_kwargs):
+    raise _RemoteUnavailable("No such file")
+
+
+@pytest.mark.asyncio
+async def test_activate_project_series_uses_pending_release_without_remote(
+    monkeypatch: pytest.MonkeyPatch,
+    env: Path,
+) -> None:
+    """Project startup activates a series whose upload is still queued: the
+    pending record's manifest must drive activation with zero remote calls
+    (the Storage Box has no current.json yet)."""
+    from app.services.storage_box_repository import StorageBoxRepository
+
+    record = _make_finalized_series(env)
+    PendingPublishStore.save(record)
+    await LibraryHydrationService.apply_local_publish_state(record)
+    monkeypatch.setattr(StorageBoxRepository, "get_current_release", _no_remote)
+    monkeypatch.setattr(StorageBoxRepository, "get_series_manifest", _no_remote)
+
+    messages: list[str] = []
+
+    async def progress(_value: float, message: str) -> None:
+        messages.append(message)
+
+    state = await LibraryHydrationService.activate_project_series(
+        project_id="proj-1",
+        library_type="anime",
+        series_id=record.series_id,
+        progress_callback=progress,
+    )
+
+    assert state["hydration_status"] == HYDRATION_STATUS_FULLY_LOCAL
+    operation = LibraryStateDb.get_operation("anime", record.series_id, "activate")
+    assert operation is not None and operation.status == "complete"
+    row = LibraryStateDb.get_series_state("anime", record.series_id)
+    assert row is not None
+    assert row.release_id == record.release_id
+    assert row.hydration_status == HYDRATION_STATUS_FULLY_LOCAL
+    assert messages[-1] == "Library activation complete."
+    assert LibraryStateDb.count_project_pins(record.series_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_activate_project_series_heals_clobbered_pending_state(
+    monkeypatch: pytest.MonkeyPatch,
+    env: Path,
+) -> None:
+    """A state row wiped by an earlier failure (release_id=None, status=error)
+    is rebuilt from the pending record, so the matching gate passes again."""
+    from app.services.storage_box_repository import StorageBoxRepository
+
+    record = _make_finalized_series(env)
+    PendingPublishStore.save(record)
+    await LibraryHydrationService.apply_local_publish_state(record)
+    LibraryStateDb.upsert_series_state(
+        library_type="anime",
+        series_id=record.series_id,
+        release_id=None,
+        hydration_status="error",
+        local_episode_count=0,
+        expected_episode_count=0,
+        last_error="No such file",
+    )
+    monkeypatch.setattr(StorageBoxRepository, "get_current_release", _no_remote)
+    assert not await LibraryHydrationService.ensure_index_ready(
+        library_type="anime", series_id=record.series_id
+    )
+
+    await LibraryHydrationService.activate_project_series(
+        project_id="proj-1",
+        library_type="anime",
+        series_id=record.series_id,
+    )
+
+    assert await LibraryHydrationService.ensure_index_ready(
+        library_type="anime", series_id=record.series_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_activate_project_series_failure_keeps_pending_state(
+    monkeypatch: pytest.MonkeyPatch,
+    env: Path,
+) -> None:
+    """When activation of a pending series fails, the finalize-time state row
+    must survive: it is what keeps the series matchable until upload."""
+    record = _make_finalized_series(env)
+    PendingPublishStore.save(record)
+    await LibraryHydrationService.apply_local_publish_state(record)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("cache write failed")
+
+    monkeypatch.setattr(LibraryHydrationService, "_cache_manifest", boom)
+
+    with pytest.raises(RuntimeError, match="cache write failed"):
+        await LibraryHydrationService.activate_project_series(
+            project_id="proj-1",
+            library_type="anime",
+            series_id=record.series_id,
+        )
+
+    row = LibraryStateDb.get_series_state("anime", record.series_id)
+    assert row is not None
+    assert row.release_id == record.release_id
+    assert row.hydration_status == HYDRATION_STATUS_FULLY_LOCAL
+    operation = LibraryStateDb.get_operation("anime", record.series_id, "activate")
+    assert operation is not None and operation.status == "error"
+
+
+@pytest.mark.asyncio
+async def test_activate_project_series_pending_with_missing_shard_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    env: Path,
+) -> None:
+    """No remote release to hydrate from and no local shard: fail with a
+    message that says so instead of an SFTP 'No such file'."""
+    from app.services.storage_box_repository import StorageBoxRepository
+
+    record = _make_finalized_series(env)
+    PendingPublishStore.save(record)
+    await LibraryHydrationService.apply_local_publish_state(record)
+    library_path = AnimeLibraryService.get_library_path("anime")
+    (library_path / AnimeLibraryService.INDEX_DIR_NAME / "series" / "astro-note" / "faiss.index").unlink()
+    monkeypatch.setattr(StorageBoxRepository, "get_current_release", _no_remote)
+
+    with pytest.raises(RuntimeError, match="pending publish"):
+        await LibraryHydrationService.activate_project_series(
+            project_id="proj-1",
+            library_type="anime",
+            series_id=record.series_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_ensure_series_index_hydrated_uses_pending_release(
+    monkeypatch: pytest.MonkeyPatch,
+    env: Path,
+) -> None:
+    from app.services.storage_box_repository import StorageBoxRepository
+
+    record = _make_finalized_series(env)
+    PendingPublishStore.save(record)
+    await LibraryHydrationService.apply_local_publish_state(record)
+    monkeypatch.setattr(StorageBoxRepository, "get_current_release", _no_remote)
+
+    manifest = await LibraryHydrationService.ensure_series_index_hydrated(
+        library_type="anime",
+        series_id=record.series_id,
+    )
+    assert manifest["release_id"] == record.release_id
