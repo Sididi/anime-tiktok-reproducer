@@ -239,6 +239,8 @@ export function ProjectManagerModal({
 
           if (accountsRes.status === "fulfilled") {
             setAccounts(accountsRes.value.accounts);
+          } else {
+            throw accountsRes.reason;
           }
 
           if (projectsRes.status === "rejected") {
@@ -796,14 +798,12 @@ export function ProjectManagerModal({
     (row: ProjectManagerRow) => {
       if (selectedAccountId) {
         void startUploadWithChecks(row.project_id, selectedAccountId);
-      } else if (accounts.length > 0) {
+      } else {
         setAccountPickerMode("auto");
         setAccountPickerForProject(row.project_id);
-      } else {
-        void startUploadWithChecks(row.project_id);
       }
     },
-    [selectedAccountId, accounts, startUploadWithChecks],
+    [selectedAccountId, startUploadWithChecks],
   );
 
   const [schedulingForProject, setSchedulingForProject] = useState<{
@@ -1094,7 +1094,7 @@ export function ProjectManagerModal({
           </motion.div>
 
           <AccountPickerPopup
-            open={!!accountPickerForProject && compatibleAccounts.length > 0}
+            open={!!accountPickerForProject}
             accounts={compatibleAccounts}
             blockedAccountIds={pickerBlockedAccountIds}
             onPick={(accountId) => {

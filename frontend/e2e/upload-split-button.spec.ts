@@ -53,6 +53,7 @@ function installMocks(payload: {
   const testWindow = window as Window &
     typeof globalThis & {
       __uploadCalled?: boolean;
+      __uploadAccountId?: string;
     };
   testWindow.__uploadCalled = false;
   const orig = window.fetch.bind(window);
@@ -78,6 +79,15 @@ function installMocks(payload: {
     }
     if (url.pathname === "/api/project-manager/upload-jobs") {
       return json({ jobs: [] });
+    }
+    if (url.pathname.endsWith("/upload-restrictions")) {
+      return json({
+        mother_project_id: null,
+        family_project_ids: [],
+        blocked_accounts: [],
+        blocked_windows: [],
+        min_spacing_days: 30,
+      });
     }
     if (url.pathname === "/api/anime/source-details") {
       return json([]);
@@ -114,6 +124,10 @@ function installMocks(payload: {
     }
     if (url.pathname.endsWith("/upload") && init?.method === "POST") {
       testWindow.__uploadCalled = true;
+      const uploadBody = JSON.parse(String(init.body ?? "{}")) as {
+        account_id?: string;
+      };
+      testWindow.__uploadAccountId = uploadBody.account_id;
       return json({
         job_id: "j1",
         project_id: "p1",
@@ -155,6 +169,36 @@ test("Auto upload (single click on Upload) still works as before", async ({
   await page.waitForFunction(
     () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled === true,
   );
+});
+
+test("All Projects always asks for an account, including when only one is compatible", async ({
+  page,
+}) => {
+  await page.addInitScript(installEventHubMock, {});
+  await page.addInitScript(installMocks, { account: ACCOUNT, row: ROW });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects" }).click();
+
+  const projectRow = page.locator("tr").filter({ hasText: "Show Alpha" });
+  await expect(projectRow).toBeVisible();
+  await projectRow.getByRole("button", { name: /^Upload$/ }).click();
+
+  await expect(page.getByRole("heading", { name: "Select Account" })).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled,
+    ),
+  ).toBe(false);
+
+  await page.getByRole("button", { name: /Account A/ }).click();
+  await page.waitForFunction(
+    () => (window as unknown as { __uploadCalled?: boolean }).__uploadCalled === true,
+  );
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { __uploadAccountId?: string }).__uploadAccountId,
+    ),
+  ).toBe("acc_a");
 });
 
 test("failed preflight clears Checking and never queues an upload", async ({

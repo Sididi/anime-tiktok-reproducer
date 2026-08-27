@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from ..config import settings
 from ..models import Project, ProjectPhase
 from .project_service import ProjectService
 
@@ -263,6 +264,9 @@ class UploadRestrictionService:
         Per-language: only family members sharing `project.output_language`
         contribute. Each publish datetime blocks +/- MIN_SPACING_DAYS.
         """
+        if not settings.duplicate_same_language_spacing_enabled:
+            return []
+
         language = project.output_language
         if not language:
             return []

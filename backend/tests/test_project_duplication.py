@@ -8,7 +8,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.config import Settings
 from app.models import PlatformSchedule, Project, ProjectPhase
+from app.services import project_duplication_service
 from app.services.project_duplication_service import (
     DuplicationVariant,
     ProjectDuplicationService,
@@ -241,6 +243,50 @@ def test_30_day_rule_is_per_language_and_symmetric(projects_dir):
     UploadRestrictionService.validate_upload(dup_fr, None, [slot + timedelta(days=31)])
     # Different language: never blocked by the FR sibling.
     UploadRestrictionService.validate_upload(dup_en, None, [slot + timedelta(days=1)])
+
+
+def test_same_language_spacing_can_be_temporarily_disabled(
+    projects_dir, monkeypatch
+):
+    mother = _make_mother(
+        projects_dir,
+        upload_completed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+    )
+    duplicate = _save_project(
+        projects_dir,
+        Project(
+            id="dupfr0000001",
+            mother_project_id=mother.id,
+            output_language="fr",
+        ),
+    )
+    monkeypatch.setattr(
+        project_duplication_service.settings,
+        "duplicate_same_language_spacing_enabled",
+        False,
+    )
+
+    # A different account may upload inside the normally blocked window.
+    UploadRestrictionService.validate_upload(
+        duplicate,
+        "acc_fr_2",
+        [datetime(2026, 8, 10, tzinfo=timezone.utc)],
+    )
+    assert UploadRestrictionService.describe(duplicate)["blocked_windows"] == []
+
+    # Disabling spacing never disables the one-account-per-family rule.
+    with pytest.raises(ValueError, match="acc_fr_1"):
+        UploadRestrictionService.validate_upload(
+            duplicate,
+            "acc_fr_1",
+            [datetime(2026, 8, 10, tzinfo=timezone.utc)],
+        )
+
+
+def test_same_language_spacing_flag_reads_from_environment(monkeypatch):
+    monkeypatch.setenv("ATR_DUPLICATE_SAME_LANGUAGE_SPACING_ENABLED", "false")
+    configured = Settings(_env_file=None)
+    assert configured.duplicate_same_language_spacing_enabled is False
 
 
 def test_describe_exposes_windows_and_blocked_accounts(projects_dir):

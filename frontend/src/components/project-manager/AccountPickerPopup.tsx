@@ -40,6 +40,11 @@ export function AccountPickerPopup({
           >
             <h3 className="font-semibold mb-3">Select Account</h3>
             <div className="space-y-1">
+              {accounts.length === 0 && (
+                <p className="px-3 py-2 text-sm text-[hsl(var(--muted-foreground))]">
+                  No compatible account is available for this project.
+                </p>
+              )}
               {accounts.map((acc) => {
                 const blocked = !!blockedAccountIds?.has(acc.id);
                 return (

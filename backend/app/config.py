@@ -90,6 +90,10 @@ class Settings(BaseSettings):
 
     # Scheduling v2 feature flag (Planning system Phase 1)
     scheduling_v2_enabled: bool = True
+    # Temporary kill switch for the cross-account, same-language spacing rule
+    # between members of a duplicated-project family. The permanent rule that
+    # prevents one account from uploading two family members is unaffected.
+    duplicate_same_language_spacing_enabled: bool = True
 
     # HuggingFace (pyannote diarization for raw scene detection)
     hf_token: str | None = None
