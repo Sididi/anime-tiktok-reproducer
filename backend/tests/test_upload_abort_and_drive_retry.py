@@ -128,6 +128,23 @@ def test_transfer_client_uses_long_socket_timeout(monkeypatch):
     assert GoogleDriveService._TRANSFER_HTTP_TIMEOUT_SECONDS > 60
 
 
+def test_drive_http_transports_do_not_treat_308_as_redirect(monkeypatch):
+    """Resumable uploads get "308 Resume Incomplete" per chunk; a bare
+    httplib2.Http() raises RedirectMissingLocation on it (2026-08-27)."""
+    import httplib2
+
+    assert 308 in httplib2.Http().redirect_codes  # the default we must undo
+
+    class _Creds:
+        token = "t"
+
+    monkeypatch.setattr(GoogleDriveService, "_client_local", local())
+    monkeypatch.setattr(GoogleDriveService, "_credentials", classmethod(lambda cls: _Creds()))
+    for client in (GoogleDriveService.client(), GoogleDriveService._video_metadata_client()):
+        assert 308 not in client._http.http.redirect_codes
+    assert GoogleDriveService._build_http(5).timeout == 5
+
+
 def test_swallow_logs_http_error_response_body(monkeypatch, caplog):
     monkeypatch.setattr(DiscordService, "is_configured", classmethod(lambda cls: True))
 

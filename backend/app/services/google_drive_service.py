@@ -196,6 +196,21 @@ class GoogleDriveService:
             }
         )
 
+    @staticmethod
+    def _build_http(timeout_seconds: float) -> httplib2.Http:
+        """httplib2 transport with the settings googleapiclient.build_http() applies.
+
+        Google APIs answer every intermediate resumable-upload chunk with
+        "308 Resume Incomplete"; a bare httplib2.Http() treats 308 as a
+        redirect and raises RedirectMissingLocation on it (2026-08-27
+        regression when the 300s transfer client replaced build_http()).
+        """
+        http = httplib2.Http(timeout=max(float(timeout_seconds), 1.0))
+        redirect_codes = getattr(http, "redirect_codes", None)
+        if redirect_codes is not None and 308 in redirect_codes:
+            http.redirect_codes = redirect_codes - {308}
+        return http
+
     @classmethod
     def client(cls):
         """Return a thread-local Drive API client bound to refreshed credentials."""
@@ -208,7 +223,7 @@ class GoogleDriveService:
         if cached_client is None or cached_creds_ref is not creds:
             authorized_http = AuthorizedHttp(
                 creds,
-                http=httplib2.Http(timeout=cls._TRANSFER_HTTP_TIMEOUT_SECONDS),
+                http=cls._build_http(cls._TRANSFER_HTTP_TIMEOUT_SECONDS),
             )
             cached_client = build(
                 "drive", "v3", http=authorized_http, cache_discovery=False
@@ -242,7 +257,7 @@ class GoogleDriveService:
         if cached_client is None or cached_creds_ref is not creds:
             authorized_http = AuthorizedHttp(
                 creds,
-                http=httplib2.Http(timeout=cls._VIDEO_METADATA_HTTP_TIMEOUT_SECONDS),
+                http=cls._build_http(cls._VIDEO_METADATA_HTTP_TIMEOUT_SECONDS),
             )
             cached_client = build(
                 "drive",
