@@ -7,7 +7,6 @@ var TRANSIENT_ERROR_STATUSES = {
   importing: true,
   exporting: true,
   uploading: true,
-  cleaning: true,
 };
 
 function cloneRecord(value) {
@@ -44,6 +43,21 @@ function normalizeLoadedProjectStates(loadedStates, nowIsoValue) {
     var state = cloneRecord(input[projectId] || {});
     var status = String(state.status || "");
 
+    if (
+      state.host_cleanup_complete !== true &&
+      state.host_cleanup_result &&
+      state.host_cleanup_result.ok === true &&
+      state.host_cleanup_result.release_verification &&
+      state.host_cleanup_result.release_verification.ok === true
+    ) {
+      state.host_cleanup_complete = true;
+      state.updated_at = timestamp;
+      if (changedProjectIds.indexOf(projectId) === -1) {
+        changedCount += 1;
+        changedProjectIds.push(projectId);
+      }
+    }
+
     if (TRANSIENT_ERROR_STATUSES[status]) {
       state.status = "error";
       state.last_error = buildRecoveryDisabledMessage(status);
@@ -54,16 +68,20 @@ function normalizeLoadedProjectStates(loadedStates, nowIsoValue) {
       state.video_export_job_id = null;
       state.audio_export_job_id = null;
       state.updated_at = timestamp;
-      changedCount += 1;
-      changedProjectIds.push(projectId);
-    } else if (status === "cleanup_pending") {
+      if (changedProjectIds.indexOf(projectId) === -1) {
+        changedCount += 1;
+        changedProjectIds.push(projectId);
+      }
+    } else if (status === "cleanup_pending" || status === "cleaning") {
       state.status = "cleanup_failed";
       state.cleanup_retryable = false;
       state.cleanup_next_retry_at = null;
       state.cleanup_error = buildRecoveryDisabledMessage(status);
       state.updated_at = timestamp;
-      changedCount += 1;
-      changedProjectIds.push(projectId);
+      if (changedProjectIds.indexOf(projectId) === -1) {
+        changedCount += 1;
+        changedProjectIds.push(projectId);
+      }
     }
 
     normalized[projectId] = state;

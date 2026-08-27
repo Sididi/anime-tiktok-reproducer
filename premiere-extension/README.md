@@ -14,6 +14,11 @@ CEP panel for Premiere Pro 25.x with:
 2. Start Premiere Pro 2025
 3. Open `Window > Extensions > Tiktok Reproducer`
 
+For every extension update, run the installer again while both Adobe apps are
+closed, then restart Premiere. The panel and persistent ExtendScript host are
+build-gated; copying only part of the extension intentionally disables
+automation instead of running mixed code.
+
 ## One-time Setup (inside panel)
 
 Fill and save in **Automation Settings**:
@@ -89,7 +94,9 @@ When file is stable for 10s, panel uploads it automatically to the same Drive fo
 ### Managed export via panel
 
 Select tracked project and click **Export via CEP**.
-The panel starts AME export with configured `.epr`, tracks encoder job events, then triggers upload when export completes.
+The panel locates the managed sequence in its owning open Premiere project,
+even when another project is active, then starts AME export with the configured
+`.epr`, tracks encoder job events, and triggers upload when export completes.
 
 ## Cleanup option
 
@@ -118,7 +125,10 @@ Files:
 
 After Premiere restart, tracked project state is restored for UI visibility and manual actions only.
 Queued/in-progress jobs are **not** resumed automatically, export monitors are **not** re-armed automatically, and cleanup retries are **not** restarted automatically.
-Transient states left by a crash/restart are normalized to manual-intervention states when the panel boots again.
+Transient states left by a crash/restart are normalized to manual-intervention
+states when the panel boots again. A pending/failed cleanup exposes **Retry
+cleanup**; if Premiere-side release was already verified, that retry deletes
+the local folder only and does not repeat AME clearing or project teardown.
 
 ## Legacy trigger still supported
 
@@ -132,4 +142,14 @@ The historical flow still works:
 - **Port already in use**: panel logs an explicit error and does not auto-switch port.
 - **Drive ambiguous match**: if multiple `SPM_*_{project_id}` folders match, job is rejected.
 - **No upload after export**: verify export path is exactly `output.mp4` in downloaded project root.
-- **Managed export unavailable**: check `.epr` path exists and active Premiere sequence is open.
+- **Managed export unavailable**: check the `.epr` path and review the preflight diagnostics for the owning project, automation bin, and sequence ID.
+
+## Regression checks
+
+From the repository root, run:
+
+`node premiere-extension/tests/run_tests.js`
+
+The suite covers download accounting, heartbeat failure/recovery, restart-safe
+cleanup, asynchronous deletion, multi-project sequence preflight/export, and
+syntax checks for every panel/host module.

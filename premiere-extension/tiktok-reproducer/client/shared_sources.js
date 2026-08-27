@@ -10,7 +10,7 @@
  * transcoded proxies) from sibling project folders still on disk, so the
  * download loop's existing dest-exists reuse branch short-circuits them.
  *
- * Pure Node (no CEP/DOM dependencies): required from the drive worker, the
+ * Pure Node (no CEP/DOM dependencies): required from the Drive task runner, the
  * panel fallback path, and plain `node` for smoke tests.
  */
 

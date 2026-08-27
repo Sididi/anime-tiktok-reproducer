@@ -4,6 +4,7 @@ function createProgressState() {
   return {
     has_emitted_initial: false,
     last_bucket: -1,
+    max_downloaded_bytes: 0,
   };
 }
 
@@ -24,7 +25,12 @@ function computePercent(downloadedBytes, totalBytes) {
   if (!isFinite(total) || total <= 0) {
     return 0;
   }
-  return clampPercent((downloaded / total) * 100);
+  if (downloaded >= total) {
+    return 100;
+  }
+  // Rounding 99.5% up made the UI claim completion while bytes were still
+  // arriving. Only the declared completed byte count is allowed to emit 100.
+  return Math.max(0, Math.min(99, Math.floor((downloaded / total) * 100)));
 }
 
 function computeBucket(percent) {
@@ -39,13 +45,25 @@ function formatMegabytes(bytes) {
   return (Math.max(0, Number(bytes || 0)) / (1024 * 1024)).toFixed(1);
 }
 
+function computeConcurrentDownloadedBytes(completedBytes, activeBytes) {
+  return (
+    Math.max(0, Number(completedBytes || 0)) +
+    Math.max(0, Number(activeBytes || 0))
+  );
+}
+
 function buildSummaryEvent(state, details) {
   var runtime = state || createProgressState();
   var totalBytes = Math.max(0, Number((details && details.total_bytes) || 0));
-  var downloadedBytes = Math.max(
+  var reportedDownloadedBytes = Math.max(
     0,
     Number((details && details.downloaded_bytes) || 0),
   );
+  var downloadedBytes = Math.max(
+    Number(runtime.max_downloaded_bytes || 0),
+    reportedDownloadedBytes,
+  );
+  runtime.max_downloaded_bytes = downloadedBytes;
   var percent = computePercent(downloadedBytes, totalBytes);
   var bucket = computeBucket(percent);
   var shouldEmit = false;
@@ -54,7 +72,7 @@ function buildSummaryEvent(state, details) {
     shouldEmit = true;
   } else if (percent >= 100 && runtime.last_bucket !== 100) {
     shouldEmit = true;
-  } else if (bucket >= 10 && bucket !== runtime.last_bucket) {
+  } else if (bucket >= 10 && bucket > runtime.last_bucket) {
     shouldEmit = true;
   }
 
@@ -88,6 +106,7 @@ function buildSummaryEvent(state, details) {
 
 module.exports = {
   buildSummaryEvent: buildSummaryEvent,
+  computeConcurrentDownloadedBytes: computeConcurrentDownloadedBytes,
   computeBucket: computeBucket,
   computePercent: computePercent,
   createProgressState: createProgressState,

@@ -7,7 +7,7 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-08-25-shared-sources-v18";
+var ATR_HOST_BUILD_ID = "2026-08-27-cep-reliability-v19";
 // Separates runScript()'s status from the non-fatal warnings the executed
 // script published. Must stay in sync with HOST_RUN_WARNING_SEPARATOR in
 // client/main.js.
@@ -20,6 +20,7 @@ var __atrProxyAttachAttemptMap = {};
 var __atrImportedProjectRefs = [];
 var __atrCleanupTargetProjectRefs = [];
 var __atrCleanupClosingProjectIdentities = [];
+var __atrManagedExportTargetsByProjectId = {};
 var __atrEncoderCallbacksBound = false;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
 var __atrProjectPurgeBinName = "__ATR_PURGE__";
@@ -1837,6 +1838,276 @@ function __atrFindSequenceByName(sequenceName) {
   return null;
 }
 
+function __atrGetProjectName(projectObject) {
+  try {
+    return __atrSafeString(projectObject && projectObject.name);
+  } catch (eName) {
+    return "";
+  }
+}
+
+function __atrGetProjectPath(projectObject) {
+  try {
+    return __atrNormalizePath(projectObject && projectObject.path);
+  } catch (ePath) {
+    return "";
+  }
+}
+
+function __atrGetProjectSequences(projectObject) {
+  try {
+    return projectObject && projectObject.sequences
+      ? projectObject.sequences
+      : null;
+  } catch (eSequences) {
+    return null;
+  }
+}
+
+function __atrFindDirectChildByName(containerItem, itemName) {
+  var targetName = __atrSafeString(itemName);
+  var count = __atrGetProjectItemChildCount(containerItem);
+  for (var i = 0; i < count; i += 1) {
+    var child = containerItem.children[i];
+    if (child && __atrGetProjectItemName(child) === targetName) {
+      return child;
+    }
+  }
+  return null;
+}
+
+function __atrGetProjectItemNodeId(projectItem) {
+  try {
+    return __atrSafeString(projectItem && projectItem.nodeId);
+  } catch (eNodeId) {
+    return "";
+  }
+}
+
+function __atrCollectProjectItemNodeIds(containerItem, nodeIds) {
+  var target = nodeIds || {};
+  var count = __atrGetProjectItemChildCount(containerItem);
+  for (var i = 0; i < count; i += 1) {
+    var child = containerItem.children[i];
+    if (!child) {
+      continue;
+    }
+    var nodeId = __atrGetProjectItemNodeId(child);
+    if (nodeId) {
+      target[nodeId] = true;
+    }
+    if (__atrGetProjectItemChildCount(child) > 0) {
+      __atrCollectProjectItemNodeIds(child, target);
+    }
+  }
+  return target;
+}
+
+function __atrSequenceBelongsToBin(sequence, automationBin, binNodeIds) {
+  if (!sequence || !automationBin) {
+    return false;
+  }
+  var sequenceItem = null;
+  try {
+    sequenceItem = sequence.projectItem || null;
+  } catch (eSequenceItem) {}
+  if (!sequenceItem) {
+    return false;
+  }
+  try {
+    if (sequenceItem === automationBin || sequenceItem.parent === automationBin) {
+      return true;
+    }
+  } catch (eParent) {}
+  var nodeId = __atrGetProjectItemNodeId(sequenceItem);
+  return !!(nodeId && binNodeIds && binNodeIds[nodeId]);
+}
+
+function __atrDescribeManagedSequence(projectId, projectObject, sequence) {
+  return {
+    project_id: __atrSafeString(projectId),
+    project_identity: __atrGetProjectIdentity(projectObject),
+    project_name: __atrGetProjectName(projectObject),
+    project_path: __atrGetProjectPath(projectObject),
+    sequence_id: __atrGetSequenceId(sequence),
+    sequence_name: __atrGetSequenceName(sequence),
+  };
+}
+
+function __atrDescribeManagedProject(projectObject, hasAutomationBin, rootMatch) {
+  var sequenceDescriptions = [];
+  var sequences = __atrGetProjectSequences(projectObject);
+  var sequenceCount = 0;
+  try {
+    sequenceCount = Number(sequences && sequences.numSequences || 0);
+  } catch (eSequenceCount) {
+    sequenceCount = 0;
+  }
+  for (var i = 0; i < sequenceCount && i < 20; i += 1) {
+    if (!sequences[i]) {
+      continue;
+    }
+    sequenceDescriptions.push({
+      sequence_id: __atrGetSequenceId(sequences[i]),
+      sequence_name: __atrGetSequenceName(sequences[i]),
+    });
+  }
+  return {
+    project_identity: __atrGetProjectIdentity(projectObject),
+    project_name: __atrGetProjectName(projectObject),
+    project_path: __atrGetProjectPath(projectObject),
+    has_automation_bin: !!hasAutomationBin,
+    local_root_match: !!rootMatch,
+    sequence_count: sequenceCount,
+    sequences: sequenceDescriptions,
+  };
+}
+
+function __atrDescribeManagedCandidates(candidates) {
+  var descriptions = [];
+  for (var i = 0; candidates && i < candidates.length; i += 1) {
+    descriptions.push(candidates[i].descriptor);
+  }
+  return descriptions;
+}
+
+function __atrResolveManagedSequence(entry, allowRepair) {
+  var projectId = __atrSafeString(entry && entry.project_id);
+  var expectedName = __atrSafeString(entry && entry.sequence_name);
+  var localRoot = __atrNormalizePath(entry && entry.local_root);
+  var automationBinName = "__ATR_PROJECT__" + projectId;
+  var projects = __atrGetOpenProjects();
+  var exactCandidates = [];
+  var binCandidates = [];
+  var projectDiagnostics = [];
+
+  for (var p = 0; p < projects.length; p += 1) {
+    var projectObject = projects[p];
+    var rootItem = null;
+    try {
+      rootItem = projectObject.rootItem || null;
+    } catch (eRootItem) {}
+    var automationBin = __atrFindDirectChildByName(rootItem, automationBinName);
+    var rootMatch = false;
+    if (localRoot) {
+      rootMatch = __atrProjectReferencesAnyCleanupRoot(projectObject, [localRoot]);
+    }
+    projectDiagnostics.push(
+      __atrDescribeManagedProject(projectObject, !!automationBin, rootMatch),
+    );
+    if (!automationBin && !rootMatch) {
+      continue;
+    }
+    var binNodeIds = automationBin
+      ? __atrCollectProjectItemNodeIds(automationBin, {})
+      : {};
+    var sequences = __atrGetProjectSequences(projectObject);
+    var sequenceCount = 0;
+    try {
+      sequenceCount = Number(sequences && sequences.numSequences || 0);
+    } catch (eSequenceCount) {
+      sequenceCount = 0;
+    }
+    for (var s = 0; s < sequenceCount; s += 1) {
+      var sequence = sequences[s];
+      if (!sequence) {
+        continue;
+      }
+      var sequenceName = __atrGetSequenceName(sequence);
+      var candidate = {
+        project: projectObject,
+        sequence: sequence,
+        descriptor: __atrDescribeManagedSequence(
+          projectId,
+          projectObject,
+          sequence,
+        ),
+      };
+      if (sequenceName === expectedName) {
+        exactCandidates.push(candidate);
+      }
+      if (
+        automationBin &&
+        __atrSequenceBelongsToBin(sequence, automationBin, binNodeIds)
+      ) {
+        binCandidates.push(candidate);
+      }
+    }
+  }
+
+  if (exactCandidates.length === 1) {
+    exactCandidates[0].descriptor.repaired_name = false;
+    return {
+      status: "resolved",
+      target: exactCandidates[0],
+      descriptor: exactCandidates[0].descriptor,
+      projects: projectDiagnostics,
+    };
+  }
+  if (exactCandidates.length > 1) {
+    return {
+      status: "ambiguous",
+      project_id: projectId,
+      sequence_name: expectedName,
+      local_root: localRoot,
+      projects: projectDiagnostics,
+      candidates: __atrDescribeManagedCandidates(exactCandidates),
+      reason: "Multiple exact managed sequence matches",
+    };
+  }
+
+  if (allowRepair && binCandidates.length === 1 && expectedName) {
+    var repaired = binCandidates[0];
+    try {
+      repaired.sequence.name = expectedName;
+    } catch (eRenameSequence) {}
+    try {
+      if (repaired.sequence.projectItem) {
+        repaired.sequence.projectItem.name = expectedName;
+      }
+    } catch (eRenameProjectItem) {}
+    repaired.descriptor = __atrDescribeManagedSequence(
+      projectId,
+      repaired.project,
+      repaired.sequence,
+    );
+    if (repaired.descriptor.sequence_name === expectedName) {
+      repaired.descriptor.repaired_name = true;
+      return {
+        status: "resolved",
+        target: repaired,
+        descriptor: repaired.descriptor,
+        projects: projectDiagnostics,
+      };
+    }
+  }
+
+  if (binCandidates.length > 1) {
+    return {
+      status: "ambiguous",
+      project_id: projectId,
+      sequence_name: expectedName,
+      local_root: localRoot,
+      projects: projectDiagnostics,
+      candidates: __atrDescribeManagedCandidates(binCandidates),
+      reason: "Multiple sequences belong to the automation bin",
+    };
+  }
+
+  return {
+    status: "missing",
+    project_id: projectId,
+    sequence_name: expectedName,
+    local_root: localRoot,
+    projects: projectDiagnostics,
+    candidates: __atrDescribeManagedCandidates(binCandidates),
+    reason:
+      binCandidates.length === 1
+        ? "Unique automation sequence could not be renamed"
+        : "No managed sequence found",
+  };
+}
+
 function preflightManagedBatchExport(batchJson) {
   try {
     var entries = [];
@@ -1851,46 +2122,54 @@ function preflightManagedBatchExport(batchJson) {
         ok: false,
         checked: 0,
         found: 0,
+        resolved: [],
         missing: [],
+        ambiguous: [],
         error: "No batch sequences to preflight",
       });
     }
 
+    var resolved = [];
     var missing = [];
-    var found = 0;
+    var ambiguous = [];
+    __atrManagedExportTargetsByProjectId = {};
     for (var i = 0; i < entries.length; i += 1) {
       var entry = entries[i] || {};
-      var sequenceName = __atrSafeString(entry.sequence_name);
       var projectId = __atrSafeString(entry.project_id);
-      if (!sequenceName || !__atrFindSequenceByName(sequenceName)) {
-        missing.push({
-          project_id: projectId,
-          sequence_name: sequenceName,
-        });
+      var resolution = __atrResolveManagedSequence(entry, true);
+      if (resolution.status === "resolved") {
+        resolved.push(resolution.descriptor);
+        __atrManagedExportTargetsByProjectId[projectId] = resolution.target;
+      } else if (resolution.status === "ambiguous") {
+        ambiguous.push(resolution);
       } else {
-        found += 1;
+        missing.push(resolution);
       }
     }
 
     return JSON.stringify({
-      ok: missing.length === 0,
+      ok: missing.length === 0 && ambiguous.length === 0,
       checked: entries.length,
-      found: found,
+      found: resolved.length,
+      resolved: resolved,
       missing: missing,
+      ambiguous: ambiguous,
     });
   } catch (e) {
     return "ERROR: " + e.message + " (line " + e.line + ")";
   }
 }
 
-function __atrCloneSequence(sourceSequence) {
-  var sequences = app && app.project ? app.project.sequences : null;
+function __atrCloneSequence(sourceSequence, owningProject) {
+  var sequences = __atrGetProjectSequences(
+    owningProject || (app && app.project ? app.project : null),
+  );
   if (!sequences) {
     throw new Error("No sequence collection available");
   }
 
   var beforeCount = 0;
-  var beforeKeys = __atrCaptureSequenceKeys();
+  var beforeKeys = __atrCaptureSequenceKeys(owningProject);
   try {
     beforeCount = Number(sequences.numSequences || 0);
   } catch (eBefore) {
@@ -1964,9 +2243,11 @@ function __atrSequenceNameHasTempAudioPrefix(sequenceName) {
   return __atrSafeString(sequenceName).indexOf(__atrTempAudioSequencePrefix) === 0;
 }
 
-function __atrCaptureSequenceKeys() {
+function __atrCaptureSequenceKeys(projectObject) {
   var out = {};
-  var sequences = app && app.project ? app.project.sequences : null;
+  var sequences = __atrGetProjectSequences(
+    projectObject || (app && app.project ? app.project : null),
+  );
   var count = 0;
   if (!sequences) {
     return out;
@@ -2007,7 +2288,10 @@ function __atrFindSequenceByTempRecord(record) {
     return null;
   }
 
-  var sequences = app && app.project ? app.project.sequences : null;
+  var recordProject = record && typeof record !== "string" ? record.project : null;
+  var sequences = __atrGetProjectSequences(
+    recordProject || (app && app.project ? app.project : null),
+  );
   var count = 0;
   if (!sequences) {
     return null;
@@ -3010,36 +3294,111 @@ function setPanelPersistent() {
   }
 }
 
-/**
- * Start managed export via Adobe Media Encoder and return job ID.
- *
- * @param {string} projectId
- * @param {string} sequenceName
- * @param {string} outputPath
- * @param {string} presetPath
- * @returns {string} jobID or ERROR message
- */
-function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
+function __atrFindSequenceByIdInProject(projectObject, sequenceId) {
+  var targetId = __atrSafeString(sequenceId);
+  var sequences = __atrGetProjectSequences(projectObject);
+  var count = 0;
   try {
-    if (!app || !app.project) {
-      return "ERROR: No active Premiere project";
+    count = Number(sequences && sequences.numSequences || 0);
+  } catch (eCount) {
+    count = 0;
+  }
+  for (var i = 0; i < count; i += 1) {
+    if (sequences[i] && __atrGetSequenceId(sequences[i]) === targetId) {
+      return sequences[i];
+    }
+  }
+  return null;
+}
+
+function __atrResolvePreflightedExportTarget(descriptor) {
+  var resolvedDescriptor = descriptor || {};
+  var projectId = __atrSafeString(resolvedDescriptor.project_id);
+  var projectIdentity = __atrSafeString(resolvedDescriptor.project_identity);
+  var sequenceId = __atrSafeString(resolvedDescriptor.sequence_id);
+  if (!projectId || !projectIdentity || !sequenceId) {
+    return null;
+  }
+
+  var openProjects = __atrGetOpenProjects();
+  var cached = __atrManagedExportTargetsByProjectId[projectId];
+  if (
+    cached &&
+    cached.project &&
+    __atrProjectIsOpen(cached.project, openProjects) &&
+    __atrGetProjectIdentity(cached.project) === projectIdentity
+  ) {
+    var cachedSequence = __atrFindSequenceByIdInProject(
+      cached.project,
+      sequenceId,
+    );
+    if (cachedSequence) {
+      return {
+        project: cached.project,
+        sequence: cachedSequence,
+      };
+    }
+  }
+
+  for (var i = 0; i < openProjects.length; i += 1) {
+    if (__atrGetProjectIdentity(openProjects[i]) !== projectIdentity) {
+      continue;
+    }
+    var sequence = __atrFindSequenceByIdInProject(openProjects[i], sequenceId);
+    if (sequence) {
+      return {
+        project: openProjects[i],
+        sequence: sequence,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Start managed export via Adobe Media Encoder from a descriptor returned by
+ * preflightManagedBatchExport(). The owning Project object and sequence ID are
+ * authoritative; app.project may point at another open project.
+ *
+ * @param {string} exportJson JSON export payload
+ * @returns {string} job IDs as JSON or an ERROR message
+ */
+function startManagedExport(exportJson) {
+  try {
+    var payload = null;
+    try {
+      payload =
+        typeof exportJson === "string"
+          ? JSON.parse(exportJson || "{}")
+          : exportJson;
+    } catch (ePayloadParse) {
+      return "ERROR: Invalid managed export payload";
+    }
+    var descriptor = payload && payload.resolved_sequence
+      ? payload.resolved_sequence
+      : null;
+    var target = __atrResolvePreflightedExportTarget(descriptor);
+    if (!target) {
+      return "ERROR: Preflighted project or sequence is no longer open";
+    }
+    var owningProject = target.project;
+    var targetSequence = target.sequence;
+    var projectId = __atrSafeString(descriptor.project_id);
+    var sequenceId = __atrGetSequenceId(targetSequence);
+    if (!owningProject.openSequence) {
+      return "ERROR: Owning project cannot activate sequence " + sequenceId;
+    }
+    var openResult = owningProject.openSequence(sequenceId);
+    if (openResult === false) {
+      return "ERROR: Owning project failed to activate sequence " + sequenceId;
     }
 
-    var targetSequenceName = __atrSafeString(sequenceName);
-    if (!targetSequenceName) {
-      return "ERROR: Missing sequence name";
-    }
-    var targetSequence = __atrFindSequenceByName(targetSequenceName);
-    if (!targetSequence) {
-      return "ERROR: Sequence not found: " + targetSequenceName;
-    }
-
-    var exportAudioNoMusic =
-      Number(arguments.length >= 5 ? arguments[4] : 0) === 1;
-    var audioOutputPath =
-      arguments.length >= 6 ? __atrSafeString(arguments[5]) : "";
-    var audioPresetPath =
-      arguments.length >= 7 ? __atrSafeString(arguments[6]) : "";
+    var outputPath = __atrSafeString(payload.output_path);
+    var presetPath = __atrSafeString(payload.preset_path);
+    var audioOptions = payload.audio_export || {};
+    var exportAudioNoMusic = !!audioOptions.enabled;
+    var audioOutputPath = __atrSafeString(audioOptions.output_path);
+    var audioPresetPath = __atrSafeString(audioOptions.preset_path);
 
     var normalizedPresetPath = __atrNormalizePath(presetPath);
     var presetFile = new File(normalizedPresetPath);
@@ -3122,7 +3481,7 @@ function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
         audioOutFile.fsName || normalizedAudioOutputPath,
       );
 
-      var tempSequence = __atrCloneSequence(targetSequence);
+      var tempSequence = __atrCloneSequence(targetSequence, owningProject);
       var tempSequenceName =
         __atrTempAudioSequencePrefix +
         __atrSafeString(projectId) +
@@ -3151,6 +3510,7 @@ function startManagedExport(projectId, sequenceName, outputPath, presetPath) {
       __atrTempAudioSequenceByJob[audioJobID] = {
         name: __atrSafeString(tempSequenceName),
         sequence_id: __atrGetSequenceId(tempSequence),
+        project: owningProject,
       };
       __atrPushEncoderEvent("queued", audioJobID, {
         output_path: audioOutputFsPath,
@@ -3678,12 +4038,6 @@ function cancelAtrProxyRenderingAndClearMediaEncoder() {
     return JSON.stringify(response);
   }
 
-  __atrPushHostTrace(
-    "",
-    "Canceled proxy rendering and cleared Adobe Media Encoder queue",
-    "info",
-    response,
-  );
   return JSON.stringify(response);
 }
 

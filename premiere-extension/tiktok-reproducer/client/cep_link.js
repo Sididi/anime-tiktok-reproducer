@@ -27,6 +27,8 @@ var AUTH_TIMEOUT_MS = 5000;
 var RECONNECT_MIN_MS = 1000;
 var RECONNECT_MAX_MS = 60000;
 var TEST_TIMEOUT_MS = 8000;
+var MIN_SERVER_HEARTBEAT_INTERVAL_MS = 1000;
+var MAX_SERVER_HEARTBEAT_INTERVAL_MS = 300000;
 
 var CLOSE_CODES = {
   AUTH_FAILED: 4401,
@@ -72,6 +74,17 @@ function describeClose(code, reason) {
   return text;
 }
 
+function normalizeHeartbeatIntervalMs(intervalSeconds) {
+  var parsedMs = Number(intervalSeconds) * 1000;
+  if (!isFinite(parsedMs) || parsedMs <= 0) {
+    return HEARTBEAT_INTERVAL_MS;
+  }
+  return Math.max(
+    MIN_SERVER_HEARTBEAT_INTERVAL_MS,
+    Math.min(MAX_SERVER_HEARTBEAT_INTERVAL_MS, Math.round(parsedMs)),
+  );
+}
+
 function createLinkClient(options) {
   var opts = options || {};
   var getSettings = opts.getSettings || function () { return {}; };
@@ -106,6 +119,7 @@ function createLinkClient(options) {
     launches_received: 0,
     last_launch_at: null,
     server_pending_count: null,
+    heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
   };
 
   var socket = null;
@@ -114,7 +128,11 @@ function createLinkClient(options) {
   var reconnectTimer = null;
   var authTimer = null;
   var heartbeatTimer = null;
-  var lastPongAt = 0;
+  var heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS;
+  var heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS;
+  var lastInboundAt = 0;
+  var lastHeartbeatTickAt = 0;
+  var outstandingProbeAt = 0;
 
   function getState() {
     var copy = {};
@@ -188,23 +206,48 @@ function createLinkClient(options) {
 
   function startHeartbeat() {
     stopHeartbeat();
-    lastPongAt = now().getTime();
+    var startedAt = now().getTime();
+    lastInboundAt = startedAt;
+    lastHeartbeatTickAt = startedAt;
+    outstandingProbeAt = 0;
     heartbeatTimer = setIntervalFn(function () {
       if (!socket || socket.readyState !== 1) {
         return;
       }
-      if (now().getTime() - lastPongAt > HEARTBEAT_TIMEOUT_MS) {
-        log("Premiere Link heartbeat timed out, reconnecting", "warn");
-        state.last_error = "heartbeat timeout";
-        try {
-          socket.close(CLOSE_CODES.CLIENT_HEARTBEAT, "heartbeat timeout");
-        } catch (e) {
-          // onclose still fires
+      var currentTime = now().getTime();
+      var tickDelay = Math.max(0, currentTime - lastHeartbeatTickAt);
+      lastHeartbeatTickAt = currentTime;
+
+      if (
+        outstandingProbeAt > 0 &&
+        currentTime - outstandingProbeAt >= heartbeatTimeoutMs &&
+        lastInboundAt < outstandingProbeAt
+      ) {
+        // CEP's renderer can be delayed by a long Premiere evalScript call or
+        // local filesystem pressure. When our own interval was starved, the
+        // old probe's deadline is not evidence of a dead connection: grant a
+        // fresh probe and require that one to fail before reconnecting.
+        if (tickDelay >= heartbeatIntervalMs * 1.5) {
+          outstandingProbeAt = 0;
+        } else {
+          log("Premiere Link heartbeat timed out, reconnecting", "warn");
+          state.last_error = "heartbeat timeout";
+          try {
+            socket.close(CLOSE_CODES.CLIENT_HEARTBEAT, "heartbeat timeout");
+          } catch (e) {
+            // onclose still fires
+          }
+          return;
         }
-        return;
       }
-      safeSend({ type: "ping", ts: now().toISOString() });
-    }, HEARTBEAT_INTERVAL_MS);
+
+      if (
+        outstandingProbeAt <= 0 &&
+        safeSend({ type: "ping", ts: new Date(currentTime).toISOString() })
+      ) {
+        outstandingProbeAt = currentTime;
+      }
+    }, heartbeatIntervalMs);
   }
 
   function stopHeartbeat() {
@@ -212,6 +255,12 @@ function createLinkClient(options) {
       clearIntervalFn(heartbeatTimer);
       heartbeatTimer = null;
     }
+    outstandingProbeAt = 0;
+  }
+
+  function markInboundActivity() {
+    lastInboundAt = now().getTime();
+    outstandingProbeAt = 0;
   }
 
   function handleLaunch(frame) {
@@ -257,6 +306,9 @@ function createLinkClient(options) {
     if (!frame || typeof frame !== "object") {
       return;
     }
+    // Any valid protocol frame proves the connection is alive. A launch or
+    // server ping is as authoritative as a pong for heartbeat purposes.
+    markInboundActivity();
     switch (frame.type) {
       case "auth_ok":
         if (authTimer) {
@@ -271,6 +323,11 @@ function createLinkClient(options) {
         state.last_error = null;
         state.last_connected_at = now().toISOString();
         state.server_pending_count = Number(frame.pending_count || 0);
+        heartbeatIntervalMs = normalizeHeartbeatIntervalMs(
+          frame.heartbeat_interval_s,
+        );
+        heartbeatTimeoutMs = heartbeatIntervalMs * 2;
+        state.heartbeat_interval_ms = heartbeatIntervalMs;
         startHeartbeat();
         log(
           "Premiere Link connected" +
@@ -282,14 +339,11 @@ function createLinkClient(options) {
         emit();
         break;
       case "ping":
-        lastPongAt = now().getTime();
         safeSend({ type: "pong", ts: frame.ts });
         break;
       case "pong":
-        lastPongAt = now().getTime();
         break;
       case "launch":
-        lastPongAt = now().getTime();
         handleLaunch(frame);
         break;
       case "error":
@@ -555,6 +609,7 @@ module.exports = {
   CLOSE_CODES: CLOSE_CODES,
   DEFAULT_LINK_URL: DEFAULT_LINK_URL,
   HEARTBEAT_INTERVAL_MS: HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_TIMEOUT_MS: HEARTBEAT_TIMEOUT_MS,
   RECONNECT_MAX_MS: RECONNECT_MAX_MS,
   RECONNECT_MIN_MS: RECONNECT_MIN_MS,
   computeBackoffMs: computeBackoffMs,
@@ -562,4 +617,5 @@ module.exports = {
   isEnabled: isEnabled,
   isValidLinkUrl: isValidLinkUrl,
   normalizeLinkUrl: normalizeLinkUrl,
+  normalizeHeartbeatIntervalMs: normalizeHeartbeatIntervalMs,
 };

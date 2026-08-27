@@ -7,7 +7,7 @@
  * - Google Drive download/import automation
  * - Export monitoring for output.mp4 + ATR_*.mp4
  * - Managed AME export + encoder event polling
- * - Resumable Drive upload in worker process
+ * - Resumable asynchronous Drive upload
  */
 
 (function () {
@@ -158,14 +158,14 @@
   var proxyCleanupBlockedProjects = {}; // project_id -> true once cleanup starts
   var encoderPollTimer = null;
   var encoderPollTick = 0;
-  var driveTasksFallback = null;
+  var driveTasksModule = null;
+  var cleanupRuntimeHelperModule = null;
   var batchRuntimeHelperModule = null;
   var runtimeStateHelperModule = null;
   var subtitleArchiveHelperModule = null;
   var panelLogHelperModule = null;
   var orchestrationMetricsHelperModule = null;
   var cleanupRetryTimers = {}; // project_id -> timeoutId
-  var activeWorkerChildren = {}; // pid -> child process (killed on unload)
   var volatileStateWriteTimers = {}; // project_id -> timeoutId
   var volatileRenderTimer = null;
 
@@ -396,9 +396,8 @@
   }
 
   function removePathSafe(targetPath, options) {
-    // Recursive deletion (chmod walk, rmSync retries, Windows shell
-    // fallbacks) runs in the drive worker so the panel thread stays
-    // responsive; only the rare in-process fallback still blocks.
+    // Recursive deletion and Windows fallbacks remain asynchronous so CEP can
+    // continue servicing Premiere Link while files are locked.
     var payload = {
       target_path: String(targetPath || "").trim(),
       max_attempts: Math.max(1, Number((options || {}).maxAttempts || 1)),
@@ -498,6 +497,15 @@
       runtimeStateHelperModule = require(getClientFilePath("runtime_state.js"));
     }
     return runtimeStateHelperModule;
+  }
+
+  function getCleanupRuntimeHelper() {
+    if (!cleanupRuntimeHelperModule) {
+      cleanupRuntimeHelperModule = require(
+        getClientFilePath("cleanup_runtime.js"),
+      );
+    }
+    return cleanupRuntimeHelperModule;
   }
 
   function getSubtitleArchiveHelper() {
@@ -1699,6 +1707,7 @@
       }
       entries.push({
         project_id: projectId,
+        local_root: String(state.local_root || ""),
         sequence_name: String(
           state.sequence_name || buildProjectSequenceName(projectId),
         ),
@@ -1708,7 +1717,9 @@
       return Promise.resolve({
         ok: true,
         checked: 0,
+        resolved: [],
         missing: [],
+        ambiguous: [],
       });
     }
     var hostCall =
@@ -2567,6 +2578,11 @@
       cleanup_error: null,
       host_cleanup_error: null,
       host_cleanup_result: null,
+      host_cleanup_complete: false,
+      sequence_id: null,
+      host_project_identity: null,
+      host_project_name: null,
+      sequence_name_repaired: false,
       cleanup_retryable: false,
       cleanup_retry_count: 0,
       cleanup_next_retry_at: null,
@@ -2695,11 +2711,7 @@
       return Promise.resolve(false);
     }
 
-    var status = String(state.status || "");
-    var canRetry =
-      status === "cleanup_pending" ||
-      (status === "cleanup_failed" && !!state.cleanup_retryable);
-    if (!canRetry) {
+    if (!getCleanupRuntimeHelper().canRetryCleanup(state, source)) {
       clearCleanupRetry(id);
       return Promise.resolve(false);
     }
@@ -2720,13 +2732,34 @@
       id,
     );
 
-    return cleanupImportedProjectInHost(id, state.local_root, true)
+    var cleanupPhase = getCleanupRuntimeHelper().selectCleanupPhase(state);
+    var hostCleanupPromise =
+      cleanupPhase === "disk_only"
+        ? Promise.resolve(state.host_cleanup_result || null)
+        : cleanupImportedProjectInHost(id, state.local_root, true).catch(
+            function (hostError) {
+              var normalizedHostError =
+                hostError instanceof Error
+                  ? hostError
+                  : new Error(formatCleanupError(hostError));
+              normalizedHostError.atr_cleanup_phase = "host";
+              throw normalizedHostError;
+            },
+          );
+
+    return hostCleanupPromise
       .then(function (hostSummary) {
+        var hostCleanupComplete =
+          cleanupPhase === "disk_only" ||
+          getCleanupRuntimeHelper().hasCompletedHostCleanup({
+            host_cleanup_result: hostSummary || null,
+          });
         upsertProjectState(id, {
           host_cleanup_result: hostSummary || null,
           host_cleanup_error: null,
+          host_cleanup_complete: hostCleanupComplete,
         });
-        if (hostSummary && hostSummary.ok === false) {
+        if (!hostCleanupComplete) {
           var hostDetail = buildHostCleanupErrorDetail(hostSummary);
           var nextRetryCount = retryCount + 1;
           var canRetryHost = nextRetryCount < CLEANUP_RETRYABLE_MAX_PASSES;
@@ -2775,24 +2808,35 @@
           maxAttempts: CLEANUP_BACKGROUND_MAX_ATTEMPTS,
         });
       })
-      .catch(function (hostErr) {
+      .catch(function (cleanupErr) {
+        var failedPhase = String(cleanupErr.atr_cleanup_phase || "disk");
+        var errorMessage = formatCleanupError(cleanupErr);
         clearCleanupRetry(id);
-        upsertProjectState(id, {
-          host_cleanup_error: hostErr.message,
+        var failurePatch = {
           status: "cleanup_failed",
-          cleanup_error: hostErr.message,
+          cleanup_error: errorMessage,
           cleanup_retryable: false,
           cleanup_next_retry_at: null,
-        });
+        };
+        if (failedPhase === "host") {
+          failurePatch.host_cleanup_error = errorMessage;
+        }
+        upsertProjectState(id, failurePatch);
         log(
-          "Premiere cleanup warning for " +
+          (failedPhase === "host" ? "Premiere cleanup" : "Disk cleanup") +
+            " warning for " +
             id +
             " during retry: " +
-            hostErr.message,
+            errorMessage,
           "warn",
         );
         if (isBatchProject) {
-          handleBatchFailure(id, "Premiere cleanup crashed: " + hostErr.message);
+          handleBatchFailure(
+            id,
+            (failedPhase === "host" ? "Premiere cleanup" : "Disk cleanup") +
+              " crashed: " +
+              errorMessage,
+          );
         }
         return false;
       })
@@ -3093,145 +3137,14 @@
     return Promise.reject(new Error("Unknown job type: " + job.type));
   }
 
-  // --- Worker runner ---
-
-  function runDriveTaskFallback(taskName, payload, onProgress) {
-    if (!driveTasksFallback) {
-      driveTasksFallback = require(getClientFilePath("drive_tasks.js"));
-    }
-    return driveTasksFallback.runTask(taskName, payload, onProgress);
-  }
-
-  function trackWorkerChild(child) {
-    if (child && child.pid) {
-      activeWorkerChildren[child.pid] = child;
-    }
-  }
-
-  function untrackWorkerChild(child) {
-    if (child && child.pid) {
-      delete activeWorkerChildren[child.pid];
-    }
-  }
-
-  function killTrackedWorkerChildren() {
-    Object.keys(activeWorkerChildren).forEach(function (pid) {
-      try {
-        activeWorkerChildren[pid].kill();
-      } catch (e) {}
-      delete activeWorkerChildren[pid];
-    });
-  }
+  // --- Asynchronous Drive runner ---
 
   function runDriveTask(taskName, payload, onProgress) {
-    return new Promise(function (resolve, reject) {
-      var workerPath = getClientFilePath("drive_worker.js");
-      var child;
-      var exitingWithFallback = false;
-
-      try {
-        child = childProcess.fork(workerPath, [], {
-          // CEP's renderer can populate process.execArgv with Chromium flags.
-          // Passing those to the Node helper makes it exit with code 1 on
-          // affected Windows installations before drive_worker.js executes.
-          execArgv: [],
-          stdio: ["ignore", "ignore", "pipe", "ipc"],
-        });
-      } catch (forkErr) {
-        log("Worker unavailable, using in-process fallback", "warn");
-        runDriveTaskFallback(taskName, payload, onProgress).then(
-          resolve,
-          reject,
-        );
-        return;
+    return Promise.resolve().then(function () {
+      if (!driveTasksModule) {
+        driveTasksModule = require(getClientFilePath("drive_tasks.js"));
       }
-
-      trackWorkerChild(child);
-      var settled = false;
-      var workerStderr = "";
-
-      if (child.stderr) {
-        child.stderr.on("data", function (chunk) {
-          workerStderr = (workerStderr + String(chunk || "")).slice(-1200);
-        });
-      }
-
-      function completeWithError(err) {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        try {
-          child.kill();
-        } catch (e) {}
-        untrackWorkerChild(child);
-        reject(err);
-      }
-
-      child.on("message", function (msg) {
-        if (!msg || settled) {
-          return;
-        }
-        if (msg.type === "progress") {
-          if (typeof onProgress === "function") {
-            onProgress(msg.progress || {});
-          }
-          return;
-        }
-        if (msg.type === "result") {
-          settled = true;
-          resolve(msg.result);
-          try {
-            child.kill();
-          } catch (eKill) {}
-          untrackWorkerChild(child);
-          return;
-        }
-        if (msg.type === "error") {
-          completeWithError(
-            new Error((msg.error && msg.error.message) || "Worker error"),
-          );
-        }
-      });
-
-      child.on("error", function (err) {
-        completeWithError(err);
-      });
-
-      child.on("exit", function (code) {
-        untrackWorkerChild(child);
-        if (settled) {
-          return;
-        }
-        if (code === 0) {
-          completeWithError(new Error("Worker exited before sending result"));
-          return;
-        }
-
-        if (exitingWithFallback) {
-          completeWithError(new Error("Worker exited with code " + code));
-          return;
-        }
-
-        exitingWithFallback = true;
-        log(
-          "Worker exited with code " +
-            code +
-            ", retrying in-process fallback" +
-            (workerStderr ? ": " + workerStderr.trim() : ""),
-          "warn",
-        );
-        runDriveTaskFallback(taskName, payload, onProgress).then(
-          resolve,
-          reject,
-        );
-      });
-
-      child.send({
-        type: "run",
-        task: taskName,
-        payload: payload,
-      });
+      return driveTasksModule.runTask(taskName, payload, onProgress);
     });
   }
 
@@ -3254,6 +3167,11 @@
       cleanup_error: null,
       host_cleanup_error: null,
       host_cleanup_result: null,
+      host_cleanup_complete: false,
+      sequence_id: null,
+      host_project_identity: null,
+      host_project_name: null,
+      sequence_name_repaired: false,
       cleanup_retryable: false,
       cleanup_retry_count: 0,
       cleanup_next_retry_at: null,
@@ -3641,6 +3559,7 @@
       cleanup_error: null,
       host_cleanup_error: null,
       host_cleanup_result: null,
+      host_cleanup_complete: false,
       cleanup_retryable: false,
       cleanup_retry_count: 0,
       cleanup_next_retry_at: null,
@@ -3792,6 +3711,11 @@
       cleanup_error: null,
       host_cleanup_error: null,
       host_cleanup_result: null,
+      host_cleanup_complete: false,
+      sequence_id: null,
+      host_project_identity: null,
+      host_project_name: null,
+      sequence_name_repaired: false,
       cleanup_retryable: false,
       cleanup_retry_count: 0,
       cleanup_next_retry_at: null,
@@ -4426,6 +4350,7 @@
         status: "cleaning",
         host_cleanup_error: null,
         host_cleanup_result: null,
+        host_cleanup_complete: false,
         cleanup_error: null,
         cleanup_retryable: false,
         cleanup_retry_count: 0,
@@ -4449,13 +4374,18 @@
 
     cleanupImportedProjectInHost("batch", batchCleanupRoots, false)
       .then(function (hostSummary) {
+        var hostCleanupComplete =
+          getCleanupRuntimeHelper().hasCompletedHostCleanup({
+            host_cleanup_result: hostSummary || null,
+          });
         batchIds.forEach(function (projectId) {
           upsertProjectState(projectId, {
             host_cleanup_result: hostSummary || null,
             host_cleanup_error: null,
+            host_cleanup_complete: hostCleanupComplete,
           });
         });
-        if (hostSummary && hostSummary.ok === false) {
+        if (!hostCleanupComplete) {
           var hostDetail = buildHostCleanupErrorDetail(hostSummary);
           batchIds.forEach(function (projectId) {
             upsertProjectState(projectId, {
@@ -5711,8 +5641,8 @@
     }
 
     setStatus("running");
-    log("Clearing Adobe Media Encoder before Export via CEP", "info");
-    var locallyDroppedProxyJobs = clearLocalProxyTrackingForExport();
+    var resolvedSequenceByProjectId = {};
+    var locallyDroppedProxyJobs = 0;
 
     // The host-side AME clear now uses short BridgeTalk deadlines so each
     // attempt blocks Premiere's UI briefly; the panel retries between
@@ -5761,7 +5691,131 @@
       );
     }
 
-    prepareMediaEncoderWithRetry(1)
+    var preflightBatchIds = exportReadiness.current_batch_ids.slice(0);
+    preflightManagedBatchExportInHost(preflightBatchIds)
+      .then(function (preflightResult) {
+        if (!preflightResult || preflightResult.ok === false) {
+          var unresolved = [];
+          var missing = preflightResult && Array.isArray(preflightResult.missing)
+            ? preflightResult.missing
+            : [];
+          var ambiguous =
+            preflightResult && Array.isArray(preflightResult.ambiguous)
+              ? preflightResult.ambiguous
+              : [];
+          missing.concat(ambiguous).forEach(function (entry) {
+            var candidateText = Array.isArray(entry.candidates)
+              ? entry.candidates
+                  .map(function (candidate) {
+                    return (
+                      String(candidate.project_name || "unnamed project") +
+                      " [" +
+                      String(candidate.project_path || "unsaved") +
+                      "] / " +
+                      String(candidate.sequence_name || "unnamed sequence") +
+                      " (" +
+                      String(candidate.sequence_id || "no id") +
+                      ")"
+                    );
+                  })
+                  .join("; ")
+              : "";
+            var projectText = Array.isArray(entry.projects)
+              ? entry.projects
+                  .map(function (project) {
+                    var sequenceText = Array.isArray(project.sequences)
+                      ? project.sequences
+                          .map(function (sequence) {
+                            return (
+                              String(
+                                sequence.sequence_name || "unnamed sequence",
+                              ) +
+                              " (" +
+                              String(sequence.sequence_id || "no id") +
+                              ")"
+                            );
+                          })
+                          .join(", ")
+                      : "";
+                    return (
+                      String(project.project_name || "unnamed project") +
+                      " [" +
+                      String(project.project_path || "unsaved") +
+                      "]" +
+                      (sequenceText ? " sequences: " + sequenceText : "")
+                    );
+                  })
+                  .join("; ")
+              : "";
+            unresolved.push(
+              String(entry.project_id || "unknown") +
+                "=" +
+                String(entry.sequence_name || "missing") +
+                " (" +
+                String(entry.reason || "not resolved") +
+                ")" +
+                (candidateText
+                  ? " candidates: " + candidateText
+                  : projectText
+                    ? " projects: " + projectText
+                    : ""),
+            );
+          });
+          throw new Error(
+            "Batch sequence preflight failed" +
+              (unresolved.length ? ": " + unresolved.join(" | ") : ""),
+          );
+        }
+
+        var resolved = Array.isArray(preflightResult.resolved)
+          ? preflightResult.resolved
+          : [];
+        resolved.forEach(function (descriptor) {
+          var resolvedProjectId = String(descriptor.project_id || "").trim();
+          if (!resolvedProjectId) {
+            return;
+          }
+          var previousResolvedState =
+            getProjectState(resolvedProjectId) || {};
+          resolvedSequenceByProjectId[resolvedProjectId] = descriptor;
+          upsertProjectState(resolvedProjectId, {
+            sequence_id: String(descriptor.sequence_id || ""),
+            sequence_name: String(descriptor.sequence_name || ""),
+            host_project_identity: String(descriptor.project_identity || ""),
+            host_project_name: String(descriptor.project_name || ""),
+            sequence_name_repaired:
+              !!descriptor.repaired_name ||
+              !!previousResolvedState.sequence_name_repaired,
+          });
+          if (descriptor.repaired_name) {
+            log(
+              "Repaired managed sequence name for " + resolvedProjectId,
+              "warn",
+            );
+          }
+        });
+
+        var unresolvedProjectIds = preflightBatchIds.filter(
+          function (projectId) {
+            var projectState = getProjectState(projectId);
+            return (
+              projectState &&
+              !hasAllExpectedUploads(projectState) &&
+              !resolvedSequenceByProjectId[projectId]
+            );
+          },
+        );
+        if (unresolvedProjectIds.length > 0) {
+          throw new Error(
+            "Batch sequence preflight returned no descriptor for: " +
+              unresolvedProjectIds.join(", "),
+          );
+        }
+
+        log("Clearing Adobe Media Encoder before Export via CEP", "info");
+        locallyDroppedProxyJobs = clearLocalProxyTrackingForExport();
+        return prepareMediaEncoderWithRetry(1);
+      })
       .then(function (clearResult) {
         var clearErrors =
           clearResult && Array.isArray(clearResult.errors)
@@ -5783,29 +5837,6 @@
             " proxy job(s)",
           "info",
         );
-
-        var preflightBatchIds = exportReadiness.current_batch_ids.slice(0);
-        return preflightManagedBatchExportInHost(preflightBatchIds);
-      })
-      .then(function (preflightResult) {
-        if (!preflightResult || preflightResult.ok === false) {
-          var missing = preflightResult && Array.isArray(preflightResult.missing)
-            ? preflightResult.missing
-            : [];
-          var missingText = missing
-            .map(function (entry) {
-              return (
-                String(entry.project_id || "unknown") +
-                "=" +
-                String(entry.sequence_name || "missing")
-              );
-            })
-            .join(", ");
-          throw new Error(
-            "Batch sequence preflight failed" +
-              (missingText ? ": " + missingText : ""),
-          );
-        }
 
         var batchIds = getBatchRuntimeHelper().beginExportPhase(runtime);
         syncTrackedBatchProjectMetadata();
@@ -5847,32 +5878,26 @@
             ? [String(state.output_path), String(audioOutputPath)]
             : [String(state.output_path)],
         );
-        var sequenceName = String(
-          state.sequence_name || buildProjectSequenceName(projectId),
-        );
-        var hostCall = [
-          "startManagedExport(",
-          '"',
-          escapeForEval(projectId),
-          '",',
-          '"',
-          escapeForEval(String(sequenceName).replace(/\\/g, "/")),
-          '",',
-          '"',
-          escapeForEval(String(state.output_path).replace(/\\/g, "/")),
-          '",',
-          '"',
-          escapeForEval(String(presetPath).replace(/\\/g, "/")),
-          '",',
-          audioEnabled ? "1," : "0,",
-          '"',
-          escapeForEval(String(audioOutputPath).replace(/\\/g, "/")),
-          '",',
-          '"',
-          escapeForEval(String(audioPresetPath).replace(/\\/g, "/")),
-          '"',
-          ")",
-        ].join("");
+        var resolvedDescriptor = resolvedSequenceByProjectId[projectId];
+        if (!resolvedDescriptor) {
+          throw new Error(
+            "Project has no preflighted sequence descriptor: " + projectId,
+          );
+        }
+        var managedExportPayload = {
+          resolved_sequence: resolvedDescriptor,
+          output_path: String(state.output_path).replace(/\\/g, "/"),
+          preset_path: String(presetPath).replace(/\\/g, "/"),
+          audio_export: {
+            enabled: audioEnabled,
+            output_path: String(audioOutputPath).replace(/\\/g, "/"),
+            preset_path: String(audioPresetPath).replace(/\\/g, "/"),
+          },
+        };
+        var hostCall =
+          'startManagedExport("' +
+          escapeForEval(JSON.stringify(managedExportPayload)) +
+          '")';
 
         disarmExportMonitor(projectId);
         resetMonitorCandidateSelection(projectId);
@@ -6158,12 +6183,11 @@
       clearCleanupRetry(projectId);
     });
 
-    // Kill ffmpeg proxy renders and any forked drive worker so a panel
-    // reload never leaves orphan child processes writing temp files.
+    // Kill ffmpeg proxy renders so a panel reload never leaves orphan child
+    // processes writing temporary proxy files.
     try {
       cancelLocalProxyRenderProcessesForExport();
     } catch (eProxyKill) {}
-    killTrackedWorkerChildren();
 
     if (volatileRenderTimer) {
       try {
