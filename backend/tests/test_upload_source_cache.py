@@ -224,3 +224,32 @@ def test_source_status_reports_bytes_progress(tmp_path, monkeypatch):
     assert status["state"] == "in_progress"
     assert status["bytes_done"] == 1234
     assert status["bytes_total"] == 10000
+
+
+def test_stage_source_video_downloads_once_then_serves_retries_from_cache(
+    source_cache, monkeypatch, tmp_path
+):
+    """The upload run's download step goes through the shared cache: a
+    retry must not hit Drive again (2026-08-27: 3 x 174 MB re-downloads)."""
+    from app.services import upload_phase as up
+
+    downloads: list[str] = []
+
+    def fake_download(file_id: str, destination: Path) -> None:
+        downloads.append(file_id)
+        destination.write_bytes(b"final-video-bytes")
+
+    monkeypatch.setattr(up.GoogleDriveService, "download_file", staticmethod(fake_download))
+    monkeypatch.setattr(up.GoogleDriveService, "get_file_size", staticmethod(lambda _fid: None))
+    monkeypatch.setattr(up, "ensure_bt709_tags", lambda _p: None)
+    readiness = _readiness(drive_video_id="drive-1", drive_video_name="output.mp4")
+
+    first_run = UploadPhaseService._stage_source_video("p1", readiness, tmp_path / "run1" / "output.mp4")
+    second_run = UploadPhaseService._stage_source_video("p1", readiness, tmp_path / "run2" / "output.mp4")
+
+    assert downloads == ["drive-1"]
+    assert first_run.read_bytes() == second_run.read_bytes() == b"final-video-bytes"
+    assert UploadPhaseService.cached_source_video("p1") == source_cache / "p1" / "output.mp4"
+    # The run works on its own copy: deleting it leaves the cache intact.
+    first_run.unlink()
+    assert UploadPhaseService.cached_source_video("p1") is not None

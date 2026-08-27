@@ -1356,13 +1356,11 @@ class UploadPhaseService:
         with tempfile.TemporaryDirectory(prefix=f"atr-upload-{project_id}-") as tmp_dir:
             video_name = drive_video_name or "final_video.mp4"
             local_video_path = Path(tmp_dir) / video_name
-            cached_source = cls.cached_source_video(project_id)
-            if cached_source is not None and cached_source.exists():
-                emit_progress(0.30, "download", "Copying final video from preview cache...")
-                shutil.copy2(cached_source, local_video_path)
+            if cls.cached_source_video(project_id) is not None:
+                emit_progress(0.30, "download", "Copying final video from source cache...")
             else:
                 emit_progress(0.30, "download", "Downloading final video from Drive...")
-                GoogleDriveService.download_file(drive_video_id, local_video_path)
+            cls._stage_source_video(project_id, readiness, local_video_path)
 
             # TikTok deliberately keeps the ORIGINAL copyrighted audio: capture
             # the pre-remux file for the PFM media staging before
@@ -2196,6 +2194,24 @@ class UploadPhaseService:
             finally:
                 partial.unlink(missing_ok=True)
             return destination
+
+    @classmethod
+    def _stage_source_video(
+        cls, project_id: str, readiness: UploadReadiness, destination: Path
+    ) -> Path:
+        """Put the final video at ``destination`` by way of the shared source cache.
+
+        The upload run used to download straight into its temp dir, so every
+        retry re-fetched the whole file from Drive (3 x 174 MB on 2026-08-27).
+        Going through ``_ensure_source_video`` downloads once into
+        ``cache/upload_source/<project>`` (evicted after
+        ``_SOURCE_CACHE_MAX_AGE_SECONDS``) and shares those bytes with the
+        preview/thumbnail paths; the run still works on its own private copy.
+        """
+        source = cls._ensure_source_video(project_id, readiness)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        return destination
 
     @classmethod
     def start_source_video_download(
