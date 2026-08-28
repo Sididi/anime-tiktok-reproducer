@@ -17,4 +17,9 @@ export JOBLIB_MULTIPROCESSING="${JOBLIB_MULTIPROCESSING:-0}"
 
 # --reload-dir app: without it uvicorn's watcher walks the whole cwd, which
 # includes backend/data (~100 GB of projects). Only source edits restart.
-exec uvicorn app.main:app --reload --reload-dir app --host 127.0.0.1 --port 8000
+# --timeout-graceful-shutdown: the browser's shared event stream keeps SSE
+# connections open forever, and uvicorn's default (no timeout) waits for them
+# before swapping in the new worker → every reload with the app open became a
+# zombie (port listening, nothing answering; seen 2026-08-28). Clients
+# reconnect on their own.
+exec uvicorn app.main:app --reload --reload-dir app --timeout-graceful-shutdown 5 --host 127.0.0.1 --port 8000

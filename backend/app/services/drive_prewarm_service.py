@@ -13,10 +13,12 @@ Coordination:
 
 * one pre-warm batch runs at a time (FIFO), so a batch gets the whole link;
 * inside :meth:`DriveSharedSources.ensure_uploaded` every shared name is
-  locked for its list→upload→verify span. A second project reaching the
-  script phase with the same episodes, or an export starting while a
-  pre-warm is still uploading, waits on exactly those names, re-lists and
-  reuses — the same bytes are never uploaded twice;
+  locked while the folder is listed, and the names actually uploaded stay
+  locked through upload + verify. A second project reaching the script phase
+  with the same episodes, or an export starting while a pre-warm is still
+  uploading, waits on exactly those names (relaying the pre-warm's progress
+  to its own user), re-lists and reuses — the same bytes are never uploaded
+  twice, and names already on Drive never block anyone;
 * the GC race guard holds: the project's local manifest references its files
   (``status: pending``) before any shared write, and every manifest write
   merges with what is already on disk so an overlapping export's references
@@ -38,7 +40,7 @@ from typing import Any
 
 from ..config import settings
 from ..models import Project, ProjectPhase, SceneMatch
-from .drive_shared_sources import DriveSharedSources, SharedFileRecord
+from .drive_shared_sources import DriveSharedSources, InflightUpload, SharedFileRecord
 from .executors import run_heavy
 from .export_service import ExportService, ManifestEntry
 from .google_drive_service import GoogleDriveService
@@ -365,13 +367,11 @@ class DrivePrewarmService:
             return cls._finish(state, "skipped", "project was deleted before upload")
 
         shared_folder_id = await run_heavy(DriveSharedSources.ensure_shared_folder)
+        state.status = "uploading"
 
-        busy = DriveSharedSources.names_in_flight(record.shared_name for record in planned)
-        if busy:
+        def _on_wait(inflight: list[InflightUpload]) -> None:
             state.status = "waiting"
-            state.detail = f"{len(busy)} file(s) already being uploaded by another job"
-        else:
-            state.status = "uploading"
+            state.detail = DriveSharedSources.describe_wait(inflight)
 
         def _on_stats(stats: RcloneStats) -> None:
             state.status = "uploading"
@@ -384,11 +384,20 @@ class DrivePrewarmService:
             state.status = "uploading" if missing else "verifying"
             state.detail = f"{reused} reused, {missing} to upload"
 
+        def _on_restart(reason: str) -> None:
+            state.detail = f"restarted a throttled upload session ({reason})"
+            logger.warning(
+                "Drive pre-warm restarted transfer: project_id=%s %s", project_id, reason
+            )
+
         uploaded = await DriveSharedSources.ensure_uploaded(
             pairs,
             shared_folder_id=shared_folder_id,
             stats_callback=_on_stats,
+            on_wait=_on_wait,
             on_plan=_on_plan,
+            on_restart=_on_restart,
+            owner=f"the script-phase pre-warm of project {project_id}",
         )
         state.records = uploaded
         state.transferred_bytes = max(state.transferred_bytes, 0)

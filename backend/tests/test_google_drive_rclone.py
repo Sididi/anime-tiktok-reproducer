@@ -179,7 +179,9 @@ async def test_sync_stats_reach_callback(
                     "totalBytes": 2048,
                     "speed": 1048576.0,
                     "eta": 7,
-                    "transferring": [{"name": "sources/episode.mkv"}],
+                    "transferring": [
+                        {"name": "sources/episode.mkv", "bytes": 300, "size": 1000, "speed": 2048.0}
+                    ],
                     "transfers": 1,
                     "totalTransfers": 3,
                     "checks": 5,
@@ -205,6 +207,9 @@ async def test_sync_stats_reach_callback(
     assert stats.checks == 5
     assert stats.total_checks == 9
     assert stats.transferring_names == ["sources/episode.mkv"]
+    assert stats.transferring[0].bytes_done == 300
+    assert stats.transferring[0].size == 1000
+    assert stats.transferring[0].speed_bytes_per_sec == 2048.0
 
 
 @pytest.mark.asyncio
@@ -230,3 +235,139 @@ async def test_missing_binary_raises_hint(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.setattr(GoogleDriveRclone, "binary", classmethod(lambda cls: None))
     with pytest.raises(GoogleDriveRcloneError, match="pacman -S rclone"):
         await GoogleDriveRclone.sync_tree(tmp_path, folder_id="folder-123")
+
+
+# --------------------------------------------------------------------------- #
+# Throttled-session guard                                                     #
+# --------------------------------------------------------------------------- #
+
+from app.services.google_drive_rclone import _SlowStreamGuard  # noqa: E402
+from app.services import google_drive_rclone as gdr_module  # noqa: E402
+from app.services.rclone_runner import RcloneRestartRequested  # noqa: E402
+
+_MIB = 1024 * 1024
+
+
+def _batch_stats(done: int, total: int) -> RcloneStats:
+    return RcloneStats(
+        bytes_transferred=done, bytes_total=total, speed_bytes_per_sec=0.0, eta_seconds=None,
+        transferring_names=[], transfers=0, total_transfers=1, checks=0, total_checks=0,
+    )
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _guard(clock: _Clock) -> _SlowStreamGuard:
+    return _SlowStreamGuard(
+        floor_bytes_per_sec=1 * _MIB, window_seconds=60, min_remaining_bytes=64 * _MIB, clock=clock
+    )
+
+
+def test_guard_restarts_a_session_crawling_for_a_full_window() -> None:
+    clock = _Clock()
+    guard = _guard(clock)
+    total = 1400 * _MIB
+    # 0.5 MB/s for 70 s: under the floor once the window is full.
+    for second in range(0, 71):
+        clock.now = 1000.0 + second
+        reason = guard.check(_batch_stats(done=second * _MIB // 2, total=total))
+        if second < 60:
+            assert reason is None, second
+    assert reason is not None and "throttled" in reason
+
+
+def test_guard_keeps_a_healthy_session_and_small_remainders() -> None:
+    clock = _Clock()
+    guard = _guard(clock)
+    total = 1400 * _MIB
+    for second in range(0, 91):  # 8 MB/s
+        clock.now = 1000.0 + second
+        assert guard.check(_batch_stats(done=second * 8 * _MIB, total=total)) is None
+    # Crawling, but only 10 MB left: finishing beats restarting.
+    guard = _guard(clock)
+    for second in range(0, 91):
+        clock.now = 2000.0 + second
+        assert guard.check(_batch_stats(done=total - 10 * _MIB + second, total=total)) is None
+    # Still scanning (no total yet) never trips.
+    guard = _guard(clock)
+    for second in range(0, 91):
+        clock.now = 3000.0 + second
+        assert guard.check(_batch_stats(done=0, total=0)) is None
+
+
+def test_guard_window_is_trailing_not_lifetime() -> None:
+    clock = _Clock()
+    guard = _guard(clock)
+    total = 1400 * _MIB
+    # 8 MB/s for 100 s (800 MB in), then the session degrades to 0.3 MB/s.
+    done = 0
+    for second in range(0, 100):
+        clock.now = 1000.0 + second
+        done = second * 8 * _MIB
+        assert guard.check(_batch_stats(done=done, total=total)) is None
+    for second in range(100, 151):
+        clock.now = 1000.0 + second
+        done += int(0.3 * _MIB)
+        # The trailing window still holds enough of the fast phase.
+        assert guard.check(_batch_stats(done=done, total=total)) is None, second
+    clock.now = 1000.0 + 162
+    done += int(0.3 * _MIB)
+    # A lifetime average (~5 MB/s) would never trip; the trailing window does.
+    assert guard.check(_batch_stats(done=done, total=total)) is not None
+
+
+@pytest.mark.asyncio
+async def test_run_restarts_then_lets_the_last_attempt_finish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(settings, "drive_slow_stream_restart_enabled", True)
+    monkeypatch.setattr(settings, "drive_slow_stream_max_restarts", 2)
+    monkeypatch.setattr(GoogleDriveRclone, "binary", classmethod(lambda cls: "/bin/true"))
+
+    async def _env(cls, folder_id):
+        return {"FOLDER": folder_id}
+
+    monkeypatch.setattr(GoogleDriveRclone, "_build_env", classmethod(_env))
+    calls: list[object] = []
+
+    async def _fake_run(argv, *, env=None, stats_callback=None, error_prefix="rclone", should_restart=None):
+        calls.append(should_restart)
+        if len(calls) <= 2:
+            raise RcloneRestartRequested("upload session throttled", None)
+        return None
+
+    monkeypatch.setattr(gdr_module, "run_rclone", _fake_run)
+    restarts: list[str] = []
+    await GoogleDriveRclone.copy_tree(tmp_path, folder_id="f", on_restart=restarts.append)
+
+    assert len(calls) == 3
+    assert calls[0] is not None and calls[1] is not None
+    assert calls[2] is None  # last allowed attempt runs unguarded
+    assert restarts == ["upload session throttled", "upload session throttled"]
+
+
+@pytest.mark.asyncio
+async def test_run_without_guard_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(settings, "drive_slow_stream_restart_enabled", False)
+    monkeypatch.setattr(GoogleDriveRclone, "binary", classmethod(lambda cls: "/bin/true"))
+
+    async def _env(cls, folder_id):
+        return {}
+
+    monkeypatch.setattr(GoogleDriveRclone, "_build_env", classmethod(_env))
+    seen: list[object] = []
+
+    async def _fake_run(argv, *, env=None, stats_callback=None, error_prefix="rclone", should_restart=None):
+        seen.append(should_restart)
+
+    monkeypatch.setattr(gdr_module, "run_rclone", _fake_run)
+    await GoogleDriveRclone.sync_tree(tmp_path, folder_id="f")
+    assert seen == [None]

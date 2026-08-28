@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.api.routes.processing import _gdrive_progress_to_sse_payload
 from app.services.export_service import _RcloneDriveProgressAdapter
+from app.services.drive_shared_sources import InflightUpload
 from app.services.rclone_runner import RcloneStats
 
 EXPECTED_KEYS = {
@@ -134,3 +135,66 @@ def test_checks_only_sync_keeps_frames_flowing() -> None:
     assert frame["phase"] == "upload"
     assert frame["progress"] == 0.35  # documented floor when total_bytes == 0
     assert "Comparing files" in frame["message"]
+
+
+def test_manifest_frame_reports_project_folder_bytes_and_shared_apart() -> None:
+    payloads: list[dict[str, Any]] = []
+    adapter = _RcloneDriveProgressAdapter(
+        callback=payloads.append,
+        file_count=11,
+        total_bytes=40_000,
+        shared_count=2,
+        shared_bytes=1_500_000_000,
+    )
+    adapter.emit_manifest()
+    frame = _gdrive_progress_to_sse_payload(payloads[0])
+    assert set(frame.keys()) == EXPECTED_KEYS
+    # The episodes are deduplicated on Drive: they must not inflate the
+    # project-folder size shown to the user.
+    assert frame["total_bytes"] == 40_000
+    assert frame["file_count"] == 11
+    assert "11 files, 39.1 KB" in frame["message"]
+    assert "2 shared source(s), 1.4 GB" in frame["message"]
+
+
+def test_waiting_frames_relay_the_other_jobs_progress() -> None:
+    payloads: list[dict[str, Any]] = []
+    adapter = _RcloneDriveProgressAdapter(
+        callback=payloads.append, file_count=5, total_bytes=1_000
+    )
+    inflight = [
+        InflightUpload(
+            shared_name="3071478fd446d61e__Episode 01.mp4",
+            owner="the script-phase pre-warm of project abc",
+            size=1_000,
+            bytes_done=250,
+            speed_bytes_per_sec=1024 * 1024,
+        )
+    ]
+    adapter.emit_waiting(inflight)
+    adapter.emit_waiting([])
+    upload, listing = [_gdrive_progress_to_sse_payload(p) for p in payloads]
+    assert set(upload.keys()) == EXPECTED_KEYS
+    assert upload["phase"] == "upload"
+    assert upload["uploaded_bytes"] == 250 and upload["total_bytes"] == 1_000
+    assert upload["current_file"] == "Episode 01.mp4"
+    assert "Episode 01.mp4" in upload["message"]
+    assert "pre-warm of project abc" in upload["message"]
+    assert "25%" in upload["message"]
+    assert upload["progress"] == pytest.approx(0.3 + 0.25 * 0.65)
+    assert listing["phase"] == "manifest"
+    assert "Waiting for another job" in listing["message"]
+
+
+def test_restart_frame_keeps_the_contract() -> None:
+    payloads: list[dict[str, Any]] = []
+    adapter = _RcloneDriveProgressAdapter(
+        callback=payloads.append, file_count=5, total_bytes=1_000
+    )
+    adapter.on_stats(_stats(bytes_done=1_000, total=4_000))
+    adapter.emit_restart("upload session throttled to 0.40 MB/s")
+    frame = _gdrive_progress_to_sse_payload(payloads[-1])
+    assert set(frame.keys()) == EXPECTED_KEYS
+    assert frame["phase"] == "upload"
+    assert frame["uploaded_bytes"] == 0
+    assert "throttled" in frame["message"]

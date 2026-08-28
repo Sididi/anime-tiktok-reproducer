@@ -87,7 +87,7 @@ async def test_upload_manifest_syncs_staged_tree_and_cleans_up(
         ),
     )
 
-    async def _fake_sync(cls, stage_dir: Path, *, folder_id, stats_callback=None):
+    async def _fake_sync(cls, stage_dir: Path, *, folder_id, stats_callback=None, on_restart=None):
         synced.append(
             {
                 "stage_dir": stage_dir,
@@ -170,7 +170,7 @@ async def test_upload_manifest_externalizes_shared_sources(
 
     copied: list[dict[str, Any]] = []
 
-    async def _fake_copy(cls, stage_dir: Path, *, folder_id, stats_callback=None):
+    async def _fake_copy(cls, stage_dir: Path, *, folder_id, stats_callback=None, on_restart=None):
         # GC race guard: the pending manifest must be on disk before any
         # shared upload runs.
         pending = DriveSharedSources.load_local_manifest(project.id)
@@ -190,7 +190,7 @@ async def test_upload_manifest_externalizes_shared_sources(
 
     synced_files: list[list[str]] = []
 
-    async def _fake_sync(cls, stage_dir: Path, *, folder_id, stats_callback=None):
+    async def _fake_sync(cls, stage_dir: Path, *, folder_id, stats_callback=None, on_restart=None):
         synced_files.append(
             sorted(
                 str(p.relative_to(stage_dir))
@@ -242,7 +242,7 @@ async def test_stage_dir_cleaned_up_on_sync_failure(
         ),
     )
 
-    async def _boom(cls, stage_dir: Path, *, folder_id, stats_callback=None):
+    async def _boom(cls, stage_dir: Path, *, folder_id, stats_callback=None, on_restart=None):
         raise RuntimeError("sync failed")
 
     monkeypatch.setattr(GoogleDriveRclone, "sync_tree", classmethod(_boom))

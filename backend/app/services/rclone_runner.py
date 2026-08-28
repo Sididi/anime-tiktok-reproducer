@@ -15,7 +15,7 @@ import json
 import logging
 import shutil
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
 from ..utils.subprocess_runner import terminate_process
@@ -32,6 +32,25 @@ class RcloneError(RuntimeError):
     """Raised when an rclone subprocess fails or rclone is unavailable."""
 
 
+class RcloneRestartRequested(RcloneError):
+    """Raised by :func:`run_rclone` when ``should_restart`` asked to abandon the run."""
+
+    def __init__(self, reason: str, last_stats: "RcloneStats | None") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.last_stats = last_stats
+
+
+@dataclass
+class RcloneFileProgress:
+    """One entry of rclone's ``transferring`` array: a file in flight."""
+
+    name: str  # path relative to the transfer root
+    bytes_done: int
+    size: int  # -1 while rclone does not know it
+    speed_bytes_per_sec: float
+
+
 @dataclass
 class RcloneStats:
     bytes_transferred: int
@@ -43,9 +62,13 @@ class RcloneStats:
     total_transfers: int
     checks: int  # files compared and skipped (delta sync)
     total_checks: int
+    transferring: list[RcloneFileProgress] = field(default_factory=list)
 
 
 StatsCallback = Callable[[RcloneStats], Awaitable[None] | None]
+# Consulted on every stats frame; a non-empty string is the reason to abandon
+# the current process (the caller decides whether to run again).
+RestartPredicate = Callable[[RcloneStats], str | None]
 
 
 def find_binary() -> str | None:
@@ -58,11 +81,14 @@ async def run_rclone(
     env: dict[str, str] | None = None,
     stats_callback: StatsCallback | None = None,
     error_prefix: str = "rclone",
+    should_restart: RestartPredicate | None = None,
 ) -> RcloneStats | None:
     """Run rclone, streaming stats to ``stats_callback``.
 
     Returns the last stats seen (None if rclone emitted none). Raises
-    :class:`RcloneError` on non-zero exit, with the last error lines.
+    :class:`RcloneError` on non-zero exit, with the last error lines, and
+    :class:`RcloneRestartRequested` when ``should_restart`` returned a reason
+    (the process is terminated first).
     """
     process = await asyncio.create_subprocess_exec(
         *argv,
@@ -83,9 +109,14 @@ async def run_rclone(
             if not line:
                 break
             stats = _parse_stderr_line(line, error_lines)
-            if stats is not None:
-                last_stats = stats
-                await _emit(stats_callback, stats)
+            if stats is None:
+                continue
+            last_stats = stats
+            await _emit(stats_callback, stats)
+            reason = should_restart(stats) if should_restart is not None else None
+            if reason:
+                await terminate_process(process)
+                raise RcloneRestartRequested(reason, stats)
         returncode = await process.wait()
     except asyncio.CancelledError:
         await terminate_process(process)
@@ -95,6 +126,28 @@ async def run_rclone(
         details = "; ".join(error_lines) or "no error output captured"
         raise RcloneError(f"{error_prefix} exited with code {returncode}: {details}")
     return last_stats
+
+
+def _parse_file_progress(raw: object) -> list[RcloneFileProgress]:
+    if not isinstance(raw, list):
+        return []
+    files: list[RcloneFileProgress] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            size = item.get("size")
+            files.append(
+                RcloneFileProgress(
+                    name=str(item.get("name") or ""),
+                    bytes_done=max(0, int(item.get("bytes") or 0)),
+                    size=int(size) if size is not None else -1,
+                    speed_bytes_per_sec=float(item.get("speed") or 0.0),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return files
 
 
 def _parse_stderr_line(
@@ -116,27 +169,19 @@ def _parse_stderr_line(
     if not isinstance(stats, dict):
         return None
     try:
-        transferring = stats.get("transferring")
-        names = (
-            [
-                str(item.get("name") or "")
-                for item in transferring
-                if isinstance(item, dict)
-            ]
-            if isinstance(transferring, list)
-            else []
-        )
+        transferring = _parse_file_progress(stats.get("transferring"))
         eta = stats.get("eta")
         return RcloneStats(
             bytes_transferred=max(0, int(stats.get("bytes") or 0)),
             bytes_total=max(0, int(stats.get("totalBytes") or 0)),
             speed_bytes_per_sec=float(stats.get("speed") or 0.0),
             eta_seconds=float(eta) if isinstance(eta, (int, float)) else None,
-            transferring_names=names,
+            transferring_names=[item.name for item in transferring],
             transfers=max(0, int(stats.get("transfers") or 0)),
             total_transfers=max(0, int(stats.get("totalTransfers") or 0)),
             checks=max(0, int(stats.get("checks") or 0)),
             total_checks=max(0, int(stats.get("totalChecks") or 0)),
+            transferring=transferring,
         )
     except (TypeError, ValueError):
         return None

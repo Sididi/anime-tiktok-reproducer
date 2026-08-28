@@ -23,6 +23,7 @@ from .anime_library import AnimeLibraryService
 from .drive_shared_sources import (
     REMOTE_MANIFEST_FILENAME,
     DriveSharedSources,
+    InflightUpload,
     SharedFileRecord,
 )
 from .google_drive_rclone import GoogleDriveRclone
@@ -70,23 +71,73 @@ class _RcloneDriveProgressAdapter:
         callback: DriveUploadProgressCallback | None,
         file_count: int,
         total_bytes: int,
+        shared_count: int = 0,
+        shared_bytes: int = 0,
     ) -> None:
         self._callback = callback
         self._started_at = time.perf_counter()
+        # Project-folder payload only; shared sources are counted apart
+        # because they are deduplicated on Drive (mostly already there).
         self.manifest_file_count = file_count
         self.manifest_total_bytes = total_bytes
+        self.shared_count = shared_count
+        self.shared_bytes = shared_bytes
         self.last_stats: RcloneStats | None = None
 
     def emit_manifest(self) -> None:
+        message = (
+            f"Preparing Drive manifest ({self.manifest_file_count} files, "
+            f"{_format_bytes(self.manifest_total_bytes)}"
+        )
+        if self.shared_count:
+            message += (
+                f"; {self.shared_count} shared source(s), "
+                f"{_format_bytes(self.shared_bytes)}, deduplicated on Drive"
+            )
+        message += ")"
         self._emit(
             phase="manifest",
-            message=(
-                f"Preparing Drive manifest ({self.manifest_file_count} files, "
-                f"{_format_bytes(self.manifest_total_bytes)})"
-            ),
+            message=message,
             file_count=self.manifest_file_count,
             files_completed=0,
             total_bytes=self.manifest_total_bytes,
+            uploaded_bytes=0,
+            current_file=None,
+            throughput_mb_per_sec=0.0,
+        )
+
+    def emit_waiting(self, inflight: list[InflightUpload]) -> None:
+        """Another job is uploading a shared source we need: relay its progress.
+
+        Emitted every heartbeat while waiting, so the stream never goes silent
+        (the page's stall watchdog would otherwise abort a healthy export).
+        """
+        message = DriveSharedSources.describe_wait(inflight)
+        if not inflight:
+            self.emit_status(message)
+            return
+        self._emit(
+            phase="upload",
+            message=message,
+            file_count=len(inflight),
+            files_completed=0,
+            total_bytes=sum(item.size for item in inflight),
+            uploaded_bytes=sum(item.bytes_done for item in inflight),
+            current_file=inflight[0].basename,
+            throughput_mb_per_sec=round(
+                inflight[0].speed_bytes_per_sec / (1024 * 1024), 3
+            ),
+        )
+
+    def emit_restart(self, reason: str) -> None:
+        """A throttled upload session was abandoned for a fresh one."""
+        stats = self.last_stats
+        self._emit(
+            phase="upload",
+            message=f"Upload session throttled by Google — restarting the transfer ({reason})",
+            file_count=stats.total_transfers if stats else 0,
+            files_completed=stats.transfers if stats else 0,
+            total_bytes=stats.bytes_total if stats else 0,
             uploaded_bytes=0,
             current_file=None,
             throughput_mb_per_sec=0.0,
@@ -673,21 +724,34 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
         started_at = time.perf_counter()
         folder_name = cls.output_folder_name(project)
-        _, entries = await run_heavy(cls.build_manifest, project, matches)
-        diagnostics = cls._build_manifest_diagnostics(entries)
+        shared_enabled = DriveSharedSources.is_enabled()
+
+        def _prepare() -> tuple[list[ManifestEntry], list[ManifestEntry], dict[str, Any], int]:
+            _, all_entries = cls.build_manifest(project, matches)
+            if shared_enabled:
+                kept, shared = DriveSharedSources.partition_entries(all_entries)
+            else:
+                kept, shared = all_entries, []
+            # Sizes are reported for what actually lands in the project
+            # folder; shared sources are deduplicated on Drive and mostly
+            # already there (script-phase pre-warm), so they are shown apart.
+            return (
+                kept,
+                shared,
+                cls._build_manifest_diagnostics(kept),
+                sum(entry.source_path.stat().st_size for entry in shared),
+            )
+
+        entries, externalized, diagnostics, shared_bytes = await run_heavy(_prepare)
         total_bytes = diagnostics["total_bytes"]
         adapter = _RcloneDriveProgressAdapter(
             callback=progress_callback,
             file_count=len(entries),
             total_bytes=total_bytes,
+            shared_count=len(externalized),
+            shared_bytes=shared_bytes,
         )
         adapter.emit_manifest()
-
-        shared_enabled = DriveSharedSources.is_enabled()
-        if shared_enabled:
-            entries, externalized = DriveSharedSources.partition_entries(entries)
-        else:
-            externalized = []
 
         folder_id, folder_url = await run_heavy(
             GoogleDriveService.ensure_project_folder,
@@ -735,12 +799,12 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
                 pairs,
                 shared_folder_id=shared_folder_id,
                 stats_callback=adapter.on_stats,
-                on_wait=lambda: adapter.emit_status(
-                    "Waiting for shared sources being uploaded by another export..."
-                ),
+                on_wait=adapter.emit_waiting,
                 on_plan=lambda reused, missing: adapter.emit_status(
                     f"Shared sources: {reused} already on Drive, {missing} to upload"
                 ),
+                on_restart=adapter.emit_restart,
+                owner=f"the Drive export of project {project.id}",
             )
             remote_manifest = DriveSharedSources.build_remote_manifest(
                 project, shared_records, shared_folder_id=shared_folder_id
@@ -762,11 +826,14 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             }
         logger.info(
             "Drive manifest sync starting: project_id=%s folder_id=%s files=%d "
-            "total_bytes=%d transfers=%d bytes_by_root=%s largest_files=%s",
+            "total_bytes=%d shared_files=%d shared_bytes=%d transfers=%d "
+            "bytes_by_root=%s largest_files=%s",
             project.id,
             folder_id,
             len(entries),
             total_bytes,
+            len(externalized),
+            shared_bytes,
             settings.drive_rclone_transfers,
             diagnostics["bytes_by_root"],
             diagnostics["largest_files"],
@@ -782,6 +849,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
                 stage_dir,
                 folder_id=folder_id,
                 stats_callback=adapter.on_stats,
+                on_restart=adapter.emit_restart,
             )
         finally:
             await run_heavy(shutil.rmtree, stage_dir, True)
@@ -835,6 +903,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             "folder_id": folder_id,
             "folder_url": folder_url,
             "file_count": len(entries),
+            # Project-folder payload; shared sources are reported under "shared".
             "total_bytes": total_bytes,
         }
         if shared_stats is not None:

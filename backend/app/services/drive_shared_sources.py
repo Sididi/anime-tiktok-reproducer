@@ -17,6 +17,10 @@ nobody references anymore. ``audit`` reconciles Drive against the manifests.
 Ordering contract (GC race guard): the local manifest is written with
 ``status: "pending"`` BEFORE any shared-Drive mutation, so an in-flight
 export's references are always visible to a concurrent teardown's GC scan.
+
+Concurrency: per-shared-name asyncio locks (see ``_acquire_names``) make sure
+the same bytes are never uploaded twice, and an in-flight table lets a job
+waiting on someone else's upload relay that upload's progress to its user.
 """
 
 from __future__ import annotations
@@ -27,19 +31,19 @@ import logging
 import re
 import shutil
 import tempfile
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from ..config import settings
 from ..models import Project
 from .executors import run_heavy
-from .google_drive_rclone import GoogleDriveRclone
+from .google_drive_rclone import GoogleDriveRclone, RestartCallback
 from .google_drive_service import GoogleDriveService
 from .project_service import ProjectService
-from .rclone_runner import StatsCallback
+from .rclone_runner import RcloneStats, StatsCallback
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -50,16 +54,57 @@ SCHEMA_VERSION = 1
 # Only names of this exact shape are ever deleted by GC/audit — a guard
 # against wiping anything a human (or another tool) put in the folder.
 SHARED_NAME_RE = re.compile(r"^[0-9a-f]{16}__.+")
+# While a job waits for a name another job holds, its ``on_wait`` callback is
+# fed the holder's progress at this cadence (keeps the export's SSE stream —
+# and the page's stall watchdog — alive during a long pre-warm upload).
+WAIT_HEARTBEAT_SECONDS = 1.0
+_MIB = 1024 * 1024
 
-# One lock per shared name (``{sha16}__basename``), held for the whole
-# list→upload→verify span of any job that needs that file. Two jobs wanting
-# the same bytes — duplicate projects exported at once, or an export starting
-# while the script-phase pre-warm is still uploading — serialize on exactly
-# those names: the first uploads, the second re-lists and reuses. Jobs with
-# disjoint sets run concurrently. Locks are always taken in sorted-name
-# order, which makes overlapping sets deadlock-free.
+# One lock per shared name (``{sha16}__basename``). A job takes the locks of
+# every name it needs (sorted order → deadlock-free) while it lists the folder
+# and decides reuse vs upload; names already on Drive are released right
+# there, names it uploads stay locked through upload + verify. So two jobs
+# wanting the same missing bytes — duplicate projects exported at once, or an
+# export starting while the script-phase pre-warm is still uploading —
+# serialize on exactly those names (the first uploads, the second re-lists
+# and reuses), while a job that merely *reuses* a file never queues behind
+# someone else's upload of a different one.
 _shared_name_locks: dict[str, asyncio.Lock] = {}
+# Progress of the files being uploaded right now, keyed by shared name, so a
+# waiting job can show its user what it is waiting for.
+_inflight_uploads: dict[str, "InflightUpload"] = {}
 _shared_folder_id_cache: str | None = None
+
+
+@dataclass
+class InflightUpload:
+    """A shared file some job is uploading right now."""
+
+    shared_name: str
+    owner: str  # human-readable job label, e.g. "the script-phase pre-warm of project X"
+    size: int
+    bytes_done: int = 0
+    speed_bytes_per_sec: float = 0.0
+    started_at: float = field(default_factory=time.monotonic)
+
+    @property
+    def basename(self) -> str:
+        return self.shared_name.split("__", 1)[1] if "__" in self.shared_name else self.shared_name
+
+    @property
+    def fraction(self) -> float:
+        if self.size <= 0:
+            return 0.0
+        return max(0.0, min(1.0, self.bytes_done / self.size))
+
+    @property
+    def eta_seconds(self) -> float | None:
+        if self.size <= 0 or self.speed_bytes_per_sec <= 0:
+            return None
+        return max(0.0, (self.size - self.bytes_done) / self.speed_bytes_per_sec)
+
+
+WaitCallback = Callable[[list[InflightUpload]], None]
 
 
 def _name_lock(name: str) -> asyncio.Lock:
@@ -70,19 +115,66 @@ def _name_lock(name: str) -> asyncio.Lock:
     return lock
 
 
-@asynccontextmanager
-async def _hold_name_locks(names: Iterable[str]) -> AsyncIterator[None]:
+def _inflight_for(names: Iterable[str]) -> list[InflightUpload]:
+    return [_inflight_uploads[name] for name in names if name in _inflight_uploads]
+
+
+async def _acquire_names(
+    names: Iterable[str],
+    *,
+    on_wait: WaitCallback | None,
+    heartbeat_seconds: float,
+) -> list[str]:
+    """Take the locks of ``names`` in sorted order; return the held names.
+
+    While a lock is held by another job, ``on_wait`` is called at once and
+    then every ``heartbeat_seconds`` with the in-flight uploads among the
+    names still to acquire. Nothing stays held if this raises.
+    """
     ordered = sorted(set(names))
-    held: list[asyncio.Lock] = []
+    held: list[str] = []
     try:
-        for name in ordered:
+        for index, name in enumerate(ordered):
             lock = _name_lock(name)
-            await lock.acquire()
-            held.append(lock)
-        yield
-    finally:
-        for lock in reversed(held):
+            if on_wait is not None and lock.locked():
+                on_wait(_inflight_for(ordered[index:]))
+            while True:
+                try:
+                    await asyncio.wait_for(
+                        lock.acquire(),
+                        timeout=heartbeat_seconds if on_wait is not None else None,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    on_wait(_inflight_for(ordered[index:]))  # type: ignore[misc]
+            held.append(name)
+    except BaseException:
+        _release_names(held)
+        raise
+    return held
+
+
+def _release_names(names: Iterable[str]) -> None:
+    """Release locks the caller holds (callers only pass names they acquired)."""
+    for name in names:
+        lock = _shared_name_locks.get(name)
+        if lock is not None and lock.locked():
             lock.release()
+
+
+def _format_rate(bytes_per_sec: float) -> str:
+    return f"{bytes_per_sec / _MIB:.1f} MB/s"
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, rem = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{rem:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 @dataclass
@@ -137,6 +229,28 @@ class DriveSharedSources:
             for name in set(names)
             if (lock := _shared_name_locks.get(name)) is not None and lock.locked()
         )
+
+    @staticmethod
+    def inflight_uploads(names: Iterable[str]) -> list[InflightUpload]:
+        """Progress of the given shared names' uploads, if any is in flight."""
+        return _inflight_for(sorted(set(names)))
+
+    @staticmethod
+    def describe_wait(inflight: list[InflightUpload]) -> str:
+        """Human-readable line for a job waiting on other jobs' shared names."""
+        if not inflight:
+            return "Waiting for another job to finish checking the shared Drive folder..."
+        first = inflight[0]
+        line = (
+            f"Waiting for {first.basename} — being uploaded by {first.owner}: "
+            f"{int(first.fraction * 100)}% at {_format_rate(first.speed_bytes_per_sec)}"
+        )
+        eta = first.eta_seconds
+        if eta is not None:
+            line += f", ~{_format_duration(eta)} left"
+        if len(inflight) > 1:
+            line += f" (+{len(inflight) - 1} more)"
+        return line
 
     # ------------------------------------------------------------------ #
     # Manifest entry partitioning                                        #
@@ -193,131 +307,208 @@ class DriveSharedSources:
         *,
         shared_folder_id: str,
         stats_callback: StatsCallback | None = None,
-        on_wait: Callable[[], None] | None = None,
+        on_wait: WaitCallback | None = None,
         on_plan: Callable[[int, int], None] | None = None,
+        on_restart: RestartCallback | None = None,
+        owner: str = "another Drive upload",
     ) -> list[SharedFileRecord]:
         """Make sure every (entry, sha256) exists in the shared folder.
 
         Reuses present files (by deterministic name + size), uploads missing
         ones with one rclone ``copy`` batch, then verifies by re-listing.
-        Jobs needing the same shared names (duplicate exports, or an export
-        overlapping the script-phase pre-warm) serialize per name: the first
-        uploads, the others wait then reuse. ``on_wait`` fires when that wait
-        is about to happen; ``on_plan(reused, missing)`` once the reuse/upload
-        split is known.
+
+        Lock discipline: every wanted name is locked while the folder is
+        listed and the reuse/upload split decided; names already on Drive are
+        released right away, names being uploaded stay locked through
+        upload + verify. ``on_wait(inflight)`` fires (and keeps firing every
+        :data:`WAIT_HEARTBEAT_SECONDS`) while another job holds a wanted
+        name, with that job's progress; ``on_plan(reused, missing)`` once the
+        split is known; ``on_restart(reason)`` when a throttled upload session
+        is abandoned for a fresh one. ``owner`` labels this job for waiters.
         """
-        names = [
-            cls.shared_name(sha256, entry.source_path.name)
+        wanted: list[tuple[Any, str, str]] = [
+            (entry, sha256, cls.shared_name(sha256, entry.source_path.name))
             for entry, sha256 in externalized
         ]
-        if on_wait is not None and cls.names_in_flight(names):
-            on_wait()
-        async with _hold_name_locks(names):
-            children = await run_heavy(
-                GoogleDriveService.list_children_with_hashes, shared_folder_id
-            )
-            by_name: dict[str, dict[str, Any]] = {}
-            for child in children:
-                name = str(child.get("name") or "")
-                if name:
-                    by_name.setdefault(name, child)
-
+        held = await _acquire_names(
+            (name for _, _, name in wanted),
+            on_wait=on_wait,
+            heartbeat_seconds=WAIT_HEARTBEAT_SECONDS,
+        )
+        try:
+            grouped = await cls._list_grouped(shared_folder_id)
+            records: dict[str, SharedFileRecord] = {}
             missing: list[tuple[Any, str, str]] = []
-            for entry, sha256 in externalized:
-                name = cls.shared_name(sha256, entry.source_path.name)
-                present = by_name.get(name)
-                if present is not None:
-                    expected_size = entry.source_path.stat().st_size
-                    if int(present.get("size") or -1) == expected_size:
-                        continue
-                    # Torn/mismatched upload: replace it.
-                    logger.warning(
-                        "Shared source %s has wrong size on Drive "
-                        "(expected %d, got %s); re-uploading",
-                        name,
-                        expected_size,
-                        present.get("size"),
-                    )
-                    await run_heavy(
-                        GoogleDriveService.delete_file, str(present.get("id") or "")
-                    )
-                missing.append((entry, sha256, name))
+            for entry, sha256, name in wanted:
+                if name in records:
+                    continue
+                expected_size = entry.source_path.stat().st_size
+                keeper = await cls._settle(
+                    name, grouped.get(name, []), expected_size, after_upload=False
+                )
+                if keeper is None:
+                    missing.append((entry, sha256, name))
+                    continue
+                records[name] = cls._record(entry, sha256, name, keeper, expected_size)
+
+            # Files already on Drive need no protection any more: a job that
+            # only reuses them (an export whose pre-warm already landed) must
+            # not queue behind this job's upload of something else.
+            _release_names(name for name in held if name in records)
+            held = [name for name in held if name not in records]
 
             if on_plan is not None:
-                on_plan(len(externalized) - len(missing), len(missing))
+                on_plan(len(records), len(missing))
 
             if missing:
-                stage_dir = Path(
-                    tempfile.mkdtemp(
-                        prefix="atr-shared-sources-", dir=str(settings.cache_dir)
-                    )
+                await cls._upload_missing(
+                    missing,
+                    shared_folder_id=shared_folder_id,
+                    stats_callback=stats_callback,
+                    on_restart=on_restart,
+                    owner=owner,
                 )
-                try:
-
-                    def _stage() -> None:
-                        for entry, _sha, name in missing:
-                            (stage_dir / name).symlink_to(
-                                Path(entry.source_path).resolve()
-                            )
-
-                    await run_heavy(_stage)
-                    await GoogleDriveRclone.copy_tree(
-                        stage_dir,
-                        folder_id=shared_folder_id,
-                        stats_callback=stats_callback,
+                # Verify-after: one re-list settles uploads AND concurrent-writer
+                # duplicates (keep the lexicographically-first id, drop extras).
+                grouped = await cls._list_grouped(shared_folder_id)
+                for entry, sha256, name in missing:
+                    expected_size = entry.source_path.stat().st_size
+                    keeper = await cls._settle(
+                        name, grouped.get(name, []), expected_size, after_upload=True
                     )
-                finally:
-                    await run_heavy(shutil.rmtree, stage_dir, True)
+                    if keeper is None:
+                        raise RuntimeError(
+                            f"Shared source upload verification failed: {name} "
+                            "is missing from the shared Drive folder after upload"
+                        )
+                    records[name] = cls._record(entry, sha256, name, keeper, expected_size)
+            return [records[name] for _, _, name in wanted]
+        finally:
+            _release_names(held)
 
-            # Verify-after: one re-list settles uploads AND concurrent-writer
-            # duplicates (keep the lexicographically-first id, drop extras).
-            children = await run_heavy(
-                GoogleDriveService.list_children_with_hashes, shared_folder_id
+    @classmethod
+    async def _list_grouped(cls, shared_folder_id: str) -> dict[str, list[dict[str, Any]]]:
+        children = await run_heavy(
+            GoogleDriveService.list_children_with_hashes, shared_folder_id
+        )
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for child in children:
+            name = str(child.get("name") or "")
+            if name:
+                grouped.setdefault(name, []).append(child)
+        return grouped
+
+    @classmethod
+    async def _settle(
+        cls,
+        name: str,
+        candidates: list[dict[str, Any]],
+        expected_size: int,
+        *,
+        after_upload: bool,
+    ) -> dict[str, Any] | None:
+        """Pick the file to reference for ``name`` (caller holds its lock).
+
+        Duplicates from concurrent writers are dropped (first id wins). A
+        size mismatch means a torn upload: before our own upload it is
+        deleted and ``None`` returned so the file gets re-uploaded; after it,
+        it is an error.
+        """
+        ordered = sorted(candidates, key=lambda item: str(item.get("id") or ""))
+        if not ordered:
+            return None
+        keeper = ordered[0]
+        for extra in ordered[1:]:
+            logger.warning(
+                "Removing duplicate shared source %s (id %s)", name, extra.get("id")
             )
-            grouped: dict[str, list[dict[str, Any]]] = {}
-            for child in children:
-                name = str(child.get("name") or "")
-                if name:
-                    grouped.setdefault(name, []).append(child)
+            await run_heavy(GoogleDriveService.delete_file, str(extra.get("id") or ""))
+        if int(keeper.get("size") or -1) == expected_size:
+            return keeper
+        if after_upload:
+            raise RuntimeError(
+                f"Shared source upload verification failed: {name} has "
+                f"size {keeper.get('size')} on Drive, expected {expected_size}"
+            )
+        logger.warning(
+            "Shared source %s has wrong size on Drive (expected %d, got %s); re-uploading",
+            name,
+            expected_size,
+            keeper.get("size"),
+        )
+        await run_heavy(GoogleDriveService.delete_file, str(keeper.get("id") or ""))
+        return None
 
-            records: list[SharedFileRecord] = []
-            for entry, sha256 in externalized:
-                name = cls.shared_name(sha256, entry.source_path.name)
-                candidates = sorted(
-                    grouped.get(name, []), key=lambda item: str(item.get("id") or "")
-                )
-                if not candidates:
-                    raise RuntimeError(
-                        f"Shared source upload verification failed: {name} "
-                        "is missing from the shared Drive folder after upload"
-                    )
-                keeper = candidates[0]
-                for extra in candidates[1:]:
-                    logger.warning(
-                        "Removing duplicate shared source %s (id %s)",
-                        name,
-                        extra.get("id"),
-                    )
-                    await run_heavy(
-                        GoogleDriveService.delete_file, str(extra.get("id") or "")
-                    )
-                expected_size = entry.source_path.stat().st_size
-                if int(keeper.get("size") or -1) != expected_size:
-                    raise RuntimeError(
-                        f"Shared source upload verification failed: {name} has "
-                        f"size {keeper.get('size')} on Drive, expected {expected_size}"
-                    )
-                records.append(
-                    SharedFileRecord(
-                        path_in_folder=cls.path_in_folder(entry),
-                        size=expected_size,
-                        sha256=sha256,
-                        md5=str(keeper.get("md5Checksum") or "") or None,
-                        drive_file_id=str(keeper.get("id") or ""),
-                        shared_name=name,
-                    )
-                )
-            return records
+    @classmethod
+    def _record(
+        cls,
+        entry: Any,
+        sha256: str,
+        name: str,
+        child: dict[str, Any],
+        size: int,
+    ) -> SharedFileRecord:
+        return SharedFileRecord(
+            path_in_folder=cls.path_in_folder(entry),
+            size=size,
+            sha256=sha256,
+            md5=str(child.get("md5Checksum") or "") or None,
+            drive_file_id=str(child.get("id") or ""),
+            shared_name=name,
+        )
+
+    @classmethod
+    async def _upload_missing(
+        cls,
+        missing: list[tuple[Any, str, str]],
+        *,
+        shared_folder_id: str,
+        stats_callback: StatsCallback | None,
+        on_restart: RestartCallback | None,
+        owner: str,
+    ) -> None:
+        """One rclone copy batch of ``missing`` (caller holds their locks).
+
+        The batch is registered in the in-flight table for its whole life so
+        jobs waiting on these names can relay real progress to their users.
+        """
+        inflight = {
+            name: InflightUpload(
+                shared_name=name, owner=owner, size=entry.source_path.stat().st_size
+            )
+            for entry, _sha, name in missing
+        }
+        _inflight_uploads.update(inflight)
+        stage_dir = Path(
+            tempfile.mkdtemp(prefix="atr-shared-sources-", dir=str(settings.cache_dir))
+        )
+
+        def _stage() -> None:
+            for entry, _sha, name in missing:
+                (stage_dir / name).symlink_to(Path(entry.source_path).resolve())
+
+        def _relay(stats: RcloneStats):
+            active = {item.name: item for item in stats.transferring}
+            for name, upload in inflight.items():
+                item = active.get(name)
+                if item is not None:
+                    upload.bytes_done = item.bytes_done
+                    upload.speed_bytes_per_sec = item.speed_bytes_per_sec
+            return stats_callback(stats) if stats_callback is not None else None
+
+        try:
+            await run_heavy(_stage)
+            await GoogleDriveRclone.copy_tree(
+                stage_dir,
+                folder_id=shared_folder_id,
+                stats_callback=_relay,
+                on_restart=on_restart,
+            )
+        finally:
+            for name in inflight:
+                if _inflight_uploads.get(name) is inflight[name]:
+                    _inflight_uploads.pop(name, None)
+            await run_heavy(shutil.rmtree, stage_dir, True)
 
     # ------------------------------------------------------------------ #
     # Manifests                                                          #

@@ -28,6 +28,7 @@ from app.services.export_service import ManifestEntry
 from app.services.google_drive_rclone import GoogleDriveRclone
 from app.services.google_drive_service import GoogleDriveService
 from app.services.project_service import ProjectService
+from app.services.rclone_runner import RcloneFileProgress, RcloneStats
 from app.services.source_hash_service import SourceHashService
 
 
@@ -42,17 +43,21 @@ class FakeDrive:
         self.gate_names: set[str] | None = None
         self.in_flight = asyncio.Event()
         self.deleted: list[str] = []
+        # The stats callback of the batch currently held at the gate, so a
+        # test can feed it rclone-style progress while the upload is "running".
+        self.stats_callback = None
 
     def list_children(self, folder_id: str, drive=None) -> list[dict[str, Any]]:
         return [dict(child) for child in self.children]
 
-    async def copy_tree(self, stage_dir: Path, *, folder_id: str, stats_callback=None):
+    async def copy_tree(self, stage_dir: Path, *, folder_id: str, stats_callback=None, on_restart=None):
         names = sorted(p.name for p in stage_dir.iterdir())
         self.batches.append(names)
         gated = self.gate is not None and (
             self.gate_names is None or bool(set(names) & self.gate_names)
         )
         if gated:
+            self.stats_callback = stats_callback
             self.in_flight.set()
             await self.gate.wait()
         for name in names:
@@ -104,7 +109,7 @@ def drive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> FakeDrive:
     monkeypatch.setattr(
         GoogleDriveRclone,
         "copy_tree",
-        classmethod(lambda cls, stage_dir, *, folder_id, stats_callback=None: fake.copy_tree(
+        classmethod(lambda cls, stage_dir, *, folder_id, stats_callback=None, on_restart=None: fake.copy_tree(
             stage_dir, folder_id=folder_id, stats_callback=stats_callback
         )),
     )
@@ -235,7 +240,7 @@ async def test_export_overlapping_a_running_prewarm_waits_on_that_file_only(
                 (ManifestEntry(relative_path="SPM_c/sources/Ep03.mkv", source_path=ep3), _sha("Ep03.mkv")),
             ],
             shared_folder_id="shared-1",
-            on_wait=lambda: events.append("wait"),
+            on_wait=lambda inflight: events.append("wait"),
             on_plan=lambda reused, missing: events.append(f"plan:{reused}/{missing}"),
         )
     )
@@ -260,6 +265,98 @@ async def test_export_overlapping_a_running_prewarm_waits_on_that_file_only(
     assert events == ["wait", "plan:1/1"]
     assert sorted(drive.batches) == [[_shared("Ep01.mkv")], [_shared("Ep03.mkv")], [_shared("Ep09.mkv")]]
     assert {r.shared_name for r in records} == {_shared("Ep01.mkv"), _shared("Ep03.mkv")}
+
+
+@pytest.mark.asyncio
+async def test_job_reusing_a_present_file_does_not_wait_behind_its_uploader(
+    drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 2026-08-28 stall: both projects shared one music file already on
+    Drive; the pre-warm uploading project B's episode held the music lock for
+    its whole run, so project A's export — needing nothing new — waited ~25
+    minutes behind a 1.4 GB upload it had no stake in."""
+    sources, episode = episodes
+    music, ep_b = episode("Music.wav"), episode("EpB.mkv")
+    drive.children.append(
+        {"id": "d-music", "name": _shared("Music.wav"), "size": "64", "md5Checksum": "m"}
+    )
+    b = _make_project(monkeypatch, sources, "bbbbbbbbbbbb")
+    sources[b.id] = [ep_b, music]
+
+    drive.gate = asyncio.Event()
+    DrivePrewarmService.schedule(b.id, reason="t")
+    await asyncio.wait_for(drive.in_flight.wait(), 5)
+    # B's pre-warm is uploading EpB; Music was released at the reuse decision.
+    assert DriveSharedSources.names_in_flight([_shared("EpB.mkv")]) == [_shared("EpB.mkv")]
+    assert DriveSharedSources.names_in_flight([_shared("Music.wav")]) == []
+
+    waits: list[list] = []
+    records = await asyncio.wait_for(
+        DriveSharedSources.ensure_uploaded(
+            [(ManifestEntry(relative_path="SPM_a/sources/Music.wav", source_path=music), _sha("Music.wav"))],
+            shared_folder_id="shared-1",
+            on_wait=waits.append,
+        ),
+        2,
+    )
+    assert waits == []
+    assert records[0].drive_file_id == "d-music"
+
+    drive.gate.set()
+    await DrivePrewarmService.wait(b.id)
+    assert DrivePrewarmService.status(b.id)["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_waiter_relays_the_uploaders_progress(
+    drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sources, episode = episodes
+    ep1 = episode("Ep01.mkv")
+    a = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
+    sources[a.id] = [ep1]
+    monkeypatch.setattr(dss_module, "WAIT_HEARTBEAT_SECONDS", 0.01)
+
+    drive.gate = asyncio.Event()
+    DrivePrewarmService.schedule(a.id, reason="t")
+    await asyncio.wait_for(drive.in_flight.wait(), 5)
+
+    snapshots: list[list] = []
+    waiter = asyncio.create_task(
+        DriveSharedSources.ensure_uploaded(
+            [(ManifestEntry(relative_path="SPM_c/sources/Ep01.mkv", source_path=ep1), _sha("Ep01.mkv"))],
+            shared_folder_id="shared-1",
+            on_wait=lambda inflight: snapshots.append(list(inflight)),
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert snapshots and snapshots[0][0].shared_name == _shared("Ep01.mkv")
+    assert snapshots[0][0].owner == f"the script-phase pre-warm of project {a.id}"
+    assert snapshots[0][0].bytes_done == 0
+
+    # rclone reports progress on the pre-warm's batch → the waiter sees it.
+    assert drive.stats_callback is not None
+    drive.stats_callback(
+        RcloneStats(
+            bytes_transferred=32, bytes_total=64, speed_bytes_per_sec=8.0, eta_seconds=4.0,
+            transferring_names=[_shared("Ep01.mkv")], transfers=0, total_transfers=1,
+            checks=0, total_checks=0,
+            transferring=[RcloneFileProgress(name=_shared("Ep01.mkv"), bytes_done=32, size=64, speed_bytes_per_sec=8.0)],
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert snapshots[-1][0].bytes_done == 32
+    assert snapshots[-1][0].speed_bytes_per_sec == 8.0
+    assert DrivePrewarmService.status(a.id)["status"] == "uploading"
+    assert "Ep01.mkv" in DriveSharedSources.describe_wait(snapshots[-1])
+    assert "50%" in DriveSharedSources.describe_wait(snapshots[-1])
+
+    drive.gate.set()
+    records = await asyncio.wait_for(waiter, 5)
+    await DrivePrewarmService.wait(a.id)
+    assert records[0].shared_name == _shared("Ep01.mkv")
+    assert drive.batches == [[_shared("Ep01.mkv")]]  # reused, never uploaded twice
+    assert DriveSharedSources.inflight_uploads([_shared("Ep01.mkv")]) == []
 
 
 @pytest.mark.asyncio

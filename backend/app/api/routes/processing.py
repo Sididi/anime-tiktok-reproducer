@@ -10,12 +10,12 @@ import json
 import re
 import tempfile
 from pathlib import Path
-from threading import Lock
 import wave
 from pydantic import BaseModel
 
 from pydub import AudioSegment
 
+from ...services.drive_export_job import DriveExportJobs
 from ...services.drive_prewarm_service import DrivePrewarmService
 from ...services.executors import run_heavy
 from ...config import settings
@@ -66,12 +66,6 @@ def _llm_endpoint_payload(project=None) -> dict[str, Any]:
 
 
 UPLOAD_CHUNK_SIZE = 1024 * 1024
-_gdrive_upload_locks_guard = Lock()
-_gdrive_upload_locks: dict[str, Lock] = {}
-
-
-class DriveUploadInProgressError(RuntimeError):
-    """Raised when an upload is already active for the same project."""
 
 
 class MetadataPromptRequest(BaseModel):
@@ -186,43 +180,26 @@ def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
         pass
 
 
-def _get_gdrive_upload_lock(project_id: str) -> Lock:
-    with _gdrive_upload_locks_guard:
-        existing = _gdrive_upload_locks.get(project_id)
-        if existing is not None:
-            return existing
-        lock = Lock()
-        _gdrive_upload_locks[project_id] = lock
-        return lock
-
-
 async def _upload_manifest_and_persist(
-    project_id: str,
     project,
     matches,
     progress_callback=None,
 ) -> dict[str, Any]:
-    """Run upload + persistence under a project lock."""
-    lock = _get_gdrive_upload_lock(project_id)
-    if not lock.acquire(blocking=False):
-        raise DriveUploadInProgressError("Upload already in progress for this project")
-    try:
-        result = await ExportService.upload_manifest_to_drive(
-            project,
-            matches,
-            progress_callback=progress_callback,
-        )
+    """Upload the export tree, then record the Drive folder on the project."""
+    result = await ExportService.upload_manifest_to_drive(
+        project,
+        matches,
+        progress_callback=progress_callback,
+    )
 
-        def _persist() -> None:
-            project.drive_folder_id = result["folder_id"]
-            project.drive_folder_url = result["folder_url"]
-            project.drive_export_uploaded_once = True
-            ProjectService.save(project)
+    def _persist() -> None:
+        project.drive_folder_id = result["folder_id"]
+        project.drive_folder_url = result["folder_url"]
+        project.drive_export_uploaded_once = True
+        ProjectService.save(project)
 
-        await asyncio.to_thread(_persist)
-        return result
-    finally:
-        lock.release()
+    await asyncio.to_thread(_persist)
+    return result
 
 
 async def _write_upload_to_path(upload: UploadFile, destination: Path) -> None:
@@ -1274,6 +1251,24 @@ async def upload_to_gdrive(project_id: str, auto: bool = False):
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
+    # The upload is a detached job: a browser that gives up (stall watchdog,
+    # closed tab) no longer orphans it, a retry re-attaches to the running
+    # job instead of failing with "already in progress", and the Discord /
+    # Premiere-Link notification fires whether or not anyone is watching.
+    async def _runner(progress_callback):
+        return await _upload_manifest_and_persist(
+            project, matches.matches, progress_callback
+        )
+
+    async def _on_complete(result: dict[str, Any]) -> None:
+        await asyncio.to_thread(
+            _notify_drive_upload_complete, project_id, result["folder_url"]
+        )
+
+    job, attached = DriveExportJobs.start_or_attach(
+        project_id, runner=_runner, on_complete=_on_complete
+    )
+
     async def stream_progress():
         yield (
             "data: "
@@ -1282,71 +1277,44 @@ async def upload_to_gdrive(project_id: str, auto: bool = False):
                     "status": "processing",
                     "step": "gdrive",
                     "progress": 0.1,
-                    "message": "Preparing Drive upload...",
+                    "message": (
+                        "Reconnected to the running Drive upload..."
+                        if attached
+                        else "Preparing Drive upload..."
+                    ),
                     "phase": "manifest",
                 }
             )
             + "\n\n"
         )
-        try:
-            progress_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
-            sentinel = object()
+        async for payload in job.frames():
+            yield f"data: {json.dumps(_gdrive_progress_to_sse_payload(payload))}\n\n"
 
-            # The rclone adapter emits on the event loop; no cross-thread
-            # marshalling needed.
-            def _progress_callback(payload: dict[str, Any]) -> None:
-                progress_queue.put_nowait(payload)
+        if job.error is not None or job.result is None:
+            error = str(job.error or "Drive upload did not produce a result")
+            yield f"data: {json.dumps({'status': 'error', 'step': 'gdrive', 'progress': 0.0, 'error': error, 'message': 'Drive upload failed'})}\n\n"
+            return
 
-            async def _run_upload():
-                try:
-                    return await _upload_manifest_and_persist(
-                        project_id,
-                        project,
-                        matches.matches,
-                        _progress_callback,
-                    )
-                finally:
-                    progress_queue.put_nowait(sentinel)
-
-            worker = asyncio.create_task(_run_upload())
-            while True:
-                payload = await progress_queue.get()
-                if payload is sentinel:
-                    break
-                yield f"data: {json.dumps(_gdrive_progress_to_sse_payload(payload))}\n\n"
-
-            result = await worker
-            asyncio.create_task(
-                asyncio.to_thread(
-                    _notify_drive_upload_complete,
-                    project_id,
-                    result["folder_url"],
-                )
+        result = job.result
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "status": "complete",
+                    "step": "gdrive",
+                    "progress": 1.0,
+                    "message": "Upload complete",
+                    "phase": "complete",
+                    "folder_url": result["folder_url"],
+                    "folder_id": result["folder_id"],
+                    "file_count": result.get("file_count"),
+                    "files_completed": result.get("file_count"),
+                    "total_bytes": result.get("total_bytes"),
+                    "uploaded_bytes": result.get("total_bytes"),
+                }
             )
-
-            yield (
-                "data: "
-                + json.dumps(
-                    {
-                        "status": "complete",
-                        "step": "gdrive",
-                        "progress": 1.0,
-                        "message": "Upload complete",
-                        "phase": "complete",
-                        "folder_url": result["folder_url"],
-                        "folder_id": result["folder_id"],
-                        "file_count": result.get("file_count"),
-                        "files_completed": result.get("file_count"),
-                        "total_bytes": result.get("total_bytes"),
-                        "uploaded_bytes": result.get("total_bytes"),
-                    }
-                )
-                + "\n\n"
-            )
-        except DriveUploadInProgressError as exc:
-            yield f"data: {json.dumps({'status': 'error', 'step': 'gdrive', 'progress': 0.0, 'error': str(exc), 'error_code': 'upload_in_progress', 'message': 'Drive upload already running for this project'})}\n\n"
-        except Exception as exc:
-            yield f"data: {json.dumps({'status': 'error', 'step': 'gdrive', 'progress': 0.0, 'error': str(exc), 'message': 'Drive upload failed'})}\n\n"
+            + "\n\n"
+        )
 
     return StreamingResponse(
         stream_progress(),

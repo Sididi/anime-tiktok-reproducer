@@ -276,7 +276,7 @@ async def test_ensure_uploaded_reuses_uploads_and_verifies(
 
     staged_batches: list[list[str]] = []
 
-    async def _fake_copy(cls, stage_dir: Path, *, folder_id, stats_callback=None):
+    async def _fake_copy(cls, stage_dir: Path, *, folder_id, stats_callback=None, on_restart=None):
         names = sorted(p.name for p in stage_dir.iterdir())
         staged_batches.append(names)
         for name in names:
@@ -330,7 +330,7 @@ async def test_ensure_uploaded_replaces_size_mismatch(
 
     monkeypatch.setattr(GoogleDriveService, "delete_file", classmethod(_delete))
 
-    async def _fake_copy(cls, stage_dir: Path, *, folder_id, stats_callback=None):
+    async def _fake_copy(cls, stage_dir: Path, *, folder_id, stats_callback=None, on_restart=None):
         for p in stage_dir.iterdir():
             drive_children.append(
                 {"id": "d-new", "name": p.name, "size": str(p.stat().st_size)}
@@ -360,7 +360,7 @@ async def test_ensure_uploaded_fails_when_verify_finds_nothing(
         classmethod(lambda cls, folder_id, drive=None: []),
     )
 
-    async def _noop_copy(cls, stage_dir: Path, *, folder_id, stats_callback=None):
+    async def _noop_copy(cls, stage_dir: Path, *, folder_id, stats_callback=None, on_restart=None):
         return None
 
     monkeypatch.setattr(GoogleDriveRclone, "copy_tree", classmethod(_noop_copy))
@@ -404,7 +404,7 @@ async def test_ensure_uploaded_reports_wait_and_plan(
     records = await DriveSharedSources.ensure_uploaded(
         [(entry, "aa" * 32)],
         shared_folder_id="shared-1",
-        on_wait=lambda: events.append("wait"),
+        on_wait=lambda inflight: events.append("wait"),
         on_plan=lambda reused, missing: events.append(f"plan:{reused}/{missing}"),
     )
     await releaser

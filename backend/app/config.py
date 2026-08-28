@@ -219,6 +219,18 @@ class Settings(BaseSettings):
     # Startup resume only re-queues script/processing-phase projects touched
     # within this window: abandoned projects must not eat the link at boot.
     drive_prewarm_resume_max_age_days: int = 14
+    # Google throttles individual upload sessions at random (measured
+    # 2026-08-28: 3 of 11 fresh sessions crawled at ~0.7 MB/s while the rest
+    # ran at 4-12 MB/s on the same link, receiver-window limited). A batch
+    # whose trailing throughput stays under the floor for a full window is
+    # restarted so it lands on a new session; the bytes in flight are lost,
+    # so small remainders always finish, and the last allowed attempt runs
+    # unguarded.
+    drive_slow_stream_restart_enabled: bool = True
+    drive_slow_stream_min_mb_per_sec: float = 1.0
+    drive_slow_stream_window_seconds: int = 60
+    drive_slow_stream_max_restarts: int = 2
+    drive_slow_stream_min_remaining_mb: int = 64
     # Retry settings for transient SFTP/network errors (VPN flaps, NAT timeouts,
     # brief Hetzner reachability dips). Per-operation retry — the retried
     # operation re-acquires a fresh SSH session, so a half-dead pooled

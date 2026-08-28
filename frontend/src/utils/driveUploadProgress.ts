@@ -33,6 +33,15 @@ export function formatDriveUploadMessage(
     return event.message ?? null;
   }
 
+  // The backend's message is the most specific text available for a frame
+  // (hashing, "N already on Drive", waiting on a pre-warm upload with its
+  // progress, throttled-session restarts...). The strings composed below are
+  // only fallbacks for frames that carry no message.
+  const backendMessage = event.message?.trim();
+  if (backendMessage && event.phase !== "complete") {
+    return backendMessage;
+  }
+
   switch (event.phase) {
     case "manifest": {
       if (event.file_count && event.total_bytes) {
