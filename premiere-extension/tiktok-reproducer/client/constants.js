@@ -10,7 +10,7 @@
  */
 
 module.exports = {
-  ATR_BUILD_ID: "2026-08-27-cep-reliability-v19",
+  ATR_BUILD_ID: "2026-08-29-managed-target-v20",
 
   OUTPUT_FILENAME: "output.mp4",
   AUDIO_NO_MUSIC_OUTPUT_FILENAME: "output_no_music.wav",

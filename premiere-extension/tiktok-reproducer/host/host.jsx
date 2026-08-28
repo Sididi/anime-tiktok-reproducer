@@ -7,7 +7,7 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-08-27-cep-reliability-v19";
+var ATR_HOST_BUILD_ID = "2026-08-29-managed-target-v20";
 // Separates runScript()'s status from the non-fatal warnings the executed
 // script published. Must stay in sync with HOST_RUN_WARNING_SEPARATOR in
 // client/main.js.
@@ -213,6 +213,42 @@ function __atrGetProjectIdentity(projectObject) {
   return documentId || projectPath || projectName;
 }
 
+function __atrGetProjectObjectScore(projectObject) {
+  if (!projectObject) {
+    return -1;
+  }
+
+  var score = 0;
+  try {
+    if (projectObject.rootItem) {
+      score += 1000;
+      score += __atrGetProjectItemChildCount(projectObject.rootItem) * 100;
+    }
+  } catch (eRootItem) {}
+  try {
+    if (projectObject.sequences) {
+      score += 1000;
+      score += Number(projectObject.sequences.numSequences || 0) * 1000;
+    }
+  } catch (eSequences) {}
+  try {
+    if (projectObject.activeSequence) {
+      score += 10000;
+    }
+  } catch (eActiveSequence) {}
+  try {
+    if (projectObject.path) {
+      score += 10;
+    }
+  } catch (ePath) {}
+  try {
+    if (projectObject.name) {
+      score += 1;
+    }
+  } catch (eName) {}
+  return score;
+}
+
 function __atrPushUniqueProject(projects, projectObject) {
   if (!projectObject) {
     return;
@@ -230,6 +266,17 @@ function __atrPushUniqueProject(projects, projectObject) {
       existingIdentity &&
       candidateIdentity === existingIdentity
     ) {
+      // Premiere can retain multiple ExtendScript wrappers for a project that
+      // has been closed and reopened at the same path. documentID/path are
+      // project identities, not wrapper-instance identities. Keep the wrapper
+      // that exposes the richest current project state instead of whichever
+      // stale wrapper app.projects happened to return first.
+      if (
+        __atrGetProjectObjectScore(projectObject) >
+        __atrGetProjectObjectScore(projects[i])
+      ) {
+        projects[i] = projectObject;
+      }
       return;
     }
   }
@@ -238,6 +285,29 @@ function __atrPushUniqueProject(projects, projectObject) {
 
 function __atrGetOpenProjects() {
   var projects = [];
+  // Prefer the front Project object. app.projects may still expose an older
+  // same-identity wrapper after the scratch project is recycled.
+  try {
+    if (app && app.project) {
+      __atrPushUniqueProject(projects, app.project);
+    }
+  } catch (eActiveProject) {}
+
+  // Project view IDs provide a second, documented route to the Project
+  // objects currently represented in Premiere's Project panels.
+  try {
+    if (app && app.getProjectViewIDs && app.getProjectFromViewID) {
+      var viewIds = app.getProjectViewIDs();
+      var viewCount = Number(viewIds && viewIds.length || 0);
+      for (var viewIndex = 0; viewIndex < viewCount; viewIndex += 1) {
+        var viewProject = app.getProjectFromViewID(viewIds[viewIndex]);
+        if (viewProject) {
+          __atrPushUniqueProject(projects, viewProject);
+        }
+      }
+    }
+  } catch (eProjectViews) {}
+
   try {
     if (app && app.projects) {
       var count = Number(app.projects.numProjects || app.projects.length || 0);
@@ -246,11 +316,7 @@ function __atrGetOpenProjects() {
       }
     }
   } catch (eProjects) {}
-  try {
-    if (app && app.project) {
-      __atrPushUniqueProject(projects, app.project);
-    }
-  } catch (eActiveProject) {}
+
   return projects;
 }
 
@@ -1864,6 +1930,52 @@ function __atrGetProjectSequences(projectObject) {
   }
 }
 
+function __atrPushUniqueSequence(sequences, sequence) {
+  if (!sequence) {
+    return;
+  }
+  var candidateId = __atrGetSequenceId(sequence);
+  for (var i = 0; i < sequences.length; i += 1) {
+    try {
+      if (sequences[i] === sequence) {
+        return;
+      }
+    } catch (eSameSequence) {}
+    var existingId = __atrGetSequenceId(sequences[i]);
+    if (candidateId && existingId && candidateId === existingId) {
+      return;
+    }
+  }
+  sequences.push(sequence);
+}
+
+function __atrGetProjectSequenceCandidates(projectObject) {
+  var candidates = [];
+  if (!projectObject) {
+    return candidates;
+  }
+
+  // activeSequence can remain valid while a stale SequenceCollection wrapper
+  // reports zero entries after a project close/reopen cycle.
+  try {
+    __atrPushUniqueSequence(candidates, projectObject.activeSequence || null);
+  } catch (eActiveSequence) {}
+
+  var sequenceCollection = __atrGetProjectSequences(projectObject);
+  var count = 0;
+  try {
+    count = Number(sequenceCollection && sequenceCollection.numSequences || 0);
+  } catch (eSequenceCount) {
+    count = 0;
+  }
+  for (var i = 0; i < count; i += 1) {
+    try {
+      __atrPushUniqueSequence(candidates, sequenceCollection[i]);
+    } catch (eSequenceItem) {}
+  }
+  return candidates;
+}
+
 function __atrFindDirectChildByName(containerItem, itemName) {
   var targetName = __atrSafeString(itemName);
   var count = __atrGetProjectItemChildCount(containerItem);
@@ -1936,13 +2048,8 @@ function __atrDescribeManagedSequence(projectId, projectObject, sequence) {
 
 function __atrDescribeManagedProject(projectObject, hasAutomationBin, rootMatch) {
   var sequenceDescriptions = [];
-  var sequences = __atrGetProjectSequences(projectObject);
-  var sequenceCount = 0;
-  try {
-    sequenceCount = Number(sequences && sequences.numSequences || 0);
-  } catch (eSequenceCount) {
-    sequenceCount = 0;
-  }
+  var sequences = __atrGetProjectSequenceCandidates(projectObject);
+  var sequenceCount = sequences.length;
   for (var i = 0; i < sequenceCount && i < 20; i += 1) {
     if (!sequences[i]) {
       continue;
@@ -1976,7 +2083,39 @@ function __atrResolveManagedSequence(entry, allowRepair) {
   var expectedName = __atrSafeString(entry && entry.sequence_name);
   var localRoot = __atrNormalizePath(entry && entry.local_root);
   var automationBinName = "__ATR_PROJECT__" + projectId;
+  var registeredTarget = __atrManagedExportTargetsByProjectId[projectId];
+  if (
+    registeredTarget &&
+    registeredTarget.project &&
+    registeredTarget.sequence &&
+    (!expectedName ||
+      __atrGetSequenceName(registeredTarget.sequence) === expectedName)
+  ) {
+    var registeredDescriptor = __atrDescribeManagedSequence(
+      projectId,
+      registeredTarget.project,
+      registeredTarget.sequence,
+    );
+    if (registeredDescriptor.sequence_id && registeredDescriptor.sequence_name) {
+      registeredDescriptor.repaired_name = false;
+      registeredDescriptor.registered_target = true;
+      return {
+        status: "resolved",
+        target: registeredTarget,
+        descriptor: registeredDescriptor,
+        projects: [],
+      };
+    }
+  }
   var projects = __atrGetOpenProjects();
+  // runScript() captures the exact Project object used by every managed
+  // import. Include those references only for sequence recovery; treating them
+  // as globally open would break cleanup's post-close verification.
+  for (var remembered = 0;
+    remembered < __atrImportedProjectRefs.length;
+    remembered += 1) {
+    __atrPushUniqueProject(projects, __atrImportedProjectRefs[remembered]);
+  }
   var exactCandidates = [];
   var binCandidates = [];
   var projectDiagnostics = [];
@@ -2001,13 +2140,8 @@ function __atrResolveManagedSequence(entry, allowRepair) {
     var binNodeIds = automationBin
       ? __atrCollectProjectItemNodeIds(automationBin, {})
       : {};
-    var sequences = __atrGetProjectSequences(projectObject);
-    var sequenceCount = 0;
-    try {
-      sequenceCount = Number(sequences && sequences.numSequences || 0);
-    } catch (eSequenceCount) {
-      sequenceCount = 0;
-    }
+    var sequences = __atrGetProjectSequenceCandidates(projectObject);
+    var sequenceCount = sequences.length;
     for (var s = 0; s < sequenceCount; s += 1) {
       var sequence = sequences[s];
       if (!sequence) {
@@ -2132,7 +2266,9 @@ function preflightManagedBatchExport(batchJson) {
     var resolved = [];
     var missing = [];
     var ambiguous = [];
-    __atrManagedExportTargetsByProjectId = {};
+    // Keep targets captured immediately after import. Rebuilding this map here
+    // used to discard the only reliable direct references before preflight
+    // searched Premiere's occasionally stale Project/Sequence collections.
     for (var i = 0; i < entries.length; i += 1) {
       var entry = entries[i] || {};
       var projectId = __atrSafeString(entry.project_id);
@@ -3164,6 +3300,7 @@ function openCleanupScratchProject(scratchProjectPath) {
       __atrCleanupClosingProjectIdentities = [];
       __atrCleanupTargetProjectRefs = [];
       __atrImportedProjectRefs = [];
+      __atrManagedExportTargetsByProjectId = {};
     }
     return JSON.stringify(result);
   } catch (e) {
@@ -3204,11 +3341,25 @@ function verifyImportedProjectsCleanup(localRootsJson) {
 /**
  * Execute a .jsx script file with error handling.
  * @param {string} scriptPath - Absolute path to the .jsx file (forward slashes)
+ * @param {string} managedProjectId - Optional project ID requiring sequence validation
+ * @param {string} managedSequenceName - Optional expected managed sequence name
+ * @param {string} managedLocalRoot - Optional downloaded project root for resolution
  * @returns {string} "OK", "OK::ATR_WARN::<warnings>" on success (non-fatal
  *   issues the script published), or "ERROR: ..." on failure
  */
-function runScript(scriptPath) {
+function runScript(
+  scriptPath,
+  managedProjectId,
+  managedSequenceName,
+  managedLocalRoot
+) {
   try {
+    var normalizedManagedProjectId = __atrSafeString(managedProjectId);
+    var normalizedManagedSequenceName = __atrSafeString(managedSequenceName);
+    var normalizedManagedLocalRoot = __atrNormalizePath(managedLocalRoot);
+    if (normalizedManagedProjectId) {
+      delete __atrManagedExportTargetsByProjectId[normalizedManagedProjectId];
+    }
     var file = new File(scriptPath);
     if (!file.exists) {
       return "ERROR: File not found: " + scriptPath;
@@ -3228,6 +3379,34 @@ function runScript(scriptPath) {
     try {
       __atrRememberImportedProject(app && app.project ? app.project : null);
     } catch (eRememberAfter) {}
+
+    if (normalizedManagedProjectId) {
+      var expectedManagedSequenceName =
+        normalizedManagedSequenceName ||
+        "ATR_BATCH__" + normalizedManagedProjectId;
+      var managedResolution = __atrResolveManagedSequence(
+        {
+          project_id: normalizedManagedProjectId,
+          sequence_name: expectedManagedSequenceName,
+          local_root: normalizedManagedLocalRoot,
+        },
+        true,
+      );
+      if (!managedResolution || managedResolution.status !== "resolved") {
+        return (
+          "ERROR: Managed import created no resolvable sequence " +
+          expectedManagedSequenceName +
+          " (" +
+          __atrSafeString(
+            managedResolution && managedResolution.reason || "not resolved",
+          ) +
+          ")"
+        );
+      }
+      __atrManagedExportTargetsByProjectId[normalizedManagedProjectId] =
+        managedResolution.target;
+    }
+
     // Report the warnings in THIS round-trip. The panel used to fetch them with
     // a second evalScript right after a multi-minute import; that follow-up call
     // can be swallowed once Premiere returns to its event loop, which stranded
@@ -3296,13 +3475,8 @@ function setPanelPersistent() {
 
 function __atrFindSequenceByIdInProject(projectObject, sequenceId) {
   var targetId = __atrSafeString(sequenceId);
-  var sequences = __atrGetProjectSequences(projectObject);
-  var count = 0;
-  try {
-    count = Number(sequences && sequences.numSequences || 0);
-  } catch (eCount) {
-    count = 0;
-  }
+  var sequences = __atrGetProjectSequenceCandidates(projectObject);
+  var count = sequences.length;
   for (var i = 0; i < count; i += 1) {
     if (sequences[i] && __atrGetSequenceId(sequences[i]) === targetId) {
       return sequences[i];
@@ -3322,6 +3496,29 @@ function __atrResolvePreflightedExportTarget(descriptor) {
 
   var openProjects = __atrGetOpenProjects();
   var cached = __atrManagedExportTargetsByProjectId[projectId];
+  if (
+    cached &&
+    cached.project &&
+    cached.sequence &&
+    __atrGetProjectIdentity(cached.project) === projectIdentity &&
+    __atrGetSequenceId(cached.sequence) === sequenceId
+  ) {
+    // The direct Sequence object captured at import/preflight is authoritative.
+    // Do not require it to reappear in project.sequences: that collection is
+    // the stale-wrapper failure mode this cache exists to survive.
+    try {
+      if (
+        __atrGetSequenceName(cached.sequence) &&
+        __atrGetProjectIdentity(cached.project)
+      ) {
+        return {
+          project: cached.project,
+          sequence: cached.sequence,
+        };
+      }
+    } catch (eCachedTarget) {}
+  }
+
   if (
     cached &&
     cached.project &&

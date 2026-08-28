@@ -1950,8 +1950,12 @@
     };
   }
 
-  function runScript(jsxPath) {
+  function runScript(jsxPath, managedProjectId, managedLocalRoot) {
     var normalized = String(jsxPath || "").replace(/\\/g, "/");
+    var normalizedManagedProjectId = String(managedProjectId || "").trim();
+    var normalizedManagedLocalRoot = String(managedLocalRoot || "")
+      .trim()
+      .replace(/\\/g, "/");
     var runStartedAt = Date.now();
     var subtitleExpandStartedAt = runStartedAt;
     var subtitleExpandElapsedMs = 0;
@@ -1983,8 +1987,22 @@
           );
         }
         hostStartedAt = Date.now();
+        var hostCall = 'runScript("' + escapeForEval(normalized) + '"';
+        if (normalizedManagedProjectId) {
+          hostCall +=
+            ',"' +
+            escapeForEval(normalizedManagedProjectId) +
+            '","' +
+            escapeForEval(
+              buildProjectSequenceName(normalizedManagedProjectId),
+            ) +
+            '","' +
+            escapeForEval(normalizedManagedLocalRoot) +
+            '"';
+        }
+        hostCall += ")";
         return evalHostScriptRun(
-          'runScript("' + escapeForEval(normalized) + '")',
+          hostCall,
         );
       })
       .then(function (result) {
@@ -3430,7 +3448,11 @@
             });
         }
 
-        return runScript(importPath).then(function (runOutcome) {
+        return runScript(
+          importPath,
+          projectId,
+          result.local_root,
+        ).then(function (runOutcome) {
           var readyAtIso = nowIso();
           var audioOutputPath = path.join(
             path.dirname(String(result.output_path || "")),

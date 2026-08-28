@@ -70,6 +70,10 @@ function createProject(options) {
       children: collection(rootChildren, "numItems"),
     },
     sequences: collection(sequences, "numSequences"),
+    activeSequence:
+      opts.activeSequence === false || sequences.length === 0
+        ? null
+        : sequences[sequences.length - 1],
     openedSequenceIds: [],
     openSequence: function (sequenceId) {
       this.openedSequenceIds.push(String(sequenceId));
@@ -381,6 +385,141 @@ test("host preflight resolves an exact sequence in a non-active project", functi
   assert.strictEqual(result.resolved[0].repaired_name, false);
 });
 
+test("host preflight prefers the populated live wrapper over stale same-identity scratch", function () {
+  var staleScratch = createProject({
+    projectId: "stale",
+    identity: "shared-scratch-document",
+    name: "ATR_Automation_Scratch.prproj",
+    projectPath: "C:/state/ATR_Automation_Scratch.prproj",
+    sequences: [],
+    withBin: false,
+  });
+  var liveScratch = createProject({
+    projectId: "live",
+    identity: "shared-scratch-document",
+    name: "ATR_Automation_Scratch.prproj",
+    projectPath: "C:/state/ATR_Automation_Scratch.prproj",
+    sequences: [
+      { name: "ATR_BATCH__live", id: "sequence-live" },
+    ],
+  });
+  // app.projects returns the stale wrapper first; app.project is the populated
+  // live wrapper. The old identity-only dedupe discarded app.project here.
+  var harness = createHostHarness(
+    [staleScratch, liveScratch],
+    liveScratch.project,
+  );
+  var result = preflight(harness, [
+    {
+      project_id: "live",
+      sequence_name: "ATR_BATCH__live",
+      local_root: "C:/downloads/live",
+    },
+  ]);
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.resolved[0].sequence_id, "sequence-live");
+});
+
+test("host preflight can recover a populated project through its Project view", function () {
+  var staleScratch = createProject({
+    projectId: "view",
+    identity: "view-scratch-document",
+    name: "ATR_Automation_Scratch.prproj",
+    projectPath: "C:/state/ATR_Automation_Scratch.prproj",
+    sequences: [],
+    withBin: false,
+  });
+  var liveScratch = createProject({
+    projectId: "view",
+    identity: "view-scratch-document",
+    name: "ATR_Automation_Scratch.prproj",
+    projectPath: "C:/state/ATR_Automation_Scratch.prproj",
+    sequences: [
+      { name: "ATR_BATCH__view", id: "sequence-view" },
+    ],
+  });
+  var harness = createHostHarness([staleScratch], staleScratch.project);
+  harness.app.getProjectViewIDs = function () {
+    return ["live-view"];
+  };
+  harness.app.getProjectFromViewID = function () {
+    return liveScratch.project;
+  };
+  var result = preflight(harness, [
+    {
+      project_id: "view",
+      sequence_name: "ATR_BATCH__view",
+      local_root: "C:/downloads/view",
+    },
+  ]);
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.resolved[0].sequence_id, "sequence-view");
+});
+
+test("remembered import references are not reported as globally open projects", function () {
+  var liveScratch = createProject({
+    projectId: "live-open",
+    identity: "live-open-owner",
+    sequences: [],
+    withBin: false,
+  });
+  var closedImport = createProject({
+    projectId: "closed-import",
+    identity: "closed-import-owner",
+    sequences: [
+      { name: "ATR_BATCH__closed-import", id: "sequence-closed" },
+    ],
+  });
+  var harness = createHostHarness([liveScratch], liveScratch.project);
+  harness.context.__atrImportedProjectRefs = [closedImport.project];
+  var openProjects = harness.context.__atrGetOpenProjects();
+  assert.strictEqual(openProjects.length, 1);
+  assert.strictEqual(openProjects[0], liveScratch.project);
+});
+
+test("managed runScript validates and captures its exact export target", function () {
+  var owner = createProject({
+    projectId: "captured",
+    identity: "captured-owner",
+    sequences: [
+      { name: "ATR_BATCH__captured", id: "sequence-captured" },
+    ],
+  });
+  var harness = createHostHarness([owner], owner.project);
+  harness.context.$.evalFile = function () {};
+  var result = harness.context.runScript(
+    "C:/downloads/captured/import_project.jsx",
+    "captured",
+    "ATR_BATCH__captured",
+    "C:/downloads/captured",
+  );
+  assert.strictEqual(result, "OK");
+  assert.strictEqual(
+    harness.context.__atrManagedExportTargetsByProjectId.captured.sequence,
+    owner.sequences[0],
+  );
+
+  var missing = createProject({
+    projectId: "missing-capture",
+    identity: "missing-capture-owner",
+    sequences: [],
+  });
+  var missingHarness = createHostHarness([missing], missing.project);
+  missingHarness.context.$.evalFile = function () {};
+  var missingResult = missingHarness.context.runScript(
+    "C:/downloads/missing/import_project.jsx",
+    "missing-capture",
+    "ATR_BATCH__missing-capture",
+    "C:/downloads/missing",
+  );
+  assert.ok(
+    String(missingResult).indexOf(
+      "ERROR: Managed import created no resolvable sequence",
+    ) === 0,
+    missingResult,
+  );
+});
+
 test("host preflight repairs exactly one automation-bin sequence", function () {
   var owner = createProject({
     projectId: "repair",
@@ -474,6 +613,60 @@ test("managed export activates and queues through the owning project", function 
   assert.strictEqual(harness.app.project, scratch.project);
 });
 
+test("managed export uses the captured sequence when SequenceCollection is stale", function () {
+  var owner = createProject({
+    projectId: "cached",
+    identity: "cached-owner",
+    sequences: [],
+    activeSequence: false,
+  });
+  var capturedSequence = createSequence(
+    "ATR_BATCH__cached",
+    "sequence-cached",
+    owner.bin,
+  );
+  var harness = createHostHarness([owner], owner.project);
+  harness.context.__atrManagedExportTargetsByProjectId.cached = {
+    project: owner.project,
+    sequence: capturedSequence,
+  };
+  var result = preflight(harness, [
+    {
+      project_id: "cached",
+      sequence_name: "ATR_BATCH__cached",
+      local_root: "C:/downloads/cached",
+    },
+  ]);
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.resolved[0].registered_target, true);
+
+  var raw = harness.context.startManagedExport(
+    JSON.stringify({
+      resolved_sequence: result.resolved[0],
+      output_path: "C:/downloads/cached/output.mp4",
+      preset_path: "C:/presets/video.epr",
+      audio_export: { enabled: false },
+    }),
+  );
+  assert.ok(String(raw).indexOf("ERROR:") !== 0, raw);
+  assert.deepStrictEqual(owner.project.openedSequenceIds, ["sequence-cached"]);
+  assert.strictEqual(harness.encodedSequences[0], capturedSequence);
+});
+
+test("managed download/import passes sequence validation metadata to host", function () {
+  var mainSource = fs.readFileSync(path.join(clientRoot, "main.js"), "utf8");
+  assert.ok(
+    /runScript\(\s*importPath,\s*projectId,\s*result\.local_root,/m.test(
+      mainSource,
+    ),
+  );
+  assert.ok(
+    mainSource.indexOf(
+      "buildProjectSequenceName(normalizedManagedProjectId)",
+    ) !== -1,
+  );
+});
+
 test("failed preflight precedes and leaves AME/proxy clearing untouched", function () {
   var owner = createProject({
     projectId: "missing",
@@ -520,7 +713,7 @@ test("CEP build gate is synchronized and the fork worker is gone", function () {
   );
   assert.ok(hostBuildMatch);
   assert.strictEqual(hostBuildMatch[1], constants.ATR_BUILD_ID);
-  assert.ok(manifestSource.indexOf('ExtensionBundleVersion="1.0.3"') !== -1);
+  assert.ok(manifestSource.indexOf('ExtensionBundleVersion="1.0.4"') !== -1);
   assert.strictEqual(mainSource.indexOf("childProcess.fork"), -1);
   assert.strictEqual(
     fs.existsSync(path.join(clientRoot, "drive_worker.js")),
