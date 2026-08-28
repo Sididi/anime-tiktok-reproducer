@@ -31,7 +31,7 @@ torchcodec = ">=0.7.0,<0.8.0"
 # in-process NVDEC via NVIDIA's PyNvVideoCodec; nvidia-npp-cu12 provides the
 # NPP runtime it links. Both are optional at runtime: a capability probe falls
 # back transparently to cv2 per-process when the decoder/driver is unavailable.
-pynvvideocodec = "==2.1.0"
+pynvvideocodec = "==2.2.2"
 nvidia-npp-cu12 = ">=12.4,<13"
 
 # WhisperX — now used ONLY for wav2vec2 forced alignment + audio loading
