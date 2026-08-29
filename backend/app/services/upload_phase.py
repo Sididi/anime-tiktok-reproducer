@@ -483,25 +483,9 @@ class UploadPhaseService:
                     time.sleep(min(0.25 * attempt, 0.75))
 
         def _build_row(project: Project) -> dict[str, Any]:
-            project_dir = ProjectService.get_project_dir(project.id)
-            metadata_exists = ProjectService.get_metadata_file(project.id).exists()
             if upload_locked[project.id]:
-                # Upload-locked: the row's readiness is never surfaced, so
-                # answer from persisted data (folder link, preview video id)
-                # without touching Drive or the shared video cache.
-                folder_id, folder_url = cls._resolve_drive_folder_offline(
+                readiness = cls._locked_manager_readiness(
                     project, folder_candidates_by_name
-                )
-                video = _persisted_drive_video(project) or cls._cached_drive_video(
-                    project_id=project.id,
-                    folder_id=folder_id,
-                )
-                readiness = cls._build_readiness(
-                    metadata_exists=metadata_exists,
-                    folder_id=folder_id,
-                    folder_url=folder_url,
-                    video_files=[video] if video else [],
-                    video_lookup_failed=video is None,
                 )
             else:
                 folder_id, folder_url = cls._resolve_drive_folder(
@@ -525,46 +509,13 @@ class UploadPhaseService:
                         video_files=video_files,
                     )
                 readiness = cls._build_readiness(
-                    metadata_exists=metadata_exists,
+                    metadata_exists=ProjectService.get_metadata_file(project.id).exists(),
                     folder_id=folder_id,
                     folder_url=folder_url,
                     video_files=video_files,
                     video_lookup_failed=drive_batch_lookup_failed,
                 )
-            return {
-                "project_id": project.id,
-                "anime_title": project.anime_name,
-                "library_type": project.library_type.value,
-                "language": project.output_language,
-                "local_size_bytes": _dir_size(project_dir) if project_dir.exists() else 0,
-                **_uploaded_fields(project),
-                "can_upload_status": readiness.status,
-                "can_upload_reasons": readiness.reasons,
-                "has_metadata": readiness.metadata_exists,
-                "drive_video_count": readiness.drive_video_count,
-                "drive_video_name": readiness.drive_video_name,
-                "drive_video_web_url": readiness.drive_video_web_url,
-                "drive_folder_id": readiness.drive_folder_id,
-                "drive_folder_url": readiness.drive_folder_url,
-                "drive_video_id": readiness.drive_video_id,
-                "created_at": project.created_at.isoformat() if project.created_at else None,
-                "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
-                "scheduled_account_id": project.scheduled_account_id,
-                "mother_project_id": project.mother_project_id,
-                "platform_schedules": {
-                    platform: {
-                        "slot": ps.slot.isoformat(),
-                        "scheduled_at": ps.scheduled_at.isoformat(),
-                    }
-                    for platform, ps in (project.platform_schedules or {}).items()
-                },
-                "llm_preset_resolved": project.resolved_llm_preset_key(),
-                "llm_preset_is_default": project.llm_preset is None,
-                "template_resolved": project.resolved_template_key(),
-                "template_is_default": project.template is None,
-                "min_playback_speed_resolved": project.resolved_min_playback_speed(),
-                "min_playback_speed_is_default": project.min_playback_speed is None,
-            }
+            return cls._manager_row_payload(project, readiness)
 
         if not projects:
             return []
@@ -580,6 +531,93 @@ class UploadPhaseService:
                 idx = future_to_index[future]
                 rows[idx] = future.result()
         return [row for row in rows if row is not None]
+
+    @classmethod
+    def _locked_manager_readiness(
+        cls,
+        project: Project,
+        folder_candidates_by_name: dict[str, dict[str, Any]] | None,
+    ) -> UploadReadiness:
+        """Readiness for an upload-locked row, resolved without touching Drive.
+
+        Locked rows render with the Upload button disabled, so their Drive
+        readiness is never surfaced: answer from persisted data (folder link,
+        preview video id) instead of issuing a lookup.
+        """
+        folder_id, folder_url = cls._resolve_drive_folder_offline(
+            project, folder_candidates_by_name
+        )
+        video = _persisted_drive_video(project) or cls._cached_drive_video(
+            project_id=project.id,
+            folder_id=folder_id,
+        )
+        return cls._build_readiness(
+            metadata_exists=ProjectService.get_metadata_file(project.id).exists(),
+            folder_id=folder_id,
+            folder_url=folder_url,
+            video_files=[video] if video else [],
+            video_lookup_failed=video is None,
+        )
+
+    @classmethod
+    def get_manager_row(cls, project_id: str) -> dict[str, Any] | None:
+        """Build a single manager row without the all-projects Drive sweep.
+
+        The manager refreshes one row after an upload reaches a terminal state.
+        By then the project is upload-locked, so its readiness comes from
+        persisted data and the call costs no Drive requests at all. A row that
+        is still unlocked falls back to the single-project live lookup, which
+        is still one project's worth of work instead of the whole list's.
+        """
+        project = ProjectService.load(project_id)
+        if project is None:
+            return None
+        readiness = (
+            cls._locked_manager_readiness(project, None)
+            if _upload_locked(project)
+            else cls.compute_readiness(project)
+        )
+        return cls._manager_row_payload(project, readiness)
+
+    @classmethod
+    def _manager_row_payload(
+        cls, project: Project, readiness: UploadReadiness
+    ) -> dict[str, Any]:
+        project_dir = ProjectService.get_project_dir(project.id)
+        return {
+            "project_id": project.id,
+            "anime_title": project.anime_name,
+            "library_type": project.library_type.value,
+            "language": project.output_language,
+            "local_size_bytes": _dir_size(project_dir) if project_dir.exists() else 0,
+            **_uploaded_fields(project),
+            "can_upload_status": readiness.status,
+            "can_upload_reasons": readiness.reasons,
+            "has_metadata": readiness.metadata_exists,
+            "drive_video_count": readiness.drive_video_count,
+            "drive_video_name": readiness.drive_video_name,
+            "drive_video_web_url": readiness.drive_video_web_url,
+            "drive_folder_id": readiness.drive_folder_id,
+            "drive_folder_url": readiness.drive_folder_url,
+            "drive_video_id": readiness.drive_video_id,
+            "created_at": project.created_at.isoformat() if project.created_at else None,
+            "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
+            "scheduled_account_id": project.scheduled_account_id,
+            "mother_project_id": project.mother_project_id,
+            "platform_schedules": {
+                platform: {
+                    "slot": ps.slot.isoformat(),
+                    "scheduled_at": ps.scheduled_at.isoformat(),
+                }
+                for platform, ps in (project.platform_schedules or {}).items()
+            },
+            "llm_preset_resolved": project.resolved_llm_preset_key(),
+            "llm_preset_is_default": project.llm_preset is None,
+            "template_resolved": project.resolved_template_key(),
+            "template_is_default": project.template is None,
+            "min_playback_speed_resolved": project.resolved_min_playback_speed(),
+            "min_playback_speed_is_default": project.min_playback_speed is None,
+        }
 
     _FRENCH_DAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
     _FRENCH_MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"]

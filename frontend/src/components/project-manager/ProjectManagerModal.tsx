@@ -85,7 +85,7 @@ interface UploadSession {
 
 const LOAD_RETRY_DELAY_MS = 1000;
 const LOAD_RETRY_WINDOW_MS = 45000;
-const TERMINAL_RELOAD_DEBOUNCE_MS = 400;
+const TERMINAL_ROW_REFRESH_DEBOUNCE_MS = 400;
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => {
@@ -179,7 +179,7 @@ export function ProjectManagerModal({
   const uploadSessionsRef = useRef<Record<string, UploadSession>>({});
 
   const [activeDeleteId, setActiveDeleteId] = useState<string | null>(null);
-  const reloadRowsTimerRef = useRef<number | null>(null);
+  const rowRefreshTimersRef = useRef<Record<string, number>>({});
 
   const [accountPickerForProject, setAccountPickerForProject] = useState<
     string | null
@@ -272,15 +272,55 @@ export function ProjectManagerModal({
     }
   }, []);
 
-  const scheduleRowsReload = useCallback(() => {
-    if (reloadRowsTimerRef.current) {
-      window.clearTimeout(reloadRowsTimerRef.current);
-    }
-    reloadRowsTimerRef.current = window.setTimeout(() => {
-      reloadRowsTimerRef.current = null;
-      void loadData();
-    }, TERMINAL_RELOAD_DEBOUNCE_MS);
-  }, [loadData]);
+  const patchRow = useCallback((row: ProjectManagerRow) => {
+    setRows((prev) => {
+      const index = prev.findIndex((r) => r.project_id === row.project_id);
+      if (index === -1) return prev;
+      const next = [...prev];
+      next[index] = row;
+      return next;
+    });
+  }, []);
+
+  const dropRows = useCallback((projectIds: Iterable<string>) => {
+    const removed = new Set(projectIds);
+    if (removed.size === 0) return;
+    setRows((prev) => prev.filter((r) => !removed.has(r.project_id)));
+  }, []);
+
+  /**
+   * Re-read a single row instead of the whole table.
+   *
+   * A full `loadData()` re-runs the all-projects Drive lookup, which is by far
+   * the slowest thing this modal does; nothing about one project settling
+   * changes the other rows, so only that row is refetched.
+   */
+  const refreshRow = useCallback(
+    async (projectId: string) => {
+      try {
+        const { project } = await api.getProjectManagerRow(projectId);
+        patchRow(project);
+      } catch {
+        // A single stale row is not worth an error banner: the next manual
+        // refresh (or reopen) reconciles it.
+      }
+    },
+    [patchRow],
+  );
+
+  const scheduleRowRefresh = useCallback(
+    (projectId: string) => {
+      const timers = rowRefreshTimersRef.current;
+      if (timers[projectId]) {
+        window.clearTimeout(timers[projectId]);
+      }
+      timers[projectId] = window.setTimeout(() => {
+        delete timers[projectId];
+        void refreshRow(projectId);
+      }, TERMINAL_ROW_REFRESH_DEBOUNCE_MS);
+    },
+    [refreshRow],
+  );
 
   const uploadJobsRef = useRef<Record<string, ProjectUploadJob>>({});
   const upsertUploadJob = useCallback(
@@ -299,10 +339,10 @@ export function ProjectManagerModal({
       }));
 
       if (isNewTerminalState) {
-        scheduleRowsReload();
+        scheduleRowRefresh(job.project_id);
       }
     },
-    [scheduleRowsReload],
+    [scheduleRowRefresh],
   );
 
   useEffect(() => {
@@ -352,9 +392,9 @@ export function ProjectManagerModal({
 
   useEffect(
     () => () => {
-      if (reloadRowsTimerRef.current) {
-        window.clearTimeout(reloadRowsTimerRef.current);
-      }
+      const timers = rowRefreshTimersRef.current;
+      Object.values(timers).forEach((id) => window.clearTimeout(id));
+      rowRefreshTimersRef.current = {};
     },
     [],
   );
@@ -433,6 +473,13 @@ export function ProjectManagerModal({
             own_reservations: context.urgent.ownReservations ?? null,
             confirm_before_tiktok: true,
           });
+          // The shift is the one thing that mutates *other* rows, and the
+          // response names them: refresh just those instead of the table.
+          new Set(
+            applied.shifts
+              .filter((s) => s.status === "ok")
+              .map((s) => s.project_id),
+          ).forEach((id) => void refreshRow(id));
           const problems = applied.shifts.filter((s) => s.status !== "ok");
           if (problems.length > 0) {
             // Non-blocking: the urgent publish proceeds; surface what could
@@ -468,7 +515,13 @@ export function ProjectManagerModal({
         setError((err as Error).message);
       }
     },
-    [isSessionCurrent, patchUploadSession, removeUploadSession, upsertUploadJob],
+    [
+      isSessionCurrent,
+      patchUploadSession,
+      refreshRow,
+      removeUploadSession,
+      upsertUploadJob,
+    ],
   );
 
   // THUMBNAIL FEATURE DISABLED (2026-08-16, owner request): the selection
@@ -702,11 +755,13 @@ export function ProjectManagerModal({
     setError(null);
     const ids = Array.from(selectedProjectIds);
     const failedIds: string[] = [];
+    const deletedIds: string[] = [];
 
     try {
       for (const id of ids) {
         try {
           await api.deleteManagedProject(id, true);
+          deletedIds.push(id);
         } catch {
           failedIds.push(id);
         }
@@ -717,16 +772,15 @@ export function ProjectManagerModal({
       setMultiDeleting(false);
     }
 
+    dropRows(deletedIds);
+
     if (failedIds.length > 0) {
-      const deletedCount = ids.length - failedIds.length;
       setError(
-        deletedCount > 0
-          ? `Deleted ${deletedCount}/${ids.length} selected projects. ${failedIds.length} failed.`
+        deletedIds.length > 0
+          ? `Deleted ${deletedIds.length}/${ids.length} selected projects. ${failedIds.length} failed.`
           : `Failed to delete ${failedIds.length} selected project${failedIds.length === 1 ? "" : "s"}.`,
       );
     }
-
-    await loadData();
   };
 
   const filteredRows = useMemo(() => {
@@ -887,14 +941,14 @@ export function ProjectManagerModal({
       setError(null);
       try {
         await api.deleteManagedProject(projectId, true);
-        await loadData();
+        dropRows([projectId]);
       } catch (err) {
         setError((err as Error).message);
       } finally {
         setActiveDeleteId(null);
       }
     },
-    [loadData],
+    [dropRows],
   );
 
   const requestDelete = (row: ProjectManagerRow) => setDeleteConfirmRow(row);

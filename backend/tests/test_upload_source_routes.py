@@ -153,3 +153,22 @@ def test_duration_check_reports_transient_preflight_as_503(
     assert response.status_code == 503
     assert response.headers["retry-after"] == "5"
     assert response.json()["detail"] == "Drive metadata temporarily unavailable"
+
+
+def test_manager_row_route_returns_single_row(client, monkeypatch):
+    monkeypatch.setattr(
+        UploadPhaseService,
+        "get_manager_row",
+        classmethod(lambda cls, pid: {"project_id": pid, "uploaded": True}),
+    )
+    resp = client.get("/api/project-manager/projects/p1/row")
+    assert resp.status_code == 200
+    assert resp.json() == {"project": {"project_id": "p1", "uploaded": True}}
+
+
+def test_manager_row_route_404_when_project_missing(client, monkeypatch):
+    monkeypatch.setattr(
+        UploadPhaseService, "get_manager_row", classmethod(lambda cls, pid: None)
+    )
+    resp = client.get("/api/project-manager/projects/p1/row")
+    assert resp.status_code == 404

@@ -72,6 +72,20 @@ async def list_project_manager_projects():
     return {"projects": rows}
 
 
+@router.get("/projects/{project_id}/row")
+async def get_project_manager_row(project_id: str):
+    """Refresh a single manager row, skipping the all-projects Drive sweep."""
+    try:
+        # Light pool: one row is a project read (no Drive sweep), so it must
+        # not queue behind heavy work while an upload/export is running.
+        row = await asyncio.to_thread(UploadPhaseService.get_manager_row, project_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"project": row}
+
+
 @router.post("/projects/{project_id}/upload")
 async def run_upload_phase(
     project_id: str,

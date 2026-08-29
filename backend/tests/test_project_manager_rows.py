@@ -197,3 +197,68 @@ def test_persisted_drive_video_recovery_variants():
 
     assert _persisted_drive_video(Project(upload_last_result=None)) is None
     assert _persisted_drive_video(Project(upload_last_result={"platforms": []})) is None
+
+
+def _set_single(monkeypatch, project):
+    """get_manager_row loads one project by id rather than listing all."""
+    monkeypatch.setattr(
+        up.ProjectService,
+        "load",
+        classmethod(lambda cls, pid: project if pid == project.id else None),
+    )
+
+
+def test_get_manager_row_for_locked_project_issues_no_drive_call(
+    drive_calls, monkeypatch
+):
+    # The row refreshed after an upload settles is upload-locked by then, so
+    # the single-row path must cost zero Drive requests.
+    posted = Project(
+        id="posted1",
+        anime_name="A",
+        scheduled_at=PAST,
+        drive_folder_id="fposted",
+        drive_folder_url="https://drive.google.com/drive/folders/fposted",
+        upload_last_result={
+            "drive_video_id": "vid123",
+            "drive_video_name": "output.mp4",
+        },
+    )
+    _set_single(monkeypatch, posted)
+    monkeypatch.setattr(
+        up.GoogleDriveService,
+        "list_project_folders_under_parent",
+        classmethod(lambda cls, **kw: (_ for _ in ()).throw(AssertionError("no Drive"))),
+    )
+    monkeypatch.setattr(
+        up.GoogleDriveService,
+        "list_root_video_files_by_parent_ids",
+        classmethod(lambda cls, *a, **kw: (_ for _ in ()).throw(AssertionError("no Drive"))),
+    )
+
+    row = UploadPhaseService.get_manager_row("posted1")
+
+    assert row is not None
+    assert row["uploaded"] is True
+    assert row["drive_video_id"] == "vid123"
+    assert row["drive_folder_url"] == "https://drive.google.com/drive/folders/fposted"
+
+
+def test_get_manager_row_matches_the_list_row(drive_calls, monkeypatch):
+    posted = Project(
+        id="posted1",
+        anime_name="A",
+        scheduled_at=PAST,
+        drive_folder_id="fposted",
+        upload_last_result={"drive_video_id": "vid123", "drive_video_name": "o.mp4"},
+    )
+    drive_calls["set_projects"]([posted])
+    listed = _rows_by_id(UploadPhaseService.list_manager_rows())["posted1"]
+
+    _set_single(monkeypatch, posted)
+    assert UploadPhaseService.get_manager_row("posted1") == listed
+
+
+def test_get_manager_row_unknown_project_is_none(drive_calls, monkeypatch):
+    monkeypatch.setattr(up.ProjectService, "load", classmethod(lambda cls, pid: None))
+    assert UploadPhaseService.get_manager_row("nope") is None

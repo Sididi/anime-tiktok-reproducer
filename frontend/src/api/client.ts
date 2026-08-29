@@ -231,6 +231,13 @@ export const api = {
       "/project-manager/projects",
     ),
 
+  // Refresh a single row (after an upload settles, a project is edited...)
+  // without paying for the all-projects Drive lookup.
+  getProjectManagerRow: (projectId: string) =>
+    request<{ project: import("@/types").ProjectManagerRow }>(
+      `/project-manager/projects/${projectId}/row`,
+    ),
+
   runProjectUpload: (
     projectId: string,
     accountId?: string,
