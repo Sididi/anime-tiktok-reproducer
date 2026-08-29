@@ -39,6 +39,7 @@ import { EpisodeSelectModal } from "@/components/matches/EpisodeSelectModal";
 import { ZoomSearchJobsBridge } from "@/components/matches/ZoomSearchJobsBridge";
 import { zoomJobMatchesSceneLayout } from "@/utils/zoomSearchLayout";
 import { ZoomSearchAlertStack } from "@/components/matches/ZoomSearchAlertStack";
+import { ContinuityClaimNavigator } from "@/components/matches/ContinuityClaimNavigator";
 import { useZoomSearchAlertStore } from "@/stores/zoomSearchAlertStore";
 import { proposeEpisodes } from "@/utils/proposeEpisodes";
 import type { MatchesClipPlayerHandle } from "@/components/video/MatchesClipPlayer";
@@ -2642,6 +2643,27 @@ export function MatchValidation() {
     [fastWatchPlaying, playFastWatchFromScene, scrollToScene],
   );
 
+  // Scene closest to the viewport centre, read straight from the DOM so the
+  // sticky navigator anchors on the real scroll position even before playback
+  // is ready (the viewport->activeSceneIndex sync only runs once it is).
+  const getAnchorSceneIndex = useCallback(() => {
+    const viewportCenter = window.innerHeight / 2;
+    let bestSceneIndex: number | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const [sceneIndex, element] of sceneRefs.current.entries()) {
+      const rect = element.getBoundingClientRect();
+      const sceneCenter = (rect.top + rect.bottom) / 2;
+      const distance = Math.abs(sceneCenter - viewportCenter);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestSceneIndex = sceneIndex;
+      }
+    }
+
+    return bestSceneIndex;
+  }, []);
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center">
@@ -3107,6 +3129,15 @@ export function MatchValidation() {
             </Button>
           </div>
         </div>
+      )}
+
+      {matches.length > 0 && (
+        <ContinuityClaimNavigator
+          claimedSceneIndices={continuitySummary.claimedSceneIndices}
+          scenePositionByIndex={scenePositionByIndex}
+          getAnchorSceneIndex={getAnchorSceneIndex}
+          onJump={handleClaimJump}
+        />
       )}
 
       {toast && (
