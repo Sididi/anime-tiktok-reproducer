@@ -116,6 +116,10 @@ function createHostHarness(projectRecords, activeProject) {
         return true;
       },
     };
+    this.remove = function () {
+      this.exists = false;
+      return true;
+    };
   }
 
   var context = vm.createContext({
@@ -713,12 +717,137 @@ test("CEP build gate is synchronized and the fork worker is gone", function () {
   );
   assert.ok(hostBuildMatch);
   assert.strictEqual(hostBuildMatch[1], constants.ATR_BUILD_ID);
-  assert.ok(manifestSource.indexOf('ExtensionBundleVersion="1.0.4"') !== -1);
+  assert.ok(manifestSource.indexOf('ExtensionBundleVersion="1.0.5"') !== -1);
   assert.strictEqual(mainSource.indexOf("childProcess.fork"), -1);
   assert.strictEqual(
     fs.existsSync(path.join(clientRoot, "drive_worker.js")),
     false,
   );
+});
+
+test("host cleanup closes a proxy-owning project while media is still linked", function () {
+  var owner = createProject({
+    projectId: "cleanup",
+    identity: "cleanup-owner",
+    sequences: [],
+  });
+  var proxyMutationCalls = 0;
+  var mediaItem = {
+    name: "episode.mkv",
+    nodeId: "cleanup-media",
+    children: collection([], "numItems"),
+    getMediaPath: function () {
+      return "C:/downloads/cleanup/sources/episode.mkv";
+    },
+    hasProxy: function () {
+      return true;
+    },
+    getProxyPath: function () {
+      return "C:/downloads/cleanup/proxies/sources/episode__atr_proxy.mp4";
+    },
+    detachProxy: function () {
+      proxyMutationCalls += 1;
+      throw new Error("cleanup must not detach proxies");
+    },
+    setOffline: function () {
+      proxyMutationCalls += 1;
+      throw new Error("cleanup must not offline media");
+    },
+  };
+  owner.bin.children = collection([mediaItem], "numItems");
+  var harness = createHostHarness([owner], owner.project);
+  var closeArguments = [];
+  owner.project.closeDocument = function (saveFirst, promptIfDirty) {
+    closeArguments.push([saveFirst, promptIfDirty]);
+    harness.app.project = null;
+    harness.app.projects = collection([], "numProjects");
+    return 0;
+  };
+
+  var raw = harness.context.closeImportedProjectsForCleanup(
+    JSON.stringify(["C:/downloads/cleanup"]),
+  );
+  assert.ok(String(raw).indexOf("ERROR:") !== 0, raw);
+  var result = JSON.parse(String(raw));
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.target_project_count, 1);
+  assert.strictEqual(result.close_requested_count, 1);
+  assert.strictEqual(result.closed_project_count, 1);
+  assert.deepStrictEqual(closeArguments, [[0, 0]]);
+  assert.strictEqual(proxyMutationCalls, 0);
+});
+
+test("cleanup scratch is recreated instead of reopening saved proxy state", function () {
+  var harness = createHostHarness([], null);
+  var newProjectPaths = [];
+  harness.app.newProject = function (projectPath) {
+    newProjectPaths.push(String(projectPath));
+    var scratch = createProject({
+      identity: "fresh-scratch",
+      name: "ATR_Automation_Scratch.prproj",
+      projectPath: String(projectPath),
+      sequences: [],
+      withBin: false,
+    }).project;
+    harness.app.project = scratch;
+    harness.app.projects = collection([scratch], "numProjects");
+    return true;
+  };
+
+  var raw = harness.context.openCleanupScratchProject(
+    "C:/state/ATR_Automation_Scratch.prproj",
+  );
+  assert.ok(String(raw).indexOf("ERROR:") !== 0, raw);
+  var result = JSON.parse(String(raw));
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.removed_existing_scratch, true);
+  assert.strictEqual(result.created_scratch, true);
+  assert.deepStrictEqual(newProjectPaths, [
+    "C:/state/ATR_Automation_Scratch.prproj",
+  ]);
+});
+
+test("cleanup closes the owning project without proxy-item mutation", function () {
+  var mainSource = fs.readFileSync(path.join(clientRoot, "main.js"), "utf8");
+  var hostSource = fs.readFileSync(hostPath, "utf8");
+  var cleanupStart = mainSource.indexOf(
+    "function cleanupImportedProjectInHost(",
+  );
+  var cleanupEnd = mainSource.indexOf(
+    "// --- Persistent project states ---",
+    cleanupStart,
+  );
+  var cleanupSource = mainSource.slice(cleanupStart, cleanupEnd);
+  var scratchStart = hostSource.indexOf(
+    "function openCleanupScratchProject(",
+  );
+  var scratchEnd = hostSource.indexOf(
+    "function verifyImportedProjectsCleanup(",
+    scratchStart,
+  );
+  var scratchSource = hostSource.slice(scratchStart, scratchEnd);
+
+  assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart);
+  assert.ok(
+    cleanupSource.indexOf("closeImportedProjectsForCleanup") !== -1,
+  );
+  assert.strictEqual(
+    cleanupSource.indexOf("prepareImportedProjectsForCleanup"),
+    -1,
+  );
+  assert.strictEqual(
+    cleanupSource.indexOf("cleanupImportedProjectsForLocalRoots"),
+    -1,
+  );
+  assert.strictEqual(
+    cleanupSource.indexOf("prepareMediaEncoderForExportInHost"),
+    -1,
+  );
+  assert.strictEqual(hostSource.indexOf(".detachProxy("), -1);
+  assert.strictEqual(hostSource.indexOf(".setOffline("), -1);
+  assert.ok(scratchSource.indexOf("scratchFile.remove()") !== -1);
+  assert.ok(scratchSource.indexOf("app.newProject") !== -1);
+  assert.strictEqual(scratchSource.indexOf("app.openDocument"), -1);
 });
 
 test("all client modules and host.jsx pass syntax checks", function () {

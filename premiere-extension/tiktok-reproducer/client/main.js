@@ -67,12 +67,8 @@
   var CLEANUP_BACKGROUND_MAX_ATTEMPTS = 3;
   var CLEANUP_RETRYABLE_MAX_PASSES = 240;
   var CLEANUP_RETRY_DELAY_MS = 15000;
-  var CLEANUP_PROXY_SETTLE_MS = 1000;
-  var CLEANUP_MEDIA_SETTLE_MS = 1000;
-  var CLEANUP_PURGE_SETTLE_MS = 2500;
   var CLEANUP_PROJECT_CLOSE_SETTLE_MS = 2000;
   var CLEANUP_SCRATCH_OPEN_SETTLE_MS = 2500;
-  var CLEANUP_PROXY_DETACH_MAX_PASSES = 5;
   var PROXY_RECONCILE_MAX_ATTACH_ATTEMPTS = 120;
   var MAX_LOG_ENTRIES = 200;
   var AME_CLEAR_MAX_ATTEMPTS = 3;
@@ -2105,158 +2101,81 @@
       return parsed;
     }
 
-    function runPreparationStage(stage) {
-      var hostCall =
-        'prepareImportedProjectsForCleanup("' +
-        escapeForEval(JSON.stringify(cleanupRoots)) +
-        '","' +
-        escapeForEval(stage) +
-        '")';
-      return evalHost(hostCall).then(function (result) {
-        var summary = parseCleanupHostResult(
-          result,
-          stage + " preparation",
-        );
-        return summary;
-      });
-    }
-
-    function runDetachPass(passNumber, preparation) {
-      return runPreparationStage("detach")
-        .then(function (detachSummary) {
-          preparation.detach_attempts.push(detachSummary);
-          // A panel-side timer yields Premiere's UI thread; $.sleep() inside
-          // ExtendScript does not let detachProxy() commit on affected Windows
-          // installations.
-          return sleep(CLEANUP_PROXY_SETTLE_MS);
-        })
-        .then(function () {
-          return runPreparationStage("verify_detach");
-        })
-        .then(function (verifySummary) {
-          preparation.detach_verification = verifySummary;
-          if (
-            verifySummary.ok ||
-            passNumber >= CLEANUP_PROXY_DETACH_MAX_PASSES
-          ) {
-            return verifySummary;
-          }
-          return runDetachPass(passNumber + 1, preparation);
-        });
-    }
-
-    var preparation = {
-      detach_attempts: [],
-      detach_verification: null,
-      offline: null,
-      media_encoder_release: null,
-    };
     var scratchProjectPath = normalizeSlashes(
       path.join(STATE_DIR, "ATR_Automation_Scratch.prproj"),
     );
-    return prepareMediaEncoderForExportInHost()
-      .then(
-        function (mediaEncoderSummary) {
-          preparation.media_encoder_release = mediaEncoderSummary || null;
-        },
-        function (mediaEncoderError) {
-          // AME queue cleanup releases completed-job handles on some Windows
-          // systems. Failure is non-fatal: the verified Premiere purge and the
-          // filesystem retry loop remain authoritative.
-          preparation.media_encoder_release = {
-            ok: false,
-            error: mediaEncoderError.message,
-          };
-        },
-      )
-      .then(function () {
-        return runDetachPass(1, preparation);
-      })
-      .then(function (detachVerification) {
-        if (!detachVerification.ok) {
-          // setOffline() while a proxy is still attached is the operation that
-          // can raise Premiere's blocking "link missing proxies" dialog. Purge
-          // the project item while both files still exist instead.
-          preparation.offline = {
-            ok: true,
-            skipped: true,
-            reason: "proxy_detach_not_verified",
-          };
-          return null;
-        }
-        return runPreparationStage("offline");
-      })
-      .then(function (offlineSummary) {
-        if (offlineSummary) {
-          preparation.offline = offlineSummary;
-        }
-        return sleep(CLEANUP_MEDIA_SETTLE_MS);
-      })
-      .then(function () {
-        var hostCall =
-          'cleanupImportedProjectsForLocalRoots("' +
-          escapeForEval(JSON.stringify(cleanupRoots)) +
-          '")';
-        return evalHost(hostCall);
-      })
+    var summary = {
+      ok: true,
+      strategy: "close_project_before_disk_cleanup",
+      target_project_count: 0,
+      sequences_deleted: 0,
+      items_moved_to_purge_bin: 0,
+      remaining_sequences: 0,
+      remaining_root_items: 0,
+      remaining_media_references: 0,
+      remaining_proxy_references: 0,
+      warnings: [],
+      project_release: null,
+      scratch_project: null,
+      release_verification: null,
+    };
+
+    // ProjectItem.detachProxy() is not part of Premiere's supported scripting
+    // surface and can enqueue a Link Media modal on Windows even after
+    // hasProxy() reports false. Do not mutate project items or the completed
+    // AME queue here. Closing the transient owning project while all media
+    // still exists is the release boundary for source and proxy records.
+    var closeCall =
+      'closeImportedProjectsForCleanup("' +
+      escapeForEval(JSON.stringify(cleanupRoots)) +
+      '")';
+    return evalHost(closeCall)
       .then(function (result) {
-        var summary = parseCleanupHostResult(result, "project purge");
-        summary.preparation = preparation;
-        summary.purge_ok = summary.ok;
-        // The live project tree can be empty while Premiere still retains
-        // proxy records internally. Closing the generated project without
-        // saving is the supported lifetime boundary for those records. A
-        // dedicated blank scratch project is then opened for the next import.
-        return sleep(CLEANUP_PURGE_SETTLE_MS).then(function () {
-          var closeCall =
-            'closeImportedProjectsAfterCleanup("' +
-            escapeForEval(JSON.stringify(cleanupRoots)) +
-            '")';
-          return evalHost(closeCall).then(function (closeResult) {
-            var projectRelease = parseCleanupHostResult(
-              closeResult,
-              "project close",
+        var projectRelease = parseCleanupHostResult(result, "project close");
+        summary.project_release = projectRelease;
+        summary.target_project_count = Number(
+          projectRelease.target_project_count || 0,
+        );
+        summary.warnings = Array.isArray(projectRelease.warnings)
+          ? projectRelease.warnings.slice()
+          : [];
+        if (!projectRelease.ok) {
+          summary.ok = false;
+          summary.error =
+            projectRelease.error ||
+            "Premiere did not accept the cleanup project close";
+          return summary;
+        }
+
+        if (Number(projectRelease.close_requested_count || 0) <= 0) {
+          return summary;
+        }
+
+        return sleep(CLEANUP_PROJECT_CLOSE_SETTLE_MS)
+          .then(function () {
+            var scratchCall =
+              'openCleanupScratchProject("' +
+              escapeForEval(scratchProjectPath) +
+              '")';
+            return evalHost(scratchCall);
+          })
+          .then(function (scratchResult) {
+            var scratchSummary = parseCleanupHostResult(
+              scratchResult,
+              "blank scratch project creation",
             );
-            summary.project_release = projectRelease;
-            if (!projectRelease.ok) {
+            summary.scratch_project = scratchSummary;
+            if (!scratchSummary.ok) {
               summary.ok = false;
               summary.error =
-                projectRelease.error ||
-                "Premiere did not release the cleanup project";
+                scratchSummary.error ||
+                "Premiere could not create the ATR scratch project";
               return summary;
             }
-
-            if (Number(projectRelease.closed_project_count || 0) <= 0) {
+            return sleep(CLEANUP_SCRATCH_OPEN_SETTLE_MS).then(function () {
               return summary;
-            }
-
-            return sleep(CLEANUP_PROJECT_CLOSE_SETTLE_MS)
-              .then(function () {
-                var scratchCall =
-                  'openCleanupScratchProject("' +
-                  escapeForEval(scratchProjectPath) +
-                  '")';
-                return evalHost(scratchCall);
-              })
-              .then(function (scratchResult) {
-                var scratchSummary = parseCleanupHostResult(
-                  scratchResult,
-                  "scratch project open",
-                );
-                summary.scratch_project = scratchSummary;
-                if (!scratchSummary.ok) {
-                  summary.ok = false;
-                  summary.error =
-                    scratchSummary.error ||
-                    "Premiere could not open the ATR scratch project";
-                  return summary;
-                }
-                return sleep(CLEANUP_SCRATCH_OPEN_SETTLE_MS).then(function () {
-                  return summary;
-                });
-              });
+            });
           });
-        });
       })
       .then(function (summary) {
         if (
@@ -2273,27 +2192,20 @@
         return evalHost(verifyCall).then(function (verifyResult) {
           var releaseVerification = parseCleanupHostResult(
             verifyResult,
-            "post-close release verification",
+            "closed-project release verification",
           );
           summary.release_verification = releaseVerification;
+          summary.remaining_media_references = Number(
+            releaseVerification.remaining_media_references || 0,
+          );
+          summary.remaining_proxy_references = Number(
+            releaseVerification.remaining_proxy_references || 0,
+          );
           if (!releaseVerification.ok) {
             summary.ok = false;
             summary.error =
               "Premiere still has linked source/proxy media after project close";
-            summary.remaining_media_references = Number(
-              releaseVerification.remaining_media_references || 0,
-            );
-            summary.remaining_proxy_references = Number(
-              releaseVerification.remaining_proxy_references || 0,
-            );
-          } else if (
-            Number(summary.project_release.closed_project_count || 0) > 0 &&
-            summary.scratch_project &&
-            summary.scratch_project.ok
-          ) {
-            // Closing the transient project is stronger than an incomplete
-            // item-by-item purge: no live or retained project object can refer
-            // to the files after this point.
+          } else {
             summary.ok = true;
             summary.error = null;
           }
@@ -2302,66 +2214,29 @@
       })
       .then(function (summary) {
         if (!quiet && summary) {
-          var sequencesDeleted = Number(summary.sequences_deleted || 0);
-          var movedItems = Number(summary.items_moved_to_purge_bin || 0);
-          var remainingSequences = Number(summary.remaining_sequences || 0);
-          var remainingRootItems = Number(summary.remaining_root_items || 0);
           var warningCount = Array.isArray(summary.warnings)
             ? summary.warnings.length
             : Number(summary.warning_count || 0);
-          var detachAttempts = preparation.detach_attempts || [];
-          var lastDetachAttempt =
-            detachAttempts.length > 0
-              ? detachAttempts[detachAttempts.length - 1]
-              : {};
-          var detachedProxyCount = Number(
-            lastDetachAttempt.detached_proxy_count || 0,
-          );
-          var detachFailedCount = Number(
-            preparation.detach_verification &&
-              preparation.detach_verification.remaining_attached_proxy_count ||
-              0,
-          );
-          var mediaOfflineCount = Number(
-            preparation.offline && preparation.offline.media_offline_count || 0,
-          );
-          var mediaOfflineDeferredProxyCount = Number(
-            preparation.offline &&
-              preparation.offline.media_offline_deferred_proxy_count ||
-              0,
-          );
           log(
-            "Premiere cleanup for " +
+            "Premiere project release for " +
               projectId +
-              ": sequencesDeleted=" +
-              sequencesDeleted +
-              ", movedToPurgeBin=" +
-              movedItems +
-              ", remainingSequences=" +
-              remainingSequences +
-              ", remainingRootItems=" +
-              remainingRootItems +
-              ", targetProjects=" +
+              ": targetProjects=" +
               Number(summary.target_project_count || 0) +
-              ", closedProjects=" +
+              ", closeRequested=" +
               Number(
                 summary.project_release &&
-                  summary.project_release.closed_project_count ||
+                  summary.project_release.close_requested_count ||
                   0,
               ) +
               ", scratchReady=" +
               !!(summary.scratch_project && summary.scratch_project.ok) +
-              ", detachedProxies=" +
-              detachedProxyCount +
-              ", detachFailed=" +
-              detachFailedCount +
-              ", mediaOffline=" +
-              mediaOfflineCount +
-              ", mediaOfflineDeferredForProxy=" +
-              mediaOfflineDeferredProxyCount +
+              ", remainingMediaLinks=" +
+              Number(summary.remaining_media_references || 0) +
+              ", remainingProxyLinks=" +
+              Number(summary.remaining_proxy_references || 0) +
               ", warnings=" +
               warningCount,
-            detachFailedCount > 0 ? "warn" : "info",
+            summary.ok ? "info" : "warn",
           );
         }
         return summary;

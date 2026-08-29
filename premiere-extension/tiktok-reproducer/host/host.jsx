@@ -7,7 +7,7 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-08-29-managed-target-v20";
+var ATR_HOST_BUILD_ID = "2026-08-29-close-first-cleanup-v21";
 // Separates runScript()'s status from the non-fatal warnings the executed
 // script published. Must stay in sync with HOST_RUN_WARNING_SEPARATOR in
 // client/main.js.
@@ -18,12 +18,10 @@ var __atrEncoderJobMetaMap = {};
 var __atrTempAudioSequenceByJob = {};
 var __atrProxyAttachAttemptMap = {};
 var __atrImportedProjectRefs = [];
-var __atrCleanupTargetProjectRefs = [];
 var __atrCleanupClosingProjectIdentities = [];
 var __atrManagedExportTargetsByProjectId = {};
 var __atrEncoderCallbacksBound = false;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
-var __atrProjectPurgeBinName = "__ATR_PURGE__";
 var __atrProxyOutputSuffix = "__atr_proxy.mp4";
 var __atrProxyRepairOutputSuffix = "__atr_proxy_projectitem.mp4";
 
@@ -1053,7 +1051,7 @@ function __atrProjectReferencesAnyCleanupRoot(projectObject, normalizedRoots) {
   return false;
 }
 
-function __atrResolveCleanupTargetProjects(normalizedRoots, rememberMatches) {
+function __atrResolveCleanupTargetProjects(normalizedRoots) {
   if (!normalizedRoots || normalizedRoots.length === 0) {
     return [];
   }
@@ -1066,32 +1064,11 @@ function __atrResolveCleanupTargetProjects(normalizedRoots, rememberMatches) {
     }
   }
 
-  // The detach/offline stages can make media-path discovery unavailable on
-  // some Premiere builds. Keep the exact project objects found on the first
-  // pass, rather than falling back to whichever project happens to be active.
-  if (resolved.length === 0 && !rememberMatches) {
-    for (var remembered = 0;
-      remembered < __atrCleanupTargetProjectRefs.length;
-      remembered += 1) {
-      if (
-        __atrProjectIsOpen(
-          __atrCleanupTargetProjectRefs[remembered],
-          openProjects,
-        )
-      ) {
-        __atrPushUniqueProject(
-          resolved,
-          __atrCleanupTargetProjectRefs[remembered],
-        );
-      }
-    }
-  }
-
   // runScript() records the owning project before and after every import. Use
-  // that as an initial-stage fallback only when it identifies one unambiguous
-  // open project. Reusing every historical import here could purge an unrelated
-  // project during a later disk-only cleanup retry.
-  if (resolved.length === 0 && rememberMatches) {
+  // that as a fallback only when it identifies one unambiguous open project.
+  // Reusing every historical import here could close an unrelated project
+  // during a later disk-only cleanup retry.
+  if (resolved.length === 0) {
     var openImportedProjects = [];
     for (
       var imported = 0;
@@ -1110,15 +1087,6 @@ function __atrResolveCleanupTargetProjects(normalizedRoots, rememberMatches) {
     }
   }
 
-  if (rememberMatches) {
-    __atrCleanupTargetProjectRefs = [];
-    for (var target = 0; target < resolved.length; target += 1) {
-      __atrPushUniqueProject(
-        __atrCleanupTargetProjectRefs,
-        resolved[target],
-      );
-    }
-  }
   return resolved;
 }
 
@@ -1227,290 +1195,6 @@ function __atrCloseSourceMonitorForCleanup(result) {
       );
     }
   }
-}
-
-function __atrDetachManagedProxiesForCleanupObject(
-  localRootPath,
-  projectObject,
-) {
-  var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
-  var result = {
-    ok: true,
-    considered_proxy_items: 0,
-    detached_proxy_count: 0,
-    detach_proxy_unavailable_count: 0,
-    detach_proxy_failed_count: 0,
-    detach_proxy_warnings: [],
-  };
-
-  var targetProject = projectObject || (app && app.project ? app.project : null);
-  if (!normalizedRootPath || !targetProject || !targetProject.rootItem) {
-    return result;
-  }
-
-  __atrCloseSourceMonitorForCleanup(result);
-
-  try {
-    if (app.setEnableProxies) {
-      app.setEnableProxies(0);
-    }
-  } catch (eDisableProxyView) {
-    result.detach_proxy_warnings.push(
-      "Could not disable proxy view: " +
-        __atrSafeString(eDisableProxyView.message || eDisableProxyView),
-    );
-  }
-
-  var scan = __atrBuildImportedCleanupScan(
-    normalizedRootPath,
-    targetProject,
-    true,
-  );
-  for (var i = 0; i < scan.imported_leaf_items.length; i += 1) {
-    var item = scan.imported_leaf_items[i];
-    if (!item || !item.hasProxy || !item.getProxyPath) {
-      continue;
-    }
-
-    var proxyPath = "";
-    try {
-      if (!item.hasProxy()) {
-        continue;
-      }
-      proxyPath = __atrSafeString(item.getProxyPath());
-    } catch (eProxyState) {
-      continue;
-    }
-
-    // The entire local root is about to be deleted from disk, so any proxy
-    // whose file lives under it will disappear. Detach every such proxy - not
-    // only the ones matching the managed-name heuristic - because if the
-    // attachment survives, Premiere keeps the proxy registered and raises a
-    // blocking "link missing proxies" modal the moment the file is removed.
-    if (
-      !__atrPathStartsWith(proxyPath, normalizedRootPath) &&
-      !__atrLooksLikeManagedProxyPath(proxyPath, normalizedRootPath)
-    ) {
-      continue;
-    }
-
-    result.considered_proxy_items += 1;
-    if (!item.detachProxy) {
-      result.detach_proxy_unavailable_count += 1;
-      continue;
-    }
-
-    // detachProxy() can return before Premiere commits the change on Windows.
-    // Do one request and return control to the panel; the panel deliberately
-    // yields between cleanup phases so Premiere's UI thread can commit it.
-    // Repeated detach/refresh/sleep calls in one ExtendScript invocation do not
-    // yield to Premiere and can keep the proxy registered until after the disk
-    // file is removed, which queues the "link missing proxies" modal.
-    var detachCommitted = false;
-    var lastDetachError = null;
-    try {
-      item.detachProxy();
-    } catch (eDetach) {
-      lastDetachError = eDetach;
-    }
-    try {
-      detachCommitted = !item.hasProxy();
-    } catch (eHasProxyAfter) {
-      // Item can no longer be queried for proxy state; project purge will
-      // release it.
-      detachCommitted = true;
-    }
-
-    if (detachCommitted) {
-      result.detached_proxy_count += 1;
-    } else {
-      result.detach_proxy_failed_count += 1;
-      if (result.detach_proxy_warnings.length < 5) {
-        result.detach_proxy_warnings.push(
-          "Proxy still attached after detach for " +
-            __atrGetProjectItemName(item) +
-            (lastDetachError
-              ? ": " +
-                __atrSafeString(lastDetachError.message || lastDetachError)
-              : ""),
-        );
-      }
-    }
-  }
-
-  if (result.detach_proxy_unavailable_count > 0) {
-    result.detach_proxy_warnings.push(
-      "projectItem.detachProxy is unavailable for " +
-        result.detach_proxy_unavailable_count +
-        " managed proxy item(s); project purge will release them.",
-    );
-  }
-
-  result.ok = result.detach_proxy_failed_count === 0;
-  return result;
-}
-
-function __atrVerifyManagedProxiesDetachedForCleanupObject(
-  localRootPath,
-  projectObject,
-) {
-  var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
-  var result = {
-    ok: true,
-    considered_proxy_items: 0,
-    remaining_attached_proxy_count: 0,
-    detach_proxy_warnings: [],
-  };
-  var targetProject = projectObject || (app && app.project ? app.project : null);
-  if (!normalizedRootPath || !targetProject || !targetProject.rootItem) {
-    return result;
-  }
-
-  var scan = __atrBuildImportedCleanupScan(
-    normalizedRootPath,
-    targetProject,
-    true,
-  );
-  for (var i = 0; i < scan.imported_leaf_items.length; i += 1) {
-    var item = scan.imported_leaf_items[i];
-    if (!item || !item.hasProxy || !item.getProxyPath) {
-      continue;
-    }
-    try {
-      if (!item.hasProxy()) {
-        continue;
-      }
-      var proxyPath = __atrSafeString(item.getProxyPath());
-      if (
-        !__atrPathStartsWith(proxyPath, normalizedRootPath) &&
-        !__atrLooksLikeManagedProxyPath(proxyPath, normalizedRootPath)
-      ) {
-        continue;
-      }
-      result.considered_proxy_items += 1;
-      result.remaining_attached_proxy_count += 1;
-      if (result.detach_proxy_warnings.length < 5) {
-        result.detach_proxy_warnings.push(
-          "Proxy remains attached for " + __atrGetProjectItemName(item),
-        );
-      }
-    } catch (eProxyState) {
-      result.remaining_attached_proxy_count += 1;
-      if (result.detach_proxy_warnings.length < 5) {
-        result.detach_proxy_warnings.push(
-          "Could not verify proxy state for " +
-            __atrGetProjectItemName(item) +
-            ": " +
-            __atrSafeString(eProxyState.message || eProxyState),
-        );
-      }
-    }
-  }
-  result.ok = result.remaining_attached_proxy_count === 0;
-  return result;
-}
-
-function __atrSetImportedMediaOfflineForCleanupObject(
-  localRootPath,
-  projectObject,
-) {
-  var normalizedRootPath = __atrNormalizeComparePath(localRootPath);
-  var result = {
-    ok: true,
-    considered_media_items: 0,
-    media_offline_count: 0,
-    media_offline_unavailable_count: 0,
-    media_offline_failed_count: 0,
-    media_offline_deferred_proxy_count: 0,
-    media_release_warnings: [],
-  };
-
-  var targetProject = projectObject || (app && app.project ? app.project : null);
-  if (!normalizedRootPath || !targetProject || !targetProject.rootItem) {
-    return result;
-  }
-
-  __atrCloseSourceMonitorForCleanup(result);
-
-  var scan = __atrBuildImportedCleanupScan(
-    normalizedRootPath,
-    targetProject,
-    false,
-  );
-  for (var i = 0; i < scan.imported_leaf_items.length; i += 1) {
-    var item = scan.imported_leaf_items[i];
-    if (!item) {
-      continue;
-    }
-    result.considered_media_items += 1;
-
-    // Never make the original media offline while a to-be-deleted proxy is
-    // still registered. On Windows that ordering can open Premiere's missing
-    // proxy confirmation modal. The preceding panel phase normally detaches
-    // it; if the detach is still pending, project purge is the safe fallback.
-    try {
-      if (item.hasProxy && item.getProxyPath && item.hasProxy()) {
-        var attachedProxyPath = __atrSafeString(item.getProxyPath());
-        if (
-          __atrPathStartsWith(attachedProxyPath, normalizedRootPath) ||
-          __atrLooksLikeManagedProxyPath(
-            attachedProxyPath,
-            normalizedRootPath,
-          )
-        ) {
-          result.media_offline_deferred_proxy_count += 1;
-          continue;
-        }
-      }
-    } catch (eAttachedProxyState) {}
-
-    if (!item.setOffline) {
-      result.media_offline_unavailable_count += 1;
-      continue;
-    }
-
-    try {
-      if (item.isOffline && item.isOffline()) {
-        result.media_offline_count += 1;
-        continue;
-      }
-    } catch (eOfflineState) {}
-
-    try {
-      var offlineResult = item.setOffline();
-      if (
-        offlineResult === undefined ||
-        offlineResult === 0 ||
-        offlineResult === true ||
-        offlineResult === "0"
-      ) {
-        result.media_offline_count += 1;
-      } else {
-        result.media_offline_failed_count += 1;
-      }
-    } catch (eSetOffline) {
-      result.media_offline_failed_count += 1;
-      if (result.media_release_warnings.length < 5) {
-        result.media_release_warnings.push(
-          "Could not make media offline for " +
-            __atrGetProjectItemName(item) +
-            ": " +
-            __atrSafeString(eSetOffline.message || eSetOffline),
-        );
-      }
-    }
-  }
-
-  if (result.media_offline_unavailable_count > 0) {
-    result.media_release_warnings.push(
-      "projectItem.setOffline is unavailable for " +
-        result.media_offline_unavailable_count +
-        " imported item(s); project purge will be used instead.",
-    );
-  }
-
-  result.ok = result.media_offline_failed_count === 0;
-  return result;
 }
 
 function __atrPushEncoderEvent(type, jobID, detail) {
@@ -2563,18 +2247,6 @@ function __atrGetSequenceCount(projectObject) {
   }
 }
 
-function __atrGetRootChildCount(rootItem) {
-  if (!rootItem || !rootItem.children) {
-    return 0;
-  }
-
-  try {
-    return Number(rootItem.children.numItems || 0);
-  } catch (eCount) {
-    return 0;
-  }
-}
-
 function __atrDeleteSequenceObject(sequence, projectObject) {
   var targetProject = projectObject || (app && app.project ? app.project : null);
   if (!sequence || !targetProject) {
@@ -2625,462 +2297,7 @@ function __atrDeleteSequenceObject(sequence, projectObject) {
   return deleted;
 }
 
-function purgeActiveProject(projectObject) {
-  try {
-    var targetProject =
-      projectObject || (app && app.project ? app.project : null);
-    if (!targetProject || !targetProject.rootItem) {
-      return "ERROR: No target Premiere project is available";
-    }
-
-    var root = targetProject.rootItem;
-    var warnings = [];
-    var sequencesDeleted = 0;
-    var sequencesFailed = 0;
-    var movedToPurgeBin = 0;
-    var moveFailures = 0;
-    var movePasses = 0;
-    var purgeBinDeleted = false;
-    var purgeBinCreateFailed = false;
-    var purgeBinDeleteFailed = false;
-
-    for (var s = __atrGetSequenceCount(targetProject) - 1; s >= 0; s -= 1) {
-      var sequence = targetProject.sequences[s];
-      if (!sequence) {
-        continue;
-      }
-      if (__atrDeleteSequenceObject(sequence, targetProject)) {
-        sequencesDeleted += 1;
-      } else {
-        sequencesFailed += 1;
-        warnings.push(
-          "Could not delete sequence '" + __atrGetSequenceName(sequence) + "'.",
-        );
-      }
-    }
-
-    var remainingRootItemsBeforePurge = __atrGetRootChildCount(root);
-    if (remainingRootItemsBeforePurge > 0) {
-      var purgeBin = null;
-      try {
-        purgeBin = root.createBin(__atrProjectPurgeBinName);
-      } catch (eCreate) {
-        purgeBin = null;
-      }
-
-      if (!purgeBin) {
-        purgeBinCreateFailed = true;
-      } else {
-        var moveGuard = 0;
-        while (__atrGetRootChildCount(root) > 1 && moveGuard < 10000) {
-          moveGuard += 1;
-          movePasses += 1;
-          var movedInPass = false;
-
-          for (var i = __atrGetRootChildCount(root) - 1; i >= 0; i -= 1) {
-            var child = root.children[i];
-            if (!child || child === purgeBin) {
-              continue;
-            }
-
-            try {
-              child.moveBin(purgeBin);
-              movedToPurgeBin += 1;
-              movedInPass = true;
-            } catch (eMove) {
-              moveFailures += 1;
-              warnings.push(
-                "Could not move item '" +
-                  __atrSafeString(child.name || "item#" + i) +
-                  "' into purge bin.",
-              );
-            }
-          }
-
-          if (!movedInPass) {
-            break;
-          }
-        }
-
-        if (moveGuard >= 10000) {
-          warnings.push("Purge guard reached while moving project items.");
-        }
-
-        try {
-          var deleteBinResult = purgeBin.deleteBin();
-          // Premiere's ExtendScript API returns 0 on a successful deleteBin().
-          // Boolean coercion inverted that result and incorrectly ran the
-          // fallback path against an already-deleted bin.
-          purgeBinDeleted =
-            deleteBinResult === 0 ||
-            deleteBinResult === "0" ||
-            deleteBinResult === true ||
-            (deleteBinResult === undefined &&
-              __atrGetRootChildCount(root) === 0);
-        } catch (eDeleteBin0) {
-          purgeBinDeleted = false;
-        }
-        if (!purgeBinDeleted) {
-          try {
-            if (targetProject.deleteBin) {
-              targetProject.deleteBin(purgeBin);
-              purgeBinDeleted = true;
-            }
-          } catch (eDeleteBin1) {
-            purgeBinDeleted = false;
-          }
-        }
-        if (!purgeBinDeleted) {
-          purgeBinDeleteFailed = true;
-        }
-      }
-    }
-
-    var remainingSequences = __atrGetSequenceCount(targetProject);
-    var remainingRootItems = __atrGetRootChildCount(root);
-    var result = {
-      ok: remainingSequences === 0 && remainingRootItems === 0,
-      sequences_deleted: sequencesDeleted,
-      sequences_failed: sequencesFailed,
-      items_moved_to_purge_bin: movedToPurgeBin,
-      move_failures: moveFailures,
-      move_passes: movePasses,
-      remaining_sequences: remainingSequences,
-      remaining_root_items: remainingRootItems,
-      purge_bin_create_failed: purgeBinCreateFailed,
-      purge_bin_delete_failed: purgeBinDeleteFailed,
-      project_identity: __atrGetProjectIdentity(targetProject),
-      warning_count: warnings.length,
-      warnings: warnings,
-    };
-
-    if (!result.ok) {
-      if (purgeBinCreateFailed) {
-        result.error =
-          "Could not create purge bin '" + __atrProjectPurgeBinName + "'.";
-      } else if (purgeBinDeleteFailed) {
-        result.error =
-          "Could not delete purge bin '" + __atrProjectPurgeBinName + "'.";
-      } else {
-        result.error = "Premiere project purge incomplete";
-      }
-    }
-
-    return JSON.stringify(result);
-  } catch (e) {
-    return "ERROR: " + e.message + " (line " + e.line + ")";
-  }
-}
-
-function prepareImportedProjectsForCleanup(localRootsJson, stage) {
-  try {
-    var roots = [];
-    try {
-      roots =
-        typeof localRootsJson === "string"
-          ? JSON.parse(localRootsJson || "[]")
-          : localRootsJson;
-    } catch (eParse) {
-      roots = [];
-    }
-    if (!roots || !roots.length) {
-      roots = [];
-    }
-
-    var normalizedStage = __atrSafeString(stage).toLowerCase();
-    var result = {
-      ok: true,
-      stage: normalizedStage,
-      root_count: 0,
-      detached_proxy_count: 0,
-      detach_failed_count: 0,
-      media_offline_count: 0,
-      media_offline_failed_count: 0,
-      media_offline_deferred_proxy_count: 0,
-      remaining_attached_proxy_count: 0,
-      target_project_count: 0,
-      summaries: [],
-      warnings: [],
-    };
-
-    if (
-      normalizedStage !== "detach" &&
-      normalizedStage !== "verify_detach" &&
-      normalizedStage !== "offline"
-    ) {
-      return "ERROR: Unknown Premiere cleanup preparation stage: " + stage;
-    }
-
-    var normalizedRoots = [];
-    for (var i = 0; i < roots.length; i += 1) {
-      var normalizedRoot = __atrNormalizeComparePath(roots[i]);
-      if (normalizedRoot) {
-        normalizedRoots.push(normalizedRoot);
-      }
-    }
-    if (normalizedRoots.length === 0) {
-      return "ERROR: No local project roots were provided for cleanup preparation";
-    }
-    result.root_count = normalizedRoots.length;
-    var targetProjects = __atrResolveCleanupTargetProjects(
-      normalizedRoots,
-      normalizedStage === "detach",
-    );
-    result.target_project_count = targetProjects.length;
-
-    for (var p = 0; p < targetProjects.length; p += 1) {
-      var targetProject = targetProjects[p];
-      for (var rootIndex = 0; rootIndex < normalizedRoots.length; rootIndex += 1) {
-        var rootPath = normalizedRoots[rootIndex];
-        if (normalizedStage === "detach") {
-          var detachSummary = __atrDetachManagedProxiesForCleanupObject(
-            rootPath,
-            targetProject,
-          );
-          detachSummary.local_root = rootPath;
-          detachSummary.project_identity =
-            __atrGetProjectIdentity(targetProject);
-          result.summaries.push(detachSummary);
-          result.detached_proxy_count += Number(
-            detachSummary.detached_proxy_count || 0,
-          );
-          result.detach_failed_count += Number(
-            detachSummary.detach_proxy_failed_count || 0,
-          );
-          if (
-            detachSummary.detach_proxy_warnings &&
-            detachSummary.detach_proxy_warnings.length
-          ) {
-            for (
-              var dw = 0;
-              dw < detachSummary.detach_proxy_warnings.length;
-              dw += 1
-            ) {
-              if (result.warnings.length < 10) {
-                result.warnings.push(detachSummary.detach_proxy_warnings[dw]);
-              }
-            }
-          }
-        } else if (normalizedStage === "verify_detach") {
-          var verifySummary =
-            __atrVerifyManagedProxiesDetachedForCleanupObject(
-              rootPath,
-              targetProject,
-            );
-          verifySummary.local_root = rootPath;
-          verifySummary.project_identity =
-            __atrGetProjectIdentity(targetProject);
-          result.summaries.push(verifySummary);
-          result.remaining_attached_proxy_count += Number(
-            verifySummary.remaining_attached_proxy_count || 0,
-          );
-          if (
-            verifySummary.detach_proxy_warnings &&
-            verifySummary.detach_proxy_warnings.length
-          ) {
-            for (
-              var vw = 0;
-              vw < verifySummary.detach_proxy_warnings.length;
-              vw += 1
-            ) {
-              if (result.warnings.length < 10) {
-                result.warnings.push(verifySummary.detach_proxy_warnings[vw]);
-              }
-            }
-          }
-        } else {
-          var offlineSummary =
-            __atrSetImportedMediaOfflineForCleanupObject(
-              rootPath,
-              targetProject,
-            );
-          offlineSummary.local_root = rootPath;
-          offlineSummary.project_identity =
-            __atrGetProjectIdentity(targetProject);
-          result.summaries.push(offlineSummary);
-          result.media_offline_count += Number(
-            offlineSummary.media_offline_count || 0,
-          );
-          result.media_offline_failed_count += Number(
-            offlineSummary.media_offline_failed_count || 0,
-          );
-          result.media_offline_deferred_proxy_count += Number(
-            offlineSummary.media_offline_deferred_proxy_count || 0,
-          );
-          if (
-            offlineSummary.media_release_warnings &&
-            offlineSummary.media_release_warnings.length
-          ) {
-            for (
-              var ow = 0;
-              ow < offlineSummary.media_release_warnings.length;
-              ow += 1
-            ) {
-              if (result.warnings.length < 10) {
-                result.warnings.push(offlineSummary.media_release_warnings[ow]);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    result.ok =
-      result.detach_failed_count === 0 &&
-      result.media_offline_failed_count === 0 &&
-      result.remaining_attached_proxy_count === 0;
-    return JSON.stringify(result);
-  } catch (e) {
-    return "ERROR: " + e.message + " (line " + e.line + ")";
-  }
-}
-
-function cleanupImportedProjectsForLocalRoots(localRootsJson) {
-  try {
-    var roots = [];
-    try {
-      roots =
-        typeof localRootsJson === "string"
-          ? JSON.parse(localRootsJson || "[]")
-          : localRootsJson;
-    } catch (eParse) {
-      roots = [];
-    }
-    if (!roots || !roots.length) {
-      roots = [];
-    }
-    var normalizedRoots = [];
-    for (var i = 0; i < roots.length; i += 1) {
-      var normalizedRoot = __atrNormalizeComparePath(roots[i]);
-      if (normalizedRoot) {
-        normalizedRoots.push(normalizedRoot);
-      }
-    }
-    if (normalizedRoots.length === 0) {
-      return "ERROR: No local project roots were provided for project cleanup";
-    }
-
-    try {
-      __atrCloseSourceMonitorForCleanup(null);
-    } catch (eCloseBeforePurge) {}
-
-    var targetProjects = __atrResolveCleanupTargetProjects(
-      normalizedRoots,
-      false,
-    );
-    var purgeSummary = {
-      ok: true,
-      target_project_count: targetProjects.length,
-      project_summaries: [],
-      sequences_deleted: 0,
-      sequences_failed: 0,
-      items_moved_to_purge_bin: 0,
-      move_failures: 0,
-      move_passes: 0,
-      remaining_sequences: 0,
-      remaining_root_items: 0,
-      purge_bin_create_failed: false,
-      purge_bin_delete_failed: false,
-      warning_count: 0,
-      warnings: [],
-    };
-
-    for (var p = 0; p < targetProjects.length; p += 1) {
-      var purgeRaw = purgeActiveProject(targetProjects[p]);
-      if (purgeRaw && String(purgeRaw).indexOf("ERROR:") === 0) {
-        purgeSummary.ok = false;
-        purgeSummary.warnings.push(__atrSafeString(purgeRaw));
-        continue;
-      }
-      var projectSummary = {};
-      try {
-        projectSummary = JSON.parse(purgeRaw || "{}");
-      } catch (ePurgeParse) {
-        projectSummary = {
-          ok: false,
-          error: "Invalid project purge response",
-          raw: __atrSafeString(purgeRaw),
-        };
-      }
-      purgeSummary.project_summaries.push(projectSummary);
-      purgeSummary.ok = purgeSummary.ok && projectSummary.ok !== false;
-      purgeSummary.sequences_deleted += Number(
-        projectSummary.sequences_deleted || 0,
-      );
-      purgeSummary.sequences_failed += Number(
-        projectSummary.sequences_failed || 0,
-      );
-      purgeSummary.items_moved_to_purge_bin += Number(
-        projectSummary.items_moved_to_purge_bin || 0,
-      );
-      purgeSummary.move_failures += Number(
-        projectSummary.move_failures || 0,
-      );
-      purgeSummary.move_passes += Number(projectSummary.move_passes || 0);
-      purgeSummary.remaining_sequences += Number(
-        projectSummary.remaining_sequences || 0,
-      );
-      purgeSummary.remaining_root_items += Number(
-        projectSummary.remaining_root_items || 0,
-      );
-      purgeSummary.purge_bin_create_failed =
-        purgeSummary.purge_bin_create_failed ||
-        !!projectSummary.purge_bin_create_failed;
-      purgeSummary.purge_bin_delete_failed =
-        purgeSummary.purge_bin_delete_failed ||
-        !!projectSummary.purge_bin_delete_failed;
-      var projectWarnings = projectSummary.warnings || [];
-      for (var warningIndex = 0;
-        warningIndex < projectWarnings.length &&
-        purgeSummary.warnings.length < 12;
-        warningIndex += 1) {
-        purgeSummary.warnings.push(projectWarnings[warningIndex]);
-      }
-      if (projectSummary.error && !purgeSummary.error) {
-        purgeSummary.error = __atrSafeString(projectSummary.error);
-      }
-    }
-
-    try {
-      __atrCloseSourceMonitorForCleanup(null);
-    } catch (eCloseAfterPurge) {}
-
-    var referenceSummary =
-      __atrInspectOpenProjectCleanupReferences(normalizedRoots);
-    purgeSummary.release_verification = referenceSummary;
-    purgeSummary.referencing_project_count =
-      referenceSummary.referencing_project_count;
-    purgeSummary.remaining_media_references =
-      referenceSummary.remaining_media_references;
-    purgeSummary.remaining_proxy_references =
-      referenceSummary.remaining_proxy_references;
-    purgeSummary.warning_count = purgeSummary.warnings.length;
-    if (!referenceSummary.ok) {
-      purgeSummary.ok = false;
-      purgeSummary.error =
-        "Premiere still references local source or proxy media after purge";
-      if (referenceSummary.samples.length > 0) {
-        purgeSummary.warnings.push(
-          "Remaining references: " + referenceSummary.samples.join(", "),
-        );
-        purgeSummary.warning_count = purgeSummary.warnings.length;
-      }
-    }
-    if (!purgeSummary.ok && !purgeSummary.error) {
-      purgeSummary.error = "Premiere project purge incomplete";
-    }
-    try {
-      if ($ && $.gc) {
-        $.gc();
-      }
-    } catch (eCleanupGc) {}
-    return JSON.stringify(purgeSummary);
-  } catch (e) {
-    return "ERROR: " + e.message + " (line " + e.line + ")";
-  }
-}
-
-function closeImportedProjectsAfterCleanup(localRootsJson) {
+function closeImportedProjectsForCleanup(localRootsJson) {
   try {
     var roots = [];
     try {
@@ -3102,15 +2319,20 @@ function closeImportedProjectsAfterCleanup(localRootsJson) {
       return "ERROR: No local project roots were provided for project release";
     }
 
-    var targetProjects = __atrResolveCleanupTargetProjects(
-      normalizedRoots,
-      false,
-    );
+    // Resolve the owning project before touching any ProjectItem. In
+    // particular, do not call the undocumented detachProxy() method: on some
+    // Windows Premiere builds it reports detached but asynchronously queues a
+    // Link Media dialog when the proxy disappears.
+    var targetProjects = __atrResolveCleanupTargetProjects(normalizedRoots);
+    __atrCloseSourceMonitorForCleanup(null);
     var result = {
       ok: true,
+      strategy: "close_project_before_disk_cleanup",
       target_project_count: targetProjects.length,
-      close_attempted_count: 0,
+      close_requested_count: 0,
       closed_project_count: 0,
+      close_pending_count: 0,
+      already_released: targetProjects.length === 0,
       project_identities: [],
       project_paths: [],
       warnings: [],
@@ -3140,27 +2362,33 @@ function closeImportedProjectsAfterCleanup(localRootsJson) {
         continue;
       }
 
-      result.close_attempted_count += 1;
       try {
-        // Do not save the generated/imported project contents. Reopening a
-        // dedicated scratch project after this call provides a hard lifetime
-        // boundary for proxy records retained outside the live project tree.
+        // Both original and proxy files still exist at this point. Closing the
+        // transient document without saving releases their records as one
+        // supported operation, instead of trying to mutate each proxy item.
         var closeResult = targetProject.closeDocument(0, 0);
         var stillOpen = __atrProjectIsOpen(
           targetProject,
           __atrGetOpenProjects(),
         );
-        if (
+        var closeAccepted =
           closeResult === 0 ||
           closeResult === "0" ||
-          closeResult === true ||
-          !stillOpen
-        ) {
+          closeResult === true;
+        if (!stillOpen) {
+          result.close_requested_count += 1;
           result.closed_project_count += 1;
+        } else if (closeAccepted) {
+          // closeDocument() can be committed after this ExtendScript call
+          // returns. The panel yields, and openCleanupScratchProject() refuses
+          // to continue until this identity is actually absent.
+          result.close_requested_count += 1;
+          result.close_pending_count += 1;
         } else {
           result.ok = false;
           result.warnings.push(
-            "Premiere did not close " + (identity || "cleanup project"),
+            "Premiere rejected closeDocument for " +
+              (identity || "cleanup project"),
           );
         }
       } catch (eCloseProject) {
@@ -3176,9 +2404,9 @@ function closeImportedProjectsAfterCleanup(localRootsJson) {
 
     result.ok =
       result.ok &&
-      result.closed_project_count === result.target_project_count;
+      result.close_requested_count === result.target_project_count;
     if (!result.ok) {
-      result.error = "Premiere cleanup project did not close completely";
+      result.error = "Premiere cleanup project close was not accepted";
     }
     return JSON.stringify(result);
   } catch (e) {
@@ -3193,7 +2421,7 @@ function openCleanupScratchProject(scratchProjectPath) {
       scratch_project_path: __atrSafeString(scratchProjectPath),
       pending_cleanup_project_count: 0,
       closed_existing_scratch_count: 0,
-      opened_existing_scratch: false,
+      removed_existing_scratch: false,
       created_scratch: false,
       warnings: [],
     };
@@ -3226,9 +2454,8 @@ function openCleanupScratchProject(scratchProjectPath) {
     }
     var scratchComparePath = __atrNormalizeComparePath(normalizedScratchPath);
 
-    // The stable scratch can already be open after an interrupted cleanup.
-    // Close it without saving and reopen it so it becomes the active, pristine
-    // destination for the next automated import.
+    // The extension-owned scratch can already be open after an interrupted
+    // cleanup. Close it without saving before replacing its on-disk file.
     openProjects = __atrGetOpenProjects();
     for (var p = 0; p < openProjects.length; p += 1) {
       var candidatePath = "";
@@ -3252,32 +2479,32 @@ function openCleanupScratchProject(scratchProjectPath) {
     }
 
     var scratchFile = new File(normalizedScratchPath);
-    var opened = false;
-    if (scratchFile.exists && app.openDocument) {
+    if (scratchFile.exists) {
       try {
-        opened = !!app.openDocument(
-          scratchFile.fsName,
-          true,
-          true,
-          true,
-          true,
-        );
-        result.opened_existing_scratch = opened;
-      } catch (eOpenScratch) {
+        result.removed_existing_scratch = !!scratchFile.remove();
+      } catch (eRemoveScratch) {
         result.warnings.push(
-          "Could not open the ATR scratch project: " +
-            __atrSafeString(eOpenScratch.message || eOpenScratch),
+          "Could not remove the previous ATR scratch project: " +
+            __atrSafeString(eRemoveScratch.message || eRemoveScratch),
         );
       }
     }
+    if (scratchFile.exists) {
+      result.ok = false;
+      result.error =
+        "The previous ATR scratch project is still locked; cleanup will retry";
+      return JSON.stringify(result);
+    }
 
-    if (!opened && app.newProject) {
+    var createAttempted = false;
+    var createResult = false;
+    if (app.newProject) {
       try {
         if (!scratchFile.parent.exists) {
           scratchFile.parent.create();
         }
-        opened = !!app.newProject(scratchFile.fsName);
-        result.created_scratch = opened;
+        createAttempted = true;
+        createResult = !!app.newProject(scratchFile.fsName);
       } catch (eNewScratch) {
         result.warnings.push(
           "Could not create the ATR scratch project: " +
@@ -3293,12 +2520,15 @@ function openCleanupScratchProject(scratchProjectPath) {
       );
     } catch (eActiveScratchPath) {}
     result.active_project_path = activeProjectPath;
-    result.ok = opened && activeProjectPath === scratchComparePath;
+    result.created_scratch =
+      createAttempted &&
+      createResult &&
+      activeProjectPath === scratchComparePath;
+    result.ok = result.created_scratch;
     if (!result.ok) {
       result.error = "Premiere could not activate the ATR cleanup scratch project";
     } else {
       __atrCleanupClosingProjectIdentities = [];
-      __atrCleanupTargetProjectRefs = [];
       __atrImportedProjectRefs = [];
       __atrManagedExportTargetsByProjectId = {};
     }

@@ -103,12 +103,16 @@ even when another project is active, then starts AME export with the configured
 Checkbox **Delete local folder after successful upload** is enabled by default.
 Deletion happens only after:
 - a confirmed successful Drive upload,
-- proxy generation/reconciliation is stopped and managed proxies are detached,
-- every open Premiere project containing the downloaded source/proxy paths is purged,
-- the emptied automation project is closed without saving transient imports,
-- a clean `%APPDATA%\Adobe\TiktokReproducer\state\ATR_Automation_Scratch.prproj` project is opened for the next batch,
+- proxy generation/reconciliation is stopped,
+- every owning Premiere project is closed without saving while its source and proxy files still exist,
+- the previous extension-owned scratch project is removed and a genuinely blank `%APPDATA%\Adobe\TiktokReproducer\state\ATR_Automation_Scratch.prproj` is created for the next batch,
 - Premiere verifies that no source or proxy links to those paths remain,
 - the local downloaded folder is fully removed.
+
+Cleanup deliberately does not detach proxies, set media offline, or delete
+project items one by one. Those mutations can leave Premiere's proxy subsystem
+in a delayed relink state on Windows; closing the transient project is the
+single supported release boundary used before disk deletion.
 
 ## Reliability / Recovery
 
