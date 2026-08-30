@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import secrets
 import shutil
 import tempfile
@@ -77,6 +78,10 @@ def _sha256_file(path: Path, *, on_bytes: Callable[[int], None] | None = None) -
             hasher.update(chunk)
             if on_bytes is not None:
                 on_bytes(len(chunk))
+        # One-shot sequential read of release-sized files: drop the pages so
+        # hashing a whole series doesn't evict the desktop's working set.
+        with suppress(OSError):
+            os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
     return hasher.hexdigest()
 
 

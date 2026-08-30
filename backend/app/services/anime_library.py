@@ -27,6 +27,7 @@ from ..utils.media_binaries import (
     is_media_binary_override_error,
     rewrite_media_command,
 )
+from ..utils.low_impact import copy_file_drop_cache, wrap_low_impact
 from ..utils.subprocess_runner import CommandTimeoutError, run_command, terminate_process
 
 logger = logging.getLogger("uvicorn.error")
@@ -1862,6 +1863,10 @@ class AnimeLibraryService:
             "20",
             "-pix_fmt",
             "yuv420p",
+            # Cap x264's default 1.5x-cores thread pool (48 threads on a
+            # 32-thread box); veryfast gains almost nothing past 16 threads.
+            "-threads",
+            "16",
         ]
         cmd.extend(cls._build_audio_args(audio_streams=probe.audio_streams))
         cmd.extend(cls._build_audio_stream_metadata_args(probe.audio_streams))
@@ -2095,6 +2100,7 @@ class AnimeLibraryService:
                     )
                 ),
                 timeout_seconds=cls.LIBRARY_IMPORT_TRANSCODE_TIMEOUT_SECONDS,
+                low_impact=True,
             )
         except FileNotFoundError as exc:
             if is_media_binary_override_error(exc):
@@ -2127,6 +2133,7 @@ class AnimeLibraryService:
                     )
                 ),
                 timeout_seconds=cls.LIBRARY_IMPORT_TRANSCODE_TIMEOUT_SECONDS,
+                low_impact=True,
             )
         except FileNotFoundError as exc:
             if is_media_binary_override_error(exc):
@@ -3572,6 +3579,7 @@ class AnimeLibraryService:
                 remux_result = await run_command(
                     remux_cmd,
                     timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
+                    low_impact=True,
                 )
             except FileNotFoundError as exc:
                 if is_media_binary_override_error(exc):
@@ -3612,6 +3620,7 @@ class AnimeLibraryService:
                             probe=source_probe,
                         ),
                         timeout_seconds=cls.REMUX_TIMEOUT_SECONDS,
+                        low_impact=True,
                     )
                 except FileNotFoundError as exc:
                     if is_media_binary_override_error(exc):
@@ -3639,7 +3648,7 @@ class AnimeLibraryService:
                         f"Failed to normalize audio for {source_path.name}: {normalize_error}"
                     )
             else:
-                await asyncio.to_thread(shutil.copy2, source_path, preferred_dest)
+                await asyncio.to_thread(copy_file_drop_cache, source_path, preferred_dest)
 
         # Extract subtitles to sidecar.  Always attempt extraction regardless
         # of transform type — remux/transcode strip subtitle streams and even
@@ -3731,8 +3740,11 @@ class AnimeLibraryService:
         progress_start: float,
         progress_span: float,
     ) -> AsyncIterator[IndexProgress]:
+        # Env is derived from the unwrapped command; the low-impact scope
+        # wrapper only changes scheduling/cgroup placement (systemd-run
+        # --scope execs the payload in place, so pid/pgid semantics hold).
         process = await asyncio.create_subprocess_exec(
-            *cmd,
+            *wrap_low_impact(cmd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from .low_impact import wrap_low_impact
 from .media_binaries import get_media_subprocess_env, rewrite_media_command
 
 
@@ -85,10 +86,18 @@ async def run_command(
     *,
     cwd: str | Path | None = None,
     timeout_seconds: float | None = None,
+    low_impact: bool = False,
 ) -> CommandResult:
-    """Run a command and capture both stdout/stderr safely."""
+    """Run a command and capture both stdout/stderr safely.
+
+    ``low_impact=True`` runs it in an idle-priority, cache-bounded systemd
+    scope (see app.utils.low_impact) — use it for bulk media work whose CPU
+    and page-cache appetite would otherwise starve the desktop.
+    """
     resolved_cmd = rewrite_media_command(cmd)
     env = get_media_subprocess_env(resolved_cmd)
+    if low_impact:
+        resolved_cmd = wrap_low_impact(resolved_cmd)
     process = await asyncio.create_subprocess_exec(
         *resolved_cmd,
         stdout=asyncio.subprocess.PIPE,

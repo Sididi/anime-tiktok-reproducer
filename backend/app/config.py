@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     match_playback_max_workers_per_episode: int = 4
     min_playback_speed_factor: float = 0.75
 
+    # Low-impact media jobs: heavy subprocesses (anime_searcher indexing,
+    # library-import transcodes, storage-box rclone) run in a transient
+    # systemd user scope so the desktop stays responsive. CPUWeight "idle"
+    # uses every idle core but yields instantly to interactive tasks;
+    # MemoryHigh caps the scope's page-cache + anon footprint per job;
+    # IOWeight only takes effect after scripts/setup_low_impact_host.sh.
+    low_impact_media_jobs: bool = True
+    low_impact_cpu_weight: str = "idle"
+    low_impact_memory_high: str = "10G"
+    low_impact_io_weight: int = 50
+
     # Original matcher compatibility switch.  ATR_MATCHER_V2=1 selects the
     # old matcher; unset/0 selects the bounded hierarchical matcher.  This is
     # intentionally kept in application settings so values from .env are

@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 from ..config import settings
+from ..utils.low_impact import wrap_low_impact
 from .rclone_runner import (
     RcloneError,
     RcloneStats,
@@ -241,8 +242,11 @@ class StorageBoxRclone:
             )
 
         try:
+            # Bulk transfers stream whole releases through the page cache;
+            # the low-impact scope caps that footprint and yields CPU to
+            # interactive tasks (upload is the lowest-priority job anyway).
             last_stats = await run_rclone(
-                cmd, env=env, stats_callback=_on_stats
+                wrap_low_impact(cmd), env=env, stats_callback=_on_stats
             )
         except RcloneError as exc:
             raise StorageBoxRcloneError(str(exc)) from exc
