@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.models.cleanup import CleanupZone
 from app.services.video_cleanup_service import (
+    CLIP_CACHE_VERSION,
     CLIP_CONTEXT_FRAMES,
     CLIP_MAX_FRAMES,
     TEXT_MASK_WINDOW_FRAMES,
@@ -317,8 +318,105 @@ def test_build_clip_masks_halfres_input_matches_recompute():
 
 
 # ---------------------------------------------------------------------------
-# Temporal stride blending
+# Karaoke word-highlight subtitles
 # ---------------------------------------------------------------------------
+
+def _draw_word(frames, i, x, y, text="AAAA", color=(255, 255, 255)):
+    import cv2
+
+    # Dark outline first, then the fill — the karaoke style under test.
+    cv2.putText(
+        frames[i], text, (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 7,
+    )
+    cv2.putText(
+        frames[i], text, (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3,
+    )
+
+
+HIGHLIGHT_BGR = (0, 220, 255)  # saturated yellow: bright, sat >> 60
+
+
+def test_build_clip_masks_karaoke_highlight_word_covered():
+    # Word A flips white -> saturated yellow for longer than the ±window can
+    # bridge; the corroborated highlight class must keep it masked anyway.
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    hi_start, hi_end = clip.mask_start + 20, clip.mask_start + 50
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if not (clip.mask_start <= absolute < clip.mask_end):
+            continue
+        a_color = HIGHLIGHT_BGR if hi_start <= absolute < hi_end else (255, 255, 255)
+        _draw_word(frames, i, rx + 10, ry + 60, "AAAA", a_color)
+        _draw_word(frames, i, rx + 320, ry + 60, "BBBB", (255, 255, 255))
+
+    masks = VideoCleanupService._build_clip_masks(clip, frames)
+    word_a = (slice(ry + 15, ry + 70), slice(rx + 5, rx + 160))
+    for absolute in range(hi_start + TEXT_MASK_WINDOW_FRAMES + 2,
+                          hi_end - TEXT_MASK_WINDOW_FRAMES - 2):
+        i = absolute - clip.frame_start
+        assert masks[i][word_a].any(), (
+            f"highlighted word must stay masked mid-highlight (frame {i})"
+        )
+        assert masks[i][:, rx + 320 : rx + 470].any(), "white word must be masked"
+
+
+def test_build_clip_masks_karaoke_single_word_line():
+    # A one-word line fully highlighted has almost no white pixels: the
+    # LINE_MIN_WHITE_PIXELS guard must keep those frames in the same line so
+    # the earlier white phase corroborates them.
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    hi_start = clip.mask_start + 25
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if not (clip.mask_start <= absolute < clip.mask_end):
+            continue
+        color = HIGHLIGHT_BGR if absolute >= hi_start else (255, 255, 255)
+        _draw_word(frames, i, rx + 10, ry + 60, "AAAA", color)
+
+    masks = VideoCleanupService._build_clip_masks(clip, frames)
+    word_a = (slice(ry + 15, ry + 70), slice(rx + 5, rx + 160))
+    for absolute in range(hi_start + TEXT_MASK_WINDOW_FRAMES + 2,
+                          clip.mask_end - TEXT_MASK_WINDOW_FRAMES - 2):
+        i = absolute - clip.frame_start
+        assert masks[i][word_a].any(), (
+            f"single-word line must stay masked while highlighted (frame {i})"
+        )
+
+
+def test_build_clip_masks_saturated_background_not_corroborated():
+    # A bright saturated blob that is NEVER white text must not be swept into
+    # the mask — and its presence must not change the masks at all (byte
+    # no-regression for colorful backgrounds).
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if clip.mask_start <= absolute < clip.mask_end:
+            _draw_word(frames, i, rx + 10, ry + 60, "AAAA", (255, 255, 255))
+    with_blob = frames.copy()
+    blob = (slice(ry + 250, ry + 330), slice(rx + 600, rx + 760))
+    with_blob[:, blob[0], blob[1]] = (0, 0, 255)  # bright red rectangle
+
+    masks_plain = VideoCleanupService._build_clip_masks(clip, frames)
+    masks_blob = VideoCleanupService._build_clip_masks(clip, with_blob)
+    assert (masks_plain == masks_blob).all(), "blob must not affect masks"
+    assert not masks_blob[:, ry + 260 : ry + 320, rx + 610 : rx + 750].any()
+
+
+def test_segment_lines_splits_on_text_change_only():
+    mh, mw = 40, 200
+    left = np.zeros((mh, mw), dtype=bool)
+    left[10:30, 10:80] = True
+    right = np.zeros((mh, mw), dtype=bool)
+    right[10:30, 120:190] = True
+    sparse = np.zeros((mh, mw), dtype=bool)
+    sparse[12, 12:20] = True  # < LINE_MIN_WHITE_PIXELS: cannot vote
+
+    masks = [None, left, left, sparse, left, right, right, None, right]
+    lines = VideoCleanupService._segment_lines(masks)
+    # left-run (sparse frame swallowed) | right-run | trailing right.
+    assert lines == [[1, 2, 3, 4], [5, 6], [8]]
 
 def test_temporal_stride_blend_restricted_to_neighbor_masks(monkeypatch):
     # Fill of a model frame outside its own mask is that frame's ORIGINAL
@@ -408,7 +506,47 @@ def test_composite_alpha_thin_mask_survives_erosion():
 def test_clip_cache_name_versioned():
     plan = _plan("subtitle", [(100, 160)])
     clip = VideoCleanupService._spans_to_clips(plan, 1000)[0]
-    assert clip.cache_name.endswith("_v2.npz")
+    assert clip.cache_name.endswith("_v3.npz")
+
+
+def test_save_clip_atomic_deflates_and_roundtrips(tmp_path):
+    import zipfile
+
+    frames = np.random.default_rng(0).integers(
+        0, 256, (8, 16, 32, 3), dtype=np.uint8
+    )
+    masks = np.zeros((8, 16, 32), dtype=np.uint8)
+    masks[:, 4:12, 8:24] = 255
+    path = tmp_path / f"subtitle_x_000000_000008_v{CLIP_CACHE_VERSION}.npz"
+
+    VideoCleanupService._save_clip_atomic(path, frames, masks)
+
+    assert path.exists()
+    assert not list(tmp_path.glob("*.tmp.npz"))  # atomic rename cleaned up
+    data = np.load(path)
+    np.testing.assert_array_equal(data["frames"], frames)
+    np.testing.assert_array_equal(data["masks"], masks)
+    with zipfile.ZipFile(path) as zf:
+        infos = {i.filename: i for i in zf.infolist()}
+        assert all(i.compress_type == zipfile.ZIP_DEFLATED for i in infos.values())
+        # Binary masks are the compression win the cache relies on.
+        assert infos["masks.npy"].compress_size < masks.nbytes / 10
+
+
+def test_prune_stale_cache_drops_old_versions_and_partials(tmp_path):
+    current = tmp_path / f"subtitle_a_000000_000220_v{CLIP_CACHE_VERSION}.npz"
+    stale = tmp_path / f"subtitle_a_000000_000220_v{CLIP_CACHE_VERSION - 1}.npz"
+    partial = tmp_path / (
+        f"subtitle_a_000220_000440_v{CLIP_CACHE_VERSION}.npz.tmp.npz"
+    )
+    for f in (current, stale, partial):
+        f.write_bytes(b"x")
+
+    VideoCleanupService._prune_stale_cache(tmp_path)
+
+    assert current.exists()
+    assert not stale.exists()
+    assert not partial.exists()
 
 
 # ---------------------------------------------------------------------------

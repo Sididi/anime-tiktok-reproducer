@@ -10,7 +10,9 @@ Pipeline (all zone rects are user-drawn, normalized frame coords):
    bound GPU memory) the crop region around the rect is fed to ProPainter
    (see propainter_adapter) with clean lead-in/out context frames where the
    span edges allow it. Results are cached on disk (`cleanup/spans/*.npz`),
-   which also makes a re-run resume for free.
+   which also makes a re-run resume for free. The cache only serves the
+   running job (resume + trailing assembly): stale-version files are pruned
+   at run start and the whole directory is deleted on completion.
 3. Assembly pass — third sequential decode; span results are composited back
    (feathered mask) and raw frames are piped to an ffmpeg encoder (NVENC
    with libx264 fallback); audio is stream-copied from the original file.
@@ -24,9 +26,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import time
+import zipfile
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -89,6 +93,28 @@ CLIP_CONTEXT_FRAMES = 10
 CLIP_MAX_FRAMES = 240
 CLIP_CHUNK_OVERLAP = 10
 
+# Karaoke word-highlight subtitles: the currently-spoken word is rendered in
+# a saturated fill (yellow/cyan/…, dark outline) with NO bright unsaturated
+# pixels, so it is invisible to the white-text candidate mask — and worse,
+# the model then propagates the unmasked colored word into neighbouring
+# frames' holes as ghosts (diagnosed on b4fa0a9ec0b3, 2026-08-30). A
+# saturated candidate class is admitted into the inpaint masks (never the
+# presence score) when corroborated: the same location must be white text on
+# another frame of the same subtitle LINE — karaoke words flip white↔color
+# in place, bright colorful backgrounds don't. Lines are segmented by IoU
+# drops between consecutive white masks.
+HIGHLIGHT_LUMA_MIN = 170
+# Half-res px of corroborated highlight on some frame before a line engages
+# the class at all — plain white-subtitle content stays byte-identical.
+HIGHLIGHT_MIN_PIXELS = 40
+# Half-res dilation of the line's white union used as the corroboration
+# stencil; absorbs the italic/scale offset of the highlighted rendering.
+HIGHLIGHT_CORROBORATION_DILATE_PX = 4
+LINE_SPLIT_IOU = 0.20
+# Frames with fewer white px can't vote for a line split (a fully
+# highlighted single-word line has almost no white pixels).
+LINE_MIN_WHITE_PIXELS = 20
+
 # Inpaint mask dilation inside the rect (pixels ~ iterations). Must leave
 # enough margin past the text's dark outline (~3px, plus 2px of half-res
 # quantization) for the eroded+feathered composite alpha: with erode 2 and
@@ -109,8 +135,9 @@ COMPOSITE_ALPHA_ERODE_PX = 2
 # (env PURE_CLEANUP_FILL_UNSHARP overrides; 0 disables).
 FILL_UNSHARP_AMOUNT = 0.0
 # Bumped whenever the npz clip-cache content semantics change (masks moved
-# from per-clip union to per-frame in v2); stale versions are ignored.
-CLIP_CACHE_VERSION = 2
+# from per-clip union to per-frame in v2; karaoke highlight class in v3);
+# stale versions are pruned at run start.
+CLIP_CACHE_VERSION = 3
 
 # Temporal stride: the model processes every Nth frame; skipped frames get
 # their mask region filled by blending the two neighbouring fills. The mask
@@ -420,6 +447,107 @@ class VideoCleanupService:
         return candidate & near_edge
 
     @classmethod
+    def _highlight_candidates(cls, crop_bgr: np.ndarray) -> np.ndarray:
+        """Bright SATURATED pixels near a strong edge — the karaoke-highlight
+        candidate class. Mask-building only, never presence scoring (score
+        inflation on colorful backgrounds would create false spans)."""
+        as_int = crop_bgr.astype(np.int16)
+        cmax = as_int.max(axis=2)
+        cmin = as_int.min(axis=2)
+        candidate = (cmax >= HIGHLIGHT_LUMA_MIN) & (
+            (cmax - cmin) > TEXT_SATURATION_MAX
+        )
+        if not candidate.any():
+            return np.zeros(crop_bgr.shape[:2], dtype=bool)
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        kernel = np.ones((3, 3), np.uint8)
+        gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
+        edges = (gradient >= TEXT_GRADIENT_MIN).astype(np.uint8)
+        near_edge = cv2.dilate(edges, kernel, iterations=TEXT_GRADIENT_REACH) > 0
+        return candidate & near_edge
+
+    @staticmethod
+    def _segment_lines(text_masks: list[np.ndarray | None]) -> list[list[int]]:
+        """Split active frame indices into subtitle-line segments.
+
+        A new line starts when the white mask's IoU against the last
+        substantial white mask collapses (the whole text changed). Frames
+        with almost no white pixels (a fully highlighted single-word line)
+        never vote for a split — they stay in the current line so its white
+        union can corroborate them."""
+        lines: list[list[int]] = []
+        current: list[int] = []
+        prev_substantial: np.ndarray | None = None
+        for i, mask in enumerate(text_masks):
+            if mask is None:
+                if current:
+                    lines.append(current)
+                    current = []
+                prev_substantial = None
+                continue
+            substantial = int(mask.sum()) >= LINE_MIN_WHITE_PIXELS
+            if substantial and prev_substantial is not None and current:
+                intersection = int((prev_substantial & mask).sum())
+                union = int((prev_substantial | mask).sum())
+                if union and intersection / union < LINE_SPLIT_IOU:
+                    lines.append(current)
+                    current = []
+            current.append(i)
+            if substantial:
+                prev_substantial = mask
+        if current:
+            lines.append(current)
+        return lines
+
+    @classmethod
+    def _merge_karaoke_highlights(
+        cls,
+        clip: _Clip,
+        crop_frames_bgr: np.ndarray,
+        text_masks: list[np.ndarray | None],
+    ) -> list[np.ndarray | None]:
+        """Admit corroborated saturated-highlight pixels into the per-frame
+        raw masks. Without them, a karaoke-highlighted word is unmasked while
+        colored: it both survives removal on its own frames AND is treated
+        as revealed background by the model, which propagates it into
+        neighbouring frames' holes as ghosts. Content without a karaoke
+        highlight never engages the gate and comes back unchanged."""
+        plan = clip.zone_plan
+        cx, cy, _, _ = plan.crop
+        x, y, w, h = plan.rect
+        rx, ry = x - cx, y - cy
+        mh, mw = max(1, h // 2), max(1, w // 2)
+        stencil_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * HIGHLIGHT_CORROBORATION_DILATE_PX + 1,) * 2,
+        )
+        merged = list(text_masks)
+        for line in cls._segment_lines(text_masks):
+            white_union = np.zeros((mh, mw), dtype=bool)
+            for i in line:
+                white_union |= text_masks[i]
+            if not white_union.any():
+                continue
+            allowed = cv2.dilate(white_union.astype(np.uint8), stencil_kernel) > 0
+            highlights: dict[int, np.ndarray] = {}
+            engaged = False
+            for i in line:
+                rect_crop = crop_frames_bgr[i][ry : ry + h, rx : rx + w]
+                if (mh, mw) != (h, w):
+                    rect_crop = cv2.resize(
+                        rect_crop, (mw, mh), interpolation=cv2.INTER_AREA
+                    )
+                highlight = cls._highlight_candidates(rect_crop) & allowed
+                if int(highlight.sum()) >= HIGHLIGHT_MIN_PIXELS:
+                    engaged = True
+                highlights[i] = highlight
+            if not engaged:
+                continue
+            for i in line:
+                merged[i] = text_masks[i] | highlights[i]
+        return merged
+
+    @classmethod
     def _scores_to_spans(cls, scores: list[float], total_frames: int) -> list[tuple[int, int]]:
         """Hysteresis + smoothing over per-frame text scores."""
         present = np.zeros(len(scores), dtype=bool)
@@ -701,6 +829,12 @@ class VideoCleanupService:
 
         if text_masks is None:
             text_masks = cls._per_frame_text_masks(clip, crop_frames_bgr)
+        # Karaoke word-highlight support: corroborated saturated pixels join
+        # the raw masks here (both the full-run and the preview path pass
+        # through this method, so parity is preserved).
+        text_masks = cls._merge_karaoke_highlights(
+            clip, crop_frames_bgr, text_masks
+        )
 
         raw = [m for m in text_masks if m is not None]
         if not raw or not any(m.any() for m in raw):
@@ -761,10 +895,28 @@ class VideoCleanupService:
     @staticmethod
     def _save_clip_atomic(path: Path, frames: np.ndarray, masks: np.ndarray) -> None:
         """Write-then-rename so a concurrent assembly reader never sees a
-        partially written npz."""
+        partially written npz.
+
+        Deflate level 1 (np.savez_compressed offers no level knob): the
+        binary masks shrink to ~1% and the fill crops ~3:1 (~71 → ~20 MB
+        per subtitle clip), at ~0.5 s/clip on the save worker — well under
+        a clip's GPU inpaint time, so the 1-deep save pool never backs up.
+        """
         tmp = path.with_name(path.name + ".tmp.npz")
-        np.savez(tmp, frames=frames, masks=masks)
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            for name, arr in (("frames", frames), ("masks", masks)):
+                with zf.open(f"{name}.npy", "w") as fh:
+                    np.lib.format.write_array(fh, np.ascontiguousarray(arr))
         os.replace(tmp, path)
+
+    @staticmethod
+    def _prune_stale_cache(spans_dir: Path) -> None:
+        """Drop cache files a CLIP_CACHE_VERSION bump orphaned (nothing ever
+        reads them again) and partial writes left by a crashed run."""
+        current = f"_v{CLIP_CACHE_VERSION}.npz"
+        for f in spans_dir.glob("*.npz"):
+            if f.name.endswith(".tmp.npz") or not f.name.endswith(current):
+                f.unlink(missing_ok=True)
 
     @classmethod
     def _mask_bbox(cls, masks: np.ndarray, height: int, width: int) -> tuple[int, int, int, int]:
@@ -1189,8 +1341,8 @@ class VideoCleanupService:
             )
             rel_start = clip.out_start - clip.frame_start
             rel_end = clip.out_end - clip.frame_start
-            # Off-thread, uncompressed: neither zlib nor disk I/O may sit
-            # between two GPU clips.
+            # Off-thread: neither compression nor disk I/O may sit between
+            # two GPU clips.
             save_futures.append(
                 save_pool.submit(
                     cls._save_clip_atomic,
@@ -1340,6 +1492,7 @@ class VideoCleanupService:
         cleanup_dir = cls.get_cleanup_dir(project_id)
         spans_dir = cleanup_dir / "spans"
         spans_dir.mkdir(parents=True, exist_ok=True)
+        cls._prune_stale_cache(spans_dir)
 
         def set_progress(progress: float, message: str) -> None:
             cls._update_state(
@@ -1451,6 +1604,11 @@ class VideoCleanupService:
         state.updated_at = datetime.now()
         project.cleanup = state
         ProjectService.save(project)
+
+        # The span cache only serves resume/trailing assembly; with the clean
+        # video rendered and the swap persisted it is dead weight (~GBs per
+        # run). Kept on failure/cancel so the next attempt resumes.
+        shutil.rmtree(spans_dir, ignore_errors=True)
 
         # The browser preview proxy is keyed by source path; the swap to
         # tiktok_clean.mp4 makes the old proxy stale and the new one is
