@@ -27,7 +27,11 @@ from .pending_publish_store import (
 )
 from .storage_box_progress import ProgressCallback
 from .storage_box_rclone import StorageBoxRclone
-from .storage_box_sftp_client import StorageBoxSftpClient, _is_transient_error
+from .storage_box_sftp_client import (
+    StorageBoxSftpClient,
+    _is_transient_error,
+    is_missing_path_error,
+)
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -572,6 +576,22 @@ class StorageBoxRepository:
         try:
             series_ids = await StorageBoxSftpClient.listdir(series_root)
         except Exception as exc:
+            if is_missing_path_error(exc):
+                # A type nobody has published to yet has no series root, and an
+                # empty catalog is the truthful answer — not a failure that
+                # should redden the startup health panel. Nothing is written:
+                # catalog.json is shared mutable state, so an empty rebuild
+                # must never be able to overwrite the other machine's real one.
+                logger.info(
+                    "No remote series root for %s yet; treating its catalog as empty",
+                    scoped_type.value,
+                )
+                return {
+                    "schema_version": SCHEMA_VERSION,
+                    "library_type": scoped_type.value,
+                    "updated_at": _utc_now_iso(),
+                    "items": [],
+                }
             raise RuntimeError(
                 f"Cannot rebuild {scoped_type.value} catalog: failed to list remote series root"
             ) from exc

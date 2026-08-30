@@ -18,6 +18,14 @@ class LibraryType(str, Enum):
 
 DEFAULT_LIBRARY_TYPE = LibraryType.ANIME
 
+# Types that own a series tree on the Storage Box. PURE is deliberately out:
+# a pure project's only source is the TikTok it reproduces, so no catalog,
+# no series root and no release ever exists remotely for it — probing one
+# only yields a failed listing and a spurious integration error.
+STORAGE_BACKED_LIBRARY_TYPES: tuple[LibraryType, ...] = tuple(
+    library_type for library_type in LibraryType if library_type is not LibraryType.PURE
+)
+
 STATIC_OVERLAY_TITLES: dict[LibraryType, str] = {
     LibraryType.ANIME: "CET ANIME EST INCROYABLE !",
     LibraryType.FILMS_SERIES: "CE FILM EST INCROYABLE !",

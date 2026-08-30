@@ -84,3 +84,22 @@ async def test_hydrating_episodes_state_keeps_matcher_index_ready(
         library_type="anime",
         series_id=series_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_list_source_details_skips_storage_box_for_pure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pure has no series tree: it must never reach for the remote catalog.
+
+    The Storage Box has no ``pure`` root, so a probe costs two failing SFTP
+    round-trips (catalog read, then the rebuild fallback) and logs a
+    traceback on every Project Setup render in pure mode.
+    """
+
+    async def _fail(*args: object, **kwargs: object) -> list[dict]:
+        raise AssertionError("pure must not touch the Storage Box catalog")
+
+    monkeypatch.setattr(StorageBoxRepository, "list_catalog", _fail)
+
+    assert await LibraryHydrationService.list_source_details(library_type="pure") == []

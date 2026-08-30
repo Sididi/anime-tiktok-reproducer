@@ -1326,6 +1326,13 @@ class LibraryHydrationService:
         library_type: LibraryType | str,
     ) -> list[dict[str, Any]]:
         scoped_type = coerce_library_type(library_type)
+        if scoped_type is LibraryType.PURE:
+            # Pure projects are built from the TikTok itself: the type has no
+            # series, no local library and no Storage Box tree. Probing the
+            # remote catalog only buys two doomed SFTP round-trips (the read
+            # 404s, then the rebuild fallback 404s on the missing series root)
+            # and an alarming traceback in the log.
+            return []
         try:
             catalog = await StorageBoxRepository.list_catalog(scoped_type)
         except Exception:

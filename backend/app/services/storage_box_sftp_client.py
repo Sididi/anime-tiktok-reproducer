@@ -38,6 +38,18 @@ _TRANSIENT_OS_ERRNOS = {
 }
 
 
+def is_missing_path_error(exc: BaseException) -> bool:
+    """True when the server answered "no such file" for the requested path.
+
+    Distinguishes "this path was never created" from "the box is unreachable
+    / refuses us", so callers can treat an absent tree as empty instead of
+    as a failure.
+    """
+    if asyncssh is not None and isinstance(exc, asyncssh.sftp.SFTPNoSuchFile):
+        return True
+    return isinstance(exc, FileNotFoundError)
+
+
 def _is_transient_error(exc: BaseException) -> bool:
     if asyncssh is not None:
         # ConnectionLost: SSH layer reports the transport went away mid-op.

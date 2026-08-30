@@ -79,6 +79,12 @@ export function ProjectSetup() {
   const loadSources = useCallback(async (options?: { clearOnError?: boolean }) => {
     const requestSeq = sourceLoadSeqRef.current + 1;
     sourceLoadSeqRef.current = requestSeq;
+    if (isPure) {
+      // Pure mode lists no series (the TikTok is the only source), so the
+      // fetch has nothing to return and the source list stays hidden.
+      setSources([]);
+      return null;
+    }
     try {
       const details = await api.getSourceDetails(selectedLibraryType);
       if (requestSeq !== sourceLoadSeqRef.current) {
@@ -93,7 +99,7 @@ export function ProjectSetup() {
       }
       return null;
     }
-  }, [selectedLibraryType]);
+  }, [isPure, selectedLibraryType]);
 
   useEffect(() => {
     void loadSources();

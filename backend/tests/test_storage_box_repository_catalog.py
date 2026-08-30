@@ -440,3 +440,33 @@ async def test_reconcile_catalog_rebuilds_when_catalog_is_unreadable(
     await LibraryHydrationService.reconcile_catalog("anime")
 
     assert rebuilt == ["anime"]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_catalog_treats_missing_series_root_as_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A type nobody published to yet is empty, not broken.
+
+    Its series root simply does not exist, which used to surface as a
+    RuntimeError — one traceback per boot from the catalog warmup, plus an
+    "error" tile for that library in the startup health panel.
+    """
+
+    async def missing_listdir(remote_path: str | PurePosixPath) -> list[str]:
+        raise FileNotFoundError("No such file")
+
+    async def fail_if_written(remote_path: PurePosixPath, payload: dict) -> None:
+        raise AssertionError("an empty rebuild must not overwrite a shared catalog")
+
+    async def fail_if_replaced(src: str | PurePosixPath, dst: str | PurePosixPath) -> None:
+        raise AssertionError("an empty rebuild must not replace a shared catalog")
+
+    monkeypatch.setattr(StorageBoxSftpClient, "listdir", missing_listdir)
+    monkeypatch.setattr(StorageBoxRepository, "_write_remote_json", fail_if_written)
+    monkeypatch.setattr(StorageBoxSftpClient, "replace_file", fail_if_replaced)
+
+    payload = await StorageBoxRepository.rebuild_catalog("simpsons")
+
+    assert payload["items"] == []
+    assert payload["library_type"] == "simpsons"

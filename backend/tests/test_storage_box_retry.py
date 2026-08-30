@@ -10,7 +10,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import asyncssh
 
 from app.config import settings
-from app.services.storage_box_sftp_client import _is_transient_error, _retry_transient
+from app.services.storage_box_sftp_client import (
+    _is_transient_error,
+    _retry_transient,
+    is_missing_path_error,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -73,3 +77,10 @@ async def test_retry_transient_gives_up_after_max_attempts() -> None:
     with pytest.raises(ConnectionResetError):
         await _retry_transient("op", factory)
     assert calls["count"] == settings.storage_box_retry_max_attempts
+
+
+def test_is_missing_path_error_separates_absence_from_unreachability() -> None:
+    assert is_missing_path_error(asyncssh.sftp.SFTPNoSuchFile("No such file"))
+    assert is_missing_path_error(FileNotFoundError("No such file"))
+    assert not is_missing_path_error(asyncssh.sftp.SFTPPermissionDenied("denied"))
+    assert not is_missing_path_error(ConnectionResetError(104, "x"))

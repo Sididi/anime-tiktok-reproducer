@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 
 from .config import settings
 from .api import api_router
-from .library_types import LibraryType
+from .library_types import LibraryType, STORAGE_BACKED_LIBRARY_TYPES
 from .services.account_service import AccountService
 from .services.executors import (
     executor_stats,
@@ -104,7 +104,7 @@ async def _run_storage_box_catalog_warmup() -> None:
         return
 
     async with asyncio.TaskGroup() as task_group:
-        for library_type in LibraryType:
+        for library_type in STORAGE_BACKED_LIBRARY_TYPES:
             task_group.create_task(_warm_storage_box_catalog(library_type))
 
 
@@ -202,7 +202,7 @@ async def lifespan(app: FastAPI):
     app.state.integrations_health = IntegrationHealthService.initialize_startup_state(
         integration_enabled=settings.integration_startup_health_check_enabled,
         storage_box_enabled=settings.storage_box_enabled,
-        library_types=list(LibraryType),
+        library_types=list(STORAGE_BACKED_LIBRARY_TYPES),
     )
 
     if StorageBoxRclone.binary() is None and (
