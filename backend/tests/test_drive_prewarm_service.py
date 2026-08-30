@@ -22,9 +22,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.config import settings
 from app.models import Project, ProjectPhase
 from app.services import drive_shared_sources as dss_module
-from app.services.drive_prewarm_service import DrivePrewarmService, PREWARMED_STATUS
+from app.services.drive_prewarm_service import (
+    PENDING_STATUS,
+    PREWARMED_STATUS,
+    DrivePrewarmService,
+    PrewarmPlan,
+)
 from app.services.drive_shared_sources import DriveSharedSources, SharedFileRecord
-from app.services.export_service import ManifestEntry
+from app.services.export_service import EpisodeSourceResolution, ManifestEntry
 from app.services.google_drive_rclone import GoogleDriveRclone
 from app.services.google_drive_service import GoogleDriveService
 from app.services.project_service import ProjectService
@@ -145,14 +150,26 @@ def _make_project(monkeypatch: pytest.MonkeyPatch, sources: dict[str, list[Path]
 
 @pytest.fixture
 def episodes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    """Route collect_entries through a per-project map of source files."""
-    sources: dict[str, list[Path]] = {}
+    """Route collect_entries through a per-project map of source files.
 
-    def _collect(cls, project: Project, matches) -> list[ManifestEntry]:
-        return [
-            ManifestEntry(relative_path=f"SPM_x/sources/{path.name}", source_path=path)
-            for path in sources.get(project.id, [])
-        ]
+    ``unresolved[project_id]`` holds episode refs the library cannot resolve
+    (an evicted or not-yet-hydrated series), as the real resolution reports them.
+    """
+    sources: dict[str, list[Path]] = {}
+    unresolved: dict[str, list[str]] = {}
+
+    def _collect(cls, project: Project, matches) -> PrewarmPlan:
+        return PrewarmPlan(
+            entries=[
+                ManifestEntry(relative_path=f"SPM_x/sources/{path.name}", source_path=path)
+                for path in sources.get(project.id, [])
+            ],
+            resolution=EpisodeSourceResolution(
+                sources=list(sources.get(project.id, [])),
+                unresolved_refs=list(unresolved.get(project.id, [])),
+                missing_refs=[],
+            ),
+        )
 
     monkeypatch.setattr(DrivePrewarmService, "collect_entries", classmethod(_collect))
     monkeypatch.setattr(ProjectService, "aload_matches", classmethod(lambda cls, pid: _async(_Matches())))
@@ -166,7 +183,7 @@ def episodes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             path.write_bytes(b"e" * size)
         return path
 
-    return sources, _episode
+    return sources, _episode, unresolved
 
 
 async def _async(value):
@@ -185,7 +202,7 @@ def _manifest_names(project_id: str) -> set[str]:
 async def test_second_project_with_same_episode_waits_then_reuses(
     drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sources, episode = episodes
+    sources, episode, _unresolved = episodes
     ep1, ep2 = episode("Ep01.mkv"), episode("Ep02.mkv")
     a = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
     b = _make_project(monkeypatch, sources, "bbbbbbbbbbbb")
@@ -221,7 +238,7 @@ async def test_second_project_with_same_episode_waits_then_reuses(
 async def test_export_overlapping_a_running_prewarm_waits_on_that_file_only(
     drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sources, episode = episodes
+    sources, episode, _unresolved = episodes
     ep1, ep3 = episode("Ep01.mkv"), episode("Ep03.mkv")
     a = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
     sources[a.id] = [ep1]
@@ -275,7 +292,7 @@ async def test_job_reusing_a_present_file_does_not_wait_behind_its_uploader(
     Drive; the pre-warm uploading project B's episode held the music lock for
     its whole run, so project A's export — needing nothing new — waited ~25
     minutes behind a 1.4 GB upload it had no stake in."""
-    sources, episode = episodes
+    sources, episode, _unresolved = episodes
     music, ep_b = episode("Music.wav"), episode("EpB.mkv")
     drive.children.append(
         {"id": "d-music", "name": _shared("Music.wav"), "size": "64", "md5Checksum": "m"}
@@ -311,7 +328,7 @@ async def test_job_reusing_a_present_file_does_not_wait_behind_its_uploader(
 async def test_waiter_relays_the_uploaders_progress(
     drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sources, episode = episodes
+    sources, episode, _unresolved = episodes
     ep1 = episode("Ep01.mkv")
     a = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
     sources[a.id] = [ep1]
@@ -363,7 +380,7 @@ async def test_waiter_relays_the_uploaders_progress(
 async def test_schedule_is_idempotent_and_debounced_on_matches(
     drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sources, episode = episodes
+    sources, episode, _unresolved = episodes
     a = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
     sources[a.id] = [episode("Ep01.mkv")]
 
@@ -404,7 +421,7 @@ async def test_disabled_flags_schedule_nothing(drive: FakeDrive, monkeypatch: py
 async def test_project_deleted_mid_upload_releases_references_without_resurrecting_dir(
     drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sources, episode = episodes
+    sources, episode, _unresolved = episodes
     a = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
     sources[a.id] = [episode("Ep01.mkv")]
     gc_calls: list[tuple[set[str], str]] = []
@@ -438,7 +455,7 @@ async def test_project_deleted_mid_upload_releases_references_without_resurrecti
 async def test_request_cancel_stops_a_running_upload(
     drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sources, episode = episodes
+    sources, episode, _unresolved = episodes
     a = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
     sources[a.id] = [episode("Ep01.mkv")]
 
@@ -485,7 +502,7 @@ def test_manifest_merge_keeps_export_status_and_records(drive: FakeDrive) -> Non
 async def test_resume_pending_targets_script_and_processing_phases_only(
     drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    sources, episode = episodes
+    sources, episode, _unresolved = episodes
     script = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
     processing = _make_project(monkeypatch, sources, "bbbbbbbbbbbb")
     processing.phase = ProjectPhase.PROCESSING
@@ -514,3 +531,57 @@ async def test_resume_pending_targets_script_and_processing_phases_only(
     assert DrivePrewarmService.status(warmed.id)["status"] == "idle"
     assert DrivePrewarmService.status(stale.id)["status"] == "idle"  # older than the window
     assert drive.batches == [[_shared("Ep01.mkv")]]
+
+
+@pytest.mark.asyncio
+async def test_unhydrated_sources_skip_instead_of_failing(
+    drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 2026-08-30 startup traceback: a script-phase project whose series had
+    been evicted from the library made the pre-warm raise out of the export's
+    strict source collection. Nothing here is required for the export."""
+    sources, episode, unresolved = episodes
+    project = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
+    unresolved[project.id] = ["[EMBER] Sakamoto Days - 01", "[EMBER] Sakamoto Days - 06"]
+
+    DrivePrewarmService.schedule(project.id, reason="startup-resume")
+    await DrivePrewarmService.wait(project.id)
+
+    status = DrivePrewarmService.status(project.id)
+    assert status["status"] == "skipped"
+    assert "not in the local library" in status["detail"]
+    assert drive.batches == []
+    assert DriveSharedSources.load_local_manifest(project.id) is None
+
+
+@pytest.mark.asyncio
+async def test_partial_hydration_warms_what_exists_and_stays_retryable(
+    drive: FakeDrive, episodes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sources, episode, unresolved = episodes
+    project = _make_project(monkeypatch, sources, "aaaaaaaaaaaa")
+    sources[project.id] = [episode("Ep01.mkv")]
+    unresolved[project.id] = ["[EMBER] Sakamoto Days - 06"]
+
+    DrivePrewarmService.schedule(project.id, reason="t")
+    await DrivePrewarmService.wait(project.id)
+
+    assert DrivePrewarmService.status(project.id)["status"] == "partial"
+    assert drive.batches == [[_shared("Ep01.mkv")]]
+    manifest = DriveSharedSources.load_local_manifest(project.id) or {}
+    # Pending, not prewarmed: resume_pending must come back for the rest.
+    assert manifest["status"] == PENDING_STATUS
+    assert _manifest_names(project.id) == {_shared("Ep01.mkv")}
+    assert DrivePrewarmService._done_signatures == {}
+
+    # Once hydrated, a re-run is not short-circuited and ships the rest.
+    sources[project.id] = [episode("Ep01.mkv"), episode("Ep06.mkv")]
+    unresolved[project.id] = []
+    DrivePrewarmService.schedule(project.id, reason="t")
+    await DrivePrewarmService.wait(project.id)
+
+    assert DrivePrewarmService.status(project.id)["status"] == "done"
+    assert drive.batches == [[_shared("Ep01.mkv")], [_shared("Ep06.mkv")]]
+    manifest = DriveSharedSources.load_local_manifest(project.id) or {}
+    assert manifest["status"] == PREWARMED_STATUS
+    assert _manifest_names(project.id) == {_shared("Ep01.mkv"), _shared("Ep06.mkv")}

@@ -42,7 +42,7 @@ from ..config import settings
 from ..models import Project, ProjectPhase, SceneMatch
 from .drive_shared_sources import DriveSharedSources, InflightUpload, SharedFileRecord
 from .executors import run_heavy
-from .export_service import ExportService, ManifestEntry
+from .export_service import EpisodeSourceResolution, ExportService, ManifestEntry
 from .google_drive_service import GoogleDriveService
 from .project_service import ProjectService
 from .rclone_runner import RcloneStats
@@ -73,7 +73,8 @@ def _naive(value: datetime) -> datetime:
 class PrewarmState:
     project_id: str
     reason: str
-    # queued → hashing → waiting? → uploading → done | skipped | failed | cancelled
+    # queued → hashing → waiting? → uploading →
+    #   done | partial | skipped | failed | cancelled
     status: str = "queued"
     detail: str = ""
     queued_at: str = field(default_factory=_utc_now_iso)
@@ -104,6 +105,18 @@ class PrewarmState:
             "transferred_bytes": self.transferred_bytes,
             "speed_bytes_per_sec": self.speed_bytes_per_sec,
         }
+
+
+@dataclass
+class PrewarmPlan:
+    """What a pre-warm can ship now, plus the sources it could not resolve."""
+
+    entries: list[ManifestEntry]
+    resolution: EpisodeSourceResolution
+
+    @property
+    def is_complete(self) -> bool:
+        return self.resolution.is_complete
 
 
 class DrivePrewarmService:
@@ -216,8 +229,14 @@ class DrivePrewarmService:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def collect_entries(cls, project: Project, matches: list[SceneMatch]) -> list[ManifestEntry]:
-        """The ``sources/`` entries the export will ship for this project."""
+    def collect_entries(cls, project: Project, matches: list[SceneMatch]) -> PrewarmPlan:
+        """The ``sources/`` entries the export will ship for this project.
+
+        Source episodes can be absent from the library while a project sits in
+        the script phase (an evicted or not-yet-hydrated series). That is an
+        export-time error, not a pre-warm one: warm whatever is on disk now and
+        report the gap so the run is not marked complete.
+        """
         folder = ExportService.output_folder_name(project)
         entries: list[ManifestEntry] = []
         seen: set[str] = set()
@@ -230,12 +249,13 @@ class DrivePrewarmService:
                 ManifestEntry(relative_path=f"{folder}/sources/{path.name}", source_path=path)
             )
 
-        for source_path in ExportService._collect_episode_sources(project, matches):
+        resolution = ExportService.resolve_episode_sources(project, matches)
+        for source_path in resolution.sources:
             _add(source_path)
         music_path = ExportService._resolve_selected_music_path(project)
         if music_path is not None:
             _add(music_path)
-        return entries
+        return PrewarmPlan(entries=entries, resolution=resolution)
 
     @staticmethod
     def _matches_signature(project_id: str) -> str | None:
@@ -337,9 +357,25 @@ class DrivePrewarmService:
         if signature is not None and cls._done_signatures.get(project_id) == signature:
             return cls._finish(state, "skipped", "already pre-warmed for the current matches")
 
-        entries = await run_heavy(cls.collect_entries, project, matches.matches)
-        _, externalized = DriveSharedSources.partition_entries(entries)
+        plan = await run_heavy(cls.collect_entries, project, matches.matches)
+        if not plan.is_complete:
+            # Expected while a series is evicted or still hydrating: warm the
+            # rest, and let a later run (or the export itself) pick these up.
+            logger.info(
+                "Drive pre-warm skipping %d unhydrated source(s): project_id=%s %s",
+                plan.resolution.gap_count,
+                project_id,
+                plan.resolution.describe_gap(),
+            )
+        _, externalized = DriveSharedSources.partition_entries(plan.entries)
         if not externalized:
+            if not plan.is_complete:
+                return cls._finish(
+                    state,
+                    "skipped",
+                    f"{plan.resolution.gap_count} source episode(s) are not in the "
+                    "local library yet; the export will upload them",
+                )
             return cls._finish(state, "done", "no sources above the shared-file threshold")
 
         hashes = await run_heavy(
@@ -402,19 +438,26 @@ class DrivePrewarmService:
         state.records = uploaded
         state.transferred_bytes = max(state.transferred_bytes, 0)
 
-        if not await run_heavy(cls._persist_manifest, project_id, uploaded, PREWARMED_STATUS):
+        # A partial warm stays ``pending`` so the next resume retries the
+        # sources that were missing, instead of the manifest status closing it.
+        final_status = PREWARMED_STATUS if plan.is_complete else PENDING_STATUS
+        if not await run_heavy(cls._persist_manifest, project_id, uploaded, final_status):
             await cls._release_if_project_gone(project_id, state)
             return cls._finish(
                 state, "cancelled", "project was deleted during upload; references released"
             )
-        if signature is not None:
+        if signature is not None and plan.is_complete:
             cls._done_signatures[project_id] = signature
-        cls._finish(
-            state,
-            "done",
+        detail = (
             f"{state.reused_files} reused, {state.uploaded_files} uploaded "
-            f"({state.total_bytes} bytes referenced)",
+            f"({state.total_bytes} bytes referenced)"
         )
+        if not plan.is_complete:
+            detail += (
+                f"; {plan.resolution.gap_count} source episode(s) not in the local "
+                "library yet"
+            )
+        cls._finish(state, "done" if plan.is_complete else "partial", detail)
 
     @classmethod
     async def _release_if_project_gone(cls, project_id: str, state: PrewarmState) -> None:

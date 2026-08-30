@@ -45,6 +45,49 @@ class ManifestEntry:
     mime_type: str = "application/octet-stream"
 
 
+@dataclass
+class EpisodeSourceResolution:
+    """Outcome of mapping a project's matched episode refs to library files."""
+
+    sources: list[Path]
+    # Refs with no library file at all (evicted/never hydrated series).
+    unresolved_refs: list[str]
+    # Refs that resolved to a path that has since gone away.
+    missing_refs: list[str]
+
+    @property
+    def is_complete(self) -> bool:
+        return not self.unresolved_refs and not self.missing_refs
+
+    @property
+    def gap_count(self) -> int:
+        return len(self.unresolved_refs) + len(self.missing_refs)
+
+    def describe_gap(self) -> str:
+        """Human-readable account of what could not be resolved."""
+        details: list[str] = []
+        if self.unresolved_refs:
+            details.append(
+                "Matched episode refs could not be resolved to library sources: "
+                f"{_preview(self.unresolved_refs)}"
+            )
+        if self.missing_refs:
+            details.append(
+                f"Resolved source episode files are missing: {_preview(self.missing_refs)}"
+            )
+        details.append(
+            "Ensure the source episode exists in the hydrated library, then rerun /processing."
+        )
+        return " ".join(details)
+
+
+def _preview(values: list[str], limit: int = 3) -> str:
+    preview = ", ".join(values[:limit])
+    if len(values) > limit:
+        preview += ", ..."
+    return preview
+
+
 def _format_bytes(value: int) -> str:
     units = ("B", "KB", "MB", "GB", "TB")
     size = float(max(0, value))
@@ -370,11 +413,19 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             )
 
     @classmethod
-    def _collect_episode_sources(
+    def resolve_episode_sources(
         cls,
         project: Project,
         matches: list[SceneMatch],
-    ) -> list[Path]:
+    ) -> EpisodeSourceResolution:
+        """Resolve matched episode refs to library files without raising.
+
+        Callers that need every source (the export bundle) go through
+        :meth:`_collect_episode_sources`, which turns any gap into an error.
+        Best-effort callers (the Drive pre-warm) work with what resolved and
+        leave the rest to the export.
+        """
+
         def _resolve_export_source_path(episode_ref: str) -> Path | None:
             episode_ref = str(episode_ref or "").strip()
             if not episode_ref:
@@ -416,30 +467,22 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             seen.add(key)
             sources.append(resolved)
 
-        if unresolved_refs or missing_refs:
-            details: list[str] = []
-            if unresolved_refs:
-                unique_unresolved_refs = list(dict.fromkeys(unresolved_refs))
-                invalid_preview = ", ".join(unique_unresolved_refs[:3])
-                if len(unique_unresolved_refs) > 3:
-                    invalid_preview += ", ..."
-                details.append(
-                    "Matched episode refs could not be resolved to library sources: "
-                    f"{invalid_preview}"
-                )
-            if missing_refs:
-                unique_missing_refs = list(dict.fromkeys(missing_refs))
-                missing_preview = ", ".join(unique_missing_refs[:3])
-                if len(unique_missing_refs) > 3:
-                    missing_preview += ", ..."
-                details.append(
-                    f"Resolved source episode files are missing: {missing_preview}"
-                )
-            details.append(
-                "Ensure the source episode exists in the hydrated library, then rerun /processing."
-            )
-            raise RuntimeError(" ".join(details))
-        return sources
+        return EpisodeSourceResolution(
+            sources=sources,
+            unresolved_refs=list(dict.fromkeys(unresolved_refs)),
+            missing_refs=list(dict.fromkeys(missing_refs)),
+        )
+
+    @classmethod
+    def _collect_episode_sources(
+        cls,
+        project: Project,
+        matches: list[SceneMatch],
+    ) -> list[Path]:
+        resolution = cls.resolve_episode_sources(project, matches)
+        if resolution.is_complete:
+            return resolution.sources
+        raise RuntimeError(resolution.describe_gap())
 
     @classmethod
     def _resolve_selected_music_path(cls, project: Project) -> Path | None:
