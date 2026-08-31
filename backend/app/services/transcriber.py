@@ -9,7 +9,7 @@ import sys
 import tempfile
 import threading
 import unicodedata
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -122,6 +122,26 @@ class TranscriberService:
 
         if should_unload:
             cls.unload_models()
+
+    @classmethod
+    @contextmanager
+    def model_session(cls):
+        """Pin the shared cached models for the duration of the block.
+
+        The ASR and alignment model caches are shared across concurrent
+        pipelines. A non-forced unload_models() from another pipeline's
+        cleanup defers until the last open session exits; without this
+        guard it would pop the cache and move the alignment nn.Module to
+        CPU while this thread is mid-forward with CUDA inputs
+        ("Input type (torch.cuda.FloatTensor) and weight type
+        (torch.FloatTensor) should be the same"). Re-entrant: sessions
+        nest via a plain counter.
+        """
+        cls._start_transcription_session()
+        try:
+            yield
+        finally:
+            cls._end_transcription_session()
 
     @classmethod
     def _unload_cached_models(cls, force: bool = False) -> None:

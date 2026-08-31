@@ -251,34 +251,38 @@ class ForcedAlignmentService:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            effective_model_id = cls._resolve_project_tts_model_id(project_id)
-            manifest = cls._validate_manifest_against_script(
-                manifest=prepared_audio.manifest,
-                script_payload=script_payload,
-                model_id=effective_model_id,
-            )
-            align_language = cls._resolve_alignment_language(manifest.get("language"))
-            if prepared_audio.mode == "audio_parts":
-                result = cls._align_audio_parts(
-                    project_id=project_id,
+            # Hold the shared model caches for the whole alignment run:
+            # a concurrent pipeline's unload_models() would otherwise move
+            # the cached alignment model to CPU mid-inference.
+            with TranscriberService.model_session():
+                effective_model_id = cls._resolve_project_tts_model_id(project_id)
+                manifest = cls._validate_manifest_against_script(
+                    manifest=prepared_audio.manifest,
                     script_payload=script_payload,
-                    reference_transcription=reference_transcription,
-                    manifest=manifest,
-                    segment_audio_paths=prepared_audio.segment_audio_paths,
-                    align_language=align_language,
-                    output_dir=output_dir,
+                    model_id=effective_model_id,
                 )
-            else:
-                result = cls._align_single_audio(
-                    project_id=project_id,
-                    script_payload=script_payload,
-                    reference_transcription=reference_transcription,
-                    manifest=manifest,
-                    edited_audio_path=prepared_audio.edited_audio_path,
-                    align_language=align_language,
-                    coarse_model_size=coarse_model_size,
-                    output_dir=output_dir,
-                )
+                align_language = cls._resolve_alignment_language(manifest.get("language"))
+                if prepared_audio.mode == "audio_parts":
+                    result = cls._align_audio_parts(
+                        project_id=project_id,
+                        script_payload=script_payload,
+                        reference_transcription=reference_transcription,
+                        manifest=manifest,
+                        segment_audio_paths=prepared_audio.segment_audio_paths,
+                        align_language=align_language,
+                        output_dir=output_dir,
+                    )
+                else:
+                    result = cls._align_single_audio(
+                        project_id=project_id,
+                        script_payload=script_payload,
+                        reference_transcription=reference_transcription,
+                        manifest=manifest,
+                        edited_audio_path=prepared_audio.edited_audio_path,
+                        align_language=align_language,
+                        coarse_model_size=coarse_model_size,
+                        output_dir=output_dir,
+                    )
         except ForcedAlignmentError as exc:
             cls.write_alignment_report(output_dir, exc.report)
             raise
