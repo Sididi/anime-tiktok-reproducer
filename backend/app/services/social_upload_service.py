@@ -3397,7 +3397,7 @@ class SocialUploadService:
                         f"{base}/{video_id}/captions",
                         data={
                             "access_token": token,
-                            "locale": subtitle_locale,
+                            "default_locale": subtitle_locale,
                         },
                         files={
                             # Meta expects captions_file as text/plain or application/octet-stream.
@@ -3436,6 +3436,21 @@ class SocialUploadService:
     @classmethod
     def _is_facebook_caption_retryable(cls, response: requests.Response) -> bool:
         if response.status_code in cls._RETRY_STATUS_CODES:
+            return True
+        err = cls._graph_error_object(response)
+        try:
+            code = int(err.get("code") or 0)
+        except (TypeError, ValueError):
+            code = 0
+        try:
+            subcode = int(err.get("error_subcode") or 0)
+        except (TypeError, ValueError):
+            subcode = 0
+        # The classic /{page-id}/videos file_url upload returns its video ID
+        # before that object is consistently readable by other Graph edges.
+        # Caption insertion can therefore briefly report that the freshly
+        # created object does not exist even though the upload succeeded.
+        if code == 100 and subcode == 33:
             return True
         message = _extract_graph_error(response).lower()
         markers = (
