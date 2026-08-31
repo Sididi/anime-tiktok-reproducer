@@ -19,7 +19,7 @@ templates:
     foreground: { prfpset: fg.prfpset, zoom: 0.76 }
     background: { prfpset: bg.prfpset }
     subtitles: { mogrt: s.mogrt, raw_mogrt: r.mogrt }
-    white_border: { enabled: true, mogrt: border.mogrt }
+    white_border: { enabled: true, top_px: 8.4, bottom_px: 6.0 }
     overlay:
       enabled: true
       title: { style: classic, prfpset: null }

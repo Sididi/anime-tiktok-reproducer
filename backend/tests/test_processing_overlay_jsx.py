@@ -24,7 +24,7 @@ def _template(*, title_enabled: bool = True, category_enabled: bool = True) -> T
         foreground=ForegroundConfig(prfpset="fg.prfpset", zoom=0.76),
         background=BackgroundConfig(prfpset="bg.prfpset"),
         subtitles=SubtitlesConfig(mogrt="s.mogrt", raw_mogrt="r.mogrt"),
-        white_border=WhiteBorderConfig(enabled=True, mogrt="border.mogrt"),
+        white_border=WhiteBorderConfig(enabled=True),
         overlay=OverlayConfig(
             enabled=True,
             title=OverlaySideConfig(
@@ -172,11 +172,11 @@ def test_jsx_tries_native_fondu_additif_then_opacity_fallback():
 def test_jsx_places_white_border_early_and_verifies_after_subtitles():
     jsx = _render(title=True, category=True)
     border_fn = jsx[
-        jsx.index("function ensureWhiteBorderMogrt")
+        jsx.index("function ensureWhiteBorderImage")
         : jsx.index("function getMotionComponent")
     ]
 
-    border_call = "ensureWhiteBorderMogrt(sequence, v2, sequenceEndSec);"
+    border_call = "ensureWhiteBorderImage(sequence, v2, sequenceEndSec);"
     sequence_end = jsx.index("var sequenceEndSec = ttsEndSec;")
     early_border = jsx.index(border_call, sequence_end)
     subtitle_import = jsx.index("importUnifiedSubtitles(", early_border)
@@ -184,29 +184,24 @@ def test_jsx_places_white_border_early_and_verifies_after_subtitles():
     assert jsx.count(border_call) == 2
     assert sequence_end < early_border < subtitle_import < final_border
 
-    assert border_fn.count("importedBorderCandidate = sequence.importMGT(") == 1
-    assert 'BORDER_MOGRT_PATH,\n          "0",\n          1,\n          0,' in jsx
-    assert "borderItem = waitForTrackItemAtStart(" in jsx
-    assert "track.overwriteClip(importedBorderProjectItem, \"0\")" in jsx
+    assert "getOrImportClip(BORDER_IMAGE_FILENAME)" in border_fn
+    assert "track.overwriteClip(borderClip, 0);" in border_fn
+    assert "borderItem = waitForTrackItemAtStart(" in border_fn
     assert "pruneExtraBorderClips(track)" in border_fn
-    assert "Border Mogrt verified on V2" in jsx
+    assert "Border image verified on V2" in jsx
 
-    assert "BORDER_MOGRT_MAX_ATTEMPTS" not in jsx
-    assert "BORDER_MOGRT_RETRY_BASE_MS" not in jsx
-    assert "BORDER_MOGRT_INSTALL_WAIT_MS" not in jsx
-    assert "function installBorderMogrtFromFile(" not in jsx
-    assert "findReusableWhiteBorderProjectItem" not in jsx
-    assert "findInstalledBorderMogrtProjectItem" not in jsx
-    assert "normalizeMogrtNameKey" not in jsx
+    # The MOGRT border machinery is fully retired (subtitles still use importMGT).
+    assert "BORDER_MOGRT" not in jsx
+    assert "ensureWhiteBorderMogrt" not in jsx
+    assert "importMGT" not in border_fn
     assert "app.project.importFiles" not in border_fn
-    assert "[BORDER_MOGRT_PATH]" not in jsx
 
 
 def test_jsx_border_failure_is_nonfatal_and_silent():
     jsx = _render(title=True, category=True)
 
     border_fn = jsx[
-        jsx.index("function ensureWhiteBorderMogrt")
+        jsx.index("function ensureWhiteBorderImage")
         : jsx.index("function getMotionComponent")
     ]
     assert "throw new Error" not in border_fn
@@ -214,14 +209,12 @@ def test_jsx_border_failure_is_nonfatal_and_silent():
     assert "function recordImportWarning(" not in jsx
     assert "__ATR_IMPORT_WARNINGS__" not in jsx
     assert "function pruneExtraBorderClips(" in jsx
-    assert "Border Mogrt skipped: V2 track unavailable." in border_fn
-    assert "Border Mogrt skipped: file missing at" in border_fn
+    assert "Border image skipped: V2 track unavailable." in border_fn
+    assert "not found in /sources" in border_fn
     assert (
-        "Border Mogrt was not placed on V2; continuing without it." in border_fn
+        "Border image was not placed on V2; continuing without it." in border_fn
     )
-    assert "Border Mogrt end time could not be verified at" in border_fn
-    assert "Required Border Mogrt could not be found on V2" not in jsx
-    assert "V2 track unavailable; required Border Mogrt not inserted." not in jsx
+    assert "Border image end time could not be verified at" in border_fn
 
 
 def test_jsx_verifies_border_end_with_documented_time_object():

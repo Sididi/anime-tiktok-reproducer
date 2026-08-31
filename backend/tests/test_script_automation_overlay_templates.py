@@ -29,7 +29,7 @@ def _template(
         foreground=ForegroundConfig(prfpset="fg.prfpset", zoom=0.76),
         background=BackgroundConfig(prfpset="bg.prfpset"),
         subtitles=SubtitlesConfig(mogrt="s.mogrt", raw_mogrt="r.mogrt"),
-        white_border=WhiteBorderConfig(enabled=True, mogrt="border.mogrt"),
+        white_border=WhiteBorderConfig(enabled=True),
         overlay=OverlayConfig(
             enabled=True,
             title=OverlaySideConfig(

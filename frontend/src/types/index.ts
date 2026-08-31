@@ -55,8 +55,18 @@ export interface CleanupZone {
   h: number;
 }
 
+// Where the clean feed lies within the source frame (normalized 0..1).
+// Pure mode only; drives Premiere crop/scale geometry, never inpainted.
+export interface CleanFeedRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface CleanupState {
   zones: CleanupZone[];
+  clean_feed_rect: CleanFeedRect | null;
   status: "idle" | "running" | "complete" | "error";
   progress: number;
   message: string | null;

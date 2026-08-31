@@ -473,6 +473,18 @@ export const api = {
       },
     ),
 
+  saveCleanFeedRect: (
+    projectId: string,
+    rect: import("@/types").CleanFeedRect,
+  ) =>
+    request<import("@/types").CleanupState>(
+      `/projects/${projectId}/cleanup/clean-feed-rect`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ rect }),
+      },
+    ),
+
   renderCleanupPreview: (projectId: string, timestamp: number) =>
     request<{ before_url: string; after_url: string }>(
       `/projects/${projectId}/cleanup/preview`,

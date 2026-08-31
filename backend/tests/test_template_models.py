@@ -26,7 +26,7 @@ def _classic() -> Template:
         foreground=ForegroundConfig(prfpset="fg.prfpset", zoom=0.76),
         background=BackgroundConfig(prfpset="bg.prfpset"),
         subtitles=SubtitlesConfig(mogrt="s.mogrt", raw_mogrt="r.mogrt"),
-        white_border=WhiteBorderConfig(enabled=True, mogrt="border.mogrt"),
+        white_border=WhiteBorderConfig(enabled=True),
         overlay=OverlayConfig(
             enabled=True,
             title=OverlaySideConfig(style="classic", prfpset=None),
@@ -42,13 +42,26 @@ def test_template_zoom_must_be_positive():
         ForegroundConfig(prfpset="x", zoom=0)
 
 
-def test_white_border_disabled_allows_null_mogrt():
-    WhiteBorderConfig(enabled=False, mogrt=None)
+def test_white_border_defaults_match_retired_mogrt():
+    # Measured from "White border 10px.mogrt": 8.4px above / 6.0px below the
+    # classic 76% band.
+    border = WhiteBorderConfig(enabled=True)
+    assert border.top_px == 8.4
+    assert border.bottom_px == 6.0
 
 
-def test_white_border_enabled_requires_mogrt():
+def test_white_border_bounds():
     with pytest.raises(ValueError):
-        WhiteBorderConfig(enabled=True, mogrt=None)
+        WhiteBorderConfig(enabled=True, top_px=-1)
+    with pytest.raises(ValueError):
+        WhiteBorderConfig(enabled=True, bottom_px=201)
+
+
+def test_white_border_rejects_legacy_keys():
+    with pytest.raises(ValueError):
+        WhiteBorderConfig(enabled=True, mogrt="border.mogrt")
+    with pytest.raises(ValueError):
+        WhiteBorderConfig(enabled=True, thickness_px=10)
 
 
 def test_overlay_side_style_required():

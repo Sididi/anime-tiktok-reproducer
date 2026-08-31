@@ -31,14 +31,13 @@ class OverlayConfig(BaseModel):
 
 class WhiteBorderConfig(BaseModel):
     enabled: bool
-    mogrt: str | None = None
+    # Visible separator thickness per side (px in the 1080x1920 sequence).
+    # Defaults measured from the retired "White border 10px.mogrt": its white
+    # slab spanned seq 541.2..1376.4, i.e. 8.4px above / 6.0px below the
+    # classic 76% band — so the generated PNG renders identically.
+    top_px: float = Field(default=8.4, ge=0.0, le=200.0)
+    bottom_px: float = Field(default=6.0, ge=0.0, le=200.0)
     model_config = {"extra": "forbid"}
-
-    @model_validator(mode="after")
-    def _mogrt_required_when_enabled(self) -> "WhiteBorderConfig":
-        if self.enabled and not self.mogrt:
-            raise ValueError("white_border.mogrt is required when enabled is true")
-        return self
 
 
 class ForegroundConfig(BaseModel):

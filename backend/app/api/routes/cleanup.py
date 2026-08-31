@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from ...library_types import LibraryType
 from ...models import ProjectPhase
-from ...models.cleanup import CleanupState, CleanupZone
+from ...models.cleanup import CleanFeedRect, CleanupState, CleanupZone
 from ...services import ProjectService
 from ...services.video_cleanup_service import VideoCleanupService
 
@@ -33,6 +33,10 @@ class SaveZonesRequest(BaseModel):
     zones: list[CleanupZone]
 
 
+class SaveCleanFeedRectRequest(BaseModel):
+    rect: CleanFeedRect
+
+
 class PreviewRequest(BaseModel):
     timestamp: float = 0.0
 
@@ -48,6 +52,17 @@ async def save_zones(project_id: str, request: SaveZonesRequest) -> CleanupState
     _require_pure(project_id)
     try:
         return VideoCleanupService.save_zones(project_id, request.zones)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/clean-feed-rect")
+async def save_clean_feed_rect(
+    project_id: str, request: SaveCleanFeedRectRequest
+) -> CleanupState:
+    _require_pure(project_id)
+    try:
+        return VideoCleanupService.save_clean_feed_rect(project_id, request.rect)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -118,6 +133,11 @@ async def skip_cleanup(project_id: str) -> dict:
     if state is not None and state.status == "running":
         raise HTTPException(
             status_code=400, detail="Cleanup is running; cancel it first"
+        )
+    if state is None or state.clean_feed_rect is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Set the clean feed rectangle before continuing",
         )
     project.phase = ProjectPhase.SCENE_DETECTION
     await ProjectService.asave(project)

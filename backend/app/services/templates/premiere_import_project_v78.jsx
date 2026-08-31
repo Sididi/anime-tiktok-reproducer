@@ -1,10 +1,13 @@
 /**
- * Anime TikTok Reproducer - Premiere Pro 2025 Automation Script (v7.7 - EXTERNAL SUBTITLE MOGRT LOAD)
+ * Anime TikTok Reproducer - Premiere Pro 2025 Automation Script (v7.8 - RESOLUTION-ADAPTIVE GEOMETRY)
  *
- * CHANGES from v7.6:
- * - Removed all in-script subtitle MOGRT generation logic.
- * - Loads pre-generated subtitle MOGRT files from /subtitles.
- * - Uses subtitles.srt only for timeline timing (start/end).
+ * CHANGES from v7.7:
+ * - Per-source SOURCE_GEOMETRY map (Python-precomputed): V3/V1 scale adapts to
+ *   any source resolution (76/183 remain the 1080p fallbacks).
+ * - White border MOGRT removed; V2 carries a generated PNG with the two
+ *   horizontal separator bars hugging the clean-feed band edges.
+ * - Pure entries additionally crop both tracks to the clean-feed rect (QE
+ *   Crop effect) and set Motion Position to re-center the cropped area.
  */
 
 (function () {
@@ -16,7 +19,7 @@
   var SOURCES_DIR = ROOT_DIR + "/sources";
 
   var SEQUENCE_PRESET_PATH = ASSETS_DIR + "/TikTok60fps.sqpreset";
-  var BORDER_MOGRT_PATH = ASSETS_DIR + "/White border 10px.mogrt";
+  var BORDER_IMAGE_FILENAME = "white_border_frame.png";
   var AUDIO_FILENAME = "tts_edited.wav";
   var CATEGORY_OVERLAY_FILENAME = "category_overlay.png";
   var TITLE_OVERLAY_FILENAME = "title_overlay.png";
@@ -45,8 +48,15 @@
   var RAW_SCENE_SUBTITLE_MANIFEST_PATH =
     ROOT_DIR + "/raw_scene_subtitles/manifest.json";
   var SOURCE_AUDIO_POLICIES = {};
+  // Per-source geometry precomputed by Python (keyed by clip basename):
+  //   anime: { mode: "anime", fg_scale, bg_scale }
+  //   pure:  { mode: "pure", fg_scale, bg_scale, crop_left_pct, crop_top_pct,
+  //            crop_right_pct, crop_bottom_pct, fg_pos, bg_pos }
+  var SOURCE_GEOMETRY = {};
 
   // --- TEMPLATE TOGGLES (overridden by Python at render time) ---
+  var DEFAULT_FG_SCALE = 76;
+  var DEFAULT_BG_SCALE = 183;
   var WHITE_BORDER_ENABLED = true;
   var OVERLAY_ENABLED = true;
   var CATEGORY_OVERLAY_ENABLED = true;
@@ -687,7 +697,7 @@
   var TRACK_ITEM_WAIT_MAX_STEP_MS = 45;
   var TRACK_ITEM_WAIT_STEP_BACKOFF_MS = 10;
   var TRACK_ITEM_WAIT_MAX_MS = 180;
-  var BORDER_MOGRT_WAIT_MAX_MS = 1000;
+  var BORDER_WAIT_MAX_MS = 1000;
   var SPEED_RETRY_FAST_WAIT_MS = 12;
   var SPEED_RETRY_LONG_WAIT_MS = 60;
   var SOURCE_AUDIO_POLICY_RETRY_WAIT_MS = 40;
@@ -712,6 +722,10 @@
   var LUMETRI_PRESET_ARB_STRINGS_CACHE = {};
   var LUMETRI_LOOK_PATH_CACHE = {};
   var VIDEO_EFFECT_RESOLVE_CACHE = {};
+  var CROP_EFFECT_LOOKUP_DONE = false;
+  var CROP_EFFECT_OBJ = null;
+  var CROP_VERIFY_WAIT_STEP_MS = 10;
+  var CROP_VERIFY_WAIT_MAX_MS = 250;
   var VIDEO_TRANSITION_RESOLVE_CACHE = {};
   var KNOWN_MEDIA_EXTENSIONS = {
     ".mkv": true,
@@ -812,6 +826,7 @@
       "qeEffectPreMappedItems",
       "qeEffectContextReusedItems",
       "importMGTCalls",
+      "cropEffectApplyCalls",
       "speedApplyCalls",
       "speedApplyFullScans",
       "clearSelectionSelectionItems",
@@ -1570,8 +1585,8 @@
   }
 
   function pruneExtraBorderClips(track) {
-    // V2 is dedicated to the border. A delayed importMGT result can appear
-    // after the project-item repair; keep the first clip only.
+    // V2 is dedicated to the border. Re-entrant placement attempts can leave
+    // duplicates behind; keep the first clip only.
     // Never identity-compare TrackItems here: ExtendScript wrapper objects
     // for the same clip are not ===-equal.
     if (!track || !track.clips) return 0;
@@ -1592,81 +1607,47 @@
     return removed;
   }
 
-  function ensureWhiteBorderMogrt(sequence, track, endSec) {
+  function ensureWhiteBorderImage(sequence, track, endSec) {
     if (!WHITE_BORDER_ENABLED) {
       log("Skipping V2 border (template white_border.enabled=false).");
       return null;
     }
     if (!sequence || !track) {
-      log("Border Mogrt skipped: V2 track unavailable.");
-      return null;
-    }
-    if (!new File(BORDER_MOGRT_PATH).exists) {
-      log("Border Mogrt skipped: file missing at " + BORDER_MOGRT_PATH + ".");
+      log("Border image skipped: V2 track unavailable.");
       return null;
     }
 
     var borderItem = findTrackItemAtStart(track, 0, null);
     if (!borderItem) {
-      log("Adding packaged Border Mogrt to V2...");
-      var importedBorderCandidate = null;
-      try {
-        perfCounterInc("importMGTCalls");
-        // Premiere's documented API requires insertion time as ticks text.
-        importedBorderCandidate = sequence.importMGT(
-          BORDER_MOGRT_PATH,
-          "0",
-          1,
-          0,
+      log("Adding border image '" + BORDER_IMAGE_FILENAME + "' to V2...");
+      var borderClip = getOrImportClip(BORDER_IMAGE_FILENAME);
+      if (!borderClip) {
+        log(
+          "Border image skipped: '" +
+            BORDER_IMAGE_FILENAME +
+            "' not found in /sources.",
         );
+        return null;
+      }
+      try {
+        track.overwriteClip(borderClip, 0);
       } catch (eBorder) {
         log(
-          "Border Mogrt import error: " +
+          "Border image placement error: " +
             (eBorder && eBorder.message ? eBorder.message : eBorder),
         );
       }
-
       refreshSequenceUI(sequence);
       borderItem = waitForTrackItemAtStart(
         track,
         0,
         null,
-        BORDER_MOGRT_WAIT_MAX_MS,
+        BORDER_WAIT_MAX_MS,
       );
-
-      var importedBorderProjectItem = null;
-      try {
-        importedBorderProjectItem = importedBorderCandidate
-          ? importedBorderCandidate.projectItem
-          : null;
-      } catch (eBorderProjectItem) {
-        importedBorderProjectItem = null;
-      }
-
-      if (!borderItem && importedBorderProjectItem) {
-        log("Repairing Border Mogrt placement from its project item...");
-        try {
-          track.overwriteClip(importedBorderProjectItem, "0");
-        } catch (eOverwriteBorder) {
-          log(
-            "Border Mogrt overwrite fallback error: " +
-              (eOverwriteBorder && eOverwriteBorder.message
-                ? eOverwriteBorder.message
-                : eOverwriteBorder),
-          );
-        }
-        refreshSequenceUI(sequence);
-        borderItem = waitForTrackItemAtStart(
-          track,
-          0,
-          null,
-          BORDER_MOGRT_WAIT_MAX_MS,
-        );
-      }
     }
 
     if (!borderItem) {
-      log("Border Mogrt was not placed on V2; continuing without it.");
+      log("Border image was not placed on V2; continuing without it.");
       return null;
     }
 
@@ -1675,7 +1656,7 @@
       log(
         "Removed " +
           prunedBorderClips +
-          " duplicate Border Mogrt clip(s) from V2.",
+          " duplicate border clip(s) from V2.",
       );
       refreshSequenceUI(sequence);
       borderItem = findTrackItemAtStart(track, 0, null) || borderItem;
@@ -1683,11 +1664,11 @@
 
     if (!setTrackItemEndSeconds(borderItem, endSec)) {
       log(
-        "Border Mogrt end time could not be verified at " + endSec + "s.",
+        "Border image end time could not be verified at " + endSec + "s.",
       );
       return borderItem;
     }
-    log("Border Mogrt verified on V2. Duration: " + endSec);
+    log("Border image verified on V2. Duration: " + endSec);
     return borderItem;
   }
 
@@ -1749,6 +1730,361 @@
       }
     }
     return false;
+  }
+
+  function getSourceGeometry(name) {
+    if (!name) return null;
+    var cleanName = name.toString().replace(/^\s+|\s+$/g, "");
+    if (!cleanName) return null;
+    var nameNoExt = stripKnownExtension(cleanName);
+    return SOURCE_GEOMETRY[cleanName] || SOURCE_GEOMETRY[nameNoExt] || null;
+  }
+
+  function resolveCropVideoEffect() {
+    if (CROP_EFFECT_LOOKUP_DONE) return CROP_EFFECT_OBJ;
+    CROP_EFFECT_LOOKUP_DONE = true;
+    CROP_EFFECT_OBJ =
+      resolveVideoEffectByName("Recadrage") || resolveVideoEffectByName("Crop");
+    if (!CROP_EFFECT_OBJ) {
+      // Locale-robust fallback: scan the QE effect list for a crop-like name.
+      try {
+        var effects = qe.project.getVideoEffectList();
+        var count = 0;
+        try {
+          if (effects && effects.numItems !== undefined) {
+            count = effects.numItems;
+          } else if (effects && effects.length !== undefined) {
+            count = effects.length;
+          }
+        } catch (eCount) {}
+        for (var i = 0; i < count; i++) {
+          var candidate = null;
+          try {
+            candidate =
+              effects[i] || (effects.getItemAt ? effects.getItemAt(i) : null);
+          } catch (eItem) {}
+          var candidateName =
+            candidate && candidate.name ? candidate.name.toString() : "";
+          if (candidateName && /recadrage|crop/i.test(candidateName)) {
+            CROP_EFFECT_OBJ = candidate;
+            log(
+              "Crop effect resolved from QE effect list as '" +
+                candidateName +
+                "'.",
+            );
+            break;
+          }
+        }
+      } catch (eList) {}
+    }
+    if (!CROP_EFFECT_OBJ) {
+      log(
+        "Warning: Crop video effect could not be resolved (tried 'Recadrage'/'Crop' + list scan).",
+      );
+    }
+    return CROP_EFFECT_OBJ;
+  }
+
+  function findCropComponentOnItem(item) {
+    if (!item || !item.components) return null;
+    for (var c = 0; c < item.components.numItems; c++) {
+      var comp = item.components[c];
+      if (!comp) continue;
+      var compMatch = "";
+      try {
+        compMatch = comp.matchName ? comp.matchName.toString() : "";
+      } catch (e0) {}
+      if (compMatch && compMatch.toLowerCase().indexOf("crop") !== -1) {
+        return comp;
+      }
+      var compName = "";
+      try {
+        compName = comp.displayName ? comp.displayName.toString() : "";
+      } catch (e1) {}
+      if (compName === "Recadrage" || compName === "Crop") return comp;
+    }
+    return null;
+  }
+
+  function setCropPropertyValue(component, nameCandidates, fallbackIndex, value) {
+    if (!component || !component.properties) return false;
+    var props = component.properties;
+    for (var p = 0; p < props.numItems; p++) {
+      var prop = props[p];
+      if (!prop || !prop.displayName) continue;
+      var propName = prop.displayName.toString();
+      for (var n = 0; n < nameCandidates.length; n++) {
+        if (propName === nameCandidates[n]) {
+          return setPropertyValueFast(prop, value);
+        }
+      }
+    }
+    // Positional fallback: Crop exposes Left, Top, Right, Bottom first.
+    if (fallbackIndex >= 0 && fallbackIndex < props.numItems) {
+      return setPropertyValueFast(props[fallbackIndex], value);
+    }
+    return false;
+  }
+
+  function setCropValuesOnComponent(component, geo) {
+    var okLeft = setCropPropertyValue(
+      component,
+      ["Left", "Gauche"],
+      0,
+      typeof geo.crop_left_pct === "number" ? geo.crop_left_pct : 0,
+    );
+    var okTop = setCropPropertyValue(
+      component,
+      ["Top", "Haut"],
+      1,
+      typeof geo.crop_top_pct === "number" ? geo.crop_top_pct : 0,
+    );
+    var okRight = setCropPropertyValue(
+      component,
+      ["Right", "Droite"],
+      2,
+      typeof geo.crop_right_pct === "number" ? geo.crop_right_pct : 0,
+    );
+    var okBottom = setCropPropertyValue(
+      component,
+      ["Bottom", "Bas"],
+      3,
+      typeof geo.crop_bottom_pct === "number" ? geo.crop_bottom_pct : 0,
+    );
+    return okLeft && okTop && okRight && okBottom;
+  }
+
+  function setPositionOnItem(item, pos) {
+    if (!item || !pos || pos.length < 2) return false;
+    var motion = getMotionComponent(item);
+    if (!motion || !motion.properties) return false;
+    for (var p = 0; p < motion.properties.numItems; p++) {
+      var prop = motion.properties[p];
+      if (!prop || !prop.displayName) continue;
+      // "Position" is the same displayName in the FR locale.
+      if (prop.displayName === "Position") {
+        return setPropertyValueFast(prop, [pos[0], pos[1]]);
+      }
+    }
+    // Positional fallback: Motion's first property is Position.
+    if (motion.properties.numItems > 0) {
+      return setPropertyValueFast(motion.properties[0], [pos[0], pos[1]]);
+    }
+    return false;
+  }
+
+  function addVideoEffectToSceneItemQE(
+    startSec,
+    cleanName,
+    qeSeq,
+    qeTrackCache,
+    effectObj,
+    trackIndex,
+  ) {
+    if (!effectObj) return false;
+    try {
+      if (!qeSeq) qeSeq = qe.project.getActiveSequence();
+      if (!qeSeq) return false;
+      var qeTrack = getCachedQETrack(qeSeq, "Video", trackIndex, qeTrackCache);
+      if (!qeTrack) return false;
+      var targetTicks = secondsToTicks(startSec);
+      var toleranceTicks = secondsToTicks(0.2);
+      for (var i = qeTrack.numItems - 1; i >= 0; i--) {
+        var item = null;
+        try {
+          item = qeTrack.getItemAt(i);
+        } catch (eItem) {
+          continue;
+        }
+        if (!item || typeof item.start === "undefined") continue;
+        var startTicks = getQEItemStartTicks(item);
+        var matchTime = false;
+        if (typeof startTicks === "number" && !isNaN(startTicks)) {
+          matchTime = Math.abs(startTicks - targetTicks) < toleranceTicks;
+        } else {
+          try {
+            matchTime = Math.abs(item.start.secs - startSec) < 0.2;
+          } catch (e0) {}
+        }
+        if (!matchTime) continue;
+        if (cleanName) {
+          var itemName = item.name ? item.name.toString() : "";
+          if (!isItemNameMatch(itemName, cleanName)) continue;
+        }
+        try {
+          perfCounterInc("cropEffectApplyCalls");
+          item.addVideoEffect(effectObj);
+          return true;
+        } catch (eAdd) {
+          log(
+            "Crop addVideoEffect error: " +
+              (eAdd && eAdd.message ? eAdd.message : eAdd),
+          );
+          return false;
+        }
+      }
+    } catch (e) {
+      log("Crop QE resolve error: " + (e && e.message ? e.message : e));
+    }
+    return false;
+  }
+
+  function ensureCropOnSceneItem(
+    item,
+    geo,
+    startSec,
+    cleanName,
+    qeSeq,
+    qeTrackCache,
+    trackIndex,
+    trackLabel,
+  ) {
+    if (!item || !geo) return false;
+    var component = findCropComponentOnItem(item);
+    if (!component) {
+      var effectObj = resolveCropVideoEffect();
+      if (!effectObj) return false;
+      if (
+        !addVideoEffectToSceneItemQE(
+          startSec,
+          cleanName,
+          qeSeq,
+          qeTrackCache,
+          effectObj,
+          trackIndex,
+        )
+      ) {
+        log(
+          "Warning: Could not add Crop effect on " +
+            trackLabel +
+            " at " +
+            startSec +
+            "s (" +
+            cleanName +
+            ").",
+        );
+        return false;
+      }
+      var waitedMs = 0;
+      component = findCropComponentOnItem(item);
+      while (!component && waitedMs < CROP_VERIFY_WAIT_MAX_MS) {
+        sleep(CROP_VERIFY_WAIT_STEP_MS);
+        waitedMs += CROP_VERIFY_WAIT_STEP_MS;
+        component = findCropComponentOnItem(item);
+      }
+    }
+    if (!component) {
+      log(
+        "Warning: Crop component not found after add on " +
+          trackLabel +
+          " at " +
+          startSec +
+          "s (" +
+          cleanName +
+          ").",
+      );
+      return false;
+    }
+    if (!setCropValuesOnComponent(component, geo)) {
+      log(
+        "Warning: Crop values could not be fully applied on " +
+          trackLabel +
+          " at " +
+          startSec +
+          "s (" +
+          cleanName +
+          ").",
+      );
+      return false;
+    }
+    return true;
+  }
+
+  function resolveGeometryItem(preferredItem, track, startSec) {
+    if (preferredItem) return preferredItem;
+    if (!track) return null;
+    return (
+      findRecentTrackItemAtStart(track, startSec, null) ||
+      findTrackItemAtStart(track, startSec, null)
+    );
+  }
+
+  function applySceneGeometry(
+    v1,
+    v3,
+    v1Item,
+    v3Item,
+    startSec,
+    cleanName,
+    qeSeq,
+    qeTrackCache,
+  ) {
+    var geo = getSourceGeometry(cleanName);
+    if (!geo) {
+      log(
+        "Geometry fallback for '" +
+          cleanName +
+          "' (no SOURCE_GEOMETRY entry; using " +
+          DEFAULT_FG_SCALE +
+          "/" +
+          DEFAULT_BG_SCALE +
+          ").",
+      );
+    }
+    var fgScale =
+      geo && typeof geo.fg_scale === "number" ? geo.fg_scale : DEFAULT_FG_SCALE;
+    var bgScale =
+      geo && typeof geo.bg_scale === "number" ? geo.bg_scale : DEFAULT_BG_SCALE;
+    if (!setScaleOnItem(v3Item, fgScale) && v3)
+      setScaleAndPosition(v3, startSec, fgScale); // Main Scaled Down
+    if (!setScaleOnItem(v1Item, bgScale) && v1)
+      setScaleAndPosition(v1, startSec, bgScale); // Background Scaled Up
+
+    if (geo && geo.mode === "pure") {
+      // Pure: both tracks crop to the clean-feed rect, then Motion Position
+      // re-centers the cropped area (crop keeps the visible rect at its
+      // original offset within the clip frame).
+      var fgItem = resolveGeometryItem(v3Item, v3, startSec);
+      var bgItem = resolveGeometryItem(v1Item, v1, startSec);
+      ensureCropOnSceneItem(
+        fgItem,
+        geo,
+        startSec,
+        cleanName,
+        qeSeq,
+        qeTrackCache,
+        2,
+        "V3",
+      );
+      ensureCropOnSceneItem(
+        bgItem,
+        geo,
+        startSec,
+        cleanName,
+        qeSeq,
+        qeTrackCache,
+        0,
+        "V1",
+      );
+      if (geo.fg_pos && !setPositionOnItem(fgItem, geo.fg_pos)) {
+        log(
+          "Warning: could not set V3 position at " +
+            startSec +
+            "s (" +
+            cleanName +
+            ").",
+        );
+      }
+      if (geo.bg_pos && !setPositionOnItem(bgItem, geo.bg_pos)) {
+        log(
+          "Warning: could not set V1 position at " +
+            startSec +
+            "s (" +
+            cleanName +
+            ").",
+        );
+      }
+    }
   }
 
   function logClipDuration(item, targetSeconds, label) {
@@ -2324,6 +2660,8 @@
     PERF_COUNTERS = {};
     PRESET_PARSED_DATA_CACHE = {};
     VIDEO_EFFECT_RESOLVE_CACHE = {};
+    CROP_EFFECT_LOOKUP_DONE = false;
+    CROP_EFFECT_OBJ = null;
     VIDEO_TRANSITION_RESOLVE_CACHE = {};
     QE_TRACK_RESOLVE_CACHE = {};
     QE_TRACK_ITEM_HINTS = {};
@@ -2654,12 +2992,18 @@
         perfEnd("scenes_speed");
       }
 
-      // 4. APPLY SCALE (Standard API)
+      // 4. APPLY GEOMETRY (per-source scale, pure-mode crop)
       perfStart("scenes_scale");
-      if (!setScaleOnItem(v3Item, 76) && v3)
-        setScaleAndPosition(v3, startSec, 76); // Main Scaled Down
-      if (!setScaleOnItem(v1Item, 183) && v1)
-        setScaleAndPosition(v1, startSec, 183); // Background Scaled Up
+      applySceneGeometry(
+        v1,
+        v3,
+        v1Item,
+        v3Item,
+        startSec,
+        cleanName,
+        qeSeq,
+        qeTrackCache,
+      );
       perfEnd("scenes_scale");
 
       if (v3Item) {
@@ -2705,10 +3049,10 @@
 
     var sequenceEndSec = ttsEndSec;
 
-    // Give Premiere an early chance to materialize the packaged border before
+    // Give Premiere an early chance to materialize the border image before
     // the heavier preset and subtitle graphics work. The final call after
     // subtitles is idempotent and repairs the placement only when V2 is empty.
-    ensureWhiteBorderMogrt(sequence, v2, sequenceEndSec);
+    ensureWhiteBorderImage(sequence, v2, sequenceEndSec);
 
     validateAndRepairRawSceneVideoPlacement(v1, v3, scenes);
     clearRawAudioZone(sequence, RAW_AUDIO_TRACK_START_INDEX, rawAudioZoneWidth);
@@ -2852,7 +3196,7 @@
 
     // Verify the early border after the Motion Graphics work has settled. If
     // the first import never materialized, this makes one fresh direct attempt.
-    ensureWhiteBorderMogrt(sequence, v2, sequenceEndSec);
+    ensureWhiteBorderImage(sequence, v2, sequenceEndSec);
     refreshSequenceUI(sequence);
     perfEnd("total");
     perfLogSummary();
@@ -6604,10 +6948,16 @@
       var newDurationSeconds = snapSecondsToFrame(s.target_duration);
       enforceTrackItemDuration(v3Item, newDurationSeconds);
       enforceTrackItemDuration(v1Item, newDurationSeconds);
-      if (!setScaleOnItem(v3Item, 76) && v3)
-        setScaleAndPosition(v3, startSec, 76);
-      if (!setScaleOnItem(v1Item, 183) && v1)
-        setScaleAndPosition(v1, startSec, 183);
+      applySceneGeometry(
+        v1,
+        v3,
+        v1Item,
+        v3Item,
+        startSec,
+        cleanName,
+        null,
+        null,
+      );
 
       if (!v3Item) {
         logSceneClipFailure(

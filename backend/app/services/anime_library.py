@@ -151,6 +151,9 @@ class SourceMediaProbe:
     selected_audio_stream_index: int | None = None
     video_duration: float | None = None
     selected_audio_stream: SourceMediaStream | None = None
+    video_width: int | None = None
+    video_height: int | None = None
+    sample_aspect_ratio: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1443,7 +1446,7 @@ class AnimeLibraryService:
                 "-show_entries",
                 (
                     "format=format_name,duration:"
-                    "stream=index,codec_type,codec_name,channels,pix_fmt,avg_frame_rate,r_frame_rate,duration:"
+                    "stream=index,codec_type,codec_name,channels,width,height,sample_aspect_ratio,pix_fmt,avg_frame_rate,r_frame_rate,duration:"
                     "stream_tags=language,title,handler_name:"
                     "stream_disposition=default"
                 ),
@@ -1544,6 +1547,18 @@ class AnimeLibraryService:
 
         format_name = str(format_payload.get("format_name", "")).strip().lower() or None
         video_codec = str(video_stream.get("codec_name", "")).strip().lower() or None
+
+        def _parse_dimension(raw: Any) -> int | None:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                return None
+            return value if value > 0 else None
+
+        video_width = _parse_dimension(video_stream.get("width"))
+        video_height = _parse_dimension(video_stream.get("height"))
+        sample_aspect_ratio = str(video_stream.get("sample_aspect_ratio", "")).strip() or None
+
         base_probe = SourceMediaProbe(
             source_path=source_path,
             container_suffix=source_path.suffix.lower(),
@@ -1558,6 +1573,9 @@ class AnimeLibraryService:
             subtitle_streams=tuple(subtitle_streams),
             data_streams=tuple(data_streams),
             video_duration=video_duration,
+            video_width=video_width,
+            video_height=video_height,
+            sample_aspect_ratio=sample_aspect_ratio,
         )
         return cls._with_preferred_audio_stream(
             base_probe,

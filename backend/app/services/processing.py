@@ -22,6 +22,7 @@ from .executors import heavy_executor, run_heavy
 from ..config import settings
 from ..library_types import LibraryType
 from ..models import MatchList, Project, Transcription, SceneMatch
+from ..models.cleanup import CleanFeedRect
 from ..models.transcription import Word, SceneTranscription
 from ..utils.media_binaries import is_media_binary_override_error
 from ..utils.subprocess_runner import CommandTimeoutError, run_command
@@ -311,8 +312,23 @@ class ProcessingService:
     # Release ramp on the closing word of the voiceover.
     TTS_TAIL_FADE_SECONDS = 0.025
     PREMIERE_JSX_TEMPLATE_PATH = (
-        Path(__file__).resolve().parent / "templates" / "premiere_import_project_v77.jsx"
+        Path(__file__).resolve().parent / "templates" / "premiere_import_project_v78.jsx"
     )
+    # Output sequence dimensions (assets/TikTok60fps.sqpreset).
+    SEQUENCE_WIDTH = 1080
+    SEQUENCE_HEIGHT = 1920
+    # The height the historical scale constants (76/183) were tuned for. The
+    # foreground zoom is height-normalized against it so any resolution keeps
+    # today's exact on-screen band height.
+    REFERENCE_SOURCE_HEIGHT = 1080
+    # 183 / (16/9 * 100): preserves the historical 183% background fill at
+    # 1080p while guaranteeing full-frame coverage at any resolution/aspect.
+    BG_OVERSCAN_FACTOR = 1.029375
+    # Pure mode fills the background from a CROPPED clip: the Gaussian blur
+    # (applied after Crop) bleeds transparency in from the crop edges, so
+    # overscan far enough that the bleed stays outside the frame.
+    PURE_BG_OVERSCAN_FACTOR = 1.15
+    BORDER_FRAME_IMAGE_FILENAME = "white_border_frame.png"
     CLASSIC_SUBTITLE_TIMING_RELATIVE_PATH = "subtitles/subtitle_timings.srt"
     RAW_SCENE_TEXT_SUBTITLE_TIMING_RELATIVE_PATH = (
         "raw_scene_subtitles/text_subtitles.srt"
@@ -1061,6 +1077,8 @@ class ProcessingService:
         source_rate: FrameRateInfo | None = None,
         resolved_scene_sources: dict[int, ResolvedSceneSource] | None = None,
         source_audio_policies: dict[str, dict[str, Any]] | None = None,
+        source_dimensions: dict[str, tuple[int | None, int | None, str | None]] | None = None,
+        source_geometry_override: dict[str, dict[str, Any]] | None = None,
         subtitle_timing_relative_path: str = "subtitles/subtitle_timings.srt",
         raw_scene_subtitle_timing_relative_path: str = "raw_scene_subtitles/text_subtitles.srt",
         raw_scene_subtitle_mogrt_relative_dir: str = "raw_scene_subtitles/text_mogrts",
@@ -1071,12 +1089,13 @@ class ProcessingService:
         """
         Generate a production-ready Premiere Pro 2025 ExtendScript (.jsx) file.
 
-        This generates a script matching the canonical v7.7 template.
+        This generates a script matching the canonical v7.8 template.
         Uses the QE (Quality Engineering) DOM for reliable:
         - 60fps vertical sequence creation via .sqpreset
         - Speed adjustments via qeItem.setSpeed()
-        - 4-Track Structure: V4(Subtitles), V3(Main), V2(Border), V1(Background)
-        - Scaling: V1 (183%), V3 (76% grand mode / 68% small mode)
+        - 4-Track Structure: V4(Subtitles), V3(Main), V2(Border image), V1(Background)
+        - Scaling: per-source SOURCE_GEOMETRY map (183/76 remain the 1080p
+          fallbacks); pure mode crops + scales V3 into the white inner window
 
         Frame-Perfect Timing:
         - All timeline positions are snapped to 60fps frame grid
@@ -1090,6 +1109,10 @@ class ProcessingService:
             source_rate: Resolved source frame rate information. If None, defaults to 23.976fps.
             resolved_scene_sources: Pre-resolved scene source timings shared with playback rebuild.
             source_audio_policies: Per-source audio selection metadata keyed by clip basename.
+            source_dimensions: Per-source (width, height, sample_aspect_ratio)
+                keyed by clip basename; drives the SOURCE_GEOMETRY scale/crop map.
+            source_geometry_override: Pre-computed SOURCE_GEOMETRY map (used by
+                the regeneration script when source media is not local).
             subtitle_timing_relative_path: Relative path to the classic subtitle timing SRT.
             raw_scene_subtitle_timing_relative_path: Relative path to the raw-scene subtitle timing SRT.
             raw_scene_subtitle_mogrt_relative_dir: Relative path to baked raw-scene subtitle MOGRT files.
@@ -1244,10 +1267,44 @@ class ProcessingService:
             template.overlay.category.enabled
             and str(template.overlay.category.text or overlay.get("category", "")).strip()
         )
+        is_pure = project.library_type == LibraryType.PURE
+        clean_feed_rect: CleanFeedRect | None = (
+            project.cleanup.clean_feed_rect if project.cleanup else None
+        )
+        if is_pure and clean_feed_rect is None and source_geometry_override is None:
+            raise RuntimeError(
+                "Pure project has no clean feed rectangle. Set it on the "
+                "Cleanup screen before processing."
+            )
+        flip_fg = cls._preset_has_horizontal_flip(template.foreground.prfpset)
+        flip_bg = cls._preset_has_horizontal_flip(template.background.prfpset)
+        source_geometry: dict[str, dict[str, Any]] = dict(source_geometry_override or {})
+        for clip_name, dims in (source_dimensions or {}).items():
+            width, height, sample_aspect_ratio = dims
+            entry = cls._compute_source_geometry_entry(
+                width,
+                height,
+                sample_aspect_ratio,
+                zoom=template.foreground.zoom,
+                is_pure=is_pure,
+                clean_feed_rect=clean_feed_rect,
+                flip_fg=flip_fg,
+                flip_bg=flip_bg,
+            )
+            if entry is None:
+                logger.warning(
+                    "No usable dimensions for source '%s'; JSX will fall back "
+                    "to the default 1080p scales.",
+                    clip_name,
+                )
+                continue
+            source_geometry[clip_name] = entry
+
         return cls._render_jsx_from_template(
             project_id=project.id,
             scenes=scenes,
             source_audio_policies=source_audio_policies or {},
+            source_geometry=source_geometry,
             source_fps_num=source_rate.rate.numerator,
             source_fps_den=source_rate.rate.denominator,
             template=template,
@@ -1259,6 +1316,210 @@ class ProcessingService:
             music_filename=music_filename,
             music_gain_db=music_gain_db,
             music_copyright=music_copyright,
+        )
+
+    @staticmethod
+    def _parse_sample_aspect_ratio(raw: str | None) -> float:
+        """Parse an ffprobe SAR string ("num:den"); invalid/unknown -> square."""
+        if not raw:
+            return 1.0
+        match = re.fullmatch(r"(\d+):(\d+)", str(raw).strip())
+        if not match:
+            return 1.0
+        num, den = int(match.group(1)), int(match.group(2))
+        if num <= 0 or den <= 0:
+            return 1.0
+        return num / den
+
+    @staticmethod
+    def _ceil_scale_pct(value: float) -> float:
+        """Round a scale percentage up at the 4th decimal (never underfill)."""
+        return math.ceil(round(value, 6) * 10000) / 10000
+
+    @classmethod
+    def _preset_has_horizontal_flip(cls, prfpset_name: str) -> bool:
+        """Whether a repo prfpset applies AE.ADBE Horizontal Flip.
+
+        Flip mirrors the image about the clip center BEFORE Motion, which
+        negates the horizontal component of pure-mode position compensation.
+        Unreadable/missing presets default to True (both SPM presets flip).
+        """
+        from ..config import PROJECT_ROOT
+
+        preset_path = PROJECT_ROOT / "assets" / prfpset_name
+        try:
+            return "AE.ADBE Horizontal Flip" in preset_path.read_text(
+                encoding="utf-8", errors="ignore"
+            )
+        except OSError:
+            logger.warning(
+                "Could not inspect preset '%s' for Horizontal Flip; assuming it flips.",
+                prfpset_name,
+            )
+            return True
+
+    @classmethod
+    def _compute_source_geometry_entry(
+        cls,
+        width: int | None,
+        height: int | None,
+        sample_aspect_ratio: str | None,
+        *,
+        zoom: float,
+        is_pure: bool,
+        clean_feed_rect: "CleanFeedRect | None" = None,
+        flip_fg: bool = True,
+        flip_bg: bool = True,
+    ) -> dict[str, Any] | None:
+        """Precompute the per-source JSX geometry entry.
+
+        Every mode renders the same 3-layer stack: clean-feed band (V3, height
+        forced to SEQUENCE_WIDTH*zoom, vertically centered), blurred background
+        (V1) and white separator bars at the band edges (V2 image).
+
+        Anime mode: the whole frame IS the clean feed — height-normalized
+        foreground scale (exactly zoom*100 for a 1080-tall source) plus a
+        background scale guaranteed to fill the frame.
+
+        Pure mode: the clean feed is the user-drawn rect within the source
+        (normalized 0..1). Both tracks crop to the rect; V3 scales it to the
+        template band height, V1 scales it to fill the frame; both get Motion
+        Position compensation so the rect renders centered (crop keeps the
+        visible area at its original offset within the clip frame, and a
+        Horizontal Flip preset mirrors that offset).
+        """
+        if not width or not height or width <= 0 or height <= 0:
+            return None
+        display_width = width * cls._parse_sample_aspect_ratio(sample_aspect_ratio)
+        if display_width <= 0:
+            return None
+
+        band_height = cls.SEQUENCE_WIDTH * zoom
+
+        if is_pure:
+            if clean_feed_rect is None:
+                return None
+            rect_w_disp = clean_feed_rect.w * display_width
+            rect_h = clean_feed_rect.h * height
+            if rect_w_disp <= 0 or rect_h <= 0:
+                return None
+
+            fg_factor = band_height / rect_h
+            bg_factor = cls.PURE_BG_OVERSCAN_FACTOR * max(
+                cls.SEQUENCE_WIDTH / rect_w_disp,
+                cls.SEQUENCE_HEIGHT / rect_h,
+            )
+
+            # Rect-center offset from the clip center, in display pixels.
+            offset_x_disp = (
+                clean_feed_rect.x + clean_feed_rect.w / 2 - 0.5
+            ) * display_width
+            offset_y = (clean_feed_rect.y + clean_feed_rect.h / 2 - 0.5) * height
+
+            def _position(factor: float, flipped: bool) -> list[float]:
+                dx = offset_x_disp * factor * (-1.0 if flipped else 1.0)
+                dy = offset_y * factor
+                # Motion Position is normalized to the sequence frame;
+                # [0.5, 0.5] is centered.
+                px = (cls.SEQUENCE_WIDTH / 2 - dx) / cls.SEQUENCE_WIDTH
+                py = (cls.SEQUENCE_HEIGHT / 2 - dy) / cls.SEQUENCE_HEIGHT
+                return [round(px, 6), round(py, 6)]
+
+            return {
+                "mode": "pure",
+                "fg_scale": round(fg_factor * 100.0, 4),
+                "bg_scale": cls._ceil_scale_pct(bg_factor * 100.0),
+                "crop_left_pct": round(clean_feed_rect.x * 100.0, 4),
+                "crop_top_pct": round(clean_feed_rect.y * 100.0, 4),
+                "crop_right_pct": round(
+                    max(0.0, 1.0 - clean_feed_rect.x - clean_feed_rect.w) * 100.0, 4
+                ),
+                "crop_bottom_pct": round(
+                    max(0.0, 1.0 - clean_feed_rect.y - clean_feed_rect.h) * 100.0, 4
+                ),
+                "fg_pos": _position(fg_factor, flip_fg),
+                "bg_pos": _position(bg_factor, flip_bg),
+            }
+
+        fg_scale = round(zoom * 100.0 * cls.REFERENCE_SOURCE_HEIGHT / height, 4)
+        bg_scale = cls._ceil_scale_pct(
+            cls.BG_OVERSCAN_FACTOR
+            * max(
+                cls.SEQUENCE_WIDTH / display_width,
+                cls.SEQUENCE_HEIGHT / height,
+            )
+            * 100.0
+        )
+        return {
+            "mode": "anime",
+            "fg_scale": fg_scale,
+            "bg_scale": bg_scale,
+        }
+
+    @classmethod
+    def _generate_border_images(cls, output_dir: Path, *, project: Project) -> None:
+        """Generate the V2 border image shipped to /sources alongside the JSX.
+
+        Reproduces the retired border MOGRT's mechanics exactly: one white
+        SLAB spanning the clean-feed band (band height = 1080*zoom, vertically
+        centered) plus a small overhang per side. V3 renders above V2 and
+        covers the middle of the slab, so only the overhangs stay visible —
+        they are the separator lines, self-aligned to the band's sub-pixel
+        edges. Slab edges are drawn with alpha-fractional rows for sub-pixel
+        fidelity. Idempotent: overwrites prior output.
+        """
+        from .template_service import TemplateService
+
+        template = TemplateService.get(project.resolved_template_key())
+        if not template.white_border.enabled:
+            return
+
+        from PIL import Image, ImageDraw
+
+        width, height = cls.SEQUENCE_WIDTH, cls.SEQUENCE_HEIGHT
+        band_height = width * template.foreground.zoom
+        band_top = (height - band_height) / 2
+        band_bottom = band_top + band_height
+        slab_top = max(0.0, band_top - float(template.white_border.top_px))
+        slab_bottom = min(
+            float(height), band_bottom + float(template.white_border.bottom_px)
+        )
+
+        image = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        core_start = math.ceil(slab_top)
+        core_end = math.floor(slab_bottom)  # exclusive row
+        if core_end > core_start:
+            draw.rectangle(
+                [0, core_start, width - 1, core_end - 1], fill=(255, 255, 255, 255)
+            )
+        top_coverage = core_start - slab_top
+        if top_coverage > 0 and core_start - 1 >= 0:
+            alpha = round(255 * min(1.0, top_coverage))
+            draw.rectangle(
+                [0, core_start - 1, width - 1, core_start - 1],
+                fill=(255, 255, 255, alpha),
+            )
+        bottom_coverage = slab_bottom - core_end
+        if bottom_coverage > 0 and core_end < height:
+            alpha = round(255 * min(1.0, bottom_coverage))
+            draw.rectangle(
+                [0, core_end, width - 1, core_end], fill=(255, 255, 255, alpha)
+            )
+
+        target = output_dir / cls.BORDER_FRAME_IMAGE_FILENAME
+        output_dir.mkdir(parents=True, exist_ok=True)
+        image.save(target, format="PNG")
+        logger.info(
+            "Generated V2 border slab: %s (slab %.1f..%.1f, band %.1f..%.1f, "
+            "visible %.1f/%.1fpx)",
+            target,
+            slab_top,
+            slab_bottom,
+            band_top,
+            band_bottom,
+            band_top - slab_top,
+            slab_bottom - band_bottom,
         )
 
     @classmethod
@@ -1303,6 +1564,7 @@ class ProcessingService:
         template,  # type: ignore[no-untyped-def]
         overlay_title_enabled: bool,
         overlay_category_enabled: bool,
+        source_geometry: dict[str, dict[str, Any]] | None = None,
     ) -> str:
         template_path = cls.PREMIERE_JSX_TEMPLATE_PATH
         if not template_path.exists():
@@ -1311,14 +1573,6 @@ class ProcessingService:
         content = template_path.read_text(encoding="utf-8")
 
         # Apply template-driven substitutions before dynamic ones.
-        # White border mogrt (only used when white_border.enabled is True).
-        border_mogrt = template.white_border.mogrt or "White border 10px.mogrt"
-        content = cls._replace_template_once(
-            content,
-            r'var BORDER_MOGRT_PATH = ASSETS_DIR \+ "/White border 10px\.mogrt";',
-            f'var BORDER_MOGRT_PATH = ASSETS_DIR + "/{border_mogrt}";',
-            label="BORDER_MOGRT_PATH",
-        )
         # Background prfpset name.
         content = cls._replace_template_once(
             content,
@@ -1378,20 +1632,15 @@ class ProcessingService:
             f"var TITLE_OVERLAY_ENABLED = {'true' if effective_title_overlay_enabled else 'false'};",
             label="TITLE_OVERLAY_ENABLED",
         )
-        # Foreground V3 zoom percentage (76 by default; templates can override).
+        # Foreground fallback scale (used only for sources missing a
+        # SOURCE_GEOMETRY entry; per-source values carry the template zoom).
         zoom_pct = int(round(template.foreground.zoom * 100))
         if zoom_pct != 76:
             content = cls._replace_template_once(
                 content,
-                r"if \(!setScaleOnItem\(v3Item, 76\) && v3\)",
-                f"if (!setScaleOnItem(v3Item, {zoom_pct}) && v3)",
-                label="V3_SCALE_setScaleOnItem",
-            )
-            content = cls._replace_template_once(
-                content,
-                r"setScaleAndPosition\(v3, startSec, 76\); // Main Scaled Down",
-                f"setScaleAndPosition(v3, startSec, {zoom_pct}); // Main Scaled Down",
-                label="V3_SCALE_setScaleAndPosition",
+                r"var DEFAULT_FG_SCALE = 76;",
+                f"var DEFAULT_FG_SCALE = {zoom_pct};",
+                label="DEFAULT_FG_SCALE",
             )
 
         scenes_json = json.dumps(scenes, indent=4, ensure_ascii=False)
@@ -1419,6 +1668,23 @@ class ProcessingService:
             "var SOURCE_AUDIO_POLICIES =\n" + source_audio_policies_indented + ";",
             flags=re.MULTILINE,
             label="SOURCE_AUDIO_POLICIES",
+        )
+
+        source_geometry_json = json.dumps(
+            source_geometry or {},
+            indent=4,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        source_geometry_indented = "\n".join(
+            "  " + line for line in source_geometry_json.split("\n")
+        )
+        content = cls._replace_template_once(
+            content,
+            r"var SOURCE_GEOMETRY = \{[\s\S]*?\};",
+            "var SOURCE_GEOMETRY =\n" + source_geometry_indented + ";",
+            flags=re.MULTILINE,
+            label="SOURCE_GEOMETRY",
         )
         content = cls._replace_template_once(
             content,
@@ -2468,9 +2734,9 @@ class ProcessingService:
 
         Track layout (created by JSX script):
         - V4: Reserved for subtitles
-        - V3: Main video (Scale 76% grand mode / 68% small mode)
-        - V2: White border MOGRT (10px grand mode / 5px small mode)
-        - V1: Background (Scale 183%)
+        - V3: Main video (per-source scale; 76% fallback)
+        - V2: Generated border image (frame PNG / pure white underlay)
+        - V1: Background (per-source scale; 183% fallback; empty in pure mode)
         - A1: Original anime audio (MUTED)
         - A2: TTS audio with inserted raw-scene pauses
         - A3: Music bed
@@ -2905,6 +3171,7 @@ class ProcessingService:
             total_source_paths = len(required_source_paths)
             source_audio_policies: dict[str, dict[str, Any]] = {}
             source_audio_policy_paths: dict[str, Path] = {}
+            source_dimensions: dict[str, tuple[int | None, int | None, str | None]] = {}
 
             if total_source_paths == 0:
                 yield ProcessingProgress(
@@ -2974,6 +3241,20 @@ class ProcessingService:
                             )
                     source_audio_policy_paths[clip_name] = resolved_source_path
                     source_audio_policies[clip_name] = audio_policy.to_jsx_dict()
+                    # Dimensions are unaffected by the in-place audio
+                    # normalization above, so the pre-normalization probe is fine.
+                    if pre_probe is not None:
+                        source_dimensions[clip_name] = (
+                            pre_probe.video_width,
+                            pre_probe.video_height,
+                            pre_probe.sample_aspect_ratio,
+                        )
+                    else:
+                        logger.warning(
+                            "Probe failed for '%s'; JSX geometry will fall back "
+                            "to the default 1080p scales.",
+                            resolved_source_path.name,
+                        )
                     yield ProcessingProgress(
                         "processing",
                         "source_audio_policy",
@@ -3061,7 +3342,7 @@ class ProcessingService:
                 library_type=project.library_type,
             )
 
-            # Step 4: Generate JSX script from canonical v7.7 template
+            # Step 4: Generate JSX script from canonical v7.8 template
             jsx_content = cls.generate_jsx_script(
                 project,
                 new_transcription,
@@ -3069,12 +3350,17 @@ class ProcessingService:
                 source_rate=source_rate,
                 resolved_scene_sources=resolved_scene_sources,
                 source_audio_policies=source_audio_policies,
+                source_dimensions=source_dimensions,
                 subtitle_timing_relative_path=classic_subtitle_timing_relative_path,
                 raw_scene_subtitle_timing_relative_path=raw_scene_subtitle_timing_relative_path,
                 raw_scene_subtitle_mogrt_relative_dir=raw_scene_subtitle_mogrt_relative_dir,
                 music_filename=music_filename,
                 music_gain_db=music_gain_db,
                 music_copyright=music_copyright,
+            )
+            cls._generate_border_images(
+                output_dir,
+                project=project,
             )
             jsx_path = output_dir / "import_project.jsx"
             jsx_path.write_text(jsx_content, encoding="utf-8")

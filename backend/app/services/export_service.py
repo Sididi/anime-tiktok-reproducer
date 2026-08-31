@@ -298,8 +298,9 @@ class ExportService:
 
         Asset names come from the project's resolved template:
         - foreground/background prfpset
-        - white border mogrt (omitted when white_border.enabled is false)
         - overlay prfpsets (each side may be null)
+        (The white border is a per-project generated PNG shipped via
+        /sources, not a repo asset.)
         """
         from .template_service import TemplateService
 
@@ -311,8 +312,6 @@ class ExportService:
             template.background.prfpset,
             template.foreground.prfpset,
         ]
-        if template.white_border.enabled and template.white_border.mogrt:
-            assets.append(template.white_border.mogrt)
         if template.overlay.enabled:
             if template.overlay.title.prfpset:
                 assets.append(template.overlay.title.prfpset)
@@ -644,7 +643,12 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
         for source_path in cls._collect_episode_sources(project, matches):
             _add_source_file(source_path)
 
-        for overlay_name in ("title_overlay.png", "category_overlay.png"):
+        for overlay_name in (
+            "title_overlay.png",
+            "category_overlay.png",
+            # Generated V2 border-bar image (when white_border is enabled).
+            "white_border_frame.png",
+        ):
             overlay_path = output_dir / overlay_name
             if overlay_path.exists():
                 _add_source_file(overlay_path)

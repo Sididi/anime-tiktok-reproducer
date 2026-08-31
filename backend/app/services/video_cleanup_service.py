@@ -24,6 +24,7 @@ completion; ``project.original_video_path`` keeps the raw download.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -44,9 +45,10 @@ from .executors import heavy_executor
 from ..config import settings
 from ..library_types import LibraryType
 from ..models import ProjectPhase
-from ..models.cleanup import CleanupState, CleanupZone
+from ..models.cleanup import CleanFeedRect, CleanupState, CleanupZone
 from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from ..utils.video_color import ensure_bt709_tags
+from .atomic_files import write_text_atomic
 from .project_service import ProjectService
 
 logger = logging.getLogger("uvicorn.error")
@@ -231,9 +233,54 @@ class VideoCleanupService:
         return project
 
     @classmethod
+    def _clean_feed_default_path(cls) -> Path:
+        # Sibling of data/projects: survives project deletion, machine-local.
+        return settings.projects_dir.parent / "clean_feed_last.json"
+
+    @classmethod
+    def _load_last_clean_feed_rect(cls) -> CleanFeedRect | None:
+        path = cls._clean_feed_default_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return CleanFeedRect.model_validate(payload["rect"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    @classmethod
+    def _save_last_clean_feed_rect(cls, rect: CleanFeedRect) -> None:
+        try:
+            write_text_atomic(
+                cls._clean_feed_default_path(),
+                json.dumps(
+                    {
+                        "rect": rect.model_dump(),
+                        "updated_at": datetime.now().isoformat(),
+                    },
+                    indent=2,
+                ),
+            )
+        except OSError as exc:
+            logger.warning("Could not persist clean-feed default: %s", exc)
+
+    @classmethod
     def get_state(cls, project_id: str) -> CleanupState:
         project = cls._require_pure_project(project_id)
-        return project.cleanup or CleanupState()
+        state = project.cleanup or CleanupState()
+        # New pure projects inherit the last-used clean-feed rect (normalized
+        # coordinates transfer across resolutions) so the box comes pre-set;
+        # the user only adjusts it when the source is framed differently.
+        if state.clean_feed_rect is None:
+            default_rect = cls._load_last_clean_feed_rect()
+            if default_rect is not None:
+                state.clean_feed_rect = default_rect
+                state.updated_at = datetime.now()
+                project.cleanup = state
+                ProjectService.save(project)
+                logger.info(
+                    "Pre-set clean-feed rect for project %s from last-used settings.",
+                    project_id,
+                )
+        return state
 
     @classmethod
     def save_zones(cls, project_id: str, zones: list[CleanupZone]) -> CleanupState:
@@ -248,6 +295,25 @@ class VideoCleanupService:
         state.updated_at = datetime.now()
         project.cleanup = state
         ProjectService.save(project)
+        return state
+
+    @classmethod
+    def save_clean_feed_rect(
+        cls, project_id: str, rect: CleanFeedRect
+    ) -> CleanupState:
+        """Persist where the clean feed lies within the source frame.
+
+        Unlike zones, the rect never feeds the inpainting pipeline — it only
+        drives the Premiere crop/scale geometry at JSX generation — so it can
+        be edited even while a cleanup job is running.
+        """
+        project = cls._require_pure_project(project_id)
+        state = project.cleanup or CleanupState()
+        state.clean_feed_rect = rect
+        state.updated_at = datetime.now()
+        project.cleanup = state
+        ProjectService.save(project)
+        cls._save_last_clean_feed_rect(rect)
         return state
 
     @classmethod

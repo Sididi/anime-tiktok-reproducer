@@ -634,3 +634,64 @@ def test_canary_retry_failure_keeps_suspect_fill(monkeypatch):
     assert (result[4][60, 60] == 0).all()
     # … and the engine is restored to fp16 even on failure.
     assert load_calls == [False, True]
+
+
+# ---------------------------------------------------------------------------
+# Clean-feed rect defaults (last-used settings)
+# ---------------------------------------------------------------------------
+
+def test_clean_feed_default_roundtrip(tmp_path, monkeypatch):
+    from app.models.cleanup import CleanFeedRect
+
+    monkeypatch.setattr(
+        VideoCleanupService,
+        "_clean_feed_default_path",
+        classmethod(lambda cls: tmp_path / "clean_feed_last.json"),
+    )
+    assert VideoCleanupService._load_last_clean_feed_rect() is None
+    rect = CleanFeedRect(x=0.0, y=0.21, w=1.0, h=0.31)
+    VideoCleanupService._save_last_clean_feed_rect(rect)
+    loaded = VideoCleanupService._load_last_clean_feed_rect()
+    assert loaded == rect
+
+
+def test_clean_feed_default_ignores_corrupt_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        VideoCleanupService,
+        "_clean_feed_default_path",
+        classmethod(lambda cls: tmp_path / "clean_feed_last.json"),
+    )
+    (tmp_path / "clean_feed_last.json").write_text("not json")
+    assert VideoCleanupService._load_last_clean_feed_rect() is None
+    (tmp_path / "clean_feed_last.json").write_text('{"rect": {"x": 2.0}}')
+    assert VideoCleanupService._load_last_clean_feed_rect() is None
+
+
+def test_get_state_preloads_last_clean_feed_rect(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from app.library_types import LibraryType
+    from app.models.cleanup import CleanFeedRect
+    from app.services.project_service import ProjectService
+
+    monkeypatch.setattr(
+        VideoCleanupService,
+        "_clean_feed_default_path",
+        classmethod(lambda cls: tmp_path / "clean_feed_last.json"),
+    )
+    rect = CleanFeedRect(x=0.0, y=0.25, w=1.0, h=0.3)
+    VideoCleanupService._save_last_clean_feed_rect(rect)
+
+    fake_project = SimpleNamespace(library_type=LibraryType.PURE, cleanup=None)
+    saved: list[object] = []
+    monkeypatch.setattr(ProjectService, "load", staticmethod(lambda pid: fake_project))
+    monkeypatch.setattr(ProjectService, "save", staticmethod(lambda p: saved.append(p)))
+
+    state = VideoCleanupService.get_state("some_pure_project")
+    assert state.clean_feed_rect == rect
+    assert saved and saved[0] is fake_project  # persisted onto the project
+
+    # Second call: rect already on the project, no re-save.
+    saved.clear()
+    state2 = VideoCleanupService.get_state("some_pure_project")
+    assert state2.clean_feed_rect == rect
+    assert not saved

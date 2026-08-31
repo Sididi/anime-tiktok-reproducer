@@ -9,7 +9,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_PATH = REPO_ROOT / "working_premiere_script.jsx"
 TEMPLATE_PATH = (
-    REPO_ROOT / "backend" / "app" / "services" / "templates" / "premiere_import_project_v77.jsx"
+    REPO_ROOT / "backend" / "app" / "services" / "templates" / "premiere_import_project_v78.jsx"
 )
 
 
@@ -24,6 +24,13 @@ def _normalize(text: str) -> str:
         out,
         count=1,
     )
+    out = re.sub(
+        r"var SOURCE_GEOMETRY = \{[\s\S]*?\};",
+        "var SOURCE_GEOMETRY = <SOURCE_GEOMETRY>;",
+        out,
+        count=1,
+    )
+    out = re.sub(r"var DEFAULT_FG_SCALE = \d+;", "var DEFAULT_FG_SCALE = <DEFAULT_FG_SCALE>;", out, count=1)
     out = re.sub(r"var SOURCE_FPS_NUM = \d+;", "var SOURCE_FPS_NUM = <SOURCE_FPS_NUM>;", out, count=1)
     out = re.sub(r"var SOURCE_FPS_DEN = \d+;", "var SOURCE_FPS_DEN = <SOURCE_FPS_DEN>;", out, count=1)
     out = re.sub(r'var MUSIC_FILENAME = "[^"]*";', 'var MUSIC_FILENAME = "<MUSIC_FILENAME>";', out, count=1)

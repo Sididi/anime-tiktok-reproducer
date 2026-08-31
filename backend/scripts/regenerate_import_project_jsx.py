@@ -39,6 +39,9 @@ _NEEDS_NO_MUSIC_RE = re.compile(r"var ATR_NEEDS_NO_MUSIC_EXPORT\s*=\s*(\d);")
 _AUDIO_POLICIES_RE = re.compile(
     r"var SOURCE_AUDIO_POLICIES\s*=\s*(\{[\s\S]*?\});", re.MULTILINE
 )
+_GEOMETRY_RE = re.compile(
+    r"var SOURCE_GEOMETRY\s*=\s*(\{[\s\S]*?\});", re.MULTILINE
+)
 
 
 def _extract_jsx_constants(jsx_text: str) -> dict[str, Any]:
@@ -53,6 +56,9 @@ def _extract_jsx_constants(jsx_text: str) -> dict[str, Any]:
     if not policies_match:
         raise RuntimeError("Could not locate SOURCE_AUDIO_POLICIES block in existing JSX")
     music_filename = music_file_match.group(1) if music_file_match else ""
+    # Pre-v78 JSX has no SOURCE_GEOMETRY block; regenerated output then falls
+    # back to the default 1080p scales, matching the old hardcoded behavior.
+    geometry_match = _GEOMETRY_RE.search(jsx_text)
     return {
         "source_fps_num": int(fps_num_match.group(1)),
         "source_fps_den": int(fps_den_match.group(1)),
@@ -60,6 +66,9 @@ def _extract_jsx_constants(jsx_text: str) -> dict[str, Any]:
         "music_gain_db": float(music_gain_match.group(1)) if music_gain_match else -24.0,
         "music_copyright": _resolve_music_copyright(jsx_text, music_filename),
         "source_audio_policies": json.loads(policies_match.group(1)),
+        "source_geometry": (
+            json.loads(geometry_match.group(1)) if geometry_match else {}
+        ),
     }
 
 
@@ -142,6 +151,7 @@ def regenerate_jsx_for_project(project_id: str, *, write: bool) -> Path:
         source_rate=source_rate,
         resolved_scene_sources=resolved_scene_sources,
         source_audio_policies=constants["source_audio_policies"],
+        source_geometry_override=constants["source_geometry"],
         subtitle_timing_relative_path=ProcessingService.CLASSIC_SUBTITLE_TIMING_RELATIVE_PATH,
         raw_scene_subtitle_timing_relative_path=ProcessingService.RAW_SCENE_TEXT_SUBTITLE_TIMING_RELATIVE_PATH,
         raw_scene_subtitle_mogrt_relative_dir=ProcessingService.RAW_SCENE_TEXT_SUBTITLE_MOGRT_RELATIVE_DIR,
@@ -153,6 +163,9 @@ def regenerate_jsx_for_project(project_id: str, *, write: bool) -> Path:
     if write:
         jsx_path.write_text(jsx_content, encoding="utf-8")
         logger.info("project=%s wrote %s (%d bytes)", project_id, jsx_path, len(jsx_content))
+        # The v78 JSX expects a generated border image in /sources. Regenerate
+        # it locally; --upload replaces it on Drive alongside the JSX.
+        ProcessingService._generate_border_images(output_dir, project=project)
     else:
         logger.info(
             "project=%s dry-run; %d bytes would be written to %s",
@@ -205,6 +218,36 @@ def upload_jsx_to_drive(project_id: str) -> None:
         drive=drive,
     )
     logger.info("uploaded import_project.jsx -> id=%s", result.get("id"))
+
+    # The v78 JSX loads the generated border image from {folder}/sources/ —
+    # replace it there too so the JSX and its border PNG never drift apart.
+    border_path = output_dir / "white_border_frame.png"
+    if border_path.exists():
+        sources_folder_id = GoogleDriveService.ensure_child_folder_id(
+            "sources", parent_id=folder_id, drive=drive
+        )
+        for child in GoogleDriveService.list_children_named(
+            sources_folder_id, "white_border_frame.png", drive=drive
+        ):
+            drive.files().delete(
+                fileId=str(child["id"]), supportsAllDrives=True
+            ).execute()
+        border_result = GoogleDriveService.upload_local_file(
+            parent_id=sources_folder_id,
+            filename="white_border_frame.png",
+            local_path=border_path,
+            drive=drive,
+        )
+        logger.info(
+            "uploaded sources/white_border_frame.png -> id=%s",
+            border_result.get("id"),
+        )
+    else:
+        logger.warning(
+            "project=%s has no local white_border_frame.png (white border "
+            "disabled for its template?); nothing uploaded to sources/.",
+            project_id,
+        )
 
 
 def main() -> None:

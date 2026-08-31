@@ -9,6 +9,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import {
   ChevronLeft,
   ChevronRight,
+  Crop,
   Eraser,
   Eye,
   Loader2,
@@ -22,9 +23,11 @@ import { api } from "@/api/client";
 import { Button } from "@/components/ui";
 import { readSSEStream } from "@/utils/sse";
 import { useProjectStore } from "@/stores/projectStore";
-import type { CleanupState, CleanupZone } from "@/types";
+import type { CleanFeedRect, CleanupState, CleanupZone } from "@/types";
 
 const MIN_ZONE_SIZE = 0.02;
+// Sentinel selection id for the clean-feed rectangle (not a cleanup zone).
+const CLEAN_FEED_ID = "__clean_feed__";
 
 type DragMode =
   | "move"
@@ -60,12 +63,12 @@ function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value));
 }
 
-function applyDrag(
-  original: CleanupZone,
+function applyDrag<T extends { x: number; y: number; w: number; h: number }>(
+  original: T,
   mode: DragMode,
   dx: number,
   dy: number,
-): CleanupZone {
+): T {
   let { x, y, w, h } = original;
   if (mode === "move") {
     x = clamp01(Math.min(x + dx, 1 - w));
@@ -92,7 +95,16 @@ export function CleanupPage() {
   const zonesRef = useRef<CleanupZone[]>([]);
   const streamAbortRef = useRef<AbortController | null>(null);
 
+  const cleanFeedRectRef = useRef<CleanFeedRect | null>(null);
+  const feedDragRef = useRef<{
+    mode: DragMode;
+    startX: number;
+    startY: number;
+    original: CleanFeedRect;
+  } | null>(null);
+
   const [zones, setZones] = useState<CleanupZone[]>([]);
+  const [cleanFeedRect, setCleanFeedRect] = useState<CleanFeedRect | null>(null);
   const [selectedZoneId, setSelectedZoneId] = useState<string | null>(null);
   const [frameBox, setFrameBox] = useState<FrameBox | null>(null);
   const [cleanupState, setCleanupState] = useState<CleanupState | null>(null);
@@ -103,6 +115,7 @@ export function CleanupPage() {
   const [error, setError] = useState<string | null>(null);
 
   zonesRef.current = zones;
+  cleanFeedRectRef.current = cleanFeedRect;
   const fps = project?.video_fps || 30;
   const running = cleanupState?.status === "running";
   const complete = cleanupState?.status === "complete";
@@ -117,6 +130,7 @@ export function CleanupPage() {
       .then((state) => {
         setCleanupState(state);
         setZones(state.zones);
+        setCleanFeedRect(state.clean_feed_rect ?? null);
         if (state.status === "running") startStream();
       })
       .catch((err) => setError((err as Error).message));
@@ -223,6 +237,74 @@ export function CleanupPage() {
       persistZones(next);
     },
     [persistZones],
+  );
+
+  const persistCleanFeedRect = useCallback(
+    (rect: CleanFeedRect) => {
+      if (!projectId) return;
+      api
+        .saveCleanFeedRect(projectId, rect)
+        .then((state) => setCleanupState(state))
+        .catch((err) => setError((err as Error).message));
+    },
+    [projectId],
+  );
+
+  const addCleanFeedRect = useCallback(() => {
+    // Default: full width, 16:9 area centered vertically (the usual band of
+    // a reproduced tiktok). Take the whole frame if there is no blurred bg.
+    const video = videoRef.current;
+    let h = 0.32;
+    if (video && video.videoWidth && video.videoHeight) {
+      h = Math.min(1, (video.videoWidth * 9) / 16 / video.videoHeight);
+    }
+    const rect: CleanFeedRect = { x: 0, y: (1 - h) / 2, w: 1, h };
+    setCleanFeedRect(rect);
+    setSelectedZoneId(CLEAN_FEED_ID);
+    persistCleanFeedRect(rect);
+  }, [persistCleanFeedRect]);
+
+  const beginFeedDrag = useCallback(
+    (event: React.PointerEvent, rect: CleanFeedRect, mode: DragMode) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const point = clientToFrame(event.clientX, event.clientY);
+      if (!point) return;
+      setSelectedZoneId(CLEAN_FEED_ID);
+      feedDragRef.current = {
+        mode,
+        startX: point.x,
+        startY: point.y,
+        original: { ...rect },
+      };
+
+      const onMove = (moveEvent: PointerEvent) => {
+        const drag = feedDragRef.current;
+        const current = clientToFrame(moveEvent.clientX, moveEvent.clientY);
+        if (!drag || !current) return;
+        setCleanFeedRect(
+          applyDrag(
+            drag.original,
+            drag.mode,
+            current.x - drag.startX,
+            current.y - drag.startY,
+          ),
+        );
+      };
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        if (feedDragRef.current) {
+          feedDragRef.current = null;
+          if (cleanFeedRectRef.current) {
+            persistCleanFeedRect(cleanFeedRectRef.current);
+          }
+        }
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [clientToFrame, persistCleanFeedRect],
   );
 
   const beginDrag = useCallback(
@@ -402,6 +484,41 @@ export function CleanupPage() {
               crossOrigin="anonymous"
             />
             <div ref={overlayRef} className="absolute inset-0">
+              {cleanFeedRect && frameBox && (
+                <div
+                  className="absolute"
+                  style={{
+                    left: frameBox.offsetX + cleanFeedRect.x * frameBox.width,
+                    top: frameBox.offsetY + cleanFeedRect.y * frameBox.height,
+                    width: cleanFeedRect.w * frameBox.width,
+                    height: cleanFeedRect.h * frameBox.height,
+                    border: `2px ${selectedZoneId === CLEAN_FEED_ID ? "solid" : "dashed"} #34d399`,
+                    backgroundColor: "rgba(52, 211, 153, 0.08)",
+                    cursor: "move",
+                  }}
+                  onPointerDown={(event) =>
+                    beginFeedDrag(event, cleanFeedRect, "move")
+                  }
+                >
+                  <span
+                    className="absolute -top-5 left-0 text-[10px] font-semibold uppercase tracking-wide"
+                    style={{ color: "#34d399" }}
+                  >
+                    clean feed
+                  </span>
+                  {selectedZoneId === CLEAN_FEED_ID &&
+                    HANDLES.map((handle) => (
+                      <div
+                        key={handle.mode}
+                        className="absolute w-2.5 h-2.5 bg-white border border-black/40 rounded-sm"
+                        style={handle.style}
+                        onPointerDown={(event) =>
+                          beginFeedDrag(event, cleanFeedRect, handle.mode)
+                        }
+                      />
+                    ))}
+                </div>
+              )}
               {zones.map((zone) => {
                 const style = zoneStyles.get(zone.id);
                 if (!style) return null;
@@ -482,6 +599,26 @@ export function CleanupPage() {
 
         {/* Side panel */}
         <div className="flex-1 flex flex-col gap-4 min-w-72">
+          <div className="border border-[hsl(var(--border))] rounded p-3 flex flex-col gap-2">
+            <div className="text-sm font-semibold">
+              Clean feed <span className="text-[#34d399]">(required)</span>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={addCleanFeedRect}
+              disabled={!!cleanFeedRect}
+            >
+              <Crop className="h-4 w-4 mr-1" /> Set clean feed box
+            </Button>
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              Fit the green box precisely around the clean feed (the sharp
+              video band, inside any white border). Premiere crops to it and
+              rebuilds the blurred background from it. Take the whole frame if
+              the video has no blurred background.
+            </p>
+          </div>
+
           <div className="border border-[hsl(var(--border))] rounded p-3 flex flex-col gap-2">
             <div className="text-sm font-semibold">Zones</div>
             <div className="flex gap-2">
@@ -616,7 +753,7 @@ export function CleanupPage() {
                 <Button
                   size="sm"
                   variant={complete ? "default" : "outline"}
-                  disabled={detecting || continuing || !complete}
+                  disabled={detecting || continuing || !complete || !cleanFeedRect}
                   onClick={handleContinue}
                 >
                   {detecting ? (
@@ -631,11 +768,16 @@ export function CleanupPage() {
                 <Button
                   size="sm"
                   variant="ghost"
-                  disabled={detecting}
+                  disabled={detecting || !cleanFeedRect}
                   onClick={handleSkip}
                 >
                   <SkipForward className="h-4 w-4 mr-1" /> Skip cleanup
                 </Button>
+                {!cleanFeedRect && (
+                  <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                    Set the clean feed box before continuing.
+                  </p>
+                )}
               </>
             )}
           </div>
