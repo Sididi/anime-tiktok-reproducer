@@ -13,7 +13,7 @@ templates:
       raw_mogrt: "SPM_Anime_Subtitle_Raw.mogrt"
     white_border:
       enabled: true
-      top_px: 8.4
+      top_px: 6.0
       bottom_px: 6.0
     overlay:
       enabled: true
@@ -67,7 +67,7 @@ templates:
       raw_mogrt: "SPM_Anime_Subtitle_Raw.mogrt"
     white_border:
       enabled: true
-      top_px: 8.4
+      top_px: 6.0
       bottom_px: 6.0
     overlay:
       enabled: true

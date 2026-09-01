@@ -2272,8 +2272,15 @@ class UploadPhaseService:
         if not cache_dir.exists():
             return None
         for f in sorted(cache_dir.iterdir()):
-            if f.is_file() and f.suffix.lower() == ".mp4":
-                return f
+            if not f.is_file() or f.suffix.lower() != ".mp4":
+                continue
+            # In-flight/temp artifacts (download partials, ffmpeg color-tag
+            # remuxes) live in the same dir; serving one as "ready" wedged the
+            # duration-modal preview on a half-written file (2026-09-01).
+            name = f.name.lower()
+            if ".part" in name or ".colortag." in name:
+                continue
+            return f
         return None
 
     @classmethod

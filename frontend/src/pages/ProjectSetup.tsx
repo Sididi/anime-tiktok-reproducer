@@ -25,6 +25,10 @@ import type {
   SeriesDeleteReferencingProject,
 } from "@/types";
 
+/** Visible-tab fallback poll of the startup-job registry (the live stream is
+ * the primary channel; this only bounds how long a wedged pipe can lie). */
+const STARTUP_JOBS_POLL_MS = 60_000;
+
 export function ProjectSetup() {
   // Library state
   const [selectedLibraryType, setSelectedLibraryType] = useState<LibraryType>(
@@ -42,6 +46,10 @@ export function ProjectSetup() {
   const [statusText, setStatusText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [startupJobs, setStartupJobs] = useState<ProjectStartupJob[]>([]);
+  // Mirror of `startupJobs` keyed by project, used to reject stale updates
+  // (e.g. the POST response racing a fresher stream event) without making
+  // every consumer depend on the state value.
+  const startupJobsRef = useRef<Map<string, ProjectStartupJob>>(new Map());
   const startupTabsRef = useRef<Map<string, Window | null>>(new Map());
   const sourceLoadSeqRef = useRef(0);
 
@@ -197,18 +205,8 @@ export function ProjectSetup() {
     return popup;
   }, [renderStartupWindow]);
 
-  const upsertStartupJob = useCallback(
+  const syncStartupPopup = useCallback(
     (job: ProjectStartupJob) => {
-      setStartupJobs((prev) => {
-        const idx = prev.findIndex((entry) => entry.project_id === job.project_id);
-        if (idx >= 0) {
-          const next = [...prev];
-          next[idx] = job;
-          return next;
-        }
-        return [job, ...prev];
-      });
-
       const popup = startupTabsRef.current.get(job.project_id) ?? null;
       if (job.status === "complete" && job.ready_url) {
         if (popup && !popup.closed) {
@@ -241,19 +239,90 @@ export function ProjectSetup() {
     [renderStartupWindow],
   );
 
+  /** Merge incoming job states, dropping anything older than what we already
+   * show (the POST response and the stream race; either side may be stale).
+   * A snapshot additionally removes jobs the backend no longer knows, except
+   * very recent local-only entries whose stream event hasn't arrived yet. */
+  const applyStartupJobs = useCallback(
+    (
+      incoming: ProjectStartupJob[],
+      mode: "upsert" | "snapshot",
+    ): ProjectStartupJob[] => {
+      const map = startupJobsRef.current;
+      const fresh: ProjectStartupJob[] = [];
+      for (const job of incoming) {
+        const existing = map.get(job.project_id);
+        if (
+          existing &&
+          String(existing.updated_at).localeCompare(String(job.updated_at)) > 0
+        ) {
+          continue;
+        }
+        map.set(job.project_id, job);
+        fresh.push(job);
+      }
+      if (mode === "snapshot") {
+        const present = new Set(incoming.map((job) => job.project_id));
+        const cutoff = Date.now() - 30_000;
+        for (const [projectId, job] of Array.from(map)) {
+          if (present.has(projectId)) continue;
+          if (new Date(String(job.updated_at)).getTime() >= cutoff) continue;
+          map.delete(projectId);
+        }
+      }
+      setStartupJobs(Array.from(map.values()));
+      return fresh;
+    },
+    [],
+  );
+
+  const handleStartupJobsUpdate = useCallback(
+    (incoming: ProjectStartupJob[], mode: "upsert" | "snapshot") => {
+      for (const job of applyStartupJobs(incoming, mode)) {
+        syncStartupPopup(job);
+      }
+    },
+    [applyStartupJobs, syncStartupPopup],
+  );
+
+  const upsertStartupJob = useCallback(
+    (job: ProjectStartupJob) => handleStartupJobsUpdate([job], "upsert"),
+    [handleStartupJobsUpdate],
+  );
+
   useEffect(
     () =>
       // The shared event stream replays the current snapshot on subscribe
       // and then every update; each item is the job's full state.
       getEventHub().subscribe<ProjectStartupJob>("startup_jobs", {}, (event) => {
         if (event.kind === "snapshot") {
-          event.items.forEach((item) => upsertStartupJob(item.data));
+          handleStartupJobsUpdate(
+            event.items.map((item) => item.data),
+            "snapshot",
+          );
         } else {
-          upsertStartupJob(event.item.data);
+          handleStartupJobsUpdate([event.item.data], "upsert");
         }
       }),
-    [upsertStartupJob],
+    [handleStartupJobsUpdate],
   );
+
+  // Safety net for the live stream: even with its staleness watchdog a dead
+  // pipe can go unnoticed (worker killed mid-frame, dropped port...), and a
+  // job then looks "queued" forever while the backend long since finished.
+  // A slow visible-tab poll guarantees the panel converges regardless.
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      void api
+        .listProjectStartupJobs()
+        .then(({ jobs }) => handleStartupJobsUpdate(jobs, "snapshot"))
+        .catch(() => {
+          // Transient fetch failure: the next tick retries.
+        });
+    }, STARTUP_JOBS_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [handleStartupJobsUpdate]);
 
   const proceedWithStart = useCallback(async (popup: Window | null) => {
     if (!tiktokUrl.trim() || (!isPure && !selectedSource)) return;

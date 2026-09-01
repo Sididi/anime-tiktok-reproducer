@@ -289,7 +289,10 @@ class EventHubClientImpl implements EventHubClient {
 
   private startHeartbeat(): void {
     this.stopHeartbeat();
-    this.heartbeatTimer = window.setInterval(() => this.ping(false), PORT_HEARTBEAT_MS);
+    // Every heartbeat expects a pong: postMessage to a port the worker has
+    // dropped (or a worker the browser killed) silently goes nowhere, so a
+    // fire-and-forget ping would let a visible tab keep a dead pipe forever.
+    this.heartbeatTimer = window.setInterval(() => this.ping(true), PORT_HEARTBEAT_MS);
     window.addEventListener("pagehide", this.handlePageHide);
     document.addEventListener("visibilitychange", this.handleVisibilityChange);
   }

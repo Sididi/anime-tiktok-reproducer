@@ -18,6 +18,11 @@ export const HUB_WORKER_NAME = `atr-event-hub-v${HUB_PROTOCOL_VERSION}`;
 
 export const EVENTS_STREAM_PATH = "/api/events/stream";
 export const RECONNECT_MS = 3000;
+/** The backend writes a `: ping` keepalive every 15s, so a healthy stream is
+ * never silent for long. After this much silence (3 missed keepalives) the
+ * connection is considered dead — a suspend/resume or half-open TCP socket
+ * hangs `read()` forever without erroring — and is torn down and reopened. */
+export const STREAM_STALE_MS = 45_000;
 /** Tabs ping the worker at this cadence while visible. */
 export const PORT_HEARTBEAT_MS = 5000;
 /** A port silent for this long is dropped. Generous on purpose: Chrome

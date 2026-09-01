@@ -5,7 +5,9 @@ Pipeline (all zone rects are user-drawn, normalized frame coords):
 1. Detection pass — sequential decode; per frame, a white-text score inside
    each subtitle rect (luma/saturation candidate mask gated by outline
    contrast). Hysteresis + temporal smoothing turn scores into presence
-   spans. Watermark zones are active for the whole video.
+   spans; gaps whose frames carry a text-like karaoke highlight (saturated,
+   band-confined) are bridged. Watermark zones are active for the whole
+   video.
 2. Inpainting pass — second sequential decode; for every span (chunked to
    bound GPU memory) the crop region around the rect is fed to ProPainter
    (see propainter_adapter) with clean lead-in/out context frames where the
@@ -101,21 +103,49 @@ CLIP_CHUNK_OVERLAP = 10
 # the model then propagates the unmasked colored word into neighbouring
 # frames' holes as ghosts (diagnosed on b4fa0a9ec0b3, 2026-08-30). A
 # saturated candidate class is admitted into the inpaint masks (never the
-# presence score) when corroborated: the same location must be white text on
-# another frame of the same subtitle LINE — karaoke words flip white↔color
-# in place, bright colorful backgrounds don't. Lines are segmented by IoU
-# drops between consecutive white masks.
+# presence score) two ways, per subtitle LINE:
+#  - corroborated: pixels where the line is white text on some other frame
+#    (karaoke words flip white↔color in place; backgrounds don't);
+#  - dominated lines: when the line's text-like highlight outweighs its
+#    white union (all-yellow emphasis lines, words highlighted for their
+#    whole lifetime), its text-like highlight is admitted directly — there
+#    is no white phase to corroborate against.
+# Lines are segmented on the white∪highlight FOOTPRINT, which is stable
+# across karaoke color flips (the text never moves, only its color; a
+# white-only IoU dipped at every flip and split lines mid-karaoke, orphaning
+# the highlighted word from its white phase — b4fa0a9ec0b3 "her rate
+# suddenly").
 HIGHLIGHT_LUMA_MIN = 170
-# Half-res px of corroborated highlight on some frame before a line engages
-# the class at all — plain white-subtitle content stays byte-identical.
-HIGHLIGHT_MIN_PIXELS = 40
 # Half-res dilation of the line's white union used as the corroboration
 # stencil; absorbs the italic/scale offset of the highlighted rendering.
 HIGHLIGHT_CORROBORATION_DILATE_PX = 4
 LINE_SPLIT_IOU = 0.20
-# Frames with fewer white px can't vote for a line split (a fully
-# highlighted single-word line has almost no white pixels).
+# Frames with a smaller footprint can't vote for a line split; also the
+# floor for a dominated line's highlight union.
 LINE_MIN_WHITE_PIXELS = 20
+
+# Text-like highlight: substantial, and vertically confined to a text band
+# (background art tends to spread over the whole rect height). Gates both
+# presence bridging and dominated-line admission. Presence detection bridges
+# span gaps (and extends span edges) across text-like-highlight frames —
+# fully highlighted lines have ~zero white score and the span would close
+# around them ("crazy", "employees" shipped untouched).
+HIGHLIGHT_PRESENT_MIN_PIXELS = 100  # half-res px
+HIGHLIGHT_BAND_MAX_ROW_FRACTION = 0.8
+HIGHLIGHT_BAND_MASS_FRACTION = 0.7
+HIGHLIGHT_BRIDGE_MAX_FRAMES = 45
+HIGHLIGHT_BRIDGE_MIN_COVERAGE = 0.6
+
+# Hard scene cuts inside a clip (mean abs uint8 diff of consecutive
+# subsampled crop frames above this = a cut between the two frames). The
+# model must process the first frame of the new scene, and skipped-frame
+# fills must never blend across a cut — the 50/50 blend painted the previous
+# scene's fill into the new scene for up to stride-1 frames (the visible
+# "fill doesn't catch up" rectangle at scene changes).
+CUT_DIFF_THRESHOLD = 28.0
+# A cut's diff must exceed its neighbours' by this factor (spike test):
+# sustained motion has consecutive large diffs and is not a cut.
+CUT_SPIKE_RATIO = 2.0
 
 # Inpaint mask dilation inside the rect (pixels ~ iterations). Must leave
 # enough margin past the text's dark outline (~3px, plus 2px of half-res
@@ -137,9 +167,11 @@ COMPOSITE_ALPHA_ERODE_PX = 2
 # (env PURE_CLEANUP_FILL_UNSHARP overrides; 0 disables).
 FILL_UNSHARP_AMOUNT = 0.0
 # Bumped whenever the npz clip-cache content semantics change (masks moved
-# from per-clip union to per-frame in v2; karaoke highlight class in v3);
-# stale versions are pruned at run start.
-CLIP_CACHE_VERSION = 3
+# from per-clip union to per-frame in v2; karaoke highlight class in v3;
+# highlight-only lines + cut-aware stride in v4; footprint line
+# segmentation + dominated-line admission in v5); stale versions are pruned
+# at run start.
+CLIP_CACHE_VERSION = 5
 
 # Temporal stride: the model processes every Nth frame; skipped frames get
 # their mask region filled by blending the two neighbouring fills. The mask
@@ -495,56 +527,86 @@ class VideoCleanupService:
     # -- text detection ----------------------------------------------------
 
     @classmethod
-    def _text_mask(cls, crop_bgr: np.ndarray) -> np.ndarray:
-        """Candidate white-text pixels inside a (rect-sized) BGR crop."""
+    def _candidate_masks(
+        cls, crop_bgr: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """(white, highlight) candidate pixels inside a rect-sized BGR crop.
+
+        White = bright + unsaturated (the only class the presence SCORE may
+        use); highlight = bright + saturated, the karaoke word-highlight
+        class. Both are gated by the same outline-contrast edge mask, which
+        is computed once here."""
+        empty = np.zeros(crop_bgr.shape[:2], dtype=bool)
         as_int = crop_bgr.astype(np.int16)
         cmax = as_int.max(axis=2)
         cmin = as_int.min(axis=2)
-        bright = cmax >= TEXT_LUMA_MIN
-        unsaturated = (cmax - cmin) <= TEXT_SATURATION_MAX
-        candidate = bright & unsaturated
-        if not candidate.any():
-            return np.zeros(crop_bgr.shape[:2], dtype=bool)
+        saturation = cmax - cmin
+        white = (cmax >= TEXT_LUMA_MIN) & (saturation <= TEXT_SATURATION_MAX)
+        highlight = (cmax >= HIGHLIGHT_LUMA_MIN) & (
+            saturation > TEXT_SATURATION_MAX
+        )
+        if not white.any() and not highlight.any():
+            return empty, empty
         gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
         kernel = np.ones((3, 3), np.uint8)
         gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
         edges = (gradient >= TEXT_GRADIENT_MIN).astype(np.uint8)
         near_edge = cv2.dilate(edges, kernel, iterations=TEXT_GRADIENT_REACH) > 0
-        return candidate & near_edge
+        return white & near_edge, highlight & near_edge
+
+    @classmethod
+    def _text_mask(cls, crop_bgr: np.ndarray) -> np.ndarray:
+        """Candidate white-text pixels inside a (rect-sized) BGR crop."""
+        return cls._candidate_masks(crop_bgr)[0]
 
     @classmethod
     def _highlight_candidates(cls, crop_bgr: np.ndarray) -> np.ndarray:
         """Bright SATURATED pixels near a strong edge — the karaoke-highlight
-        candidate class. Mask-building only, never presence scoring (score
-        inflation on colorful backgrounds would create false spans)."""
-        as_int = crop_bgr.astype(np.int16)
-        cmax = as_int.max(axis=2)
-        cmin = as_int.min(axis=2)
-        candidate = (cmax >= HIGHLIGHT_LUMA_MIN) & (
-            (cmax - cmin) > TEXT_SATURATION_MAX
-        )
-        if not candidate.any():
-            return np.zeros(crop_bgr.shape[:2], dtype=bool)
-        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
-        kernel = np.ones((3, 3), np.uint8)
-        gradient = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, kernel)
-        edges = (gradient >= TEXT_GRADIENT_MIN).astype(np.uint8)
-        near_edge = cv2.dilate(edges, kernel, iterations=TEXT_GRADIENT_REACH) > 0
-        return candidate & near_edge
+        candidate class. Mask-building and span bridging only, never the
+        presence score itself (score inflation on colorful backgrounds would
+        create false spans)."""
+        return cls._candidate_masks(crop_bgr)[1]
 
     @staticmethod
-    def _segment_lines(text_masks: list[np.ndarray | None]) -> list[list[int]]:
+    def _textlike_band(mask: np.ndarray) -> bool:
+        """True when the mask's pixel mass concentrates in a text-height row
+        band: the smallest contiguous row window holding
+        HIGHLIGHT_BAND_MASS_FRACTION of the pixels must fit within
+        HIGHLIGHT_BAND_MAX_ROW_FRACTION of the rect. A karaoke word is a
+        dense band; background art / colored fringes spread over the whole
+        rect height (a raw min-max row extent fails on any stray background
+        pixel, so mass concentration is what is tested)."""
+        row_counts = mask.sum(axis=1).astype(np.int64)
+        total = int(row_counts.sum())
+        if total == 0:
+            return False
+        need = HIGHLIGHT_BAND_MASS_FRACTION * total
+        max_rows = int(HIGHLIGHT_BAND_MAX_ROW_FRACTION * mask.shape[0])
+        cumulative = np.concatenate([[0], np.cumsum(row_counts)])
+        best = mask.shape[0]
+        lo = 0
+        for hi in range(1, len(cumulative)):
+            while cumulative[hi] - cumulative[lo + 1] >= need:
+                lo += 1
+            if cumulative[hi] - cumulative[lo] >= need:
+                best = min(best, hi - lo)
+        return best <= max_rows
+
+    @staticmethod
+    def _segment_lines(footprints: list[np.ndarray | None]) -> list[list[int]]:
         """Split active frame indices into subtitle-line segments.
 
-        A new line starts when the white mask's IoU against the last
-        substantial white mask collapses (the whole text changed). Frames
-        with almost no white pixels (a fully highlighted single-word line)
-        never vote for a split — they stay in the current line so its white
-        union can corroborate them."""
+        ``footprints`` must be the per-frame white∪highlight text footprint:
+        it is stable across karaoke color flips (the text never moves, only
+        its color), so a new line starts exactly when the whole footprint
+        moves. Segmenting on the white mask alone dipped below the IoU
+        threshold at every flip and split lines mid-karaoke, orphaning the
+        highlighted word from its white phase. Frames with almost no
+        footprint never vote for a split."""
         lines: list[list[int]] = []
         current: list[int] = []
         prev_substantial: np.ndarray | None = None
-        for i, mask in enumerate(text_masks):
+        for i, mask in enumerate(footprints):
             if mask is None:
                 if current:
                     lines.append(current)
@@ -572,12 +634,22 @@ class VideoCleanupService:
         crop_frames_bgr: np.ndarray,
         text_masks: list[np.ndarray | None],
     ) -> list[np.ndarray | None]:
-        """Admit corroborated saturated-highlight pixels into the per-frame
-        raw masks. Without them, a karaoke-highlighted word is unmasked while
-        colored: it both survives removal on its own frames AND is treated
-        as revealed background by the model, which propagates it into
-        neighbouring frames' holes as ghosts. Content without a karaoke
-        highlight never engages the gate and comes back unchanged."""
+        """Admit saturated-highlight pixels into the per-frame raw masks.
+        Without them, a karaoke-highlighted word is unmasked while colored:
+        it both survives removal on its own frames AND is treated as
+        revealed background by the model, which propagates it into
+        neighbouring frames' holes as ghosts.
+
+        Two admission paths per line (segmented on the stable
+        white∪highlight footprint):
+        - corroborated: highlight ∩ dilate(line white union) — any word with
+          a white phase somewhere in the line;
+        - dominated lines: when the line's text-like highlight union
+          outweighs its white union (all-yellow emphasis lines, words
+          highlighted for their whole lifetime — there is no white phase),
+          each frame's text-like highlight is admitted directly.
+        Plain white-subtitle content has ~no highlight candidates and comes
+        back unchanged."""
         plan = clip.zone_plan
         cx, cy, _, _ = plan.crop
         x, y, w, h = plan.rect
@@ -587,35 +659,72 @@ class VideoCleanupService:
             cv2.MORPH_ELLIPSE,
             (2 * HIGHLIGHT_CORROBORATION_DILATE_PX + 1,) * 2,
         )
+
+        # Per active frame: raw highlight candidates, text-likeness, and the
+        # segmentation footprint.
+        raw_highlights: dict[int, np.ndarray] = {}
+        textlike: dict[int, bool] = {}
+        footprints: list[np.ndarray | None] = [None] * len(text_masks)
+        for i, white in enumerate(text_masks):
+            if white is None:
+                continue
+            rect_crop = crop_frames_bgr[i][ry : ry + h, rx : rx + w]
+            if (mh, mw) != (h, w):
+                rect_crop = cv2.resize(
+                    rect_crop, (mw, mh), interpolation=cv2.INTER_AREA
+                )
+            hl = cls._highlight_candidates(rect_crop)
+            raw_highlights[i] = hl
+            textlike[i] = (
+                int(hl.sum()) >= HIGHLIGHT_PRESENT_MIN_PIXELS
+                and cls._textlike_band(hl)
+            )
+            footprints[i] = white | hl
+
         merged = list(text_masks)
-        for line in cls._segment_lines(text_masks):
+        for line in cls._segment_lines(footprints):
             white_union = np.zeros((mh, mw), dtype=bool)
+            hl_textlike_union = np.zeros((mh, mw), dtype=bool)
             for i in line:
                 white_union |= text_masks[i]
-            if not white_union.any():
-                continue
-            allowed = cv2.dilate(white_union.astype(np.uint8), stencil_kernel) > 0
-            highlights: dict[int, np.ndarray] = {}
-            engaged = False
+                if textlike[i]:
+                    hl_textlike_union |= raw_highlights[i]
+            hl_mass = int(hl_textlike_union.sum())
+            # Dominated line: its text-like highlight outweighs its white —
+            # admission cannot depend on corroboration (an all-yellow line's
+            # only white pixels are stray fringes).
+            dominated = hl_mass >= max(
+                LINE_MIN_WHITE_PIXELS, int(white_union.sum())
+            )
+            stencil = None
+            if white_union.any():
+                stencil = (
+                    cv2.dilate(white_union.astype(np.uint8), stencil_kernel) > 0
+                )
             for i in line:
-                rect_crop = crop_frames_bgr[i][ry : ry + h, rx : rx + w]
-                if (mh, mw) != (h, w):
-                    rect_crop = cv2.resize(
-                        rect_crop, (mw, mh), interpolation=cv2.INTER_AREA
-                    )
-                highlight = cls._highlight_candidates(rect_crop) & allowed
-                if int(highlight.sum()) >= HIGHLIGHT_MIN_PIXELS:
-                    engaged = True
-                highlights[i] = highlight
-            if not engaged:
-                continue
-            for i in line:
-                merged[i] = text_masks[i] | highlights[i]
+                mask = text_masks[i]
+                if stencil is not None:
+                    mask = mask | (raw_highlights[i] & stencil)
+                if dominated and textlike[i]:
+                    mask = mask | raw_highlights[i]
+                merged[i] = mask
         return merged
 
     @classmethod
-    def _scores_to_spans(cls, scores: list[float], total_frames: int) -> list[tuple[int, int]]:
-        """Hysteresis + smoothing over per-frame text scores."""
+    def _scores_to_spans(
+        cls,
+        scores: list[float],
+        total_frames: int,
+        highlight_textlike: list[bool] | None = None,
+    ) -> list[tuple[int, int]]:
+        """Hysteresis + smoothing over per-frame text scores.
+
+        ``highlight_textlike`` (per-frame, aligned with ``scores``) marks
+        frames whose saturated-highlight mask looks like a text band; gaps
+        between white spans mostly made of such frames are bridged, and span
+        edges are extended through contiguous runs of them — the fix for
+        single-word lines highlighted for their whole lifetime, which the
+        white-only score cannot see at all."""
         present = np.zeros(len(scores), dtype=bool)
         on = False
         for i, score in enumerate(scores):
@@ -644,7 +753,35 @@ class VideoCleanupService:
                 result[-1] = (result[-1][0], end)
             else:
                 result.append((start, end))
-        return result
+
+        if highlight_textlike is None or not result:
+            return result
+        flags = np.asarray(highlight_textlike, dtype=bool)
+
+        # Bridge white spans across highlight-dominated gaps.
+        bridged = [result[0]]
+        for start, end in result[1:]:
+            g0, g1 = bridged[-1][1], start
+            if (
+                0 < g1 - g0 <= HIGHLIGHT_BRIDGE_MAX_FRAMES
+                and float(flags[g0:g1].mean()) >= HIGHLIGHT_BRIDGE_MIN_COVERAGE
+            ):
+                bridged[-1] = (bridged[-1][0], end)
+            else:
+                bridged.append((start, end))
+        # Extend the outermost edges through contiguous highlight frames
+        # (a highlighted word before the first / after the last white line).
+        start, end = bridged[0]
+        limit = max(0, start - HIGHLIGHT_BRIDGE_MAX_FRAMES)
+        while start > limit and flags[start - 1]:
+            start -= 1
+        bridged[0] = (start, bridged[0][1])
+        start, end = bridged[-1]
+        limit = min(total_frames, end + HIGHLIGHT_BRIDGE_MAX_FRAMES)
+        while end < limit and end < len(flags) and flags[end]:
+            end += 1
+        bridged[-1] = (bridged[-1][0], end)
+        return bridged
 
     @staticmethod
     def _bool_to_spans(values: np.ndarray) -> list[tuple[int, int]]:
@@ -697,6 +834,7 @@ class VideoCleanupService:
 
             range_start, range_end = frame_range or (0, declared_total or 1 << 31)
             scores: dict[int, list[float]] = {id(p): [] for p in subtitle_plans}
+            hl_flags: dict[int, list[bool]] = {id(p): [] for p in subtitle_plans}
 
             frame_index = 0
             observed_end = range_start
@@ -716,9 +854,13 @@ class VideoCleanupService:
                         crop = cv2.resize(
                             crop, (w // 2, h // 2), interpolation=cv2.INTER_AREA
                         )
-                    mask = cls._text_mask(crop)
+                    mask, highlight = cls._candidate_masks(crop)
                     score = float(mask.sum()) / float(mask.shape[0] * mask.shape[1])
                     scores[id(plan)].append(score)
+                    hl_flags[id(plan)].append(
+                        int(highlight.sum()) >= HIGHLIGHT_PRESENT_MIN_PIXELS
+                        and cls._textlike_band(highlight)
+                    )
                     if score_dump is not None:
                         score_dump.append((frame_index, plan.zone.id, score))
                 frame_index += 1
@@ -739,7 +881,9 @@ class VideoCleanupService:
                     plan.spans = [
                         (range_start + s, range_start + e)
                         for s, e in cls._scores_to_spans(
-                            scores[id(plan)], total_frames - range_start
+                            scores[id(plan)],
+                            total_frames - range_start,
+                            hl_flags[id(plan)],
                         )
                     ]
             return plans, total_frames, fps, width, height
@@ -752,7 +896,9 @@ class VideoCleanupService:
 
         Span-edge context frames are clean (mask inactive) references; a
         mid-span chunk boundary instead overlaps the neighbouring chunk with
-        the mask kept active.
+        the mask kept active. Context never reaches into a NEIGHBOURING
+        span's active frames: those still carry un-removed text, and the
+        model would propagate it into this clip's fills as ghosts.
         """
         # Tiny crops (watermarks) are launch-overhead-bound: double-length
         # clips halve the per-clip fixed costs at negligible VRAM.
@@ -762,9 +908,15 @@ class VideoCleanupService:
             else CLIP_MAX_FRAMES
         )
         clips: list[_Clip] = []
-        for span_start, span_end in plan.spans:
-            lead = max(0, span_start - CLIP_CONTEXT_FRAMES)
-            tail = min(total_frames, span_end + CLIP_CONTEXT_FRAMES)
+        for index, (span_start, span_end) in enumerate(plan.spans):
+            prev_end = plan.spans[index - 1][1] if index > 0 else 0
+            next_start = (
+                plan.spans[index + 1][0]
+                if index + 1 < len(plan.spans)
+                else total_frames
+            )
+            lead = max(0, prev_end, span_start - CLIP_CONTEXT_FRAMES)
+            tail = min(total_frames, next_start, span_end + CLIP_CONTEXT_FRAMES)
             if tail - lead <= max_frames:
                 clips.append(
                     _Clip(
@@ -1076,7 +1228,15 @@ class VideoCleanupService:
         """Run the model on every stride-th frame; fill skipped frames' mask
         regions from the neighbouring fills (50/50 blend where both sides
         exist). Small (watermark) crops stride harder — static logos over
-        slowly varying fills."""
+        slowly varying fills.
+
+        Skipped frames never take fill from the far side of a hard scene
+        cut: the cross-cut 50/50 blend painted the previous scene's fill
+        into the new scene for up to stride-1 frames — the visible "fill
+        doesn't catch up" rectangle at scene changes. Cuts don't join the
+        keep set (the same-side keep frame is at most stride-1 frames away
+        in the same scene, so its fill is valid) — the fix costs no extra
+        model frames."""
         length = frames_bgr.shape[0]
         stride = (
             TEMPORAL_STRIDE_SMALL_CROP
@@ -1088,6 +1248,7 @@ class VideoCleanupService:
                 frames_bgr, masks, status_cb=status_cb
             )
 
+        cuts = cls._detect_cuts(frames_bgr)
         keep = sorted(set(range(0, length, stride)) | {length - 1})
         sub_result = cls._inpaint_ladder_inner(
             np.ascontiguousarray(frames_bgr[keep]),
@@ -1113,9 +1274,24 @@ class VideoCleanupService:
             fill_n = fill_by_index[next_i]
             mask_p = masks[prev_i] > 0
             mask_n = masks[next_i] > 0
+            # First cut inside this interval (cut index c = first frame of
+            # the new scene): frames before it are the old scene and may
+            # only take the previous side's fill; frames from it on may
+            # only take the next side's.
+            interval_cuts = [c for c in cuts if prev_i < c <= next_i]
+            boundary = min(interval_cuts) if interval_cuts else None
             for j in range(prev_i + 1, next_i):
                 region = masks[j] > 0
                 if not region.any():
+                    continue
+                if boundary is not None:
+                    if j < boundary:
+                        side_mask, side_fill = mask_p, fill_p
+                    else:
+                        side_mask, side_fill = mask_n, fill_n
+                    sided = region & side_mask
+                    if sided.any():
+                        result[j][sided] = side_fill[sided]
                     continue
                 both = region & mask_p & mask_n
                 only_p = region & mask_p & ~mask_n
@@ -1134,6 +1310,28 @@ class VideoCleanupService:
                 # region pixels covered by neither neighbour are window
                 # bleed, not text at frame j — the original stays.
         return result
+
+    @staticmethod
+    def _detect_cuts(frames_bgr: np.ndarray) -> set[int]:
+        """Hard-cut indices: ``i`` in the result means the scene changes
+        between frames i-1 and i. Subsampled mean-abs-diff — a few ms per
+        clip.
+
+        A cut is a SPIKE: large diff with much smaller diffs around it.
+        Sustained fast motion (pans, action) also produces large diffs but
+        on consecutive frames — the spike test rejects it, else every
+        high-motion window would inflate the model keep set."""
+        if frames_bgr.shape[0] < 2:
+            return set()
+        sub = frames_bgr[:, ::4, ::4].astype(np.int16)
+        diffs = np.abs(sub[1:] - sub[:-1]).mean(axis=(1, 2, 3))
+        padded = np.concatenate([[0.0], diffs, [0.0]])
+        cuts: set[int] = set()
+        for i in np.flatnonzero(diffs >= CUT_DIFF_THRESHOLD):
+            neighbour = max(padded[i], padded[i + 2])  # diffs[i-1], diffs[i+1]
+            if diffs[i] >= CUT_SPIKE_RATIO * neighbour:
+                cuts.add(int(i) + 1)
+        return cuts
 
     @staticmethod
     def _fill_is_near_black(

@@ -69,6 +69,10 @@ class ProjectStartupService:
         self._jobs_path = jobs_path or (settings.data_dir / "project_startup_jobs.json")
         self._jobs = _load_jobs(self._jobs_path)
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
+        # The event loop only keeps weak references to tasks; without a strong
+        # reference here a queued/running startup task can be garbage-collected
+        # mid-flight and its job stays "queued" forever.
+        self._tasks: set[asyncio.Task] = set()
 
     async def startup_cleanup(self) -> None:
         from .project_service import ProjectService
@@ -152,7 +156,12 @@ class ProjectStartupService:
             job.created_at = _utc_now()
 
         await self._publish_job(job)
-        asyncio.create_task(self._run_job(project_id, job.job_id))
+        task = asyncio.create_task(
+            self._run_job(project_id, job.job_id),
+            name=f"project-startup:{project_id}",
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return job
 
     async def retry_project(self, project_id: str) -> ProjectStartupJob:

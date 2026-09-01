@@ -10,6 +10,9 @@
 interface ReadSSEStreamOptions<T> {
   signal?: AbortSignal;
   stopWhen?: (data: T) => boolean;
+  /** Called on every received chunk, including keepalive comments that never
+   * become events — lets callers run a staleness watchdog on raw activity. */
+  onChunk?: () => void;
 }
 
 export async function readSSEStream<T extends { status?: string; error?: string | null; message?: string | null }>(
@@ -36,6 +39,7 @@ export async function readSSEStream<T extends { status?: string; error?: string 
       : (signalOrOptions ?? {});
   const signal = options.signal;
   const stopWhen = options.stopWhen;
+  const onChunk = options.onChunk;
 
   const processBufferedEvents = (flush: boolean) => {
     buffer = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -96,6 +100,7 @@ export async function readSSEStream<T extends { status?: string; error?: string 
         break;
       }
 
+      onChunk?.();
       buffer += decoder.decode(value, { stream: true });
       processBufferedEvents(false);
     }

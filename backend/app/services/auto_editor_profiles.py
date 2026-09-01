@@ -27,6 +27,10 @@ class AutoEditorProfile:
             self.margin,
             "--silent-speed",
             str(self.silent_speed),
+            # The levels cache is keyed by basename + 1s-mtime only; concurrent
+            # projects writing part_XXXX_speed.wav in the same second collide
+            # and cut each other's audio with the wrong silence map.
+            "--no-cache",
             "--no-open",
         ]
 

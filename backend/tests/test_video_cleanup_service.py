@@ -386,22 +386,168 @@ def test_build_clip_masks_karaoke_single_word_line():
 
 
 def test_build_clip_masks_saturated_background_not_corroborated():
-    # A bright saturated blob that is NEVER white text must not be swept into
-    # the mask — and its presence must not change the masks at all (byte
-    # no-regression for colorful backgrounds).
+    # A bright saturated blob that is NEVER white text must not be swept
+    # into the mask while the line's white text outweighs it — and its
+    # presence must not change the masks at all (no-regression for colorful
+    # backgrounds behind ordinary subtitle lines).
     clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
     for i in range(frames.shape[0]):
         absolute = clip.frame_start + i
         if clip.mask_start <= absolute < clip.mask_end:
-            _draw_word(frames, i, rx + 10, ry + 60, "AAAA", (255, 255, 255))
+            _draw_word(frames, i, rx + 10, ry + 60, "AAAA BBBB CCCC", (255, 255, 255))
     with_blob = frames.copy()
-    blob = (slice(ry + 250, ry + 330), slice(rx + 600, rx + 760))
+    blob = (slice(ry + 260, ry + 300), slice(rx + 700, rx + 780))
     with_blob[:, blob[0], blob[1]] = (0, 0, 255)  # bright red rectangle
+
+    # Self-check the premise: white text mass must dominate the blob mass
+    # (the dominated-line rule intentionally wins the other way around).
+    import cv2
+
+    half = cv2.resize(
+        with_blob[15][ry : ry + h, rx : rx + w],
+        (w // 2, h // 2), interpolation=cv2.INTER_AREA,
+    )
+    white_px = int(VideoCleanupService._text_mask(half).sum())
+    hl_px = int(VideoCleanupService._highlight_candidates(half).sum())
+    assert white_px > hl_px, "test premise: white text must outweigh the blob"
 
     masks_plain = VideoCleanupService._build_clip_masks(clip, frames)
     masks_blob = VideoCleanupService._build_clip_masks(clip, with_blob)
     assert (masks_plain == masks_blob).all(), "blob must not affect masks"
-    assert not masks_blob[:, ry + 260 : ry + 320, rx + 610 : rx + 750].any()
+    assert not masks_blob[:, ry + 265 : ry + 295, rx + 705 : rx + 775].any()
+
+
+def test_build_clip_masks_karaoke_flip_does_not_split_line():
+    # "her rate suddenly": three words, the highlight walks word to word.
+    # White-only segmentation used to split the line at a flip, orphaning
+    # the later highlighted word from its white phase — the footprint is
+    # stable, so the line must stay whole and every word stay covered.
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    words = [(rx + 10, "AAA"), (rx + 260, "BBB"), (rx + 510, "CCC")]
+    phase_len = 20
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if not (clip.mask_start <= absolute < clip.mask_end):
+            continue
+        phase = min(2, (absolute - clip.mask_start) // phase_len)
+        for k, (x0, text) in enumerate(words):
+            color = HIGHLIGHT_BGR if k == phase else (255, 255, 255)
+            _draw_word(frames, i, x0, ry + 60, text, color)
+
+    masks = VideoCleanupService._build_clip_masks(clip, frames)
+    # Deep inside the LAST word's highlight phase (no white phase within any
+    # ±window reach), its region must still be masked.
+    last_start = clip.mask_start + 2 * phase_len
+    for absolute in range(last_start + TEXT_MASK_WINDOW_FRAMES + 2,
+                          clip.mask_end - TEXT_MASK_WINDOW_FRAMES - 2):
+        i = absolute - clip.frame_start
+        assert masks[i][ry + 15 : ry + 70, rx + 505 : rx + 640].any(), (
+            f"highlighted last word must stay masked (frame {i})"
+        )
+
+
+def test_build_clip_masks_all_yellow_line_covered():
+    # An emphasis line whose words are ALL highlighted, with a few stray
+    # white pixels (fringes) — too much white for a naive "no white" rule,
+    # nothing to corroborate against: the dominated-line rule must admit it.
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if not (clip.mask_start <= absolute < clip.mask_end):
+            continue
+        _draw_word(frames, i, rx + 10, ry + 60, "WOW CRAZY", HIGHLIGHT_BGR)
+        _draw_word(frames, i, rx + 700, ry + 40, "il", (255, 255, 255))  # fringe
+
+    masks = VideoCleanupService._build_clip_masks(clip, frames)
+    for absolute in range(clip.mask_start + TEXT_MASK_WINDOW_FRAMES,
+                          clip.mask_end - TEXT_MASK_WINDOW_FRAMES, 7):
+        i = absolute - clip.frame_start
+        assert masks[i][ry + 15 : ry + 70, rx + 5 : rx + 400].any(), (
+            f"all-yellow line must be masked (frame {i})"
+        )
+
+
+def test_scores_to_spans_bridges_highlight_gap():
+    on = TEXT_SCORE_ON * 2
+    scores = [on] * 30 + [0.0] * 15 + [on] * 30
+    flags = [False] * 30 + [True] * 15 + [False] * 30
+    spans = VideoCleanupService._scores_to_spans(scores, 75, flags)
+    assert len(spans) == 1, "highlight-covered gap must be bridged"
+    # Same gap without highlight stays split.
+    spans = VideoCleanupService._scores_to_spans(scores, 75, [False] * 75)
+    assert len(spans) == 2
+
+
+def test_scores_to_spans_extends_edges_through_highlight():
+    on = TEXT_SCORE_ON * 2
+    scores = [0.0] * 20 + [on] * 30 + [0.0] * 20
+    flags = [False] * 8 + [True] * 12 + [False] * 30 + [True] * 10 + [False] * 10
+    spans = VideoCleanupService._scores_to_spans(scores, 70, flags)
+    assert len(spans) == 1
+    start, end = spans[0]
+    assert start <= 8, "leading highlighted word must join the span"
+    assert end >= 60, "trailing highlighted word must join the span"
+
+
+def test_build_clip_masks_highlight_only_line_covered():
+    # A word that is NEVER white (single-word line highlighted for its whole
+    # lifetime) must still be masked via the text-band-gated highlight class.
+    clip, frames, (rx, ry, w, h) = _subtitle_clip_frames()
+    solo_start, solo_end = clip.mask_start + 25, clip.mask_start + 40
+    for i in range(frames.shape[0]):
+        absolute = clip.frame_start + i
+        if not (clip.mask_start <= absolute < clip.mask_end):
+            continue
+        if solo_start <= absolute < solo_end:
+            _draw_word(frames, i, rx + 200, ry + 60, "SOLO", HIGHLIGHT_BGR)
+        else:
+            _draw_word(frames, i, rx + 10, ry + 60, "AAAA", (255, 255, 255))
+
+    masks = VideoCleanupService._build_clip_masks(clip, frames)
+    word = (slice(ry + 15, ry + 70), slice(rx + 195, rx + 340))
+    for absolute in range(solo_start + TEXT_MASK_WINDOW_FRAMES + 1,
+                          solo_end - TEXT_MASK_WINDOW_FRAMES - 1):
+        i = absolute - clip.frame_start
+        assert masks[i][word].any(), (
+            f"never-white highlighted word must be masked (frame {i})"
+        )
+
+
+def test_spans_to_clips_context_never_reaches_neighbor_span():
+    plan = _plan("subtitle", [(100, 160), (165, 300)])
+    clips = VideoCleanupService._spans_to_clips(plan, 1000)
+    first, second = clips[0], clips[1]
+    assert first.frame_end <= 165, "tail context must stop before the next span"
+    assert second.frame_start >= 160, "lead context must stop after the previous span"
+
+
+def test_temporal_stride_never_blends_across_cut(monkeypatch):
+    # Scene A then a hard cut to scene B mid-interval: skipped frames take
+    # fill only from the keep frame on their own side of the cut (never the
+    # cross-cut 50/50 blend), at zero extra model frames.
+    def fake_ladder(cls, frames_sub, masks_sub, **_kwargs):
+        return frames_sub + 7  # distinctive, index-preserving fills
+
+    monkeypatch.setattr(
+        VideoCleanupService, "_inpaint_ladder_inner", classmethod(fake_ladder)
+    )
+    length = 30
+    frames = np.zeros((length, 40, 40, 3), dtype=np.uint8)
+    for i in range(length):
+        frames[i] = 40 + i if i < 15 else 200 + (i - 15)
+    masks = np.full((length, 40, 40), 255, dtype=np.uint8)
+
+    result = VideoCleanupService._inpaint_temporal_strided(frames, masks)
+    # stride 4 (small crop): keeps at 0,4,8,12,16,…; cut between 14 and 15.
+    for j in (13, 14):
+        expected = (40 + 12) + 7  # previous keep's fill, single-sided
+        assert (result[j] == expected).all(), (
+            f"frame {j} must not blend across the cut"
+        )
+    # First new-scene frame takes the NEXT keep's fill, single-sided.
+    assert (result[15] == (200 + 1) + 7).all()
+    # Away from the cut, normal two-sided blending: 17 blends keeps 16/20.
+    assert result[17, 0, 0, 0] == (((200 + 1) + 7) + ((200 + 5) + 7)) // 2
 
 
 def test_segment_lines_splits_on_text_change_only():
@@ -506,7 +652,7 @@ def test_composite_alpha_thin_mask_survives_erosion():
 def test_clip_cache_name_versioned():
     plan = _plan("subtitle", [(100, 160)])
     clip = VideoCleanupService._spans_to_clips(plan, 1000)[0]
-    assert clip.cache_name.endswith("_v3.npz")
+    assert clip.cache_name.endswith("_v5.npz")
 
 
 def test_save_clip_atomic_deflates_and_roundtrips(tmp_path):

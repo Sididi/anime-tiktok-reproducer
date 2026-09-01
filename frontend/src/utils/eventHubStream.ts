@@ -14,6 +14,7 @@ import { readSSEStream } from "./sse";
 import {
   EVENTS_STREAM_PATH,
   RECONNECT_MS,
+  STREAM_STALE_MS,
   type HubCache,
   type HubConnectionStatus,
   type HubItem,
@@ -26,6 +27,7 @@ export interface HubCoreOptions {
   /** Resolved at call time so a test that replaces `globalThis.fetch` is honoured. */
   fetchImpl?: () => typeof fetch;
   reconnectMs?: number;
+  streamStaleMs?: number;
 }
 
 export class HubCore {
@@ -116,6 +118,21 @@ export class HubCore {
     const fetchImpl = this.options.fetchImpl
       ? this.options.fetchImpl()
       : globalThis.fetch.bind(globalThis);
+    // Staleness watchdog: a half-open socket (suspend/resume, network path
+    // change, killed proxy) hangs `read()` forever without rejecting, and the
+    // hub would keep serving stale caches while claiming to be connected. The
+    // server keepalives every 15s, so prolonged byte-level silence means the
+    // connection is dead even though no error will ever surface.
+    let staleTimer: ReturnType<typeof setTimeout> | null = null;
+    let staleTripped = false;
+    const armStaleTimer = () => {
+      if (staleTimer !== null) clearTimeout(staleTimer);
+      staleTimer = setTimeout(() => {
+        staleTripped = true;
+        controller.abort();
+      }, this.options.streamStaleMs ?? STREAM_STALE_MS);
+    };
+    armStaleTimer();
     try {
       const response = await fetchImpl(EVENTS_STREAM_PATH, {
         signal: controller.signal,
@@ -131,12 +148,15 @@ export class HubCore {
           if (frame.kind === "hello") this.setStatus("connected");
           this.options.onFrame(frame);
         },
-        { signal: controller.signal },
+        { signal: controller.signal, onChunk: armStaleTimer },
       );
     } catch {
       // Network / abort / non-2xx: handled by the reconnect below.
+    } finally {
+      if (staleTimer !== null) clearTimeout(staleTimer);
     }
-    if (!this.running || controller.signal.aborted) return;
+    if (!this.running) return;
+    if (controller.signal.aborted && !staleTripped) return;
     this.setStatus("reconnecting");
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

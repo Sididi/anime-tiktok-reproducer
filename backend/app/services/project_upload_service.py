@@ -134,6 +134,9 @@ class ProjectUploadService:
         max_workers = max_concurrent if max_concurrent is not None else settings.project_upload_max_concurrent
         self._semaphore = asyncio.Semaphore(max(1, max_workers))
         self._requests: dict[str, UploadRequestSpec] = {}
+        # Strong references: the loop only weak-refs tasks, and a collected
+        # run task leaves its job stuck in "queued"/"running" forever.
+        self._tasks: set[asyncio.Task] = set()
 
     async def startup_cleanup(self) -> None:
         updated = False
@@ -247,10 +250,12 @@ class ProjectUploadService:
             ),
         )
         await self._publish_job(job)
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._run_job(project_id, job.job_id),
             name=f"project-upload:{project_id}",
         )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
         return job
 
     async def _publish_job(self, job: ProjectUploadJob) -> None:

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 
 interface DurationPreviewVideoProps {
@@ -9,17 +9,38 @@ interface DurationPreviewVideoProps {
 
 type MediaState = "loading" | "ready" | "error";
 
+const MAX_LOAD_RETRIES = 3;
+const RETRY_DELAY_MS = 2000;
+
 export function DurationPreviewVideo({
   src,
   maxDuration,
   playbackRate,
 }: DurationPreviewVideoProps) {
   const [mediaState, setMediaState] = useState<MediaState>("loading");
+  const [attempt, setAttempt] = useState(0);
+  const retryTimer = useRef<number>();
+
+  useEffect(() => {
+    return () => {
+      if (retryTimer.current !== undefined) {
+        window.clearTimeout(retryTimer.current);
+      }
+    };
+  }, []);
+
+  // A distinct query param forces the browser to re-request the file instead
+  // of replaying the failed response from its cache.
+  const effectiveSrc =
+    attempt === 0
+      ? src
+      : `${src}${src.includes("?") ? "&" : "?"}retry=${attempt}`;
 
   return (
     <>
       <video
-        src={src}
+        key={effectiveSrc}
+        src={effectiveSrc}
         className={`w-full h-full object-contain transition-opacity ${
           mediaState === "ready" ? "opacity-100" : "opacity-0"
         }`}
@@ -38,7 +59,18 @@ export function DurationPreviewVideo({
           }
         }}
         onLoadedData={() => setMediaState("ready")}
-        onError={() => setMediaState("error")}
+        onError={() => {
+          // The cache file may have just been finalized server-side (or the
+          // request hit a transient hiccup): retry before giving up.
+          if (attempt < MAX_LOAD_RETRIES) {
+            retryTimer.current = window.setTimeout(() => {
+              setAttempt((a) => a + 1);
+              setMediaState("loading");
+            }, RETRY_DELAY_MS);
+          } else {
+            setMediaState("error");
+          }
+        }}
         onTimeUpdate={(event) => {
           if (
             maxDuration !== undefined &&

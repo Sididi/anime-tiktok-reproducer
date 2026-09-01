@@ -76,7 +76,10 @@ def ensure_bt709_tags(path: Path) -> bool:
     ):
         return False
 
-    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.colortag.mp4")
+    # The temp file must NOT end in .mp4: siblings in shared cache dirs are
+    # discovered by *.mp4 suffix (e.g. UploadPhaseService.cached_source_video)
+    # and a half-written remux would be served as if it were the final video.
+    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.colortag.tmp")
     cmd = rewrite_media_command(
         [
             "ffmpeg",
@@ -93,6 +96,8 @@ def ensure_bt709_tags(path: Path) -> bool:
             _BT709_BSF,
             "-movflags",
             "+faststart",
+            "-f",
+            "mp4",
             "-y",
             str(tmp_path),
         ]

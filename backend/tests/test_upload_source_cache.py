@@ -85,6 +85,23 @@ def test_partial_download_is_not_ready(source_cache):
     assert UploadPhaseService.source_video_status("p1")["state"] == "missing"
 
 
+def test_inflight_temp_files_are_not_ready(source_cache):
+    """A half-written ffmpeg color-tag remux (or any in-flight artifact) in the
+    cache dir must never be reported as the ready video (2026-09-01: the
+    duration-modal preview wedged on 'Aperçu indisponible' because the status
+    flipped ready mid-remux and the browser cached the broken load)."""
+    cache_dir = source_cache / "p1"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "final.mp4.part").write_bytes(b"incomplete")
+    # legacy temp naming from before the .colortag.tmp rename
+    (cache_dir / "final.mp4.part.abc123.colortag.mp4").write_bytes(b"half-remux")
+    assert UploadPhaseService.cached_source_video("p1") is None
+    assert UploadPhaseService.source_video_status("p1")["state"] == "missing"
+    # the real file wins once it lands
+    (cache_dir / "final.mp4").write_bytes(b"done")
+    assert UploadPhaseService.cached_source_video("p1") == cache_dir / "final.mp4"
+
+
 def test_status_ready_when_cached(source_cache):
     cache_dir = source_cache / "p1"
     cache_dir.mkdir(parents=True)
