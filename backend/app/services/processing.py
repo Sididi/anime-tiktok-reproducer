@@ -1290,6 +1290,7 @@ class ProcessingService:
                 clean_feed_rect=clean_feed_rect,
                 flip_fg=flip_fg,
                 flip_bg=flip_bg,
+                pure_max_band_px=settings.pure_max_band_height_px,
             )
             if entry is None:
                 logger.warning(
@@ -1370,23 +1371,30 @@ class ProcessingService:
         clean_feed_rect: "CleanFeedRect | None" = None,
         flip_fg: bool = True,
         flip_bg: bool = True,
+        pure_max_band_px: float | None = None,
     ) -> dict[str, Any] | None:
         """Precompute the per-source JSX geometry entry.
 
-        Every mode renders the same 3-layer stack: clean-feed band (V3, height
-        forced to SEQUENCE_WIDTH*zoom, vertically centered), blurred background
-        (V1) and white separator bars at the band edges (V2 image).
+        Every mode renders the same 3-layer stack: clean-feed band (V3,
+        vertically centered), blurred background (V1) and the white separator
+        slab hugging the band edges (V2 image).
 
         Anime mode: the whole frame IS the clean feed — height-normalized
         foreground scale (exactly zoom*100 for a 1080-tall source) plus a
-        background scale guaranteed to fill the frame.
+        background scale guaranteed to fill the frame; band height is always
+        SEQUENCE_WIDTH*zoom.
 
         Pure mode: the clean feed is the user-drawn rect within the source
-        (normalized 0..1). Both tracks crop to the rect; V3 scales it to the
-        template band height, V1 scales it to fill the frame; both get Motion
-        Position compensation so the rect renders centered (crop keeps the
-        visible area at its original offset within the clip frame, and a
-        Horizontal Flip preset mirrors that offset).
+        (normalized 0..1). The feed ALWAYS fills the sequence width (never
+        white pillars at the sides): wide rects keep the template band height
+        with horizontal overflow (like anime), narrow rects grow the band
+        vertically up to `pure_max_band_px`, beyond which the feed is
+        symmetrically cropped top/bottom. Both tracks crop to the (possibly
+        vertically shrunk) rect; V1 fills the frame; both get Motion Position
+        compensation so the rect renders centered (crop keeps the visible
+        area at its original offset within the clip frame, and a Horizontal
+        Flip preset mirrors that offset). The resulting `band_height_px`
+        rides in the entry for border-slab and overlay anchoring.
         """
         if not width or not height or width <= 0 or height <= 0:
             return None
@@ -1403,14 +1411,27 @@ class ProcessingService:
             rect_h = clean_feed_rect.h * height
             if rect_w_disp <= 0 or rect_h <= 0:
                 return None
+            max_band = float(pure_max_band_px or cls.SEQUENCE_HEIGHT)
 
-            fg_factor = band_height / rect_h
+            # The feed must fill the sequence width; wide rects are still
+            # driven by the template band height (horizontal overflow).
+            fg_factor = max(
+                cls.SEQUENCE_WIDTH / rect_w_disp, band_height / rect_h
+            )
+            native_band = rect_h * fg_factor
+            band_height_px = min(native_band, max_band)
+            # Feed taller than the cap: crop it symmetrically (width stays
+            # mandatory-filled).
+            rect_h_eff = band_height_px / fg_factor
+            extra_frac = max(0.0, (rect_h - rect_h_eff) / height / 2.0)
+
             bg_factor = cls.PURE_BG_OVERSCAN_FACTOR * max(
                 cls.SEQUENCE_WIDTH / rect_w_disp,
-                cls.SEQUENCE_HEIGHT / rect_h,
+                cls.SEQUENCE_HEIGHT / rect_h_eff,
             )
 
-            # Rect-center offset from the clip center, in display pixels.
+            # Rect-center offset from the clip center, in display pixels
+            # (symmetric vertical shrink keeps the center unchanged).
             offset_x_disp = (
                 clean_feed_rect.x + clean_feed_rect.w / 2 - 0.5
             ) * display_width
@@ -1430,15 +1451,23 @@ class ProcessingService:
                 "fg_scale": round(fg_factor * 100.0, 4),
                 "bg_scale": cls._ceil_scale_pct(bg_factor * 100.0),
                 "crop_left_pct": round(clean_feed_rect.x * 100.0, 4),
-                "crop_top_pct": round(clean_feed_rect.y * 100.0, 4),
+                "crop_top_pct": round(
+                    (clean_feed_rect.y + extra_frac) * 100.0, 4
+                ),
                 "crop_right_pct": round(
                     max(0.0, 1.0 - clean_feed_rect.x - clean_feed_rect.w) * 100.0, 4
                 ),
                 "crop_bottom_pct": round(
-                    max(0.0, 1.0 - clean_feed_rect.y - clean_feed_rect.h) * 100.0, 4
+                    (
+                        max(0.0, 1.0 - clean_feed_rect.y - clean_feed_rect.h)
+                        + extra_frac
+                    )
+                    * 100.0,
+                    4,
                 ),
                 "fg_pos": _position(fg_factor, flip_fg),
                 "bg_pos": _position(bg_factor, flip_bg),
+                "band_height_px": round(band_height_px, 2),
             }
 
         fg_scale = round(zoom * 100.0 * cls.REFERENCE_SOURCE_HEIGHT / height, 4)
@@ -1457,16 +1486,56 @@ class ProcessingService:
         }
 
     @classmethod
-    def _generate_border_images(cls, output_dir: Path, *, project: Project) -> None:
+    def _pure_band_height_px(
+        cls,
+        project: Project,
+        source_dimensions: dict[str, tuple[int | None, int | None, str | None]] | None,
+    ) -> float | None:
+        """Actual band height for a pure project (None for non-pure/unknown).
+
+        Recomputes the same entry the JSX generation produced, so the border
+        slab and overlay anchors always match the timeline geometry.
+        """
+        if project.library_type != LibraryType.PURE or not source_dimensions:
+            return None
+        clean_feed_rect = project.cleanup.clean_feed_rect if project.cleanup else None
+        if clean_feed_rect is None:
+            return None
+        from .template_service import TemplateService
+
+        template = TemplateService.get(project.resolved_template_key())
+        for width, height, sample_aspect_ratio in source_dimensions.values():
+            entry = cls._compute_source_geometry_entry(
+                width,
+                height,
+                sample_aspect_ratio,
+                zoom=template.foreground.zoom,
+                is_pure=True,
+                clean_feed_rect=clean_feed_rect,
+                pure_max_band_px=settings.pure_max_band_height_px,
+            )
+            if entry is not None and "band_height_px" in entry:
+                return float(entry["band_height_px"])
+        return None
+
+    @classmethod
+    def _generate_border_images(
+        cls,
+        output_dir: Path,
+        *,
+        project: Project,
+        band_height_px: float | None = None,
+    ) -> None:
         """Generate the V2 border image shipped to /sources alongside the JSX.
 
         Reproduces the retired border MOGRT's mechanics exactly: one white
-        SLAB spanning the clean-feed band (band height = 1080*zoom, vertically
-        centered) plus a small overhang per side. V3 renders above V2 and
-        covers the middle of the slab, so only the overhangs stay visible —
-        they are the separator lines, self-aligned to the band's sub-pixel
-        edges. Slab edges are drawn with alpha-fractional rows for sub-pixel
-        fidelity. Idempotent: overwrites prior output.
+        SLAB spanning the clean-feed band (template band by default; pure
+        projects pass their actual, possibly grown, band height) plus a small
+        overhang per side. V3 renders above V2 and covers the middle of the
+        slab, so only the overhangs stay visible — they are the separator
+        lines, self-aligned to the band's sub-pixel edges. Slab edges are
+        drawn with alpha-fractional rows for sub-pixel fidelity. Idempotent:
+        overwrites prior output.
         """
         from .template_service import TemplateService
 
@@ -1477,7 +1546,7 @@ class ProcessingService:
         from PIL import Image, ImageDraw
 
         width, height = cls.SEQUENCE_WIDTH, cls.SEQUENCE_HEIGHT
-        band_height = width * template.foreground.zoom
+        band_height = band_height_px or width * template.foreground.zoom
         band_top = (height - band_height) / 2
         band_bottom = band_top + band_height
         slab_top = max(0.0, band_top - float(template.white_border.top_px))
@@ -3358,9 +3427,11 @@ class ProcessingService:
                 music_gain_db=music_gain_db,
                 music_copyright=music_copyright,
             )
+            pure_band_height = cls._pure_band_height_px(project, source_dimensions)
             cls._generate_border_images(
                 output_dir,
                 project=project,
+                band_height_px=pure_band_height,
             )
             jsx_path = output_dir / "import_project.jsx"
             jsx_path.write_text(jsx_content, encoding="utf-8")
@@ -3453,12 +3524,22 @@ class ProcessingService:
                 )
                 from .title_image_generator import TitleImageGeneratorService
 
+                # Pure projects with a grown band shift the overlays outward
+                # by how far each band edge moved, keeping their visual gap to
+                # the band; standard bands keep the historical fixed positions.
+                band_shift_px = 0
+                grown_band = cls._pure_band_height_px(project, source_dimensions)
+                standard_band = cls.SEQUENCE_WIDTH * active_template.foreground.zoom
+                if grown_band is not None and grown_band > standard_band + 0.01:
+                    band_shift_px = round((grown_band - standard_band) / 2)
+
                 overlay_paths = TitleImageGeneratorService.generate(
                     title=overlay_title,
                     category=overlay_category,
                     output_dir=output_dir,
                     title_style=active_template.overlay.title.style,
                     category_style=active_template.overlay.category.style,
+                    band_shift_px=band_shift_px,
                 )
                 logger.info(
                     "Generated title overlays: %s",

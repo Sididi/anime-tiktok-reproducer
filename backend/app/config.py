@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     match_playback_max_workers: int = 8
     match_playback_max_workers_per_episode: int = 4
     min_playback_speed_factor: float = 0.75
+    # Pure mode: the clean feed always fills the sequence width; narrow feeds
+    # grow the band vertically up to this cap (then get cropped top/bottom).
+    # Override: ATR_PURE_MAX_BAND_HEIGHT_PX.
+    pure_max_band_height_px: float = 1250.0
 
     # Low-impact media jobs: heavy subprocesses (anime_searcher indexing,
     # library-import transcodes, storage-box rclone) run in a transient

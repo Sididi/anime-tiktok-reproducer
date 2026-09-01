@@ -20,12 +20,14 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from app.library_types import LibraryType
 from app.models import Transcription
+from app.services.anime_library import AnimeLibraryService
 from app.services.export_service import ExportService
 from app.services.google_drive_service import GoogleDriveService
 from app.services.music_config_service import MusicConfigService
 from app.services.otio_timing import FrameRateInfo
-from app.services.processing import ProcessingService
+from app.services.processing import ProcessingService, _strip_known_media_extension
 from app.services.project_service import ProjectService
 
 logger = logging.getLogger("regenerate_import_project_jsx")
@@ -105,6 +107,76 @@ def _frame_rate_from_num_den(num: int, den: int) -> FrameRateInfo:
     return FrameRateInfo.from_fps(float(rate))
 
 
+def _pure_band_height_from_geometry(source_geometry: dict) -> float | None:
+    for entry in (source_geometry or {}).values():
+        if (
+            isinstance(entry, dict)
+            and entry.get("mode") == "pure"
+            and "band_height_px" in entry
+        ):
+            return float(entry["band_height_px"])
+    return None
+
+
+def _probe_pure_source_dimensions(project, resolved_scene_sources):
+    """Fresh probe of pure sources (always local) so regeneration applies the
+    CURRENT geometry rules instead of round-tripping stale baked values."""
+    if project.library_type != LibraryType.PURE:
+        return None
+    dims: dict[str, tuple[int | None, int | None, str | None]] = {}
+    seen: set[str] = set()
+    for resolved in resolved_scene_sources.values():
+        clip_name = _strip_known_media_extension(Path(resolved.source_path).name)
+        if clip_name in seen:
+            continue
+        seen.add(clip_name)
+        probe = AnimeLibraryService.probe_source_media_sync(Path(resolved.source_path))
+        if probe is not None and probe.video_width and probe.video_height:
+            dims[clip_name] = (
+                probe.video_width,
+                probe.video_height,
+                probe.sample_aspect_ratio,
+            )
+    return dims or None
+
+
+def _regenerate_overlays_for_band(project, output_dir: Path, band_height: float | None) -> None:
+    """Re-anchor the title/category overlays when a pure band is grown."""
+    from app.services.template_service import TemplateService
+    from app.services.title_image_generator import TitleImageGeneratorService
+
+    template = TemplateService.get(project.resolved_template_key())
+    standard_band = ProcessingService.SEQUENCE_WIDTH * template.foreground.zoom
+    if band_height is None or band_height <= standard_band + 0.01:
+        return
+    overlay = project.video_overlay if isinstance(project.video_overlay, dict) else {}
+    title = (
+        str(template.overlay.title.text or overlay.get("title", "")).strip()
+        if template.overlay.title.enabled
+        else ""
+    )
+    category = (
+        str(template.overlay.category.text or overlay.get("category", "")).strip()
+        if template.overlay.category.enabled
+        else ""
+    )
+    if not (template.overlay.enabled and (title or category)):
+        return
+    TitleImageGeneratorService.generate(
+        title=title,
+        category=category,
+        output_dir=output_dir,
+        title_style=template.overlay.title.style,
+        category_style=template.overlay.category.style,
+        band_shift_px=round((band_height - standard_band) / 2),
+    )
+    logger.info(
+        "project=%s re-anchored overlays for grown band %.0fpx",
+        project.id,
+        band_height,
+    )
+
+
 def _load_rebuilt_transcription(project_id: str) -> Transcription:
     """Load the post-rebuild transcription saved during processing."""
     output_dir = ExportService.get_output_dir(project_id)
@@ -143,6 +215,9 @@ def regenerate_jsx_for_project(project_id: str, *, write: bool) -> Path:
         source_rate,
         library_type=project.library_type,
     )
+    # Pure sources are local: probe them fresh so current geometry rules
+    # apply; fresh entries override the round-tripped baked ones.
+    source_dimensions = _probe_pure_source_dimensions(project, resolved_scene_sources)
 
     jsx_content = ProcessingService.generate_jsx_script(
         project,
@@ -151,6 +226,7 @@ def regenerate_jsx_for_project(project_id: str, *, write: bool) -> Path:
         source_rate=source_rate,
         resolved_scene_sources=resolved_scene_sources,
         source_audio_policies=constants["source_audio_policies"],
+        source_dimensions=source_dimensions,
         source_geometry_override=constants["source_geometry"],
         subtitle_timing_relative_path=ProcessingService.CLASSIC_SUBTITLE_TIMING_RELATIVE_PATH,
         raw_scene_subtitle_timing_relative_path=ProcessingService.RAW_SCENE_TEXT_SUBTITLE_TIMING_RELATIVE_PATH,
@@ -164,8 +240,21 @@ def regenerate_jsx_for_project(project_id: str, *, write: bool) -> Path:
         jsx_path.write_text(jsx_content, encoding="utf-8")
         logger.info("project=%s wrote %s (%d bytes)", project_id, jsx_path, len(jsx_content))
         # The v78 JSX expects a generated border image in /sources. Regenerate
-        # it locally; --upload replaces it on Drive alongside the JSX.
-        ProcessingService._generate_border_images(output_dir, project=project)
+        # it locally; --upload replaces it on Drive alongside the JSX. Pure
+        # projects with a grown band need the slab and overlay anchors to
+        # follow the actual band height.
+        if source_dimensions:
+            band_height = ProcessingService._pure_band_height_px(
+                project, source_dimensions
+            )
+        else:
+            band_height = _pure_band_height_from_geometry(
+                constants["source_geometry"]
+            )
+        ProcessingService._generate_border_images(
+            output_dir, project=project, band_height_px=band_height
+        )
+        _regenerate_overlays_for_band(project, output_dir, band_height)
     else:
         logger.info(
             "project=%s dry-run; %d bytes would be written to %s",
@@ -219,33 +308,39 @@ def upload_jsx_to_drive(project_id: str) -> None:
     )
     logger.info("uploaded import_project.jsx -> id=%s", result.get("id"))
 
-    # The v78 JSX loads the generated border image from {folder}/sources/ —
-    # replace it there too so the JSX and its border PNG never drift apart.
-    border_path = output_dir / "white_border_frame.png"
-    if border_path.exists():
-        sources_folder_id = GoogleDriveService.ensure_child_folder_id(
-            "sources", parent_id=folder_id, drive=drive
-        )
+    # The JSX loads the generated PNGs (border slab, overlays) from
+    # {folder}/sources/ — replace whichever exist locally so the JSX and its
+    # images never drift apart.
+    generated_pngs = [
+        "white_border_frame.png",
+        "title_overlay.png",
+        "category_overlay.png",
+    ]
+    sources_folder_id: str | None = None
+    for png_name in generated_pngs:
+        png_path = output_dir / png_name
+        if not png_path.exists():
+            continue
+        if sources_folder_id is None:
+            sources_folder_id = GoogleDriveService.ensure_child_folder_id(
+                "sources", parent_id=folder_id, drive=drive
+            )
         for child in GoogleDriveService.list_children_named(
-            sources_folder_id, "white_border_frame.png", drive=drive
+            sources_folder_id, png_name, drive=drive
         ):
             drive.files().delete(
                 fileId=str(child["id"]), supportsAllDrives=True
             ).execute()
-        border_result = GoogleDriveService.upload_local_file(
+        png_result = GoogleDriveService.upload_local_file(
             parent_id=sources_folder_id,
-            filename="white_border_frame.png",
-            local_path=border_path,
+            filename=png_name,
+            local_path=png_path,
             drive=drive,
         )
-        logger.info(
-            "uploaded sources/white_border_frame.png -> id=%s",
-            border_result.get("id"),
-        )
-    else:
+        logger.info("uploaded sources/%s -> id=%s", png_name, png_result.get("id"))
+    if sources_folder_id is None:
         logger.warning(
-            "project=%s has no local white_border_frame.png (white border "
-            "disabled for its template?); nothing uploaded to sources/.",
+            "project=%s has no local generated PNGs; nothing uploaded to sources/.",
             project_id,
         )
 

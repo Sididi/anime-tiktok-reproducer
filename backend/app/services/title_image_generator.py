@@ -103,8 +103,16 @@ class TitleImageGeneratorService:
         *,
         title_style: str = "classic",
         category_style: str = "classic",
+        band_shift_px: int = 0,
     ) -> dict[str, Path]:
         """Generate non-empty title and category overlay PNGs.
+
+        `band_shift_px` re-anchors the overlays to a grown clean-feed band
+        (pure projects): the title PNG shifts UP and the category PNG DOWN by
+        that amount — half the band growth, i.e. how far each band edge moved
+        — so the overlay keeps its visual distance to the band edge. The
+        finished PNGs are translated whole, preserving each style's exact
+        rendering. 0 keeps the historical fixed positions.
 
         Returns dict with keys for the generated sides.
         """
@@ -125,17 +133,32 @@ class TitleImageGeneratorService:
         generated: dict[str, Path] = {}
         title_path = output_dir / "title_overlay.png"
         category_path = output_dir / "category_overlay.png"
+        title_shift = -band_shift_px
+        category_shift = band_shift_px
         if title.strip():
             title_render(title, title_path)
+            cls._shift_overlay_vertically(title_path, title_shift)
             generated["title"] = title_path
         elif title_path.exists():
             title_path.unlink()
         if category.strip():
             category_render(category, category_path)
+            cls._shift_overlay_vertically(category_path, category_shift)
             generated["category"] = category_path
         elif category_path.exists():
             category_path.unlink()
         return generated
+
+    @staticmethod
+    def _shift_overlay_vertically(path: Path, dy: int) -> None:
+        """Translate a finished overlay PNG vertically (transparent fill)."""
+        if dy == 0:
+            return
+        with Image.open(path) as source:
+            image = source.convert("RGBA")
+        shifted = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        shifted.paste(image, (0, dy))
+        shifted.save(path, "PNG")
 
     @classmethod
     def _load_font(cls, size: int, path: Path | None = None) -> ImageFont.FreeTypeFont:
