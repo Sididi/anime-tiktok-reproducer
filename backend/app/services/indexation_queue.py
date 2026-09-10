@@ -61,10 +61,13 @@ class IndexationQueueService:
     async def acquire_heavy_slot(self, kind: str, slots: int = 1) -> None:
         """Acquire ``slots`` units of the process-wide heavyweight work budget.
 
-        Multi-slot acquirers (fast-mode matching reserves the whole budget)
-        are all serialized behind ``matching_lock``, so two of them can never
-        interleave partial acquisitions — the only other acquirers are
-        single-slot jobs that always complete and release, hence no deadlock.
+        Multi-slot acquirers (fast-mode matching and pure-mode cleanup/preview
+        reserve the whole budget) MUST hold ``matching_lock`` while acquiring,
+        so two of them can never interleave partial acquisitions — the only
+        other acquirers are single-slot jobs that always complete and release,
+        hence no deadlock. (Violated by cleanup until 2026-09-01: two queued
+        cleanups each took one slot from a finishing job's releases and waited
+        forever for the other's.)
         """
         acquired = 0
         try:

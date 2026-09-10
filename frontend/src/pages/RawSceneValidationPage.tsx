@@ -20,6 +20,8 @@ import {
 import { Button } from "@/components/ui";
 import { ProjectClippedVideoPlayer } from "@/components/video";
 import type { ClippedVideoPlayerHandle } from "@/components/video/ClippedVideoPlayer";
+import { NarratorControls } from "@/components/NarratorControls";
+import { useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { cn, formatTime } from "@/utils";
 import {
@@ -28,6 +30,7 @@ import {
   getViewportPriority,
 } from "@/utils/mediaPriorities";
 import type {
+  RawScenesResponse,
   Transcription,
   RawSceneDetectionResult,
   SceneTranscription,
@@ -36,12 +39,10 @@ import type {
 interface SceneValidationState {
   is_raw: boolean;
   text: string;
+  textEdited?: boolean;
 }
 
-interface RawScenePageData {
-  detection: RawSceneDetectionResult | null;
-  transcription: Transcription | null;
-}
+type RawScenePageData = RawScenesResponse;
 
 type SceneCardPlayResult = "completed" | "load_error" | "audio_blocked";
 
@@ -398,6 +399,8 @@ export function RawSceneValidationPage() {
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [revision, setRevision] = useState<string | undefined>();
+  const [recoverableText, setRecoverableText] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [fastWatchError, setFastWatchError] = useState<string | null>(null);
   const [detection, setDetection] = useState<RawSceneDetectionResult | null>(
@@ -423,6 +426,8 @@ export function RawSceneValidationPage() {
   autoScrollRef.current = autoScroll;
 
   const applyLoadedData = useCallback((data: RawScenePageData) => {
+    setRevision(data.narrator?.revision);
+    setRecoverableText(data.narrator?.recoverable_text ?? {});
     setDetection(data.detection);
     setTranscription(data.transcription);
 
@@ -846,9 +851,11 @@ export function RawSceneValidationPage() {
       [sceneIndex]: {
         ...prev[sceneIndex],
         is_raw: !prev[sceneIndex]?.is_raw,
+        text: prev[sceneIndex]?.textEdited ? prev[sceneIndex].text
+          : recoverableText[sceneIndex] ?? prev[sceneIndex]?.text ?? "",
       },
     }));
-  }, []);
+  }, [recoverableText]);
 
   const handleTextChange = useCallback((sceneIndex: number, text: string) => {
     setValidations((prev) => ({
@@ -856,6 +863,7 @@ export function RawSceneValidationPage() {
       [sceneIndex]: {
         ...prev[sceneIndex],
         text,
+        textEdited: true,
       },
     }));
   }, []);
@@ -895,11 +903,11 @@ export function RawSceneValidationPage() {
         .map(([idx, state]) => ({
           scene_index: Number(idx),
           is_raw: state.is_raw,
-          text: state.text || undefined,
+          text: state.textEdited ? state.text : undefined,
         }));
 
       if (sceneValidations.length > 0) {
-        const result = await api.validateRawScenes(projectId, sceneValidations);
+        const result = await api.validateRawScenes(projectId, sceneValidations, revision);
         setTranscription(result.transcription);
       }
 
@@ -917,6 +925,7 @@ export function RawSceneValidationPage() {
     stopFastWatch,
     transcription,
     validations,
+    revision,
   ]);
 
   const handleToggleFastWatch = useCallback(() => {
@@ -1009,6 +1018,20 @@ export function RawSceneValidationPage() {
             </Button>
           </div>
         </header>
+
+        {projectId && <NarratorControls projectId={projectId} refreshKey={transcription} disabled={saving}
+          hasUnsavedEdits={transcription.scenes.some((s) => {
+            const state = validations[s.scene_index];
+            return state && (state.is_raw !== s.is_raw || (state.textEdited && state.text !== s.text));
+          })}
+          onBusyChange={(busy) => { setSaving(busy); if (busy) stopFastWatch(); }}
+          onChanged={async (data) => {
+            applyLoadedData(data);
+            setActiveSceneIndex(-1);
+            preparedScenesRef.current.clear();
+            failedPreparedScenesRef.current.clear();
+            await useSceneStore.getState().loadScenes(projectId);
+          }} />}
 
         {error && (
           <div className="p-3 bg-[hsl(var(--destructive))]/10 rounded-lg">

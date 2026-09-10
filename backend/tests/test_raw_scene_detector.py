@@ -413,3 +413,93 @@ class TestPureSpeechPauseClassifier:
         # After the last word: no next word, so only the duration rule applies.
         assert RawSceneDetectorService._is_speech_pause(25.0, 25.8, self.WORDS)
         assert not RawSceneDetectorService._is_speech_pause(25.0, 27.0, self.WORDS)
+
+
+class TestSameVoiceMerge:
+    """Same-voice cluster merge (2026-09-03): pyannote split ONE narrator
+    into three "speakers" on project ded367648062 and 30% of the video was
+    flagged raw. Clusters whose voice embedding matches the TTS speaker are
+    folded back into it; genuinely different voices stay raw."""
+
+    SEGMENTS = [(0.0, 10.0, TTS), (10.0, 14.0, OTHER), (14.0, 20.0, TTS)]
+
+    def test_matching_voice_is_relabelled_as_tts(self):
+        centroids = {TTS: [1.0, 0.0], OTHER: [0.99, 0.14]}  # cos ~0.99
+        segments, merged = RawSceneDetectorService._merge_same_voice_speakers(
+            self.SEGMENTS, TTS, centroids,
+        )
+        assert merged == [OTHER]
+        assert {spk for _, _, spk in segments} == {TTS}
+        # Turn boundaries are untouched, only the label changes.
+        assert [(s, e) for s, e, _ in segments] == [(s, e) for s, e, _ in self.SEGMENTS]
+
+    def test_distinct_voice_stays_raw(self):
+        centroids = {TTS: [1.0, 0.0], OTHER: [0.6, 0.8]}  # cos 0.6
+        segments, merged = RawSceneDetectorService._merge_same_voice_speakers(
+            self.SEGMENTS, TTS, centroids,
+        )
+        assert merged == []
+        assert segments == self.SEGMENTS
+
+    def test_speaker_without_centroid_stays_raw(self):
+        # No usable turn for OTHER: conservative outcome is "not merged".
+        segments, merged = RawSceneDetectorService._merge_same_voice_speakers(
+            self.SEGMENTS, TTS, {TTS: [1.0, 0.0]},
+        )
+        assert merged == []
+        assert segments == self.SEGMENTS
+
+    def test_missing_tts_centroid_is_noop(self):
+        segments, merged = RawSceneDetectorService._merge_same_voice_speakers(
+            self.SEGMENTS, TTS, {OTHER: [1.0, 0.0]},
+        )
+        assert merged == []
+        assert segments == self.SEGMENTS
+
+    def test_only_matching_clusters_merge_when_several(self):
+        third = "SPEAKER_02"
+        segments_in = [*self.SEGMENTS, (20.0, 22.0, third)]
+        centroids = {TTS: [1.0, 0.0], OTHER: [0.99, 0.14], third: [0.0, 1.0]}
+        segments, merged = RawSceneDetectorService._merge_same_voice_speakers(
+            segments_in, TTS, centroids,
+        )
+        assert merged == [OTHER]
+        assert segments[-1] == (20.0, 22.0, third)
+        assert segments[1] == (10.0, 14.0, TTS)
+
+    def test_grey_zone_match_merges_only_with_same_pitch(self):
+        centroids = {TTS: [1.0, 0.0], OTHER: [0.83, 0.5578]}  # cos ~0.83
+        same_pitch = {TTS: 127.0, OTHER: 131.0}
+        _, merged = RawSceneDetectorService._merge_same_voice_speakers(
+            self.SEGMENTS, TTS, centroids, same_pitch,
+        )
+        assert merged == [OTHER]
+
+        different_pitch = {TTS: 172.0, OTHER: 229.0}
+        _, merged = RawSceneDetectorService._merge_same_voice_speakers(
+            self.SEGMENTS, TTS, centroids, different_pitch,
+        )
+        assert merged == []
+
+    def test_grey_zone_without_pitch_is_not_merged(self):
+        centroids = {TTS: [1.0, 0.0], OTHER: [0.83, 0.5578]}
+        _, merged = RawSceneDetectorService._merge_same_voice_speakers(
+            self.SEGMENTS, TTS, centroids, {TTS: 127.0},
+        )
+        assert merged == []
+
+    def test_below_grey_zone_never_merges_even_with_same_pitch(self):
+        centroids = {TTS: [1.0, 0.0], OTHER: [0.72, 0.694]}  # cos ~0.72
+        _, merged = RawSceneDetectorService._merge_same_voice_speakers(
+            self.SEGMENTS, TTS, centroids, {TTS: 127.0, OTHER: 127.0},
+        )
+        assert merged == []
+
+    def test_merged_segments_close_the_raw_gap(self):
+        centroids = {TTS: [1.0, 0.0], OTHER: [0.99, 0.14]}
+        segments, _ = RawSceneDetectorService._merge_same_voice_speakers(
+            self.SEGMENTS, TTS, centroids,
+        )
+        assert RawSceneDetectorService._build_raw_regions(segments, TTS, 20.0) == []
+        # Without the merge the OTHER turn is a 4s raw region.
+        assert RawSceneDetectorService._build_raw_regions(self.SEGMENTS, TTS, 20.0) == [(10.0, 14.0)]

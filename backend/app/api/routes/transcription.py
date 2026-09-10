@@ -10,6 +10,7 @@ from ...services import AnimeMatcherService, ProjectService, TranscriberService
 from ...services.drive_prewarm_service import DrivePrewarmService
 from ...services.match_playback_service import MatchPlaybackService
 from ...services.project_locks import project_edit_locked
+from ...services.narrator_service import NarratorService
 
 router = APIRouter(prefix="/projects/{project_id}/transcription", tags=["transcription"])
 
@@ -35,6 +36,7 @@ async def get_transcription_config(project_id: str):
 @router.post("/start")
 async def start_transcription(project_id: str, request: StartTranscriptionRequest):
     """Start transcription with WhisperX."""
+    NarratorService.ensure_idle(project_id)
     project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -118,6 +120,7 @@ async def get_transcription(project_id: str):
 @project_edit_locked
 async def update_transcription(project_id: str, request: UpdateTranscriptionRequest):
     """Update transcription text (user edits)."""
+    NarratorService.ensure_idle(project_id)
     project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -150,6 +153,7 @@ async def update_transcription(project_id: str, request: UpdateTranscriptionRequ
 @project_edit_locked
 async def confirm_transcription(project_id: str):
     """Confirm transcription is valid and proceed."""
+    NarratorService.ensure_idle(project_id)
     project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")

@@ -22,6 +22,7 @@ import {
 import { api } from "@/api/client";
 import { Button } from "@/components/ui";
 import { readSSEStream } from "@/utils/sse";
+import { getEventHub } from "@/utils/eventHub";
 import { useProjectStore } from "@/stores/projectStore";
 import type { CleanFeedRect, CleanupState, CleanupZone } from "@/types";
 
@@ -93,7 +94,6 @@ export function CleanupPage() {
   const overlayRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
   const zonesRef = useRef<CleanupZone[]>([]);
-  const streamAbortRef = useRef<AbortController | null>(null);
 
   const cleanFeedRectRef = useRef<CleanFeedRect | null>(null);
   const feedDragRef = useRef<{
@@ -131,34 +131,30 @@ export function CleanupPage() {
         setCleanupState(state);
         setZones(state.zones);
         setCleanFeedRect(state.clean_feed_rect ?? null);
-        if (state.status === "running") startStream();
       })
       .catch((err) => setError((err as Error).message));
-    return () => streamAbortRef.current?.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
 
-  const startStream = useCallback(() => {
+  // Live job progress arrives over the shared event-hub stream (one
+  // connection for the whole browser) instead of a per-tab SSE socket.
+  // Every item is the full CleanupState; intermediates may be coalesced.
+  useEffect(() => {
     if (!projectId) return;
-    streamAbortRef.current?.abort();
-    const controller = new AbortController();
-    streamAbortRef.current = controller;
-    void (async () => {
-      try {
-        const response = await api.streamCleanup(projectId, controller.signal);
-        await readSSEStream<CleanupState & { status: string }>(
-          response,
-          (state) => setCleanupState(state),
-          {
-            signal: controller.signal,
-            stopWhen: (state) =>
-              state.status === "complete" || state.status === "error",
-          },
-        );
-      } catch {
-        // Stream interrupted; state polling resumes on reload.
-      }
-    })();
+    return getEventHub().subscribe<CleanupState>(
+      "cleanup_jobs",
+      { projectId },
+      (event) => {
+        if (event.kind === "snapshot") {
+          // Replays (subscribe, reconnect) carry at most one item for this
+          // project; an empty snapshot must not clear the GET-loaded state.
+          const item = event.items[event.items.length - 1];
+          if (item) setCleanupState(item.data);
+        } else {
+          setCleanupState(event.item.data);
+        }
+      },
+    );
   }, [projectId]);
 
   // -- letterbox math --------------------------------------------------------
@@ -389,11 +385,10 @@ export function CleanupPage() {
       setCleanupState((state) =>
         state ? { ...state, status: "running", progress: 0 } : state,
       );
-      startStream();
     } catch (err) {
       setError((err as Error).message);
     }
-  }, [projectId, startStream]);
+  }, [projectId]);
 
   const handleCancel = useCallback(async () => {
     if (!projectId) return;

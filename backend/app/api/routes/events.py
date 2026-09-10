@@ -1,9 +1,9 @@
 """The browser's single live-update stream (see ``services/event_hub.py``).
 
-Replaces the four always-on per-topic SSE endpoints (startup jobs, upload
-jobs, indexation jobs, zoom-search jobs): every tab of the UI shares one
-connection to ``/events/stream`` through a SharedWorker, which keeps the
-browser far below its 6-sockets-per-host limit.
+Replaces the always-on per-topic SSE endpoints (startup jobs, upload jobs,
+indexation jobs, zoom-search jobs, pure-mode cleanup jobs): every tab of the
+UI shares one connection to ``/events/stream`` through a SharedWorker, which
+keeps the browser far below its 6-sockets-per-host limit.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ TOPIC_STARTUP_JOBS = "startup_jobs"
 TOPIC_UPLOAD_JOBS = "upload_jobs"
 TOPIC_INDEX_JOBS = "index_jobs"
 TOPIC_ZOOM_JOBS = "zoom_jobs"
+TOPIC_CLEANUP_JOBS = "cleanup_jobs"
 
 _topics_registered = False
 
@@ -71,8 +72,21 @@ def _zoom_jobs_snapshot() -> list[HubItem]:
     ]
 
 
+def _cleanup_jobs_snapshot() -> list[HubItem]:
+    from ...services.video_cleanup_service import VideoCleanupService
+
+    return [
+        {
+            "key": project_id,
+            "project_id": project_id,
+            "data": state.model_dump(mode="json"),
+        }
+        for project_id, state in VideoCleanupService.live_states()
+    ]
+
+
 def ensure_topics_registered() -> None:
-    """Bind the four job registries to their hub topics (idempotent).
+    """Bind the job registries to their hub topics (idempotent).
 
     Done lazily here rather than in the services' constructors so tests that
     build extra service instances never hijack the global snapshot provider,
@@ -85,6 +99,7 @@ def ensure_topics_registered() -> None:
     event_hub.register_topic(TOPIC_UPLOAD_JOBS, _upload_jobs_snapshot)
     event_hub.register_topic(TOPIC_INDEX_JOBS, _index_jobs_snapshot)
     event_hub.register_topic(TOPIC_ZOOM_JOBS, _zoom_jobs_snapshot)
+    event_hub.register_topic(TOPIC_CLEANUP_JOBS, _cleanup_jobs_snapshot)
     _topics_registered = True
 
 

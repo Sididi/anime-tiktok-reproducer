@@ -4,6 +4,7 @@ import { useParams, useNavigate } from "react-router-dom";
 import { Loader2, Play, ArrowRight, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui";
 import { ProjectClippedVideoPlayer } from "@/components/video";
+import { NarratorControls } from "@/components/NarratorControls";
 import { FloatingAudioPlayer } from "@/components/FloatingAudioPlayer";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
@@ -42,6 +43,7 @@ export function TranscriptionPage() {
   const [fullAutoEnabled, setFullAutoEnabled] = useState(false);
   const [loading, setLoading] = useState(true);
   const [transcribing, setTranscribing] = useState(false);
+  const [narratorBusy, setNarratorBusy] = useState(false);
   const [progress, setProgress] = useState<TranscriptionProgress | null>(null);
   const [language, setLanguage] = useState("auto");
   const [editedTexts, setEditedTexts] = useState<Record<number, string>>({});
@@ -305,7 +307,7 @@ export function TranscriptionPage() {
               <select
                 value={language}
                 onChange={(e) => setLanguage(e.target.value)}
-                disabled={transcribing}
+                disabled={transcribing || narratorBusy}
                 title="Language for re-transcription"
                 className="h-9 px-2 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-sm text-[hsl(var(--foreground))]"
               >
@@ -322,7 +324,7 @@ export function TranscriptionPage() {
               <Button
                 variant="outline"
                 onClick={() => handleStartTranscription()}
-                disabled={transcribing}
+                disabled={transcribing || narratorBusy}
                 title="Discard this transcript and transcribe again"
               >
                 {transcribing ? (
@@ -332,13 +334,24 @@ export function TranscriptionPage() {
                 )}
                 Re-run
               </Button>
-              <Button onClick={handleConfirm} disabled={transcribing}>
+              <Button onClick={handleConfirm} disabled={transcribing || narratorBusy}>
                 Continue
                 <ArrowRight className="h-4 w-4 ml-2" />
               </Button>
             </div>
           )}
         </header>
+
+        {transcription && projectId && <NarratorControls projectId={projectId} refreshKey={transcription}
+          hasUnsavedEdits={transcription.scenes.some((s) => (editedTexts[s.scene_index] ?? s.text) !== s.text)}
+          disabled={transcribing} onBusyChange={setNarratorBusy} onChanged={async (data) => {
+            if (data.transcription) {
+              setTranscription(data.transcription);
+              setEditedTexts(Object.fromEntries(data.transcription.scenes.map((s) => [s.scene_index, s.text])));
+              setActiveSceneIndex(-1);
+              await loadScenes(projectId);
+            }
+          }} />}
 
         {transcription && transcribing && progress && progress.status !== "complete" && (
           <div className="bg-[hsl(var(--card))] rounded-lg p-4 space-y-2">
@@ -370,7 +383,7 @@ export function TranscriptionPage() {
               <select
                 value={language}
                 onChange={(e) => setLanguage(e.target.value)}
-                disabled={transcribing}
+                disabled={transcribing || narratorBusy}
                 className="w-full h-10 px-3 rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--background))] text-[hsl(var(--foreground))]"
               >
                 {LANGUAGES.map((lang) => (
@@ -402,7 +415,7 @@ export function TranscriptionPage() {
 
             <Button
               onClick={() => handleStartTranscription()}
-              disabled={transcribing}
+              disabled={transcribing || narratorBusy}
               className="w-full"
             >
               {transcribing ? (

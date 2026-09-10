@@ -39,7 +39,12 @@ export const PONG_TIMEOUT_MS = 2000;
  * SharedWorker. */
 export const TRANSPORT_STORAGE_KEY = "atr:eventHub.transport";
 
-export type HubTopic = "startup_jobs" | "upload_jobs" | "index_jobs" | "zoom_jobs";
+export type HubTopic =
+  | "startup_jobs"
+  | "upload_jobs"
+  | "index_jobs"
+  | "zoom_jobs"
+  | "cleanup_jobs";
 
 export interface HubItem<T = unknown> {
   key: string;

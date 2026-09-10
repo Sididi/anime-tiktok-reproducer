@@ -19,7 +19,7 @@ export function DurationPreviewVideo({
 }: DurationPreviewVideoProps) {
   const [mediaState, setMediaState] = useState<MediaState>("loading");
   const [attempt, setAttempt] = useState(0);
-  const retryTimer = useRef<number>();
+  const retryTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     return () => {

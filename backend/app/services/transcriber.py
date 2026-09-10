@@ -159,7 +159,20 @@ class TranscriberService:
             had_align = len(cls._align_models)
             asr_models = [cls._asr_models.pop(key) for key in list(cls._asr_models)]
             align_models = [cls._align_models.pop(key) for key in list(cls._align_models)]
-            cls._unload_requested = False
+            # A forced unload (the CUDA-OOM retry) can run while ANOTHER
+            # pipeline is mid-inference on these very objects. Destroying
+            # them then (ct2 unload_model / .cpu()) poisons that run —
+            # "parallel_for failed: cudaErrorInvalidDevice: invalid device
+            # ordinal" (seen 2026-09-01, three concurrent transcriptions).
+            # With concurrent sessions: evict from the cache only, so the
+            # OOM'd retry loads a fresh model while live objects stay valid
+            # and are freed when their last holder drops them; the deferred
+            # request below makes the final session run the destroy pass.
+            destroy = cls._active_transcriptions <= (1 if force else 0)
+            cls._unload_requested = not destroy
+
+        if not destroy:
+            return
 
         # --- ASR models (faster_whisper.WhisperModel) ---
         # Each holds a CTranslate2 model with its own CUDA allocator that
@@ -307,6 +320,22 @@ class TranscriberService:
             "Failed to extract audio for transcription. "
             f"ffmpeg error: {stderr[:400]}"
         )
+
+    @classmethod
+    def _refresh_project_audio(cls, media_path: Path, output_wav: Path) -> None:
+        """Replace the cached WAV only after successful extraction.
+
+        Duplicated projects can share hardlinked media. Writing directly to
+        their old WAV would also overwrite the mother's audio.
+        """
+        descriptor, name = tempfile.mkstemp(prefix=".audio-refresh-", suffix=".wav", dir=output_wav.parent)
+        os.close(descriptor)
+        temporary = Path(name)
+        try:
+            cls._extract_audio_for_whisper(media_path, temporary)
+            os.replace(temporary, output_wav)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _is_cuda_oom(exc: Exception) -> bool:
@@ -1157,19 +1186,35 @@ class TranscriberService:
     ) -> AsyncIterator[TranscriptionProgress]:
         """Run transcription + diarization inside the shared two-job budget."""
         from .indexation_queue import indexation_queue
+        from .narrator_service import NarratorService
+        from .project_locks import ProjectLocks
 
-        if indexation_queue.gpu_semaphore().locked():
-            yield TranscriptionProgress(
-                "starting",
-                0,
-                "Waiting for a heavy-processing slot...",
-            )
+        async with ProjectLocks.hold(project_id):
+            if project_id in NarratorService.active_transcriptions:
+                yield TranscriptionProgress("error", error="Transcription is already running for this project.")
+                return
+            NarratorService.active_transcriptions.add(project_id)
 
         try:
+            if indexation_queue.gpu_semaphore().locked():
+                yield TranscriptionProgress(
+                    "starting",
+                    0,
+                    "Waiting for a heavy-processing slot...",
+                )
+
             async with indexation_queue.heavy_slot("transcription_diarization"):
-                async for progress in cls._transcribe_impl(project_id, language):
-                    yield progress
+                stream = cls._transcribe_impl(project_id, language)
+                try:
+                    async for progress in stream:
+                        yield progress
+                finally:
+                    # Explicitly close the inner generator while the heavy
+                    # slot and per-project busy flag are still held. Its close
+                    # waits for shielded native inference to finish.
+                    await stream.aclose()
         finally:
+            NarratorService.active_transcriptions.discard(project_id)
             # On SSE disconnect/cancellation this requests deferred cleanup if
             # the shielded native worker is still running. _end_transcription_session
             # performs the actual unload as soon as the last worker exits.
@@ -1198,6 +1243,9 @@ class TranscriberService:
                 yield TranscriptionProgress("error", 0, "", error="No scenes found")
                 return
 
+            from .narrator_service import NarratorService
+            input_signature = NarratorService.video_signature(project.video_path)
+            input_revision = NarratorService.revision(project_id)
             video_path = Path(project.video_path)
             pre_raw_match_snapshot = await ProjectService.aload_matches(project_id)
             if pre_raw_match_snapshot is not None:
@@ -1206,29 +1254,30 @@ class TranscriberService:
             # Extract WAV to project dir (reused by diarization)
             project_dir = ProjectService.get_project_dir(project_id)
             wav_path = project_dir / "audio_16khz.wav"
-            if not wav_path.exists():
-                yield TranscriptionProgress(
-                    "extracting_audio",
-                    0.05,
-                    "Extracting audio track for transcription...",
-                )
-                extraction_task = asyncio.create_task(
-                    run_heavy(cls._extract_audio_for_whisper, video_path, wav_path)
-                )
-                native_futures.append(extraction_task)
-                while True:
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.shield(extraction_task),
-                            timeout=TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS,
-                        )
-                        break
-                    except asyncio.TimeoutError:
-                        yield TranscriptionProgress(
-                            "extracting_audio",
-                            0.05,
-                            "Extracting audio track for transcription...",
-                        )
+            # A full transcription refreshes audio too: cleanup may have
+            # replaced the video since the previous cached WAV was extracted.
+            yield TranscriptionProgress(
+                "extracting_audio",
+                0.05,
+                "Extracting audio track for transcription...",
+            )
+            extraction_task = asyncio.create_task(
+                run_heavy(cls._refresh_project_audio, video_path, wav_path)
+            )
+            native_futures.append(extraction_task)
+            while True:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(extraction_task),
+                        timeout=TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    yield TranscriptionProgress(
+                        "extracting_audio",
+                        0.05,
+                        "Extracting audio track for transcription...",
+                    )
 
             yield TranscriptionProgress("starting", 0.1, "Loading transcription model...")
 
@@ -1270,106 +1319,48 @@ class TranscriberService:
                 unrecovered_gaps=list(cls._last_unrecovered_gaps),
             )
 
-            # Save transcription
-            await ProjectService.asave_transcription(project_id, transcription)
-
-            # Free WhisperX models and GPU VRAM before diarization
+            # Keep existing working files intact until the complete new
+            # source and derived outputs are ready to publish together.
             cls.unload_models()
+            from .raw_scene_detector import RawSceneDetectorService
+            from .narrator_service import NarratorService
+            from .project_locks import ProjectLocks
 
-            # --- Raw scene detection (pyannote diarization) ---
-            from ..config import settings as _settings
-            detection_result: RawSceneDetectionResult | None = None
-
-            if _settings.hf_token:
-                original_scenes = [scene.model_copy(deep=True) for scene in scene_transcriptions]
-
-                yield TranscriptionProgress(
-                    "processing", 0.85,
-                    "Detecting raw scenes (speaker diarization)...",
+            yield TranscriptionProgress(
+                "processing", 0.85, "Detecting raw scenes (speaker diarization)...",
+            )
+            diarization_future = loop.run_in_executor(
+                heavy_executor(), lambda: RawSceneDetectorService.analyze(wav_path),
+            )
+            native_futures.append(diarization_future)
+            while True:
+                try:
+                    analysis = await asyncio.wait_for(
+                        asyncio.shield(diarization_future),
+                        timeout=TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    yield TranscriptionProgress(
+                        "processing", 0.85, "Detecting raw scenes (speaker diarization)...",
+                    )
+            source = await asyncio.to_thread(
+                NarratorService.make_source, project, transcription, scenes,
+                pre_raw_match_snapshot, analysis,
+            )
+            async with ProjectLocks.hold(project_id):
+                current = await ProjectService.aload(project_id)
+                if (not current or source.video_signature != input_signature
+                        or NarratorService.video_signature(current.video_path) != input_signature
+                        or NarratorService.revision(project_id) != input_revision):
+                    raise ValueError("Project changed during transcription. Re-run transcription.")
+                # Short JSON transaction: do not leave a publishing thread
+                # running after cancellation releases the project lock.
+                NarratorService.publish_source(project_id, source)
+                transcription = await ProjectService.aload_transcription(project_id)
+                detection_result = RawSceneDetectionResult.model_validate_json(
+                    (project_dir / "raw_scene_detection.json").read_text()
                 )
-
-                from ..library_types import LibraryType
-                from .raw_scene_detector import RawSceneDetectorService
-
-                is_pure = project.library_type == LibraryType.PURE
-                diarization_future = loop.run_in_executor(
-                    heavy_executor(),
-                    lambda: RawSceneDetectorService.detect(
-                        wav_path,
-                        [scene.model_copy(deep=True) for scene in original_scenes],
-                        pure_mode=is_pure,
-                    ),
-                )
-                native_futures.append(diarization_future)
-                while True:
-                    try:
-                        updated_scenes, detection_result = await asyncio.wait_for(
-                            asyncio.shield(diarization_future),
-                            timeout=TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS,
-                        )
-                        break
-                    except asyncio.TimeoutError:
-                        yield TranscriptionProgress(
-                            "processing",
-                            0.85,
-                            "Detecting raw scenes (speaker diarization)...",
-                        )
-
-                if detection_result is not None:
-                    # Persist even when NO raw scenes were found, so the UI
-                    # never shows a previous run's stale candidates.
-                    (project_dir / "raw_scene_detection.json").write_text(
-                        detection_result.model_dump_json(indent=2)
-                    )
-
-                if detection_result and detection_result.has_raw_scenes:
-                    matches_for_raw_backup = (
-                        pre_raw_match_snapshot.model_copy(deep=True)
-                        if pre_raw_match_snapshot is not None
-                        else None
-                    )
-
-                    # Mark raw scenes and clear their text
-                    raw_indices = {c.scene_index for c in detection_result.candidates}
-                    for s in updated_scenes:
-                        if s.scene_index in raw_indices:
-                            s.is_raw = True
-                            s.text = ""
-                            s.words = []
-
-                    # Sync matches and scenes.json when scenes were split
-                    if len(updated_scenes) != len(original_scenes):
-                        remapped_match_list = cls.remap_raw_scene_match_snapshot(
-                            original_scenes,
-                            updated_scenes,
-                            pre_raw_match_snapshot,
-                            parent_scene_indices=detection_result.scene_parent_indices,
-                        )
-                        if remapped_match_list is not None:
-                            matches_for_raw_backup = remapped_match_list.model_copy(deep=True)
-                            await ProjectService.asave_matches(project_id, remapped_match_list)
-
-                        # Sync scenes.json with updated scene structure
-                        updated_scene_list = SceneList(scenes=[
-                            Scene(index=s.scene_index, start_time=s.start_time, end_time=s.end_time)
-                            for s in updated_scenes
-                        ])
-                        await ProjectService.asave_scenes(project_id, updated_scene_list)
-                        (project_dir / "scenes_raw_backup.json").write_text(
-                            updated_scene_list.model_dump_json(indent=2)
-                        )
-
-                    transcription.scenes = updated_scenes
-                    await ProjectService.asave_transcription(project_id, transcription)
-
-                    # Save backup for reset (post-detection, pre-validation)
-                    (project_dir / "transcription_raw_backup.json").write_text(
-                        transcription.model_dump_json(indent=2)
-                    )
-                    if matches_for_raw_backup is not None:
-                        (project_dir / "matches_raw_backup.json").write_text(
-                            matches_for_raw_backup.model_dump_json(indent=2)
-                        )
 
             completion_message = f"Transcribed {len(words)} words in {detected_lang}"
             if transcription.unrecovered_gaps:

@@ -508,11 +508,40 @@ export interface RawSceneDetectionResult {
   tts_speaker_id: string;
   speaker_count: number;
   scene_parent_indices: number[];
+  merged_speaker_ids?: string[];
+  selected_narrator_ids?: string[];
+  analysis_id?: string | null;
+  selection_origin?: "automatic" | "manual";
+  error?: string | null;
+}
+
+export interface NarratorSample {
+  start_time: number;
+  end_time: number;
+  text: string;
+}
+
+export interface NarratorMetadata {
+  speakers: { speaker_id: string; duration: number; samples: NarratorSample[] }[];
+  revision: string;
+  analysis_id: string | null;
+  correction_available: boolean;
+  unavailable_reason: string | null;
+  undo_available: boolean;
+  warning?: string | null;
+  recoverable_text?: Record<string, string>;
+}
+
+export interface RawScenesResponse {
+  detection: RawSceneDetectionResult | null;
+  transcription: Transcription | null;
+  narrator?: NarratorMetadata;
 }
 
 export interface Transcription {
   language: string;
   scenes: SceneTranscription[];
+  unrecovered_gaps?: [number, number][];
 }
 
 export type Platform = "youtube" | "facebook" | "instagram" | "tiktok";

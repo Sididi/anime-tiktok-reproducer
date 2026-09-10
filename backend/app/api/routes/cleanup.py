@@ -4,7 +4,7 @@ import json
 import logging
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ...library_types import LibraryType
@@ -101,21 +101,6 @@ async def run_cleanup(project_id: str) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "started"}
-
-
-@router.get("/stream")
-async def stream_cleanup(project_id: str):
-    _require_pure(project_id)
-
-    async def stream():
-        async for state in VideoCleanupService.stream_state(project_id):
-            yield "data: " + state.model_dump_json() + "\n\n"
-
-    return StreamingResponse(
-        stream(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
 
 
 @router.post("/cancel")

@@ -502,9 +502,6 @@ export const api = {
       method: "POST",
     }),
 
-  streamCleanup: (projectId: string, signal?: AbortSignal) =>
-    fetch(`${API_BASE}/projects/${projectId}/cleanup/stream`, { signal }),
-
   cancelCleanup: (projectId: string) =>
     request<{ status: string }>(`/projects/${projectId}/cleanup/cancel`, {
       method: "POST",
@@ -743,20 +740,30 @@ export const api = {
 
   // Raw Scene Validation
   getRawScenes: (projectId: string) =>
-    request<{
-      detection: import("@/types").RawSceneDetectionResult | null;
-      transcription: import("@/types").Transcription | null;
-    }>(`/projects/${projectId}/raw-scenes`),
+    request<import("@/types").RawScenesResponse>(`/projects/${projectId}/raw-scenes`),
+
+  changeNarrator: (projectId: string, speakerIds: string[] | null, expectedRevision: string) =>
+    request<import("@/types").RawScenesResponse>(`/projects/${projectId}/raw-scenes/narrator`, {
+      method: "PUT",
+      body: JSON.stringify({ speaker_ids: speakerIds, expected_revision: expectedRevision }),
+    }),
+
+  undoNarrator: (projectId: string, expectedRevision: string) =>
+    request<import("@/types").RawScenesResponse>(`/projects/${projectId}/raw-scenes/narrator/undo`, {
+      method: "POST",
+      body: JSON.stringify({ expected_revision: expectedRevision }),
+    }),
 
   validateRawScenes: (
     projectId: string,
     validations: Array<{ scene_index: number; is_raw: boolean; text?: string }>,
+    expectedRevision?: string,
   ) =>
     request<{ status: string; transcription: import("@/types").Transcription }>(
       `/projects/${projectId}/raw-scenes/validate`,
       {
         method: "POST",
-        body: JSON.stringify({ validations }),
+        body: JSON.stringify({ validations, expected_revision: expectedRevision }),
       },
     ),
 

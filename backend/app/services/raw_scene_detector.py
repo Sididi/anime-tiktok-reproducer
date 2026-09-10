@@ -9,9 +9,10 @@ import gc
 import logging
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 from ..config import settings
-from ..models.raw_scene import RawSceneCandidate, RawSceneDetectionResult
+from ..models.raw_scene import DiarizationAnalysis, RawSceneCandidate, RawSceneDetectionResult
 from ..models.transcription import SceneTranscription
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,31 @@ PURE_PAUSE_WORD_ADJACENCY_SECONDS = 0.75
 # WhisperX artifact guard: words with implausibly long durations carry
 # trailing silence, so their start time is the only reliable anchor
 MAX_WORD_DURATION = 1.0
+
+# Same-voice cluster merge: pyannote's VBx clustering (threshold 0.6) can
+# split ONE narrator into several "speakers" when music/SFX sit under part
+# of the narration (2026-09-03, project ded367648062: 30% of a Hindi Pure
+# source flagged raw, every span fluently transcribed by Whisper). Clusters
+# whose voice embedding matches the TTS speaker are folded back into it
+# before raw regions are built. Calibration (wespeaker resnet34 centroids):
+#   same voice, split by the diarizer ......... cos 0.986
+#   same voice, first half vs second half ..... cos 0.984
+#   genuinely different voices (90473eac46b6) . cos 0.72 / 0.48 / 0.34
+SAME_VOICE_MERGE_THRESHOLD = 0.90
+# Grey zone: a moderate embedding match merges only when the pitch agrees
+# too. Same project: the third cluster (7s of shouted/ceremonial lines)
+# scored cos 0.833 with the same 127-131 Hz median F0 as the narrator;
+# the different voices on 90473eac46b6 sit at 136 / 172 / 229 Hz.
+SAME_VOICE_GREY_ZONE_THRESHOLD = 0.75
+SAME_VOICE_MAX_PITCH_RATIO = 1.15
+PITCH_FRAME_SECONDS = 0.02
+PITCH_MIN_HZ = 70.0
+PITCH_MAX_HZ = 400.0
+SPEAKER_EMBEDDING_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
+# Turns shorter than this give unreliable embeddings; a cluster with no
+# turn this long falls back to its longest turns above the floor.
+EMBED_MIN_TURN_SECONDS = 1.0
+EMBED_TURN_FLOOR_SECONDS = 0.4
 
 
 class RawSceneDetectorService:
@@ -134,6 +160,216 @@ class RawSceneDetectorService:
 
         tts_speaker = max(speaker_durations, key=speaker_durations.get)  # type: ignore[arg-type]
         return tts_speaker, speaker_durations
+
+    @staticmethod
+    def _voiced_pitch_frames(waveform: Any, sample_rate: int) -> Any:
+        """F0 (Hz) of the energetic, plausibly voiced frames of a clip.
+
+        Returns a 1-D array (possibly empty). Frames are pooled across all
+        of a speaker's turns before taking the median: a per-turn median
+        over-weights the few long, shouted lines of a small cluster
+        (ded367648062 SPEAKER_00: two long turns at ~155 Hz, everything
+        else at the narrator's ~127 Hz).
+        """
+        import numpy as np
+        import torchaudio.functional as taf
+
+        frame = int(sample_rate * PITCH_FRAME_SECONDS)
+        n_frames = waveform.shape[-1] // frame
+        if n_frames < 5:
+            return np.empty(0)
+        f0 = taf.detect_pitch_frequency(
+            waveform,
+            sample_rate,
+            frame_time=PITCH_FRAME_SECONDS,
+            freq_low=int(PITCH_MIN_HZ),
+            freq_high=int(PITCH_MAX_HZ),
+        ).squeeze(0).numpy()[:n_frames]
+        samples = waveform.squeeze(0).numpy()[: n_frames * frame].reshape(n_frames, frame)
+        energy = (samples ** 2).mean(axis=1)
+        keep = energy > np.percentile(energy, 40)
+        f0 = f0[: keep.size][keep[: f0.size]]
+        return f0[(f0 > PITCH_MIN_HZ) & (f0 < PITCH_MAX_HZ)]
+
+    @classmethod
+    def _speaker_voice_profiles(
+        cls,
+        wav_path: Path,
+        segments: list[tuple[float, float, str]],
+    ) -> tuple[dict[str, Any], dict[str, float]]:
+        """Per diarization speaker: duration-weighted voice-embedding
+        centroid and median pitch (Hz).
+
+        Uses a separate speaker-verification model (wespeaker) rather than
+        the diarizer's own embeddings so the merge decision is independent
+        of the clustering that made the split.
+        """
+        import wave
+
+        import numpy as np
+        import torch
+        from pyannote.audio import Inference, Model
+
+        with wave.open(str(wav_path), "rb") as wf:
+            sample_rate = wf.getframerate()
+            channels = wf.getnchannels()
+            audio = np.frombuffer(
+                wf.readframes(wf.getnframes()), dtype=np.int16
+            ).astype(np.float32)
+        if channels > 1:
+            audio = audio.reshape(-1, channels).mean(axis=1)
+        audio /= 32768.0
+
+        by_speaker: dict[str, list[tuple[float, float]]] = {}
+        for start, end, speaker in segments:
+            by_speaker.setdefault(speaker, []).append((start, end))
+
+        model = None
+        inference = None
+        try:
+            model = Model.from_pretrained(SPEAKER_EMBEDDING_MODEL, token=settings.hf_token)
+            inference = Inference(model, window="whole", device=torch.device(cls._get_device()))
+
+            centroids: dict[str, Any] = {}
+            pitches: dict[str, float] = {}
+            for speaker, turns in by_speaker.items():
+                usable = [(s, e) for s, e in turns if e - s >= EMBED_MIN_TURN_SECONDS]
+                if not usable:
+                    usable = sorted(
+                        ((s, e) for s, e in turns if e - s >= EMBED_TURN_FLOOR_SECONDS),
+                        key=lambda t: t[1] - t[0],
+                        reverse=True,
+                    )[:3]
+                if not usable:
+                    continue
+                # Pitch pools frames over every turn above the floor (short
+                # turns are fine for F0, unlike for embeddings).
+                pitch_frames: list[Any] = []
+                for start, end in turns:
+                    if end - start < EMBED_TURN_FLOOR_SECONDS:
+                        continue
+                    clip = audio[int(start * sample_rate):int(end * sample_rate)]
+                    if clip.size == 0:
+                        continue
+                    with suppress(Exception):
+                        frames = cls._voiced_pitch_frames(
+                            torch.from_numpy(clip).unsqueeze(0), sample_rate
+                        )
+                        if frames.size:
+                            pitch_frames.append(frames)
+                if pitch_frames:
+                    pitches[speaker] = float(np.median(np.concatenate(pitch_frames)))
+
+                weighted = None
+                total = 0.0
+                for start, end in usable:
+                    clip = audio[int(start * sample_rate):int(end * sample_rate)]
+                    if clip.size == 0:
+                        continue
+                    waveform = torch.from_numpy(clip).unsqueeze(0)
+                    emb = np.asarray(
+                        inference({"waveform": waveform, "sample_rate": sample_rate})
+                    ).ravel().astype(np.float64)
+                    norm = np.linalg.norm(emb)
+                    if not np.isfinite(norm) or norm == 0:
+                        continue
+                    emb /= norm
+                    weight = end - start
+                    weighted = emb * weight if weighted is None else weighted + emb * weight
+                    total += weight
+                if weighted is not None and total > 0:
+                    centroids[speaker] = weighted / total
+            return centroids, pitches
+        finally:
+            inference = None
+            model = None
+            gc.collect()
+            with suppress(Exception):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    @staticmethod
+    def _merge_same_voice_speakers(
+        segments: list[tuple[float, float, str]],
+        tts_speaker: str,
+        centroids: dict[str, Any],
+        pitches: dict[str, float] | None = None,
+        threshold: float = SAME_VOICE_MERGE_THRESHOLD,
+        grey_zone_threshold: float = SAME_VOICE_GREY_ZONE_THRESHOLD,
+        max_pitch_ratio: float = SAME_VOICE_MAX_PITCH_RATIO,
+    ) -> tuple[list[tuple[float, float, str]], list[str]]:
+        """Relabel clusters whose voice matches the TTS speaker as TTS.
+
+        Two signals: an embedding similarity at or above ``threshold``
+        merges outright; one in the grey zone (``grey_zone_threshold`` ..
+        ``threshold``) merges only when both speakers' median pitch is
+        within ``max_pitch_ratio``. Pure function over precomputed
+        profiles so it is testable without models. A speaker with no
+        centroid (no usable turn) is left alone: it stays a raw candidate,
+        which is the conservative outcome.
+
+        Returns (relabelled segments, merged speaker ids).
+        """
+        import numpy as np
+
+        pitches = pitches or {}
+        tts_centroid = centroids.get(tts_speaker)
+        if tts_centroid is None:
+            return list(segments), []
+        tts_pitch = pitches.get(tts_speaker)
+
+        def _cos(a: Any, b: Any) -> float:
+            denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+            if denom == 0:
+                return 0.0
+            return float(np.dot(a, b) / denom)
+
+        merged: list[str] = []
+        for speaker, centroid in centroids.items():
+            if speaker == tts_speaker:
+                continue
+            similarity = _cos(centroid, tts_centroid)
+            pitch = pitches.get(speaker)
+            pitch_ratio = (
+                max(pitch, tts_pitch) / min(pitch, tts_pitch)
+                if pitch and tts_pitch
+                else None
+            )
+            if similarity >= threshold:
+                verdict = "merging (strong voice match)"
+                merge = True
+            elif (
+                similarity >= grey_zone_threshold
+                and pitch_ratio is not None
+                and pitch_ratio <= max_pitch_ratio
+            ):
+                verdict = "merging (moderate voice match, same pitch)"
+                merge = True
+            else:
+                verdict = "kept as non-TTS"
+                merge = False
+            if merge:
+                merged.append(speaker)
+            logger.info(
+                "Raw scene detection: speaker %s vs TTS %s: cos %.3f, "
+                "pitch %s vs %s Hz (ratio %s) -> %s",
+                speaker,
+                tts_speaker,
+                similarity,
+                f"{pitch:.0f}" if pitch else "n/a",
+                f"{tts_pitch:.0f}" if tts_pitch else "n/a",
+                f"{pitch_ratio:.2f}" if pitch_ratio else "n/a",
+                verdict,
+            )
+
+        if not merged:
+            return list(segments), []
+        merged_set = set(merged)
+        relabelled = [
+            (start, end, tts_speaker if speaker in merged_set else speaker)
+            for start, end, speaker in segments
+        ]
+        return relabelled, merged
 
     @staticmethod
     def _build_raw_regions(
@@ -504,34 +740,71 @@ class RawSceneDetectorService:
         Returns:
             (updated_scenes, detection_result)
         """
+        return cls.classify(cls.analyze(wav_path), scenes, pure_mode=pure_mode)
+
+    @classmethod
+    def analyze(cls, wav_path: Path) -> DiarizationAnalysis:
+        """Run models once; keep original clusters for later narrator choices."""
         if not settings.hf_token:
-            logger.info("HF_TOKEN not set, skipping raw scene detection")
-            return scenes, RawSceneDetectionResult(
-                has_raw_scenes=False, error="HF_TOKEN not set"
-            )
-
+            return DiarizationAnalysis(error="HF_TOKEN not set")
         try:
-            audio_duration = cls._get_audio_duration(wav_path)
-        except Exception as exc:
-            logger.warning("Failed to get audio duration: %s", exc)
-            return scenes, RawSceneDetectionResult(
-                has_raw_scenes=False, error=f"Audio duration probe failed: {exc}"
-            )
-
-        try:
+            duration = cls._get_audio_duration(wav_path)
             segments = cls._run_diarization(wav_path)
         except Exception as exc:
-            logger.error("Diarization failed: %s", exc)
-            return scenes, RawSceneDetectionResult(
-                has_raw_scenes=False, error=f"Diarization failed: {exc}"
-            )
+            logger.exception("Diarization failed")
+            return DiarizationAnalysis(error=f"Diarization failed: {exc}")
+        analysis = DiarizationAnalysis(audio_duration=duration, segments=segments)
+        if len({speaker for _, _, speaker in segments}) > 1:
+            try:
+                centroids, pitches = cls._speaker_voice_profiles(wav_path, segments)
+                analysis.centroids = {key: value.tolist() for key, value in centroids.items()}
+                analysis.pitches = pitches
+            except Exception as exc:
+                logger.warning("Speaker-embedding merge unavailable", exc_info=True)
+                analysis.warning = f"Same-voice merge unavailable: {exc}"
+        return analysis
 
-        if not segments:
-            return scenes, RawSceneDetectionResult(has_raw_scenes=False)
-
+    @classmethod
+    def classify(
+        cls,
+        analysis: DiarizationAnalysis,
+        scenes: list[SceneTranscription],
+        *,
+        pure_mode: bool = False,
+        narrator_id: str | None = None,
+        narrator_ids: list[str] | None = None,
+    ) -> tuple[list[SceneTranscription], RawSceneDetectionResult]:
+        """Apply a narrator choice using cached evidence, without model inference."""
+        scenes = [scene.model_copy(deep=True) for scene in scenes]
+        segments = list(analysis.segments)
+        audio_duration = analysis.audio_duration
         tts_speaker, speaker_durations = cls._identify_tts_speaker(segments)
-        if not tts_speaker:
-            return scenes, RawSceneDetectionResult(has_raw_scenes=False)
+        if narrator_id is not None and narrator_ids is not None:
+            raise ValueError("Supply one narrator selection")
+        selected = narrator_ids if narrator_ids is not None else ([narrator_id] if narrator_id is not None else None)
+        if selected is not None:
+            if not selected or any(speaker not in speaker_durations for speaker in selected):
+                raise ValueError("Unknown narrator speaker")
+            selected = sorted(set(selected))
+            tts_speaker = selected[0]
+        if analysis.error or not tts_speaker:
+            return scenes, RawSceneDetectionResult(has_raw_scenes=False, error=analysis.error)
+        selected_narrator_ids = selected if selected is not None else [tts_speaker]
+        # Match each selected voice against the original evidence. Distinct
+        # narrators share a logical label only in this classification pass.
+        narration_speakers = set(selected_narrator_ids)
+        merged_speaker_ids = []
+        for speaker in selected_narrator_ids:
+            _, same_voice = cls._merge_same_voice_speakers(
+                segments, speaker, analysis.centroids, analysis.pitches,
+            )
+            for matched in same_voice:
+                if matched not in narration_speakers:
+                    merged_speaker_ids.append(matched)
+                    narration_speakers.add(matched)
+        segments = [(start, end, tts_speaker if speaker in narration_speakers else speaker)
+                    for start, end, speaker in segments]
+        _, speaker_durations = cls._identify_tts_speaker(segments)
 
         raw_regions = cls._build_raw_regions(segments, tts_speaker, audio_duration)
 
@@ -561,6 +834,9 @@ class RawSceneDetectorService:
                 has_raw_scenes=False,
                 tts_speaker_id=tts_speaker,
                 speaker_count=len(speaker_durations),
+                merged_speaker_ids=merged_speaker_ids,
+                selected_narrator_ids=selected_narrator_ids,
+                selection_origin="manual" if selected is not None else "automatic",
             )
 
         updated_scenes, candidates, scene_parent_indices = cls._map_raw_regions_to_scenes(
@@ -589,6 +865,9 @@ class RawSceneDetectorService:
             tts_speaker_id=tts_speaker,
             speaker_count=len(speaker_durations),
             scene_parent_indices=scene_parent_indices,
+            merged_speaker_ids=merged_speaker_ids,
+            selected_narrator_ids=selected_narrator_ids,
+            selection_origin="manual" if selected is not None else "automatic",
         )
 
         return updated_scenes, result

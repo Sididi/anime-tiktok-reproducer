@@ -38,7 +38,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, Callable
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -51,6 +51,7 @@ from ..models.cleanup import CleanFeedRect, CleanupState, CleanupZone
 from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from ..utils.video_color import ensure_bt709_tags
 from .atomic_files import write_text_atomic
+from .event_hub import event_hub
 from .project_service import ProjectService
 
 logger = logging.getLogger("uvicorn.error")
@@ -241,6 +242,16 @@ class CleanupCancelled(Exception):
 _cancel_events: dict[str, threading.Event] = {}
 _running_tasks: dict[str, asyncio.Task] = {}
 
+# Live per-project cleanup states mirrored to the shared event hub (topic
+# "cleanup_jobs", key = project_id). Replaces the per-tab /cleanup/stream SSE:
+# tabs subscribe through the browser's single hub connection instead of each
+# holding a socket for the whole run. Only projects whose state changed since
+# backend start appear here (tabs GET the persisted state on load); bounded by
+# pruning non-running entries oldest-first.
+HUB_TOPIC = "cleanup_jobs"
+MAX_IDLE_LIVE_STATES = 50
+_live_states: dict[str, CleanupState] = {}
+
 
 class VideoCleanupService:
     # -- paths ------------------------------------------------------------
@@ -359,7 +370,35 @@ class VideoCleanupService:
         state.updated_at = datetime.now()
         project.cleanup = state
         ProjectService.save(project)
+        cls._publish_state(project_id, state)
         return state
+
+    @classmethod
+    def _publish_state(cls, project_id: str, state: CleanupState) -> None:
+        """Mirror a state change to the shared event hub.
+
+        Called from the event loop and from the cleanup worker thread; the
+        hub marshals off-loop publishes itself. Re-insert so dict order stays
+        recency order for the pruning below.
+        """
+        _live_states.pop(project_id, None)
+        _live_states[project_id] = state
+        idle_ids = [
+            pid for pid, s in _live_states.items() if s.status != "running"
+        ]
+        for pid in idle_ids[: max(0, len(idle_ids) - MAX_IDLE_LIVE_STATES)]:
+            del _live_states[pid]
+        event_hub.publish(
+            HUB_TOPIC,
+            key=project_id,
+            data=state.model_dump(mode="json"),
+            project_id=project_id,
+        )
+
+    @classmethod
+    def live_states(cls) -> list[tuple[str, CleanupState]]:
+        """(project_id, state) pairs for the hub topic snapshot."""
+        return list(_live_states.items())
 
     # -- job orchestration -------------------------------------------------
 
@@ -390,18 +429,23 @@ class VideoCleanupService:
 
             try:
                 # The inpainting models need the whole 8 GB card, like
-                # fast-mode matching: reserve the full heavy budget.
-                async with indexation_queue.heavy_slot(
-                    "cleanup", slots=indexation_queue.MAX_CONCURRENT
-                ):
-                    await asyncio.get_running_loop().run_in_executor(
-                        heavy_executor(),
-                        cls._run_full_cleanup_sync,
-                        project_id,
-                        Path(source),
-                        list(state.zones),
-                        cancel_event,
-                    )
+                # fast-mode matching: reserve the full heavy budget. Whole-
+                # budget acquisitions MUST hold matching_lock so two of them
+                # can never interleave partial acquisitions (each grabbing one
+                # slot and waiting forever for the other's — deadlock observed
+                # 2026-09-01 with concurrent cleanups).
+                async with indexation_queue.matching_lock():
+                    async with indexation_queue.heavy_slot(
+                        "cleanup", slots=indexation_queue.MAX_CONCURRENT
+                    ):
+                        await asyncio.get_running_loop().run_in_executor(
+                            heavy_executor(),
+                            cls._run_full_cleanup_sync,
+                            project_id,
+                            Path(source),
+                            list(state.zones),
+                            cancel_event,
+                        )
             except CleanupCancelled:
                 cls._update_state(
                     project_id,
@@ -433,20 +477,6 @@ class VideoCleanupService:
         if event is not None:
             event.set()
 
-    @classmethod
-    async def stream_state(cls, project_id: str) -> AsyncIterator[CleanupState]:
-        """Poll-based SSE stream; ends when the job reaches a terminal state."""
-        last_payload = None
-        while True:
-            state = cls.get_state(project_id)
-            payload = state.model_dump_json()
-            if payload != last_payload:
-                last_payload = payload
-                yield state
-            if state.status in ("complete", "error", "idle"):
-                return
-            await asyncio.sleep(0.5)
-
     # -- preview -----------------------------------------------------------
 
     @classmethod
@@ -461,17 +491,19 @@ class VideoCleanupService:
 
         from .indexation_queue import indexation_queue
 
-        async with indexation_queue.heavy_slot(
-            "cleanup_preview", slots=indexation_queue.MAX_CONCURRENT
-        ):
-            await asyncio.get_running_loop().run_in_executor(
-                heavy_executor(),
-                cls._render_preview_sync,
-                project_id,
-                Path(source),
-                list(state.zones),
-                timestamp,
-            )
+        # Whole-budget acquisition: must hold matching_lock (see start_full_cleanup).
+        async with indexation_queue.matching_lock():
+            async with indexation_queue.heavy_slot(
+                "cleanup_preview", slots=indexation_queue.MAX_CONCURRENT
+            ):
+                await asyncio.get_running_loop().run_in_executor(
+                    heavy_executor(),
+                    cls._render_preview_sync,
+                    project_id,
+                    Path(source),
+                    list(state.zones),
+                    timestamp,
+                )
         return {
             "before_url": f"/api/projects/{project_id}/cleanup/preview/before",
             "after_url": f"/api/projects/{project_id}/cleanup/preview/after",
@@ -1868,6 +1900,11 @@ class VideoCleanupService:
         state.updated_at = datetime.now()
         project.cleanup = state
         ProjectService.save(project)
+        # This success write bypasses _update_state (it also swaps the
+        # project's video paths), so mirror it to the event hub explicitly —
+        # without this the tabs never see the terminal state and stay frozen
+        # on the last inpainting message.
+        cls._publish_state(project_id, state)
 
         # The span cache only serves resume/trailing assembly; with the clean
         # video rendered and the swap persisted it is dead weight (~GBs per
