@@ -25,6 +25,11 @@ export const SceneHeader = Node.create({
           "data-is-raw": attributes.isRaw ? "true" : "false",
         }),
       },
+      isRepaired: {
+        default: false,
+        parseHTML: (element) => element.getAttribute("data-repaired") === "true",
+        renderHTML: (attributes) => ({ "data-repaired": attributes.isRepaired ? "true" : "false" }),
+      },
     };
   },
 
@@ -37,7 +42,7 @@ export const SceneHeader = Node.create({
     const sceneIndex: number = node.attrs.sceneIndex;
     const label = isRaw
       ? `🔒 Scene ${sceneIndex + 1} · Raw`
-      : `Scene ${sceneIndex + 1}`;
+      : `Scene ${sceneIndex + 1}${node.attrs.isRepaired ? " · Repaired" : ""}`;
     const colorClasses = isRaw
       ? "scene-header-chip bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] opacity-50 text-xs font-semibold uppercase select-none pointer-events-none px-2 py-0.5 rounded w-fit whitespace-nowrap"
       : "scene-header-chip bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] text-xs font-semibold uppercase select-none pointer-events-none px-2 py-0.5 rounded w-fit whitespace-nowrap";
@@ -45,7 +50,7 @@ export const SceneHeader = Node.create({
       "div",
       mergeAttributes(HTMLAttributes, {
         "data-scene-header": "true",
-        class: colorClasses,
+        class: `${colorClasses}${node.attrs.isRepaired ? " ring-1 ring-amber-500 bg-amber-500/15" : ""}`,
         contenteditable: "false",
       }),
       label,

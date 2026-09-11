@@ -169,8 +169,11 @@ async def test_single_batch_excludes_local_episodes_and_moves_files(
     assert len(fake.calls) == 1
     call = fake.calls[0]
     assert call["items"] == [
-        PurePosixPath(f"payload/library/{DISPLAY_NAME}/Episode 02.mkv")
+        PurePosixPath(f"release-1/payload/library/{DISPLAY_NAME}/Episode 02.mkv")
     ]
+    assert call["remote_base"] == StorageBoxRepository._releases_root(
+        LibraryType.ANIME, SERIES_ID
+    )
     assert call["total_bytes"] == len(EPISODE_CONTENT["Episode 02"])
     assert (
         series_dir / "Episode 02.mkv"
@@ -250,6 +253,67 @@ async def test_idempotent_rerun_downloads_nothing(
     )
     # All episodes local -> empty plan -> no download call at all.
     assert len(fake.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_hydration_resolves_each_artifact_release(
+    monkeypatch: pytest.MonkeyPatch, _env: dict[str, Any]
+) -> None:
+    manifest = _env["manifest"]
+    episode = manifest["episodes"][0]
+    episode["media"]["release_id"] = "original-release"
+    sidecar_content = b"subtitle metadata"
+    sidecar_relative = f"payload/library/{DISPLAY_NAME}/Episode 01.json"
+    episode["sidecars"] = [{
+        "release_id": "sidecar-release",
+        "relative_path": sidecar_relative,
+        "local_relative_path": f"{DISPLAY_NAME}/Episode 01.json",
+        "size_bytes": len(sidecar_content),
+        "sha256": _sha(sidecar_content),
+    }]
+    expected = {
+        PurePosixPath(f"original-release/{episode['media']['relative_path']}"): EPISODE_CONTENT["Episode 01"],
+        PurePosixPath(f"sidecar-release/{sidecar_relative}"): sidecar_content,
+        PurePosixPath(f"release-1/{manifest['episodes'][1]['media']['relative_path']}"): EPISODE_CONTENT["Episode 02"],
+    }
+    calls = []
+
+    async def download(items, *, remote_base, dest_root, **kwargs):
+        assert remote_base == StorageBoxRepository._releases_root(LibraryType.ANIME, SERIES_ID)
+        assert set(items) == set(expected)
+        calls.append(items)
+        for item in items:
+            path = dest_root / item
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(expected[item])
+
+    monkeypatch.setattr(StorageBoxRclone, "download_batch", download)
+    await LibraryHydrationService.hydrate_series(
+        library_type=LibraryType.ANIME, series_id=SERIES_ID,
+        episode_keys=["Episode 01", "Episode 02"],
+    )
+    assert len(calls) == 1
+    series_dir = _env["library_root"] / DISPLAY_NAME
+    for key, content in EPISODE_CONTENT.items():
+        assert (series_dir / f"{key}.mkv").read_bytes() == content
+    assert (series_dir / "Episode 01.json").read_bytes() == sidecar_content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("episode_keys", [["Unknown episode"], ["Episode 01", "Unknown episode"]])
+async def test_unknown_episode_reference_fails_before_download(
+    monkeypatch: pytest.MonkeyPatch, episode_keys: list[str]
+) -> None:
+    fake = FakeDownloadBatch(EPISODE_CONTENT)
+    monkeypatch.setattr(StorageBoxRclone, "download_batch", fake)
+    with pytest.raises(RuntimeError, match="Episodes not found in Storage Box manifest: Unknown episode"):
+        await LibraryHydrationService.hydrate_series(
+            library_type=LibraryType.ANIME, series_id=SERIES_ID,
+            episode_keys=episode_keys,
+        )
+    assert not fake.calls
+    operation = LibraryStateDb.get_operation(LibraryType.ANIME, SERIES_ID, "hydrate")
+    assert operation.status == "error"
 
 
 @pytest.mark.asyncio

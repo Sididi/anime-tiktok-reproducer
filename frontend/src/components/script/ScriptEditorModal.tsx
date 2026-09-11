@@ -10,13 +10,17 @@ import {
   getSpeedCategory,
   DELTA_COLORS,
 } from "./durationEstimation";
-import type { Transcription } from "@/types";
+import type { ScriptRepairReport, Transcription } from "@/types";
+import { validateScriptPayload } from "@/utils/scriptValidation";
+import { ScriptRepairNotice } from "./ScriptRepairNotice";
 
 interface ScriptEditorModalProps {
   isOpen: boolean;
   projectId?: string;
   onClose: () => void;
-  onSave: (updatedJson: string) => void;
+  onSave: (updatedJson: string) => void | Promise<void>;
+  onEdit?: () => void;
+  repairReport?: ScriptRepairReport | null;
   scenesJson: string;
   transcription: Transcription;
   targetLanguage: string;
@@ -45,6 +49,7 @@ interface ParsedScript {
 function buildTipTapDoc(
   scenes: SceneJsonEntry[],
   rawSceneIndices: Set<number>,
+  repairedIndices: Set<number>,
 ) {
   const content: Record<string, unknown>[] = [];
 
@@ -54,6 +59,7 @@ function buildTipTapDoc(
       attrs: {
         sceneIndex: scene.scene_index,
         isRaw: rawSceneIndices.has(scene.scene_index),
+        isRepaired: repairedIndices.has(scene.scene_index),
       },
     });
     content.push({
@@ -120,6 +126,8 @@ export function ScriptEditorModal({
   projectId,
   onClose,
   onSave,
+  onEdit,
+  repairReport,
   scenesJson,
   transcription,
   targetLanguage,
@@ -127,6 +135,9 @@ export function ScriptEditorModal({
   saveLabel = "Save Changes",
 }: ScriptEditorModalProps) {
   const [updateCounter, setUpdateCounter] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const repairedIndices = useMemo(() => new Set(repairReport?.changes.map((c) => c.scene_index)), [repairReport]);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [scenePositions, setScenePositions] = useState<number[]>([]);
 
@@ -167,14 +178,18 @@ export function ScriptEditorModal({
     ],
     content:
       parsedScript && Array.isArray(parsedScript.scenes)
-        ? buildTipTapDoc(parsedScript.scenes, rawSceneIndices)
+        ? buildTipTapDoc(parsedScript.scenes, rawSceneIndices, repairedIndices)
         : "",
     onUpdate: () => {
       setUpdateCounter((c) => c + 1);
+      setSaveError(null);
+      onEdit?.();
     },
   });
 
   // Reset content when modal opens
+  useEffect(() => { editor?.setEditable(!saving); }, [editor, saving]);
+
   useEffect(() => {
     if (
       isOpen &&
@@ -183,11 +198,10 @@ export function ScriptEditorModal({
       Array.isArray(parsedScript.scenes)
     ) {
       editor.commands.setContent(
-        buildTipTapDoc(parsedScript.scenes, rawSceneIndices),
+        buildTipTapDoc(parsedScript.scenes, rawSceneIndices, repairedIndices),
       );
-      setUpdateCounter((c) => c + 1);
     }
-  }, [isOpen, editor, parsedScript, rawSceneIndices]);
+  }, [isOpen, editor, parsedScript, rawSceneIndices, repairedIndices]);
 
   // Measure scene header chip positions for aligning stats
   useEffect(() => {
@@ -284,7 +298,7 @@ export function ScriptEditorModal({
     return { totalEstimated, totalOriginal };
   }, [sceneStats]);
 
-  const handleSave = useCallback(() => {
+  const handleSave = useCallback(async () => {
     if (!editor || !parsedScript) return;
 
     const editorJson = editor.getJSON();
@@ -305,17 +319,30 @@ export function ScriptEditorModal({
       })),
     };
 
-    onSave(JSON.stringify(updatedScript, null, 2));
-    onClose();
-  }, [editor, parsedScript, rawSceneIndices, onSave, onClose]);
+    const validation = validateScriptPayload(updatedScript, transcription);
+    if (!validation.valid) { setSaveError(validation.error); return; }
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await onSave(JSON.stringify(updatedScript, null, 2));
+      onClose();
+    } catch (error) {
+      setSaveError((error as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }, [editor, parsedScript, rawSceneIndices, onSave, onClose, transcription]);
 
   if (!isOpen) return null;
 
   return (
     <div
+      role="dialog"
+      aria-label={title}
+      aria-modal="true"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (!saving && e.target === e.currentTarget) onClose();
       }}
     >
       <div className="bg-[hsl(var(--card))] rounded-lg w-full max-w-7xl max-h-[90vh] overflow-hidden flex">
@@ -340,6 +367,7 @@ export function ScriptEditorModal({
           <h2 className="text-lg font-semibold">{title}</h2>
           <button
             onClick={onClose}
+            disabled={saving}
             className="p-1 hover:bg-[hsl(var(--muted))] rounded"
           >
             <X className="h-5 w-5" />
@@ -347,6 +375,8 @@ export function ScriptEditorModal({
         </div>
 
         {/* Content — single scroll container for linked scroll */}
+        {repairReport && <div className="px-4 pt-3"><ScriptRepairNotice report={repairReport} /></div>}
+        {saveError && <p role="alert" className="px-4 pt-2 text-red-400">{saveError}</p>}
         <div
           ref={scrollContainerRef}
           className="flex-1 overflow-y-auto min-h-0"
@@ -401,10 +431,10 @@ export function ScriptEditorModal({
             {totals.totalOriginal.toFixed(1)}s
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" onClick={onClose}>
+            <Button variant="outline" onClick={onClose} disabled={saving}>
               Cancel
             </Button>
-            <Button onClick={handleSave}>{saveLabel}</Button>
+            <Button onClick={handleSave} disabled={saving}>{saving ? "Saving..." : saveLabel}</Button>
           </div>
         </div>
         </div>

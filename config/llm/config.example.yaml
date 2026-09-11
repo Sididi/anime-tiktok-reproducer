@@ -57,3 +57,9 @@ presets:
 translation:
   openrouter_id: google/gemini-2.5-flash-lite
   thinking: null
+
+# Independent of the script generation preset; bounded local narration repair.
+script_repair:
+  openrouter_id: google/gemini-3.1-flash-lite
+  thinking:
+    effort: minimal

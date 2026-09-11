@@ -4,7 +4,7 @@ music:
   credits_song_death:
     display_name: "Credits song for my death"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/credits song for my death.wav"
-    volume_db: -30
+    volume_db: -20
 
   # credits_song_death_final_boss:
   #   display_name: "Credits song for my death but im the final boss"
@@ -46,7 +46,7 @@ music:
   kentenshi_paranoia:
     display_name: "Kentenshi Paranoia"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/kentenshi paranoia.wav"
-    volume_db: -28
+    volume_db: -20
 
   montagem_batchi:
     display_name: "Montagem Batchi"

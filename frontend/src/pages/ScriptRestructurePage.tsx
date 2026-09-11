@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, useMemo } from "react";
+import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   Loader2,
@@ -44,6 +44,9 @@ import {
 } from "@/components/script";
 import { ProjectSettingsPanel } from "@/components/script/ProjectSettingsPanel";
 import { readSSEStream } from "@/utils/sse";
+import { inspectScriptJson, narrationSignature, validateScriptPayload } from "@/utils/scriptValidation";
+import { useScriptRepair } from "@/hooks/useScriptRepair";
+import { ScriptRepairNotice } from "@/components/script/ScriptRepairNotice";
 
 // Upload mode types
 type UploadMode = "single" | "multiple";
@@ -87,82 +90,6 @@ function mapPreparedSegments(
     text: segment.text,
     characterCount: segment.character_count,
   }));
-}
-
-function validateScriptPayload(
-  payload: unknown,
-  transcription: Transcription,
-): { valid: boolean; error: string | null } {
-  if (
-    typeof payload !== "object" ||
-    payload === null ||
-    Array.isArray(payload)
-  ) {
-    return { valid: false, error: "Script JSON root must be an object" };
-  }
-
-  const obj = payload as Record<string, unknown>;
-  const rawScenes = obj.scenes;
-  if (!Array.isArray(rawScenes) || rawScenes.length === 0) {
-    return {
-      valid: false,
-      error: 'JSON must contain a non-empty "scenes" array',
-    };
-  }
-
-  if (rawScenes.length !== transcription.scenes.length) {
-    return {
-      valid: false,
-      error: `Scene count mismatch: expected ${transcription.scenes.length}, got ${rawScenes.length}`,
-    };
-  }
-
-  for (let i = 0; i < rawScenes.length; i += 1) {
-    const scene = rawScenes[i];
-    const expected = transcription.scenes[i];
-    if (typeof scene !== "object" || scene === null || Array.isArray(scene)) {
-      return {
-        valid: false,
-        error: `Scene at position ${i} must be an object`,
-      };
-    }
-
-    const sceneObj = scene as Record<string, unknown>;
-    if (typeof sceneObj.scene_index !== "number") {
-      return {
-        valid: false,
-        error: `Scene at position ${i} must have a numeric "scene_index"`,
-      };
-    }
-    if (sceneObj.scene_index !== expected.scene_index) {
-      return {
-        valid: false,
-        error: `Scene index mismatch at position ${i}: expected ${expected.scene_index}, got ${sceneObj.scene_index}`,
-      };
-    }
-    if (typeof sceneObj.text !== "string") {
-      return {
-        valid: false,
-        error: `Scene ${expected.scene_index} must have a "text" string`,
-      };
-    }
-
-    const trimmedText = sceneObj.text.trim();
-    if (expected.is_raw && trimmedText) {
-      return {
-        valid: false,
-        error: `Scene ${expected.scene_index} is raw and must keep an empty text`,
-      };
-    }
-    if (!expected.is_raw && !trimmedText) {
-      return {
-        valid: false,
-        error: `Scene ${expected.scene_index} must contain non-empty text`,
-      };
-    }
-  }
-
-  return { valid: true, error: null };
 }
 
 function validateMetadataObject(payload: unknown): {
@@ -560,6 +487,64 @@ export function ScriptRestructurePage() {
   const [duplicateModalOpen, setDuplicateModalOpen] = useState(false);
   const autostartFiredRef = useRef(false);
 
+  const draftTextRef = useRef(newScriptJson);
+  useLayoutEffect(() => { draftTextRef.current = newScriptJson; }, [newScriptJson]);
+
+  const handleJsonChange = useCallback(
+    (value: string) => {
+      if (narrationSignature(draftTextRef.current) !== narrationSignature(value)) {
+        setAudioFile(null);
+        setSegmentFiles(new Map());
+        setTtsPreparedPayload(null);
+        setCurrentRunId(null);
+        previewAudioRef.current?.pause();
+        setPreviewUrl(null);
+      }
+      draftTextRef.current = value;
+      setNewScriptJson(value);
+      setRequiredSegmentIds(null);
+      setJsonError(null);
+      setJsonValid(false);
+
+      if (!value.trim()) {
+        return;
+      }
+
+      if (!transcription) {
+        setJsonError("Transcription unavailable.");
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(value);
+        const validation = validateScriptPayload(parsed, transcription);
+        if (!validation.valid) {
+          setJsonError(validation.error);
+          return;
+        }
+
+        setJsonValid(true);
+      } catch (e) {
+        setJsonError(`Invalid JSON: ${(e as Error).message}`);
+      }
+    },
+    [transcription],
+  );
+
+  const {
+    report: repairReport, restore: restoreRepair, repair: repairScript,
+    cancel: cancelRepair, approve: approveRepair, running: repairRunning,
+    error: repairError, reviewRequired: repairReviewRequired,
+  } = useScriptRepair({
+    projectId, targetLanguage, transcription, draft: newScriptJson,
+    onApply: handleJsonChange,
+    onReady: () => setScriptEditorOpen(true),
+  });
+  const scriptInspection = useMemo(
+    () => inspectScriptJson(newScriptJson, transcription),
+    [newScriptJson, transcription],
+  );
+
   const parsedScriptPayload = useMemo<Record<string, unknown> | null>(() => {
     if (!jsonValid || !newScriptJson) return null;
     try {
@@ -787,9 +772,19 @@ export function ScriptRestructurePage() {
         // Load latest script generation + TTS audio
         try {
           const latestGen = await api.getLatestGeneration(projectId);
-          if (latestGen.exists && latestGen.script_json) {
+          if (latestGen.exists && latestGen.script_json && latestGen.source_matches === false) {
+            setError("Saved draft belongs to an older transcription. Generate a script for the current scenes.");
+          } else if (latestGen.exists && latestGen.script_json) {
             const prettyScript = JSON.stringify(latestGen.script_json, null, 2);
+            draftTextRef.current = prettyScript;
             setNewScriptJson(prettyScript);
+            const savedLanguage = latestGen.target_language || latestGen.script_json.language;
+            if (savedLanguage === "fr" || savedLanguage === "en" || savedLanguage === "es") setTargetLanguage(savedLanguage);
+            restoreRepair(latestGen.repair_report ?? null, latestGen.run_id);
+            if (latestGen.draft_status === "review_required" || latestGen.draft_status === "unresolved") {
+              if (latestGen.draft_origin !== "paste") setAutomationPhase("validating");
+              setScriptEditorOpen(true);
+            }
             const validation = validateScriptPayload(
               latestGen.script_json,
               loaded,
@@ -797,6 +792,9 @@ export function ScriptRestructurePage() {
             if (validation.valid) {
               setJsonValid(true);
               setJsonError(null);
+            } else {
+              setJsonValid(false);
+              setJsonError(validation.error);
             }
             setPromptCopied(true);
 
@@ -828,7 +826,7 @@ export function ScriptRestructurePage() {
     };
 
     loadData();
-  }, [projectId, loadProject, loadScenes, hydrateAutomationParts]);
+  }, [projectId, loadProject, loadScenes, hydrateAutomationParts, restoreRepair]);
 
   useEffect(() => {
     return () => {
@@ -893,7 +891,7 @@ export function ScriptRestructurePage() {
       clearTimeout(ttsPrepareDebounceRef.current);
     }
 
-    if (!projectId || !parsedScriptPayload) {
+    if (!projectId || !parsedScriptPayload || repairReviewRequired || repairRunning) {
       ttsPrepareRequestRef.current += 1;
       setTtsPreparedPayload(null);
       setTtsPrepareError(null);
@@ -933,7 +931,7 @@ export function ScriptRestructurePage() {
         clearTimeout(ttsPrepareDebounceRef.current);
       }
     };
-  }, [projectId, parsedScriptPayload, targetLanguage]);
+  }, [projectId, parsedScriptPayload, targetLanguage, repairReviewRequired, repairRunning]);
 
   const handleCopyPrompt = useCallback(async () => {
     if (!scriptPrompt) return;
@@ -946,38 +944,6 @@ export function ScriptRestructurePage() {
       // Clipboard API may fail in insecure contexts
     }
   }, [scriptPrompt]);
-
-  const handleJsonChange = useCallback(
-    (value: string) => {
-      setNewScriptJson(value);
-      setRequiredSegmentIds(null);
-      setJsonError(null);
-      setJsonValid(false);
-
-      if (!value.trim()) {
-        return;
-      }
-
-      if (!transcription) {
-        setJsonError("Transcription unavailable.");
-        return;
-      }
-
-      try {
-        const parsed = JSON.parse(value);
-        const validation = validateScriptPayload(parsed, transcription);
-        if (!validation.valid) {
-          setJsonError(validation.error);
-          return;
-        }
-
-        setJsonValid(true);
-      } catch (e) {
-        setJsonError(`Invalid JSON: ${(e as Error).message}`);
-      }
-    },
-    [transcription],
-  );
 
   const applyResolvedMetadata = useCallback((metadata: PlatformMetadata) => {
     const pretty = JSON.stringify(metadata, null, 2);
@@ -1428,7 +1394,7 @@ export function ScriptRestructurePage() {
   );
 
   const handleAutomate = useCallback(async () => {
-    if (!projectId || !automationConfig) return;
+    if (!projectId || !automationConfig || repairRunning || repairReviewRequired) return;
     if (!automationConfig.enabled) {
       setError("Automation is disabled on backend");
       return;
@@ -1441,6 +1407,7 @@ export function ScriptRestructurePage() {
     setError(null);
     setAutomationMetadataWarning(null);
     setAutomationOverlayWarning(null);
+    restoreRepair(null, null);
     setAutomationStep("starting");
     setAutomationMessage("Starting automation...");
     setAutomationRunning(true);
@@ -1453,7 +1420,7 @@ export function ScriptRestructurePage() {
     automationAbortRef.current = controller;
 
     // Compute skip flags based on what's already filled
-    const skipScript = jsonValid && newScriptJson.trim() !== "";
+    const skipScript = Boolean(scriptInspection?.editable && newScriptJson.trim());
     const skipMetadata = metadataValid && metadataJson.trim() !== "";
     const skipTts =
       (uploadMode === "single" && audioFile !== null) ||
@@ -1509,6 +1476,7 @@ export function ScriptRestructurePage() {
           if (event.run_id) {
             setCurrentRunId(event.run_id);
           }
+          if (event.repair_report) restoreRepair(event.repair_report, event.run_id ?? null);
           if (event.event === "error" && event.script_json) {
             const prettyScript = JSON.stringify(event.script_json, null, 2);
             handleJsonChange(prettyScript);
@@ -1619,7 +1587,6 @@ export function ScriptRestructurePage() {
     automationConfig,
     automationVoiceKey,
     targetLanguage,
-    jsonValid,
     newScriptJson,
     metadataValid,
     metadataJson,
@@ -1630,6 +1597,10 @@ export function ScriptRestructurePage() {
     hydrateAutomationParts,
     queueTitleSelection,
     validateBeforeTts,
+    scriptInspection,
+    repairRunning,
+    repairReviewRequired,
+    restoreRepair,
     overlayTitle,
     overlayCategory,
   ]);
@@ -1705,6 +1676,7 @@ export function ScriptRestructurePage() {
             setAutomationStep(event.event);
             setAutomationMessage(event.message || null);
             if (event.run_id) setCurrentRunId(event.run_id);
+            if (event.repair_report) restoreRepair(event.repair_report, event.run_id ?? null);
             if (event.event === "error" && event.script_json) {
               const prettyScript = JSON.stringify(event.script_json, null, 2);
               handleJsonChange(prettyScript);
@@ -1718,6 +1690,13 @@ export function ScriptRestructurePage() {
         if (!finalEvent) {
           if (controller.signal.aborted) return;
           throw new Error("Automation ended without completion event");
+        }
+
+        if (finalEvent.event === "script_ready" && finalEvent.script_json) {
+          handleJsonChange(JSON.stringify(finalEvent.script_json, null, 2));
+          setAutomationPhase("validating");
+          setScriptEditorOpen(true);
+          return;
         }
 
         if (finalEvent.event !== "complete") {
@@ -1790,6 +1769,7 @@ export function ScriptRestructurePage() {
       handleJsonChange,
       hydrateAutomationParts,
       queueTitleSelection,
+      restoreRepair,
       overlayTitle,
       overlayCategory,
     ],
@@ -1968,7 +1948,7 @@ export function ScriptRestructurePage() {
   }, []);
 
   const handleContinue = useCallback(async () => {
-    if (!projectId || !jsonValid) return;
+    if (!projectId || !jsonValid || repairReviewRequired || repairRunning) return;
 
     // Validate based on upload mode
     if (uploadMode === "single" && !audioFile) return;
@@ -2042,6 +2022,8 @@ export function ScriptRestructurePage() {
   }, [
     projectId,
     jsonValid,
+    repairRunning,
+    repairReviewRequired,
     audioFile,
     newScriptJson,
     navigate,
@@ -2160,7 +2142,11 @@ export function ScriptRestructurePage() {
     metadataJson.trim() !== "" &&
     previewReady;
 
-  const automationBlockedReason = automationConfigError
+  const automationBlockedReason = repairRunning
+    ? "Repairing narration..."
+    : repairReviewRequired
+      ? "Review repaired narration before continuing"
+      : automationConfigError
     ? `Automation config error: ${automationConfigError}`
     : !automationConfig
       ? "Loading automation config..."
@@ -2201,7 +2187,7 @@ export function ScriptRestructurePage() {
           characterCount: 0,
         }))
       : audioSegments;
-  const canContinue = jsonValid && previewReady;
+  const canContinue = jsonValid && previewReady && !repairReviewRequired && !repairRunning;
   const metadataDone = metadataValid || metadataDetected;
 
   return (
@@ -2318,6 +2304,7 @@ export function ScriptRestructurePage() {
                 Choisissez la langue cible pour le script restructuré.
               </p>
               <select
+                aria-label="Langue de sortie"
                 value={targetLanguage}
                 onChange={(e) => {
                   setTargetLanguage(e.target.value as TargetLanguage);
@@ -2393,16 +2380,16 @@ export function ScriptRestructurePage() {
               <div className="flex items-center justify-between">
                 <h2 className="font-semibold">Step 2: Paste New Script JSON</h2>
                 <div className="flex items-center gap-2">
-                  {jsonValid && (
+                  {scriptInspection?.editable && (
                     <>
-                      <span className="text-sm text-green-500 flex items-center gap-1">
-                        <Check className="h-4 w-4" />
-                        Valid JSON
-                      </span>
+                      {jsonValid && <span className="text-sm text-green-500 flex items-center gap-1">
+                        <Check className="h-4 w-4" /> Valid JSON
+                      </span>}
                       <Button
                         variant="outline"
                         size="sm"
                         onClick={() => setScriptEditorOpen(true)}
+                        disabled={automationRunning || repairRunning}
                       >
                         <Pencil className="h-4 w-4 mr-1.5" />
                         Edit Script
@@ -2417,7 +2404,18 @@ export function ScriptRestructurePage() {
               </p>
               <textarea
                 value={newScriptJson}
-                onChange={(e) => handleJsonChange(e.target.value)}
+                aria-label="Script JSON"
+                disabled={automationRunning}
+                onChange={(e) => { cancelRepair(); handleJsonChange(e.target.value); }}
+                onPaste={(e) => {
+                  e.preventDefault();
+                  const input = e.currentTarget;
+                  const value = input.value.slice(0, input.selectionStart) + e.clipboardData.getData("text") + input.value.slice(input.selectionEnd);
+                  cancelRepair();
+                  restoreRepair(null, null);
+                  handleJsonChange(value);
+                  setTimeout(() => void repairScript(value, true), 0);
+                }}
                 placeholder='{"language": "fr", "scenes": [...]}'
                 className="w-full min-h-[200px] p-3 rounded-md border border-[hsl(var(--input))] bg-transparent font-mono text-sm resize-y"
               />
@@ -2426,6 +2424,19 @@ export function ScriptRestructurePage() {
                   {jsonError}
                 </p>
               )}
+              {(scriptInspection?.repairable || repairRunning) && (
+                <div className="flex gap-2">
+                  <Button variant="outline" disabled={repairRunning || automationRunning}
+                    onClick={() => void repairScript()}>
+                    {repairRunning ? "Repairing narration..." : repairReport ? "Retry repair" : "Repair empty scenes"}
+                  </Button>
+                  {repairRunning && <Button variant="outline" onClick={cancelRepair}>Cancel repair</Button>}
+                </div>
+              )}
+              {repairError && <p role="alert">{repairError}</p>}
+              <ScriptRepairNotice report={repairReport} />
+              {repairReviewRequired && <Button onClick={() => setScriptEditorOpen(true)}>Review repair</Button>}
+
             </div>
 
             {/* Optional metadata step */}
@@ -3166,18 +3177,21 @@ export function ScriptRestructurePage() {
       </div>
 
       {/* Script Editor Modal */}
-      {transcription && (
+      {transcription && scriptInspection?.editable && (
         <ScriptEditorModal
           isOpen={scriptEditorOpen}
           projectId={projectId}
           onClose={() => setScriptEditorOpen(false)}
-          onSave={(updatedJson) => {
+          onSave={async (updatedJson) => {
+            const validation = validateScriptPayload(JSON.parse(updatedJson), transcription);
+            if (!validation.valid) throw new Error(validation.error || "Invalid script JSON");
+            await approveRepair(updatedJson);
             handleJsonChange(updatedJson);
             setScriptEditorOpen(false);
-            if (automationPhase === "validating") {
-              void handleResumeAfterValidation(updatedJson);
-            }
+            if (automationPhase === "validating") void handleResumeAfterValidation(updatedJson);
           }}
+          onEdit={cancelRepair}
+          repairReport={repairReport}
           scenesJson={newScriptJson}
           transcription={transcription}
           targetLanguage={targetLanguage}

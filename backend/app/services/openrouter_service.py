@@ -73,8 +73,12 @@ class OpenRouterService:
         max_output_tokens: int | None = None,
         response_schema: dict[str, Any] | None = None,
         schema_name: str = "response",
+        request_timeout: float | None = None,
     ) -> str:
         client = cls._get_client()
+        if request_timeout is not None:
+            # Bounded maintenance calls own their retry budget.
+            client = client.with_options(timeout=request_timeout, max_retries=0)
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -121,7 +125,7 @@ class OpenRouterService:
                 response = client.chat.completions.create(**kwargs)
         except APITimeoutError as exc:
             raise RuntimeError(
-                f"OpenRouter timeout after {settings.openrouter_timeout}s "
+                f"OpenRouter timeout after {request_timeout or settings.openrouter_timeout}s "
                 f"(model={entry.openrouter_id})"
             ) from exc
 
@@ -207,6 +211,9 @@ class OpenRouterService:
         entry: LLMPresetEntry,
         system: str | None = None,
         max_output_tokens: int | None = None,
+        response_schema: dict[str, Any] | None = None,
+        schema_name: str = "response",
+        request_timeout: float | None = None,
     ) -> Any:
         """JSON call with an explicit model entry, bypassing preset/tier resolution."""
         raw = cls._chat(
@@ -214,6 +221,9 @@ class OpenRouterService:
             entry=entry,
             system=system,
             max_output_tokens=max_output_tokens,
+            response_schema=response_schema,
+            schema_name=schema_name,
+            request_timeout=request_timeout,
         )
         return cls._parse_json_value(raw)
 

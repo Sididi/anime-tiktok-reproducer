@@ -25,6 +25,7 @@ from .llm_service import LLMService
 from .metadata import MetadataService
 from .project_service import ProjectService
 from .script_payload_service import ScriptPayloadService
+from .script_repair_service import ScriptRepairService
 from .script_phase_prompt_service import ScriptPhasePromptService
 from .tts_text_normalizer import TtsTextNormalizer
 from .voice_config_service import VoiceConfigService, VoiceEntry
@@ -924,18 +925,32 @@ class ScriptAutomationService:
             return None
 
         # Pick the most recently modified run directory
+        subdirs = [d for d in subdirs if (d / "draft.json").exists() or (d / "script.json").exists()]
+        if not subdirs:
+            return None
         latest = max(subdirs, key=lambda d: d.stat().st_mtime)
         run_id = latest.name
 
-        script_path = latest / "script.json"
+        script_path = latest / "draft.json"
+        if not script_path.exists():
+            script_path = latest / "script.json"
         if not script_path.exists():
             return None
 
         script_json = json.loads(script_path.read_text(encoding="utf-8"))
+        state_path = latest / "draft_state.json"
+        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        report_path = latest / "repair.json"
+        report = json.loads(report_path.read_text()) if report_path.exists() else None
+        transcription = ProjectService.load_transcription(project_id)
+        source_matches = not state.get("source_fingerprint") or bool(transcription and state["source_fingerprint"] == ScriptRepairService.source_fingerprint(transcription))
 
         parts: list[dict[str, Any]] = []
         parts_dir = latest / "parts"
-        if parts_dir.is_dir():
+        if (parts_dir.is_dir() and source_matches
+                and state.get("status", "validated") == "validated"
+                and not state.get("audio_invalidated")
+                and transcription and not ScriptPayloadService.inspect(script_json, transcription)):
             part_files = sorted(parts_dir.glob("part_*.*"))
             for pf in part_files:
                 # Extract part id from filename like part_1.mp3
@@ -952,6 +967,11 @@ class ScriptAutomationService:
             "run_id": run_id,
             "script_json": script_json,
             "parts": parts,
+            "repair_report": report,
+            "draft_status": state.get("status", "validated"),
+            "draft_origin": state.get("origin", "automation"),
+            "source_matches": source_matches,
+            "target_language": state.get("target_language"),
         }
 
     @classmethod
@@ -1003,21 +1023,7 @@ class ScriptAutomationService:
             # --- Script generation (or reuse existing) ---
             if existing_script_json is not None:
                 yield cls._event("llm_script", message="Script JSON provided — skipping generation")
-                try:
-                    script_payload = cls._normalize_script_payload(
-                        payload=existing_script_json,
-                        transcription=transcription,
-                        target_language=target_language,
-                    )
-                except RuntimeError as exc:
-                    yield {
-                        "event": "error",
-                        "status": "error",
-                        "message": "Script automation failed",
-                        "error": str(exc),
-                        "script_json": existing_script_json,
-                    }
-                    return
+                raw_script_payload = existing_script_json
             else:
                 yield cls._event("llm_script", message=f"Generating script JSON ({project.resolved_llm_preset_key()})...")
                 prompt = cls._build_script_prompt(
@@ -1036,37 +1042,35 @@ class ScriptAutomationService:
                     ),
                     schema_name="script",
                 )
-                coerced_script_payload: dict[str, Any] | None = None
-                try:
-                    coerced_script_payload = cls._coerce_generated_script_payload(
-                        payload=raw_script_payload,
-                        target_language=target_language,
-                    )
-                    script_payload = cls._normalize_script_payload(
-                        payload=coerced_script_payload,
-                        transcription=transcription,
-                        target_language=target_language,
-                    )
-                except RuntimeError as exc:
-                    # Validation failed (e.g. an empty scene) — hand back whatever
-                    # was generated so it can be fixed by hand in Step 2 and
-                    # resubmitted, instead of losing the LLM output entirely.
-                    failed_payload = coerced_script_payload
-                    if failed_payload is None and isinstance(raw_script_payload, (dict, list)):
-                        failed_payload = raw_script_payload
-                    yield {
-                        "event": "error",
-                        "status": "error",
-                        "message": "Script automation failed",
-                        "error": str(exc),
-                        "script_json": failed_payload,
-                    }
-                    return
-
-            script_path = run_dir / "script.json"
-            script_path.write_text(
-                json.dumps(script_payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            # Preserve the generated draft before validation or a model retry can fail.
+            ScriptRepairService.save_original(
+                run_dir, raw_script_payload, transcription, target_language, origin="automation",
+            )
+            try:
+                draft = cls._coerce_generated_script_payload(
+                    payload=raw_script_payload, target_language=target_language,
+                )
+            except RuntimeError as exc:
+                yield {"event": "error", "status": "error", "message": "Invalid script structure",
+                       "error": str(exc), "script_json": raw_script_payload, "run_id": run_id}
+                return
+            if ScriptPayloadService.inspect(draft, transcription):
+                yield cls._event("script_repair", message="Checking and repairing empty narration scenes...", run_id=run_id)
+            script_payload, repair_report = await ScriptRepairService.repair(draft, transcription, target_language)
+            latest_transcription = await ProjectService.aload_transcription(project_id)
+            if not latest_transcription or ScriptRepairService.source_fingerprint(latest_transcription) != ScriptRepairService.source_fingerprint(transcription):
+                yield {"event": "error", "status": "error", "message": "Source transcription changed",
+                       "error": "The source changed during generation/repair. Reload the transcription before retrying.",
+                       "run_id": run_id}
+                return
+            ScriptRepairService.save_result(run_dir, script_payload, repair_report, transcription)
+            if repair_report.issues:
+                yield {"event": "error", "status": "error", "message": "Script needs review",
+                       "error": "; ".join(issue.message for issue in repair_report.issues),
+                       "script_json": script_payload, "repair_report": repair_report.model_dump(), "run_id": run_id}
+                return
+            script_payload = cls._normalize_script_payload(
+                payload=script_payload, transcription=transcription, target_language=target_language,
             )
 
             yield cls._event(
@@ -1076,13 +1080,14 @@ class ScriptAutomationService:
             )
 
             # --- Pause for validation ---
-            if pause_after_script:
+            if pause_after_script or repair_report.review_required:
                 yield cls._event(
                     "script_ready",
                     status="paused",
-                    message="Script ready for validation",
+                    message="Repaired script ready for review" if repair_report.review_required else "Script ready for validation",
                     run_id=run_id,
                     script_json=script_payload,
+                    repair_report=repair_report.model_dump(),
                 )
                 return
 

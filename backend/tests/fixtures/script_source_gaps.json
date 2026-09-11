@@ -1,0 +1,839 @@
+{
+  "description": "Source neighborhoods copied from the three reported projects. Failed LLM drafts were not persisted; tests reconstruct output gaps explicitly. Outside these neighborhoods, long-script tests use placeholder narration.",
+  "cases": [
+    {
+      "project_id": "7f03a59d7302",
+      "source_language": "hi",
+      "scene_count": 279,
+      "missing_indices": [
+        27,
+        50,
+        57,
+        92,
+        265
+      ],
+      "source_scenes": [
+        {
+          "scene_index": 23,
+          "text": "कैल्शियम कार्बोनेट होता है, सांद्रित पानी इसे गोल देता है, और सी ओ तू",
+          "start_time": 31.766666666666666,
+          "end_time": 34.733333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 24,
+          "text": "चोड़ता है।",
+          "start_time": 34.733333333333334,
+          "end_time": 35.46666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 25,
+          "text": "इसका मतलब है कि बर्फ अम्लिय है,",
+          "start_time": 35.46666666666667,
+          "end_time": 36.833333333333336,
+          "is_raw": false
+        },
+        {
+          "scene_index": 26,
+          "text": "आपको अभी कुण नहीं",
+          "start_time": 36.833333333333336,
+          "end_time": 37.36666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 27,
+          "text": "",
+          "start_time": 37.36666666666667,
+          "end_time": 37.733333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 28,
+          "text": "खुन असमभम ये पूरी तरह से पागल हो",
+          "start_time": 37.733333333333334,
+          "end_time": 39.833333333333336,
+          "is_raw": false
+        },
+        {
+          "scene_index": 29,
+          "text": "गया हैं। लाल गोधूली,",
+          "start_time": 39.833333333333336,
+          "end_time": 40.833333333333336,
+          "is_raw": false
+        },
+        {
+          "scene_index": 30,
+          "text": "नीला सुरज",
+          "start_time": 40.833333333333336,
+          "end_time": 41.7,
+          "is_raw": false
+        },
+        {
+          "scene_index": 31,
+          "text": "और अम्लीय",
+          "start_time": 41.7,
+          "end_time": 42.06666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 46,
+          "text": "आब इन गरों में नहीं रह सकते। अरे उसे",
+          "start_time": 58.86666666666667,
+          "end_time": 60.93333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 47,
+          "text": "देखो वा अपनी घर को भी तुक्रा रहा है।",
+          "start_time": 60.93333333333333,
+          "end_time": 62.833333333333336,
+          "is_raw": false
+        },
+        {
+          "scene_index": 48,
+          "text": "चलो देखते हैं।",
+          "start_time": 62.833333333333336,
+          "end_time": 63.666666666666664,
+          "is_raw": false
+        },
+        {
+          "scene_index": 49,
+          "text": "उसका पीछा करते हैं।",
+          "start_time": 63.666666666666664,
+          "end_time": 65.16666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 50,
+          "text": "",
+          "start_time": 65.16666666666667,
+          "end_time": 65.8,
+          "is_raw": false
+        },
+        {
+          "scene_index": 51,
+          "text": "अंकल जांग का घर अजीब",
+          "start_time": 65.8,
+          "end_time": 66.73333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 52,
+          "text": "लग रहा है।",
+          "start_time": 66.73333333333333,
+          "end_time": 67.63333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 53,
+          "text": "धत्तिरे की",
+          "start_time": 67.63333333333334,
+          "end_time": 68.13333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 54,
+          "text": "कुछ होने",
+          "start_time": 68.13333333333334,
+          "end_time": 68.7,
+          "is_raw": false
+        },
+        {
+          "scene_index": 55,
+          "text": "वाला है।",
+          "start_time": 68.7,
+          "end_time": 69.26666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 56,
+          "text": "लिंगषेन, रुको,",
+          "start_time": 69.26666666666667,
+          "end_time": 70.43333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 57,
+          "text": "",
+          "start_time": 70.43333333333334,
+          "end_time": 71.06666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 58,
+          "text": "तुम्हें क्या हो गया है,",
+          "start_time": 71.06666666666666,
+          "end_time": 72.1,
+          "is_raw": false
+        },
+        {
+          "scene_index": 59,
+          "text": "बहुत थंड है,",
+          "start_time": 72.1,
+          "end_time": 72.96666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 60,
+          "text": "तुम भाहर क्यूं जा रहे हो,",
+          "start_time": 72.96666666666667,
+          "end_time": 74.36666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 61,
+          "text": "अंकल जी आंग, बहुत",
+          "start_time": 74.36666666666666,
+          "end_time": 75.76666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 88,
+          "text": "इनके अंदर नहीं सोना चाहिये।",
+          "start_time": 110.7,
+          "end_time": 112.26666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 89,
+          "text": "बक्वास। जांग",
+          "start_time": 112.26666666666667,
+          "end_time": 113.63333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 90,
+          "text": "का घर पूराना था। कोई",
+          "start_time": 113.63333333333334,
+          "end_time": 114.93333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 91,
+          "text": "आश्चर्य नहीं।",
+          "start_time": 114.93333333333334,
+          "end_time": 115.76666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 92,
+          "text": "",
+          "start_time": 115.76666666666667,
+          "end_time": 116.16666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 93,
+          "text": "वरना हम कहां सोएंगे बरफ",
+          "start_time": 116.16666666666667,
+          "end_time": 117.43333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 94,
+          "text": "में मरने के लिए। अगर तुम",
+          "start_time": 117.43333333333334,
+          "end_time": 118.63333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 95,
+          "text": "जीना चाते हो",
+          "start_time": 118.63333333333334,
+          "end_time": 119.0,
+          "is_raw": false
+        },
+        {
+          "scene_index": 96,
+          "text": "तो मेरे पीछे आओं। शंकर,",
+          "start_time": 119.0,
+          "end_time": 120.43333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 261,
+          "text": "जलता नहीं है, इसके गर्मी नहीं मिलती, और",
+          "start_time": 327.8,
+          "end_time": 329.73333333333335,
+          "is_raw": false
+        },
+        {
+          "scene_index": 262,
+          "text": "इसके खासी होती है, इसके बदले एक घर,",
+          "start_time": 329.73333333333335,
+          "end_time": 332.26666666666665,
+          "is_raw": false
+        },
+        {
+          "scene_index": 263,
+          "text": "वह सच्मुच पागल हो गया है, कोईले का पत्थर, ये",
+          "start_time": 332.26666666666665,
+          "end_time": 335.06666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 264,
+          "text": "खडानों का कछ्रा है, जो अशु",
+          "start_time": 335.06666666666666,
+          "end_time": 336.5,
+          "is_raw": false
+        },
+        {
+          "scene_index": 265,
+          "text": "",
+          "start_time": 336.5,
+          "end_time": 337.6,
+          "is_raw": false
+        },
+        {
+          "scene_index": 266,
+          "text": "गरीब लोग भी इसे नहीं चाहते।",
+          "start_time": 337.6,
+          "end_time": 338.76666666666665,
+          "is_raw": false
+        },
+        {
+          "scene_index": 267,
+          "text": "उसे कुछ नहीं पता।",
+          "start_time": 338.76666666666665,
+          "end_time": 340.06666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 268,
+          "text": "अगर तुम अदला बद्ली करना",
+          "start_time": 340.06666666666666,
+          "end_time": 341.4,
+          "is_raw": false
+        },
+        {
+          "scene_index": 269,
+          "text": "चाहते हो, तो मैं तुम्हें इसके अनुमती",
+          "start_time": 341.4,
+          "end_time": 342.96666666666664,
+          "is_raw": false
+        }
+      ]
+    },
+    {
+      "project_id": "27cd1cecf30f",
+      "source_language": "es",
+      "scene_count": 123,
+      "missing_indices": [
+        62,
+        105
+      ],
+      "source_scenes": [
+        {
+          "scene_index": 58,
+          "text": "¿Qué? ¿Sin dote? Entonces, ¿para qué subiste? Cree que por ser bonita ya puede.",
+          "start_time": 155.0,
+          "end_time": 158.2,
+          "is_raw": false
+        },
+        {
+          "scene_index": 59,
+          "text": "Es una pobre. Exacto. ¿Qué haces ahí? Bájate.",
+          "start_time": 158.2,
+          "end_time": 161.3,
+          "is_raw": false
+        },
+        {
+          "scene_index": 60,
+          "text": "Lo siento.",
+          "start_time": 161.3,
+          "end_time": 162.13333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 61,
+          "text": "¿Qué esperas? ¡Vete!",
+          "start_time": 162.13333333333333,
+          "end_time": 163.7,
+          "is_raw": false
+        },
+        {
+          "scene_index": 62,
+          "text": "",
+          "start_time": 163.7,
+          "end_time": 164.33333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 63,
+          "text": "No hay que elegir más.",
+          "start_time": 164.33333333333334,
+          "end_time": 165.46666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 64,
+          "text": "La elijo a ella.",
+          "start_time": 165.46666666666667,
+          "end_time": 166.26666666666668,
+          "is_raw": false
+        },
+        {
+          "scene_index": 65,
+          "text": "Bebé, tienes el control.",
+          "start_time": 166.26666666666668,
+          "end_time": 167.63333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 66,
+          "text": "¿Qué pasa? ¿Ahora los hombres tienen gustos tan raros?",
+          "start_time": 167.63333333333333,
+          "end_time": 170.16666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 101,
+          "text": "¡Qué guapo! Yo también quiero ser su novia.",
+          "start_time": 256.03333333333336,
+          "end_time": 257.93333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 102,
+          "text": "Ay, mamá, igual de guapo que",
+          "start_time": 257.93333333333334,
+          "end_time": 259.1,
+          "is_raw": false
+        },
+        {
+          "scene_index": 103,
+          "text": "en la pantalla.",
+          "start_time": 259.1,
+          "end_time": 259.9,
+          "is_raw": false
+        },
+        {
+          "scene_index": 104,
+          "text": "Sí, sí. Un chico tan guapo. ¿Por qué no es mi esposo? ¡Qué suerte tiene la chica de al lado! ¿Tú?",
+          "start_time": 259.9,
+          "end_time": 264.53333333333336,
+          "is_raw": false
+        },
+        {
+          "scene_index": 105,
+          "text": "",
+          "start_time": 264.53333333333336,
+          "end_time": 264.96666666666664,
+          "is_raw": false
+        },
+        {
+          "scene_index": 106,
+          "text": "Bueno, dos tés de leche con perlas. Muchas perlas, sin té.",
+          "start_time": 264.96666666666664,
+          "end_time": 267.53333333333336,
+          "is_raw": false
+        },
+        {
+          "scene_index": 107,
+          "text": "¿Vienes a molestarme? Té de leche con perlas sin té. Te voy a",
+          "start_time": 267.53333333333336,
+          "end_time": 270.43333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 108,
+          "text": "dar.",
+          "start_time": 270.43333333333334,
+          "end_time": 270.8666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 109,
+          "text": "Guau, qué guapo. Claro, guapo, lo hago ya. Es té de leche con perlas, claro.",
+          "start_time": 270.8666666666667,
+          "end_time": 274.4,
+          "is_raw": false
+        }
+      ]
+    },
+    {
+      "project_id": "cb5ed12bdee5",
+      "source_language": "hi",
+      "scene_count": 134,
+      "missing_indices": [
+        29,
+        55,
+        59,
+        60,
+        61,
+        92,
+        102,
+        103,
+        121
+      ],
+      "source_scenes": [
+        {
+          "scene_index": 25,
+          "text": "करना उनका हुनर है क्या तुमारे घर में कोई जगडा है",
+          "start_time": 42.86666666666667,
+          "end_time": 45.4,
+          "is_raw": false
+        },
+        {
+          "scene_index": 26,
+          "text": "क्या कोई गंभीर बीमारी है",
+          "start_time": 45.4,
+          "end_time": 46.7,
+          "is_raw": false
+        },
+        {
+          "scene_index": 27,
+          "text": "नहीं,",
+          "start_time": 46.7,
+          "end_time": 47.53333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 28,
+          "text": "कोई नहीं",
+          "start_time": 47.53333333333333,
+          "end_time": 48.86666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 29,
+          "text": "",
+          "start_time": 48.86666666666667,
+          "end_time": 49.666666666666664,
+          "is_raw": false
+        },
+        {
+          "scene_index": 30,
+          "text": "मैं तुम्हें दरवाजे तक ले",
+          "start_time": 49.666666666666664,
+          "end_time": 51.266666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 31,
+          "text": "जा रहा हूँ अंदर जाना दाई पर निर्भर है कोई मूर्खता मत",
+          "start_time": 51.266666666666666,
+          "end_time": 54.06666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 32,
+          "text": "करना करना. मुझे इसे हासिल करना ही",
+          "start_time": 54.06666666666667,
+          "end_time": 55.5,
+          "is_raw": false
+        },
+        {
+          "scene_index": 33,
+          "text": "होगा. मैं अपने",
+          "start_time": 55.5,
+          "end_time": 56.03333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 51,
+          "text": "से रो रहा है, शायद उसका दम घुट गया है, क्या",
+          "start_time": 75.4,
+          "end_time": 77.46666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 52,
+          "text": "तुम मुझे बता रहे हो कि मैं गलत हूँ,",
+          "start_time": 77.46666666666667,
+          "end_time": 78.93333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 53,
+          "text": "मेरी है, मेरी",
+          "start_time": 78.93333333333334,
+          "end_time": 79.53333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 54,
+          "text": "हिम्मत नहीं है",
+          "start_time": 79.53333333333333,
+          "end_time": 80.23333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 55,
+          "text": "",
+          "start_time": 80.23333333333333,
+          "end_time": 81.03333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 56,
+          "text": "नबजा बहुत धीमी है रोने",
+          "start_time": 81.03333333333333,
+          "end_time": 82.73333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 57,
+          "text": "से उर्जा को नुकसान",
+          "start_time": 82.73333333333333,
+          "end_time": 83.33333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 58,
+          "text": "पहुँचता है और चिलाना बंद करो",
+          "start_time": 83.33333333333333,
+          "end_time": 84.83333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 59,
+          "text": "",
+          "start_time": 84.83333333333333,
+          "end_time": 85.33333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 60,
+          "text": "",
+          "start_time": 85.33333333333333,
+          "end_time": 85.86666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 61,
+          "text": "",
+          "start_time": 85.86666666666666,
+          "end_time": 86.6,
+          "is_raw": false
+        },
+        {
+          "scene_index": 62,
+          "text": "बुढ़े सैम तुम किसे ले आए",
+          "start_time": 86.6,
+          "end_time": 87.86666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 63,
+          "text": "ये",
+          "start_time": 87.86666666666666,
+          "end_time": 88.5,
+          "is_raw": false
+        },
+        {
+          "scene_index": 64,
+          "text": "जगए बाहर की किसी",
+          "start_time": 88.5,
+          "end_time": 89.26666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 65,
+          "text": "लड़की के लिए नहीं है दाई",
+          "start_time": 89.26666666666667,
+          "end_time": 91.3,
+          "is_raw": false
+        },
+        {
+          "scene_index": 88,
+          "text": "कह सकती हूँ कि यह पैर की",
+          "start_time": 127.3,
+          "end_time": 128.6,
+          "is_raw": false
+        },
+        {
+          "scene_index": 89,
+          "text": "समस्या है। बायाओं पैर ज्यादा",
+          "start_time": 128.6,
+          "end_time": 129.86666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 90,
+          "text": "सिकोड रहा है। लगता है जैसे वह भी",
+          "start_time": 129.86666666666667,
+          "end_time": 131.66666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 91,
+          "text": "बकवास कर रही हो",
+          "start_time": 131.66666666666666,
+          "end_time": 132.6,
+          "is_raw": false
+        },
+        {
+          "scene_index": 92,
+          "text": "",
+          "start_time": 132.6,
+          "end_time": 133.66666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 93,
+          "text": "ड्यूक साहब",
+          "start_time": 133.66666666666666,
+          "end_time": 134.26666666666668,
+          "is_raw": false
+        },
+        {
+          "scene_index": 94,
+          "text": "हम पैर की जाच कर चुके हैं",
+          "start_time": 134.26666666666668,
+          "end_time": 135.26666666666668,
+          "is_raw": false
+        },
+        {
+          "scene_index": 95,
+          "text": "मैंने अपनी आखों से देखा",
+          "start_time": 135.26666666666668,
+          "end_time": 136.33333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 96,
+          "text": "है कि उसे कोई चोट नहीं लगी है मोजा बहुत",
+          "start_time": 136.33333333333334,
+          "end_time": 138.23333333333332,
+          "is_raw": false
+        },
+        {
+          "scene_index": 98,
+          "text": "बच्चा चेड़",
+          "start_time": 139.03333333333333,
+          "end_time": 139.46666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 99,
+          "text": "रहा है",
+          "start_time": 139.46666666666667,
+          "end_time": 140.03333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 100,
+          "text": "और बच्चा फिर",
+          "start_time": 140.03333333333333,
+          "end_time": 140.66666666666666,
+          "is_raw": false
+        },
+        {
+          "scene_index": 101,
+          "text": "परेशान करने लगा ड्यूक साहब देखिए इसे चूबी नहीं सकते",
+          "start_time": 140.66666666666666,
+          "end_time": 143.86666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 102,
+          "text": "",
+          "start_time": 143.86666666666667,
+          "end_time": 144.2,
+          "is_raw": false
+        },
+        {
+          "scene_index": 103,
+          "text": "",
+          "start_time": 144.2,
+          "end_time": 145.23333333333332,
+          "is_raw": false
+        },
+        {
+          "scene_index": 104,
+          "text": "तुम कहती हो कि पैर में दिक्कत",
+          "start_time": 145.23333333333332,
+          "end_time": 146.5,
+          "is_raw": false
+        },
+        {
+          "scene_index": 105,
+          "text": "है तो इसकी जांच कैसे",
+          "start_time": 146.5,
+          "end_time": 147.4,
+          "is_raw": false
+        },
+        {
+          "scene_index": 106,
+          "text": "करोगी मोजा उतारना",
+          "start_time": 147.4,
+          "end_time": 148.4,
+          "is_raw": false
+        },
+        {
+          "scene_index": 107,
+          "text": "नहीं बच्चा तीन दिन तक रोएगा तलवा हवा बरदाश्ट नहीं कर सकता ये मोजे बड़ी मालकिन ने बनवाय थे",
+          "start_time": 148.4,
+          "end_time": 152.86666666666667,
+          "is_raw": false
+        },
+        {
+          "scene_index": 117,
+          "text": "है तो हम इसे वापस पहना देंगे इसे",
+          "start_time": 170.73333333333332,
+          "end_time": 172.4,
+          "is_raw": false
+        },
+        {
+          "scene_index": 118,
+          "text": "उतारो इसे जोर",
+          "start_time": 172.4,
+          "end_time": 173.26666666666668,
+          "is_raw": false
+        },
+        {
+          "scene_index": 119,
+          "text": "से मत खींचो, जिसे समझ है वही करे, ऐसा लगता है",
+          "start_time": 173.26666666666668,
+          "end_time": 175.8,
+          "is_raw": false
+        },
+        {
+          "scene_index": 120,
+          "text": "कि बच्चा नहीं चाहता कि मैं उसे चूँ, तुम जाओ,",
+          "start_time": 175.8,
+          "end_time": 177.43333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 121,
+          "text": "",
+          "start_time": 177.43333333333334,
+          "end_time": 178.33333333333334,
+          "is_raw": false
+        },
+        {
+          "scene_index": 122,
+          "text": "जल्दी",
+          "start_time": 178.33333333333334,
+          "end_time": 180.0,
+          "is_raw": false
+        },
+        {
+          "scene_index": 123,
+          "text": "करो, सबके सब अनाडी हैं,",
+          "start_time": 180.0,
+          "end_time": 181.53333333333333,
+          "is_raw": false
+        },
+        {
+          "scene_index": 124,
+          "text": "इसे सावधानी से करो,",
+          "start_time": 181.53333333333333,
+          "end_time": 182.26666666666668,
+          "is_raw": false
+        },
+        {
+          "scene_index": 125,
+          "text": "अगर दर्द",
+          "start_time": 182.26666666666668,
+          "end_time": 183.06666666666666,
+          "is_raw": false
+        }
+      ]
+    }
+  ]
+}

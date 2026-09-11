@@ -3,7 +3,7 @@
 import asyncio
 import mimetypes
 import shutil
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import StreamingResponse, FileResponse
 from typing import Optional, Any
 import json
@@ -11,6 +11,7 @@ import re
 import tempfile
 from pathlib import Path
 import wave
+import uuid
 from pydantic import BaseModel
 
 from pydub import AudioSegment
@@ -41,6 +42,8 @@ from ...services.forced_alignment import ForcedAlignmentService
 from ...services.llm_config_service import LLMConfigService
 from ...services.project_locks import project_edit_locked
 from ...services.template_service import TemplateService
+from ...services.script_repair_service import ScriptRepairService
+from ...models.script_repair import ScriptRepairReport, ScriptRepairResponse
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["processing"])
 
@@ -86,6 +89,15 @@ class ScriptAutomateRequest(BaseModel):
 class ScriptTtsPrepareRequest(BaseModel):
     script_json: dict[str, Any]
     target_language: str | None = None
+
+
+class ScriptRepairRequest(BaseModel):
+    script_json: dict[str, Any]
+    target_language: str = "fr"
+
+
+class ScriptRepairReviewRequest(ScriptRepairRequest):
+    run_id: str
 
 
 class ScriptSettingsRequest(BaseModel):
@@ -383,8 +395,9 @@ async def get_latest_generation(project_id: str):
         raise HTTPException(status_code=404, detail="Project not found")
 
     latest = ScriptAutomationService.get_latest_run(project_id)
-    if latest and latest.get("script_json"):
+    if latest is not None:
         return {
+            **latest,
             "exists": True,
             "source": "automation_run",
             "run_id": latest["run_id"],
@@ -478,6 +491,53 @@ async def automate_script(project_id: str, request: ScriptAutomateRequest):
             "Connection": "keep-alive",
         },
     )
+
+
+@router.post("/script/repair", response_model=ScriptRepairResponse)
+async def repair_script(project_id: str, request: ScriptRepairRequest, http_request: Request):
+    if not await ProjectService.aload(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    transcription = _load_transcription_for_script(project_id)
+    run_id = uuid.uuid4().hex
+    run_dir, _ = ScriptAutomationService._prepare_run_dirs(project_id, run_id)
+    ScriptRepairService.save_original(run_dir, request.script_json, transcription, request.target_language, origin="paste")
+    script_json, report = await ScriptRepairService.repair(request.script_json, transcription, request.target_language)
+    if await http_request.is_disconnected():
+        raise HTTPException(status_code=499, detail="Repair cancelled")
+    current = _load_transcription_for_script(project_id)
+    if ScriptRepairService.source_fingerprint(current) != ScriptRepairService.source_fingerprint(transcription):
+        raise HTTPException(status_code=409, detail="Source transcription changed during repair. Reload before retrying.")
+    ScriptRepairService.save_result(run_dir, script_json, report, transcription)
+    return {"run_id": run_id, "script_json": script_json, "repair_report": report.model_dump()}
+
+
+@router.post("/script/repair/review", response_model=ScriptRepairResponse)
+async def review_script_repair(project_id: str, request: ScriptRepairReviewRequest):
+    if not re.fullmatch(r"[a-f0-9]{32}", request.run_id):
+        raise HTTPException(status_code=400, detail="Invalid repair run id")
+    run_dir = ProjectService.get_project_dir(project_id) / ScriptAutomationService.RUNS_DIR_NAME / request.run_id
+    transcription = _load_transcription_for_script(project_id)
+    if not (run_dir / "draft_state.json").is_file():
+        # Old runs acquire recovery state on their first explicit review/edit.
+        if not (run_dir / "script.json").is_file():
+            raise HTTPException(status_code=404, detail="Draft not found")
+        ScriptRepairService.save_original(
+            run_dir, json.loads((run_dir / "script.json").read_text()),
+            transcription, request.target_language, origin="automation",
+        )
+    state = json.loads((run_dir / "draft_state.json").read_text())
+    if (state["source_fingerprint"] != ScriptRepairService.source_fingerprint(transcription)
+            or state["target_language"] != request.target_language):
+        raise HTTPException(status_code=409, detail="Source or language changed. Repair the current draft before reviewing it.")
+    normalized = _normalize_script_payload_or_400(project_id, request.script_json, target_language=request.target_language)
+    report_path = run_dir / "repair.json"
+    report = ScriptRepairReport.model_validate_json(report_path.read_text()) if report_path.exists() else ScriptRepairReport(status="not_needed")
+    report.review_required = False
+    report.issues = []
+    report.unresolved_scene_indices = []
+    # Keep the model's original before/after report as history; draft holds reviewed edits.
+    ScriptRepairService.save_result(run_dir, normalized.public_payload, report, transcription)
+    return {"run_id": request.run_id, "script_json": normalized.public_payload, "repair_report": report.model_dump()}
 
 
 @router.post("/script/tts/prepare")

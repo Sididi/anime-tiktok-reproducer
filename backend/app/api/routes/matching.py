@@ -570,7 +570,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
 
 @router.post("/matches/deferred-download")
 async def deferred_download(project_id: str):
-    """Check for missing source episodes, recover from source or download via qBittorrent.
+    """Hydrate matched episodes from Storage Box or recover local imports.
 
     Always returns an SSE stream so the frontend can track progress phases.
     """
@@ -586,7 +586,7 @@ async def deferred_download(project_id: str):
     anime_name = project.anime_name
     series_id = project.series_id
 
-    if not anime_name:
+    if not anime_name and not series_id:
         async def _skipped():
             yield f"data: {json.dumps({'status': 'complete', 'phase': 'check', 'message': 'No anime name set', 'progress': 1.0})}\n\n"
 
@@ -629,8 +629,10 @@ async def deferred_download(project_id: str):
             })
 
         async def _produce() -> None:
+            phase = "check"
             try:
-                if series_id:
+                if series_id and episode_paths:
+                    phase = "hydrate_index"
                     await _enqueue({
                         "status": "running",
                         "phase": "hydrate_index",
@@ -642,35 +644,58 @@ async def deferred_download(project_id: str):
                         library_type=project.library_type,
                         series_id=series_id,
                     )
+                    phase = "hydrate_episode"
                     await _enqueue({
                         "status": "running",
                         "phase": "hydrate_episode",
                         "message": "Hydrating missing episodes from Storage Box...",
                         "progress": 0.15,
                     })
-                    try:
-                        await LibraryHydrationService.hydrate_series(
-                            library_type=project.library_type,
-                            series_id=series_id,
-                            episode_keys=episode_paths,
-                            full_series=False,
-                            progress_callback=_on_network_progress,
+                    await LibraryHydrationService.hydrate_series(
+                        library_type=project.library_type,
+                        series_id=series_id,
+                        episode_keys=episode_paths,
+                        full_series=False,
+                        progress_callback=_on_network_progress,
+                    )
+                elif episode_paths:
+                    # Preserve recovery for projects imported from local files.
+                    missing = await asyncio.to_thread(
+                        DeferredDownloadService.check_missing_sources,
+                        episode_paths, library_root, anime_name,
+                    )
+                    recoverable = [row for row in missing if row.original_source_path]
+                    phase = "recover"
+                    async for event in DeferredDownloadService.recover_from_sources(recoverable):
+                        await _enqueue(event)
+                        if event.get("status") == "error":
+                            return
+                    missing = await asyncio.to_thread(
+                        DeferredDownloadService.check_missing_sources,
+                        episode_paths, library_root, anime_name,
+                    )
+                    if missing:
+                        raise RuntimeError(
+                            "Source files unavailable locally; select the Storage Box series "
+                            "to hydrate: " + ", ".join(Path(row.episode_path).name for row in missing)
                         )
-                    except Exception as exc:
-                        await _enqueue({
-                            "status": "warning",
-                            "phase": "hydrate_episode",
-                            "message": f"Storage Box hydration failed, falling back: {exc}",
-                            "progress": 0.2,
-                        })
-                async for event in DeferredDownloadService.recover_missing_episodes(
-                    episode_paths, library_root, anime_name
-                ):
-                    await _enqueue(event)
+
+                # Automatic torrent fallback is retired. Keep the legacy
+                # orchestrator and torrent metadata for reference/manual use.
+                # async for event in DeferredDownloadService.recover_missing_episodes(
+                #     episode_paths, library_root, anime_name
+                # ):
+                #     await _enqueue(event)
+                await _enqueue({
+                    "status": "complete",
+                    "phase": phase,
+                    "message": f"All {len(episode_paths)} episode(s) ready",
+                    "progress": 1.0,
+                })
             except Exception as e:
                 await _enqueue({
                     "status": "error",
-                    "phase": "download",
+                    "phase": phase,
                     "error": str(e),
                     "message": str(e),
                 })

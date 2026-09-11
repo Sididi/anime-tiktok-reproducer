@@ -937,6 +937,19 @@ class LibraryHydrationService:
                 if full_series or not target_keys:
                     selected_episodes = [entry for entry in episodes if isinstance(entry, dict)]
                 else:
+                    unmatched_keys = sorted(
+                        key for key in target_keys
+                        if not any(
+                            isinstance(entry, dict)
+                            and cls._episode_matches_reference(scoped_type, entry, key)
+                            for entry in episodes
+                        )
+                    )
+                    if unmatched_keys:
+                        raise RuntimeError(
+                            "Episodes not found in Storage Box manifest: "
+                            + ", ".join(unmatched_keys)
+                        )
                     selected_episodes = [
                         entry
                         for entry in episodes
@@ -956,10 +969,9 @@ class LibraryHydrationService:
                 total_bytes = sum(
                     item.size_bytes for plan in plans for item in plan.items
                 )
-                release_root = StorageBoxRepository._release_root(
+                releases_root = StorageBoxRepository._releases_root(
                     scoped_type,
                     series_id,
-                    str(manifest["release_id"]),
                 )
                 batch_temp_root = (
                     cls._temp_root()
@@ -1005,7 +1017,7 @@ class LibraryHydrationService:
                                 for plan in plans
                                 for item in plan.items
                             ],
-                            remote_base=release_root,
+                            remote_base=releases_root,
                             dest_root=batch_temp_root,
                             total_bytes=total_bytes,
                             progress_callback=_batch_progress,
@@ -2628,7 +2640,11 @@ class LibraryHydrationService:
                     raise RuntimeError("Episode artifact is missing relative paths")
                 items.append(
                     _EpisodeDownloadItem(
-                        remote_relative=PurePosixPath(remote_relative_path),
+                        # Index-only releases can retain media and sidecars
+                        # in older releases. Resolve each artifact separately.
+                        remote_relative=PurePosixPath(
+                            str(item.get("release_id") or manifest["release_id"])
+                        ) / remote_relative_path,
                         final_target=library_root / local_relative_path,
                         sha256=str(item.get("sha256") or ""),
                         size_bytes=int(item.get("size_bytes") or 0),

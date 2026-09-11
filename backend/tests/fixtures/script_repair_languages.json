@@ -1,0 +1,416 @@
+{
+  "description": "Small live Gemini 3.1 Flash Lite assessment on 2026-09-11. Synthetic source; three target languages; no video frames. Frozen responses are regression inputs, not a guarantee of future model quality.",
+  "source": {
+    "language": "en",
+    "scenes": [
+      {
+        "scene_index": 0,
+        "text": "The guard blocks the entrance.",
+        "words": [],
+        "start_time": 0.0,
+        "end_time": 2.1,
+        "is_raw": false
+      },
+      {
+        "scene_index": 1,
+        "text": "",
+        "words": [],
+        "start_time": 2.1,
+        "end_time": 2.5,
+        "is_raw": false
+      },
+      {
+        "scene_index": 2,
+        "text": "The girl waits for him to turn away.",
+        "words": [],
+        "start_time": 2.5,
+        "end_time": 5.0,
+        "is_raw": false
+      },
+      {
+        "scene_index": 3,
+        "text": "She grabs his key.",
+        "words": [],
+        "start_time": 5.0,
+        "end_time": 6.8,
+        "is_raw": false
+      },
+      {
+        "scene_index": 4,
+        "text": "",
+        "words": [],
+        "start_time": 6.8,
+        "end_time": 7.3,
+        "is_raw": false
+      },
+      {
+        "scene_index": 5,
+        "text": "Then she unlocks the door.",
+        "words": [],
+        "start_time": 7.3,
+        "end_time": 9.4,
+        "is_raw": false
+      },
+      {
+        "scene_index": 6,
+        "text": "",
+        "words": [],
+        "start_time": 9.4,
+        "end_time": 10.4,
+        "is_raw": true
+      },
+      {
+        "scene_index": 7,
+        "text": "Outside, her brother is waiting.",
+        "words": [],
+        "start_time": 10.4,
+        "end_time": 12.4,
+        "is_raw": false
+      }
+    ],
+    "unrecovered_gaps": []
+  },
+  "cases": [
+    {
+      "language": "fr",
+      "input": {
+        "language": "fr",
+        "scenes": [
+          {
+            "scene_index": 0,
+            "text": "Le garde bloque l’entrée."
+          },
+          {
+            "scene_index": 1,
+            "text": ""
+          },
+          {
+            "scene_index": 2,
+            "text": "Elle attend qu’il détourne le regard."
+          },
+          {
+            "scene_index": 3,
+            "text": "Elle attrape sa clé."
+          },
+          {
+            "scene_index": 4,
+            "text": ""
+          },
+          {
+            "scene_index": 5,
+            "text": "Puis elle déverrouille la porte."
+          },
+          {
+            "scene_index": 6,
+            "text": ""
+          },
+          {
+            "scene_index": 7,
+            "text": "Son frère l’attend dehors."
+          }
+        ]
+      },
+      "output": {
+        "language": "fr",
+        "scenes": [
+          {
+            "scene_index": 0,
+            "text": "Le garde bloque"
+          },
+          {
+            "scene_index": 1,
+            "text": "l’entrée."
+          },
+          {
+            "scene_index": 2,
+            "text": "Elle attend qu’il détourne le regard."
+          },
+          {
+            "scene_index": 3,
+            "text": "Elle attrape sa clé."
+          },
+          {
+            "scene_index": 4,
+            "text": "Puis elle"
+          },
+          {
+            "scene_index": 5,
+            "text": "déverrouille la porte."
+          },
+          {
+            "scene_index": 6,
+            "text": ""
+          },
+          {
+            "scene_index": 7,
+            "text": "Son frère l’attend dehors."
+          }
+        ]
+      },
+      "report": {
+        "status": "repaired",
+        "attempts": 1,
+        "changes": [
+          {
+            "scene_index": 0,
+            "before": "Le garde bloque l’entrée.",
+            "after": "Le garde bloque"
+          },
+          {
+            "scene_index": 1,
+            "before": "",
+            "after": "l’entrée."
+          },
+          {
+            "scene_index": 4,
+            "before": "",
+            "after": "Puis elle"
+          },
+          {
+            "scene_index": 5,
+            "before": "Puis elle déverrouille la porte.",
+            "after": "déverrouille la porte."
+          }
+        ],
+        "unresolved_scene_indices": [],
+        "source_gap_scene_indices": [
+          1,
+          4
+        ],
+        "issues": [],
+        "warning": null,
+        "review_required": true,
+        "model": "google/gemini-3.1-flash-lite"
+      }
+    },
+    {
+      "language": "en",
+      "input": {
+        "language": "en",
+        "scenes": [
+          {
+            "scene_index": 0,
+            "text": "The guard blocks the entrance."
+          },
+          {
+            "scene_index": 1,
+            "text": ""
+          },
+          {
+            "scene_index": 2,
+            "text": "She waits for him to look away."
+          },
+          {
+            "scene_index": 3,
+            "text": "She grabs his key."
+          },
+          {
+            "scene_index": 4,
+            "text": ""
+          },
+          {
+            "scene_index": 5,
+            "text": "Then she unlocks the door."
+          },
+          {
+            "scene_index": 6,
+            "text": ""
+          },
+          {
+            "scene_index": 7,
+            "text": "Her brother is waiting outside."
+          }
+        ]
+      },
+      "output": {
+        "language": "en",
+        "scenes": [
+          {
+            "scene_index": 0,
+            "text": "The guard blocks"
+          },
+          {
+            "scene_index": 1,
+            "text": "the entrance."
+          },
+          {
+            "scene_index": 2,
+            "text": "She waits for him to look away."
+          },
+          {
+            "scene_index": 3,
+            "text": "She grabs"
+          },
+          {
+            "scene_index": 4,
+            "text": "his key."
+          },
+          {
+            "scene_index": 5,
+            "text": "Then she unlocks the door."
+          },
+          {
+            "scene_index": 6,
+            "text": ""
+          },
+          {
+            "scene_index": 7,
+            "text": "Her brother is waiting outside."
+          }
+        ]
+      },
+      "report": {
+        "status": "repaired",
+        "attempts": 1,
+        "changes": [
+          {
+            "scene_index": 0,
+            "before": "The guard blocks the entrance.",
+            "after": "The guard blocks"
+          },
+          {
+            "scene_index": 1,
+            "before": "",
+            "after": "the entrance."
+          },
+          {
+            "scene_index": 3,
+            "before": "She grabs his key.",
+            "after": "She grabs"
+          },
+          {
+            "scene_index": 4,
+            "before": "",
+            "after": "his key."
+          }
+        ],
+        "unresolved_scene_indices": [],
+        "source_gap_scene_indices": [
+          1,
+          4
+        ],
+        "issues": [],
+        "warning": null,
+        "review_required": true,
+        "model": "google/gemini-3.1-flash-lite"
+      }
+    },
+    {
+      "language": "es",
+      "input": {
+        "language": "es",
+        "scenes": [
+          {
+            "scene_index": 0,
+            "text": "El guardia bloquea la entrada."
+          },
+          {
+            "scene_index": 1,
+            "text": ""
+          },
+          {
+            "scene_index": 2,
+            "text": "Ella espera a que mire hacia otro lado."
+          },
+          {
+            "scene_index": 3,
+            "text": "Le quita la llave."
+          },
+          {
+            "scene_index": 4,
+            "text": ""
+          },
+          {
+            "scene_index": 5,
+            "text": "Entonces abre la puerta con ella."
+          },
+          {
+            "scene_index": 6,
+            "text": ""
+          },
+          {
+            "scene_index": 7,
+            "text": "Su hermano la espera fuera."
+          }
+        ]
+      },
+      "output": {
+        "language": "es",
+        "scenes": [
+          {
+            "scene_index": 0,
+            "text": "El guardia bloquea"
+          },
+          {
+            "scene_index": 1,
+            "text": "la entrada."
+          },
+          {
+            "scene_index": 2,
+            "text": "Ella espera a que mire hacia otro lado."
+          },
+          {
+            "scene_index": 3,
+            "text": "Le quita"
+          },
+          {
+            "scene_index": 4,
+            "text": "la llave,"
+          },
+          {
+            "scene_index": 5,
+            "text": "entonces abre la puerta."
+          },
+          {
+            "scene_index": 6,
+            "text": ""
+          },
+          {
+            "scene_index": 7,
+            "text": "Su hermano la espera fuera."
+          }
+        ]
+      },
+      "report": {
+        "status": "repaired",
+        "attempts": 1,
+        "changes": [
+          {
+            "scene_index": 0,
+            "before": "El guardia bloquea la entrada.",
+            "after": "El guardia bloquea"
+          },
+          {
+            "scene_index": 1,
+            "before": "",
+            "after": "la entrada."
+          },
+          {
+            "scene_index": 3,
+            "before": "Le quita la llave.",
+            "after": "Le quita"
+          },
+          {
+            "scene_index": 4,
+            "before": "",
+            "after": "la llave,"
+          },
+          {
+            "scene_index": 5,
+            "before": "Entonces abre la puerta con ella.",
+            "after": "entonces abre la puerta."
+          }
+        ],
+        "unresolved_scene_indices": [],
+        "source_gap_scene_indices": [
+          1,
+          4
+        ],
+        "issues": [],
+        "warning": null,
+        "review_required": true,
+        "model": "google/gemini-3.1-flash-lite"
+      }
+    }
+  ]
+}

@@ -54,6 +54,7 @@ class ScriptPhasePromptService:
         scenes_payload = [
             {
                 "scene_index": scene.scene_index,
+                "is_raw": scene.is_raw,
                 "text": scene.text,
                 "duration_seconds": f"{max(scene.end_time - scene.start_time, 0):.2f}",
                 "estimated_word_count": len(

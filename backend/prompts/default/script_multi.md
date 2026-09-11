@@ -13,6 +13,7 @@ _Instruction : Utilise ce titre pour comprendre le contexte et le vocabulaire sp
 
 Tu reçois un JSON contenant des scènes. Chaque scène possède :
 
+- `is_raw` : Seule indication faisant autorité pour les scènes sans narration.
 - `text` : Le script original en [SOURCE].
 - `duration_seconds` : La durée stricte de la scène.
 - `estimated_word_count` : Indication de la densité originale.
@@ -95,7 +96,7 @@ Ton input JSON découpe la vidéo en "plans de coupe" (cuts) très courts. Ne tr
 
 1. **Regroupement (Macro-Séquence) :** Identifie des groupes de 2 à 5 cuts qui forment une idée narrative complète. Écris ta phrase en [TARGET] sur l'ensemble de ce groupe pour qu'elle soit fluide.
 2. **Redistribution :** Découpe ensuite cette phrase pour la répartir dans les objets JSON correspondants.
-3. **L'Ancrage Visuel (IMPÉRATIF) :** C'est ta seule contrainte rigide lors de la redistribution.
+3. **L'Ancrage Visuel (IMPÉRATIF) :** Respecte aussi la couverture de chaque scène de narration et le silence des scènes raw.
    - Si la scène X montre une action spécifique (ex: un coup de poing), le mot correspondant en [TARGET] DOIT être dans l'objet JSON de la scène X.
    - _Méthode :_ Écris l'histoire fluide, puis "épingle" les mots-clés sur les bons index temporels.
 
@@ -121,10 +122,13 @@ Une SEULE voix TTS neutre lit tout le texte. Le spectateur ne peut PAS savoir qu
 # FORMAT DE SORTIE
 
 - Retourne **UNIQUEMENT** un JSON valide.
-- Commence l'objet JSON par une clé optionnelle `"_plan"` (une seule string, 3 à 5 lignes max) : notes-y ton découpage en macro-séquences et les mots d'ancrage visuel AVANT d'écrire les scènes. Cette clé est ignorée par le système — elle sert uniquement à structurer ta réflexion. Reste bref.
-- À part `"_plan"`, garde **STRICTEMENT** la même structure (mêmes clés, même nombre d'objets).
+- Prépare brièvement ton découpage en macro-séquences et les mots d’ancrage visuel avant d’écrire les scènes. N’affiche pas ces notes dans le JSON.
+- Retourne uniquement `{"language":"code ISO cible","scenes":[{"scene_index":0,"text":"..."}]}`. Garde STRICTEMENT les mêmes index, dans le même ordre, et le même nombre de scènes. `is_raw`, `duration_seconds` et `estimated_word_count` sont des données d’entrée, pas des clés à retourner.
 - Change la valeur de la clé `"language"` pour le code ISO de [TARGET] (ex: "fr", "es", "de").
-- Si une scène d'entrée a un `text` vide (`""`), conserve-la vide en sortie. Ne génère aucun texte pour ces scènes. Cela veut dire que ce sont des scènes purement visuelles (raw scenes) où on laisse le son originel de l'œuvre.
+- Si `is_raw` vaut `true`, conserve impérativement un `text` vide (`""`) : on garde le son original. Ne déplace aucune narration à travers ces scènes.
+- Si `is_raw` vaut `false`, le `text` de sortie DOIT contenir des mots prononçables, même si le texte source est vide. Un texte source vide ne signifie JAMAIS que la scène est raw.
+- Pour les cuts courts ou sans texte source, répartis et reformule légèrement la narration voisine dans la même macro-séquence, sans inventer de faits ni déplacer les actions ancrées. Un fragment de phrase suffit ; de la ponctuation seule ne suffit pas. Ne laisse aucune scène de narration vide après redistribution.
+- Avant de répondre, vérifie chaque index : narration remplie si `is_raw=false`, texte vide si `is_raw=true`, nombre et ordre des scènes inchangés.
 - Ne mets aucun markdown (pas de ```json), pas d'intro, pas de conclusion. Juste le raw JSON string.
 
 DONNÉES D'ENTRÉE :

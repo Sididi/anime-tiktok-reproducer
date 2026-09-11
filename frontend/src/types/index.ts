@@ -194,10 +194,35 @@ export interface ScriptTtsPrepareResponse {
   segments: ScriptTtsPreparedSegment[];
 }
 
+export interface ScriptValidationIssue {
+  code: "invalid_json" | "invalid_structure" | "empty_narration" | "raw_text";
+  message: string;
+  scene_index: number | null;
+}
+
+export interface ScriptRepairReport {
+  status: "not_needed" | "repaired" | "partial" | "failed" | "invalid";
+  attempts: number;
+  changes: Array<{ scene_index: number; before: string; after: string }>;
+  unresolved_scene_indices: number[];
+  source_gap_scene_indices: number[];
+  issues: ScriptValidationIssue[];
+  warning: string | null;
+  review_required: boolean;
+  model: string | null;
+}
+
+export interface ScriptRepairResponse {
+  run_id: string;
+  script_json: Record<string, unknown>;
+  repair_report: ScriptRepairReport;
+}
+
 export interface ScriptAutomationEvent {
   event:
     | "starting"
     | "llm_script"
+    | "script_repair"
     | "llm_metadata"
     | "generating_overlay"
     | "overlay_ready"
@@ -211,6 +236,7 @@ export interface ScriptAutomationEvent {
   error: string | null;
   run_id?: string;
   script_json?: Record<string, unknown>;
+  repair_report?: ScriptRepairReport;
   metadata_json?: PlatformMetadata | null;
   metadata_candidates_json?: MetadataTitleCandidatesPayload | null;
   metadata_warning?: string | null;

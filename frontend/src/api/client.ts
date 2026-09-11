@@ -1147,6 +1147,21 @@ export const api = {
       signal,
     }),
 
+  repairScript: (
+    projectId: string,
+    payload: { script_json: Record<string, unknown>; target_language: string },
+    signal?: AbortSignal,
+  ) => request<import("@/types").ScriptRepairResponse>(`/projects/${projectId}/script/repair`, {
+    method: "POST", body: JSON.stringify(payload), signal,
+  }),
+
+  reviewScriptRepair: (
+    projectId: string,
+    payload: { run_id: string; script_json: Record<string, unknown>; target_language: string },
+  ) => request<import("@/types").ScriptRepairResponse>(`/projects/${projectId}/script/repair/review`, {
+    method: "POST", body: JSON.stringify(payload),
+  }),
+
   prepareScriptTts: (
     projectId: string,
     payload: {
@@ -1172,6 +1187,11 @@ export const api = {
     request<{
       exists: boolean;
       source: "automation_run" | "project_root" | null;
+      repair_report?: import("@/types").ScriptRepairReport | null;
+      draft_status?: "validated" | "review_required" | "unresolved";
+      draft_origin?: "automation" | "paste";
+      source_matches?: boolean;
+      target_language?: string;
       run_id: string | null;
       script_json: Record<string, unknown> | null;
       parts: import("@/types").ScriptAutomationPart[];

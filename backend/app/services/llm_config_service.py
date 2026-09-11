@@ -67,6 +67,10 @@ class LLMConfigService:
         return cfg.presets[cfg.default].light
 
     @classmethod
+    def script_repair_entry(cls) -> LLMPresetEntry:
+        return cls.get_config().script_repair
+
+    @classmethod
     def list_presets(cls) -> list[tuple[str, LLMPreset]]:
         cfg = cls.get_config()
         return list(cfg.presets.items())

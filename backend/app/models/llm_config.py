@@ -51,6 +51,10 @@ class LLMConfig(BaseModel):
     default: str = Field(..., min_length=1)
     presets: dict[str, LLMPreset]
     translation: LLMPresetEntry | None = None
+    script_repair: LLMPresetEntry = Field(default_factory=lambda: LLMPresetEntry(
+        openrouter_id="google/gemini-3.1-flash-lite",
+        thinking=GeminiThinking(effort="minimal"),
+    ))
     model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
