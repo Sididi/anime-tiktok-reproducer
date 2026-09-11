@@ -62,6 +62,7 @@
   var ENCODER_POLL_IDLE_TICKS = 10;
   // Mirrors ATR_RUN_WARNING_SEPARATOR in host/host.jsx.
   var HOST_RUN_WARNING_SEPARATOR = "::ATR_WARN::";
+  var HOST_RUN_RESULT_SEPARATOR = "::ATR_RESULT::";
   var FS_WATCH_RETRY_DELAY_MS = 10000;
   var CLEANUP_IMMEDIATE_MAX_ATTEMPTS = 8;
   var CLEANUP_BACKGROUND_MAX_ATTEMPTS = 3;
@@ -1707,6 +1708,7 @@
         sequence_name: String(
           state.sequence_name || buildProjectSequenceName(projectId),
         ),
+        imported_sequence: state.imported_sequence || null,
       });
     });
     if (entries.length === 0) {
@@ -1934,6 +1936,17 @@
 
   function parseHostRunResult(result) {
     var raw = String(result || "");
+    var resultIndex = raw.indexOf(HOST_RUN_RESULT_SEPARATOR);
+    if (resultIndex >= 0) {
+      var payload = JSON.parse(
+        raw.substring(resultIndex + HOST_RUN_RESULT_SEPARATOR.length),
+      );
+      return {
+        status: raw.substring(0, resultIndex),
+        warnings: String(payload.warnings || ""),
+        resolved_sequence: payload.resolved_sequence || null,
+      };
+    }
     var separatorIndex = raw.indexOf(HOST_RUN_WARNING_SEPARATOR);
     if (separatorIndex < 0) {
       return { status: raw, warnings: "" };
@@ -2018,6 +2031,31 @@
           throw new Error(
             "Unexpected JSX import response: " +
               (runResult.status || "<empty>"),
+          );
+        }
+        if (normalizedManagedProjectId) {
+          var importedSequence = runResult.resolved_sequence;
+          if (
+            !importedSequence ||
+            importedSequence.project_id !== normalizedManagedProjectId ||
+            !importedSequence.project_identity ||
+            !importedSequence.sequence_id ||
+            importedSequence.sequence_name !== buildProjectSequenceName(normalizedManagedProjectId)
+          ) {
+            throw new Error("Managed import returned no valid sequence receipt");
+          }
+          upsertProjectState(normalizedManagedProjectId, {
+            imported_sequence: importedSequence,
+            sequence_id: importedSequence.sequence_id,
+            sequence_name: importedSequence.sequence_name,
+            host_project_identity: importedSequence.project_identity,
+            host_project_name: importedSequence.project_name,
+          });
+          log(
+            "Imported sequence for " + normalizedManagedProjectId + ": " +
+              importedSequence.sequence_name + " (" + importedSequence.sequence_id +
+              ") in " + importedSequence.project_name,
+            "info",
           );
         }
         log("Completed: " + path.basename(jsxPath), "success");
@@ -3215,6 +3253,7 @@
 
       upsertProjectState(projectId, {
           status: "importing",
+          imported_sequence: null,
           drive_folder_id: result.drive_folder_id,
           drive_folder_name: result.drive_folder_name,
           local_root: result.local_root,
@@ -5639,6 +5678,9 @@
                       " [" +
                       String(project.project_path || "unsaved") +
                       "]" +
+                      " sequenceCount=" + Number(project.sequence_count || 0) +
+                      " automationBin=" + !!project.has_automation_bin +
+                      " localRootMatch=" + !!project.local_root_match +
                       (sequenceText ? " sequences: " + sequenceText : "")
                     );
                   })
@@ -5689,6 +5731,9 @@
               "Repaired managed sequence name for " + resolvedProjectId,
               "warn",
             );
+          }
+          if (descriptor.recovered_import) {
+            log("Recovered imported sequence by ID for " + resolvedProjectId, "info");
           }
         });
 

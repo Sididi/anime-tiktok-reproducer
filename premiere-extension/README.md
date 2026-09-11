@@ -97,6 +97,12 @@ Select tracked project and click **Export via CEP**.
 The panel locates the managed sequence in its owning open Premiere project,
 even when another project is active, then starts AME export with the configured
 `.epr`, tracks encoder job events, and triggers upload when export completes.
+Each managed import records its exact sequence ID and owning project in panel
+state and logs them before reporting completion. If Premiere later exposes an
+empty sequence collection (for example after scratch-project cleanup), export
+can reactivate that exact sequence by ID and verify it before queueing AME.
+Sequence lookup searches all available project wrappers; host script reloads
+preserve captured targets and encoder callback registrations.
 
 ## Cleanup option
 
@@ -147,6 +153,7 @@ The historical flow still works:
 - **Drive ambiguous match**: if multiple `SPM_*_{project_id}` folders match, job is rejected.
 - **No upload after export**: verify export path is exactly `output.mp4` in downloaded project root.
 - **Managed export unavailable**: check the `.epr` path and review the preflight diagnostics for the owning project, automation bin, and sequence ID.
+- **Sequence missing after cleanup**: install build `2026-09-11-sequence-recovery-v22` (bundle `1.0.6`) with Premiere and AME closed. Check the startup build line and the next `Imported sequence for …` log. Imports made by older builds have no saved sequence receipt; reimport them if normal sequence lookup still fails. A cleanup log containing `detachedProxies` or `mediaOffline` is from the older cleanup implementation.
 
 ## Regression checks
 

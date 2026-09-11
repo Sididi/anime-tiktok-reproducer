@@ -156,6 +156,23 @@ function preflight(harness, entries) {
   return JSON.parse(String(raw));
 }
 
+function clientFunctionSource(name, nextName) {
+  var source = fs.readFileSync(path.join(clientRoot, "main.js"), "utf8");
+  var start = source.indexOf("  function " + name + "(");
+  var end = source.indexOf("  function " + nextName + "(", start);
+  assert.ok(start >= 0 && end > start);
+  return source.slice(start, end);
+}
+
+function parseImportResult(raw) {
+  var context = vm.createContext({
+    HOST_RUN_WARNING_SEPARATOR: "::ATR_WARN::",
+    HOST_RUN_RESULT_SEPARATOR: "::ATR_RESULT::",
+  });
+  vm.runInContext(clientFunctionSource("parseHostRunResult", "runScript"), context);
+  return context.parseHostRunResult(raw);
+}
+
 test("concurrent download progress is monotonic and 100% is exact", function () {
   var progress = require(path.join(clientRoot, "download_progress.js"));
   var state = progress.createProgressState();
@@ -497,7 +514,9 @@ test("managed runScript validates and captures its exact export target", functio
     "ATR_BATCH__captured",
     "C:/downloads/captured",
   );
-  assert.strictEqual(result, "OK");
+  var importResult = parseImportResult(result);
+  assert.strictEqual(importResult.status, "OK");
+  assert.strictEqual(importResult.resolved_sequence.sequence_id, "sequence-captured");
   assert.strictEqual(
     harness.context.__atrManagedExportTargetsByProjectId.captured.sequence,
     owner.sequences[0],
@@ -522,6 +541,202 @@ test("managed runScript validates and captures its exact export target", functio
     ) === 0,
     missingResult,
   );
+});
+
+test("sequence lookup searches lower-scoring same-document wrappers and deduplicates matches", function () {
+  var visible = createProject({
+    projectId: "other",
+    identity: "shared-document",
+    sequences: [{ name: "ATR_BATCH__other", id: "other-sequence" }],
+  });
+  var hidden = createProject({
+    projectId: "hidden",
+    identity: "shared-document",
+    activeSequence: false,
+    sequences: [{ name: "ATR_BATCH__hidden", id: "hidden-sequence" }],
+  });
+  var duplicateWrapper = createProject({
+    projectId: "hidden",
+    identity: "shared-document",
+    activeSequence: false,
+    sequences: [{ name: "ATR_BATCH__hidden", id: "hidden-sequence" }],
+  });
+  var harness = createHostHarness([visible, hidden, duplicateWrapper], visible.project);
+  assert.strictEqual(harness.context.__atrGetOpenProjects().length, 1);
+  var result = preflight(harness, [{
+    project_id: "hidden", sequence_name: "ATR_BATCH__hidden",
+  }]);
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.resolved[0].sequence_id, "hidden-sequence");
+});
+
+test("one stale Project view does not hide subsequent live views", function () {
+  var empty = createProject({ identity: "empty", sequences: [], withBin: false });
+  var owner = createProject({
+    identity: "view-owner", projectId: "view-recovery",
+    sequences: [{ name: "ATR_BATCH__view-recovery", id: "view-sequence" }],
+  });
+  var harness = createHostHarness([empty], empty.project);
+  harness.app.getProjectViewIDs = function () { return ["closed-view", "live-view"]; };
+  harness.app.getProjectFromViewID = function (id) {
+    if (id === "closed-view") { throw new Error("View closed"); }
+    return owner.project;
+  };
+  assert.strictEqual(preflight(harness, [{
+    project_id: "view-recovery", sequence_name: "ATR_BATCH__view-recovery",
+  }]).ok, true);
+});
+
+test("host reevaluation preserves captured targets and encoder callback state", function () {
+  var owner = createProject({
+    projectId: "reload", identity: "reload-owner",
+    sequences: [{ name: "ATR_BATCH__reload", id: "reload-sequence" }],
+  });
+  var harness = createHostHarness([owner], owner.project);
+  harness.context.$.evalFile = function () {};
+  harness.context.runScript("C:/downloads/reload/import_project.jsx", "reload");
+  harness.context.__atrEncoderCallbacksBound = true;
+  harness.context.__atrEncoderJobProjectMap["queued-job"] = "reload";
+  owner.project.sequences = collection([], "numSequences");
+  owner.project.activeSequence = null;
+  vm.runInContext(fs.readFileSync(hostPath, "utf8"), harness.context);
+  var result = preflight(harness, [{ project_id: "reload", sequence_name: "ATR_BATCH__reload" }]);
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(harness.context.__atrEncoderCallbacksBound, true);
+  assert.strictEqual(harness.context.__atrEncoderJobProjectMap["queued-job"], "reload");
+});
+
+test("saved import receipt recovers and exports the exact sequence after cache and collection loss", function () {
+  var owner = createProject({
+    projectId: "receipt", identity: "scratch-after-cleanup",
+    sequences: [{ name: "ATR_BATCH__receipt", id: "receipt-sequence" }],
+  });
+  var harness = createHostHarness([owner], owner.project);
+  harness.context.$.evalFile = function () {
+    harness.context.$.global.__ATR_IMPORT_WARNINGS__ = "Border unavailable ::ATR_WARN:: detail";
+  };
+  var imported = parseImportResult(harness.context.runScript(
+    "C:/downloads/receipt/import_project.jsx", "receipt",
+  ));
+  assert.strictEqual(imported.warnings, "Border unavailable ::ATR_WARN:: detail");
+  var receipt = JSON.parse(JSON.stringify(imported.resolved_sequence));
+  harness.context.__atrManagedExportTargetsByProjectId = {};
+  harness.context.__atrImportedProjectRefs = [];
+  owner.project.sequences = collection([], "numSequences");
+  owner.project.activeSequence = null;
+  owner.project.rootItem.children = collection([], "numItems");
+  owner.project.openSequence = function (id) {
+    this.openedSequenceIds.push(id);
+    if (id === "receipt-sequence") { this.activeSequence = owner.sequences[0]; }
+    return true;
+  };
+  var result = preflight(harness, [{
+    project_id: "receipt", sequence_name: "ATR_BATCH__receipt",
+    imported_sequence: receipt,
+  }]);
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.resolved[0].recovered_import, true);
+  assert.deepStrictEqual(owner.project.openedSequenceIds, ["receipt-sequence"]);
+  var exported = harness.context.startManagedExport(JSON.stringify({
+    resolved_sequence: result.resolved[0],
+    output_path: "C:/downloads/receipt/output.mp4",
+    preset_path: "C:/presets/video.epr", audio_export: { enabled: false },
+  }));
+  assert.ok(exported.indexOf("ERROR:") !== 0, exported);
+  assert.strictEqual(harness.encodedSequences[0], owner.sequences[0]);
+});
+
+test("receipt recovery rejects a different active sequence and never opens a different document", function () {
+  var owner = createProject({
+    projectId: "unrelated", identity: "receipt-owner",
+    sequences: [{ name: "ATR_BATCH__unrelated", id: "unrelated-sequence" }],
+  });
+  var harness = createHostHarness([owner], owner.project);
+  var entry = {
+    project_id: "missing", sequence_name: "ATR_BATCH__missing",
+    imported_sequence: {
+      project_id: "missing", sequence_name: "ATR_BATCH__missing",
+      project_identity: "receipt-owner", sequence_id: "missing-sequence",
+    },
+  };
+  assert.strictEqual(preflight(harness, [entry]).ok, false);
+  assert.deepStrictEqual(owner.project.openedSequenceIds, ["missing-sequence"]);
+  owner.project.openedSequenceIds = [];
+  entry.imported_sequence.project_identity = "closed-document";
+  assert.strictEqual(preflight(harness, [entry]).ok, false);
+  assert.deepStrictEqual(owner.project.openedSequenceIds, []);
+  assert.strictEqual(harness.encodedSequences.length, 0);
+});
+
+test("panel passes the persisted import receipt to batch preflight", async function () {
+  var receipt = { project_id: "saved", sequence_id: "saved-sequence", project_identity: "owner" };
+  var entries;
+  var context = vm.createContext({
+    getProjectState: function () { return { imported_sequence: receipt }; },
+    hasAllExpectedUploads: function () { return false; },
+    buildProjectSequenceName: function (id) { return "ATR_BATCH__" + id; },
+    escapeForEval: function (value) { entries = JSON.parse(value); return value; },
+    evalHost: function () { return Promise.resolve('{"ok":true}'); },
+  });
+  vm.runInContext(clientFunctionSource(
+    "preflightManagedBatchExportInHost", "clearLocalProxyTrackingForExport",
+  ), context);
+  await context.preflightManagedBatchExportInHost(["saved"]);
+  assert.deepStrictEqual(entries[0].imported_sequence, receipt);
+  assert.strictEqual(parseImportResult("OK").status, "OK");
+  assert.strictEqual(parseImportResult("OK::ATR_WARN::legacy warning").warnings, "legacy warning");
+  assert.throws(function () { parseImportResult("OK::ATR_RESULT::{bad json"); });
+});
+
+test("panel saves the host import receipt before reporting completion", async function () {
+  var owner = createProject({
+    projectId: "panel-import", identity: "panel-owner",
+    sequences: [{ name: "ATR_BATCH__panel-import", id: "panel-sequence" }],
+  });
+  var harness = createHostHarness([owner], owner.project);
+  harness.context.$.evalFile = function () {};
+  var state = {};
+  var completed = false;
+  var panel = vm.createContext({
+    HOST_RUN_WARNING_SEPARATOR: "::ATR_WARN::",
+    HOST_RUN_RESULT_SEPARATOR: "::ATR_RESULT::",
+    path: path,
+    fs: { existsSync: function () { return true; } },
+    isHostCompatible: function () { return true; },
+    setStatus: function () {},
+    updateGlobalStatus: function () {},
+    ensureProjectSubtitlesExpanded: function () { return Promise.resolve({}); },
+    escapeForEval: function (value) { return value; },
+    buildProjectSequenceName: function (id) { return "ATR_BATCH__" + id; },
+    evalHostScriptRun: function (script) {
+      return Promise.resolve(vm.runInContext(script, harness.context));
+    },
+    upsertProjectState: function (id, patch) {
+      assert.strictEqual(id, "panel-import");
+      state = JSON.parse(JSON.stringify(patch));
+    },
+    log: function (message) {
+      if (message.indexOf("Completed:") === 0) {
+        assert.strictEqual(state.imported_sequence.sequence_id, "panel-sequence");
+        completed = true;
+      }
+    },
+  });
+  vm.runInContext(clientFunctionSource("parseHostRunResult", "runScript") +
+    clientFunctionSource("runScript", "cleanupImportedProjectInHost"), panel);
+  var result = await panel.runScript(
+    "C:/downloads/panel-import/import_project.jsx", "panel-import", "C:/downloads/panel-import",
+  );
+  assert.strictEqual(result.host_result, "OK");
+  assert.strictEqual(state.imported_sequence.project_identity, "panel-owner");
+  assert.strictEqual(completed, true);
+
+  completed = false;
+  panel.evalHostScriptRun = function () { return Promise.resolve("OK"); };
+  await assert.rejects(panel.runScript(
+    "C:/downloads/panel-import/import_project.jsx", "panel-import", "C:/downloads/panel-import",
+  ), /no valid sequence receipt/);
+  assert.strictEqual(completed, false);
 });
 
 test("host preflight repairs exactly one automation-bin sequence", function () {
@@ -717,7 +932,7 @@ test("CEP build gate is synchronized and the fork worker is gone", function () {
   );
   assert.ok(hostBuildMatch);
   assert.strictEqual(hostBuildMatch[1], constants.ATR_BUILD_ID);
-  assert.ok(manifestSource.indexOf('ExtensionBundleVersion="1.0.5"') !== -1);
+  assert.ok(manifestSource.indexOf('ExtensionBundleVersion="1.0.6"') !== -1);
   assert.strictEqual(mainSource.indexOf("childProcess.fork"), -1);
   assert.strictEqual(
     fs.existsSync(path.join(clientRoot, "drive_worker.js")),

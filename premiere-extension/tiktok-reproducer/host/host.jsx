@@ -7,20 +7,23 @@
 
 var ATR_EXTENSION_ID = "com.animetiktok.tiktokreproducer.panel";
 // Must stay in sync with ATR_BUILD_ID in client/constants.js.
-var ATR_HOST_BUILD_ID = "2026-08-29-close-first-cleanup-v21";
+var ATR_HOST_BUILD_ID = "2026-09-11-sequence-recovery-v22";
 // Separates runScript()'s status from the non-fatal warnings the executed
 // script published. Must stay in sync with HOST_RUN_WARNING_SEPARATOR in
 // client/main.js.
 var ATR_RUN_WARNING_SEPARATOR = "::ATR_WARN::";
-var __atrEncoderEvents = [];
-var __atrEncoderJobProjectMap = {};
-var __atrEncoderJobMetaMap = {};
-var __atrTempAudioSequenceByJob = {};
-var __atrProxyAttachAttemptMap = {};
-var __atrImportedProjectRefs = [];
-var __atrCleanupClosingProjectIdentities = [];
-var __atrManagedExportTargetsByProjectId = {};
-var __atrEncoderCallbacksBound = false;
+var ATR_RUN_RESULT_SEPARATOR = "::ATR_RESULT::";
+// CEP can evaluate ScriptPath again in the same engine. Keep live import and
+// encoder state: resetting it loses targets and binds duplicate callbacks.
+var __atrEncoderEvents = typeof __atrEncoderEvents === "undefined" ? [] : __atrEncoderEvents;
+var __atrEncoderJobProjectMap = typeof __atrEncoderJobProjectMap === "undefined" ? {} : __atrEncoderJobProjectMap;
+var __atrEncoderJobMetaMap = typeof __atrEncoderJobMetaMap === "undefined" ? {} : __atrEncoderJobMetaMap;
+var __atrTempAudioSequenceByJob = typeof __atrTempAudioSequenceByJob === "undefined" ? {} : __atrTempAudioSequenceByJob;
+var __atrProxyAttachAttemptMap = typeof __atrProxyAttachAttemptMap === "undefined" ? {} : __atrProxyAttachAttemptMap;
+var __atrImportedProjectRefs = typeof __atrImportedProjectRefs === "undefined" ? [] : __atrImportedProjectRefs;
+var __atrCleanupClosingProjectIdentities = typeof __atrCleanupClosingProjectIdentities === "undefined" ? [] : __atrCleanupClosingProjectIdentities;
+var __atrManagedExportTargetsByProjectId = typeof __atrManagedExportTargetsByProjectId === "undefined" ? {} : __atrManagedExportTargetsByProjectId;
+var __atrEncoderCallbacksBound = typeof __atrEncoderCallbacksBound === "undefined" ? false : __atrEncoderCallbacksBound;
 var __atrTempAudioSequencePrefix = "ATR_AUDIO_NO_MUSIC_TMP__";
 var __atrProxyOutputSuffix = "__atr_proxy.mp4";
 var __atrProxyRepairOutputSuffix = "__atr_proxy_projectitem.mp4";
@@ -281,13 +284,28 @@ function __atrPushUniqueProject(projects, projectObject) {
   projects.push(projectObject);
 }
 
-function __atrGetOpenProjects() {
+function __atrPushProjectWrapper(projects, projectObject) {
+  if (!projectObject) {
+    return;
+  }
+  for (var i = 0; i < projects.length; i += 1) {
+    if (projects[i] === projectObject) {
+      return;
+    }
+  }
+  projects.push(projectObject);
+}
+
+function __atrGetOpenProjects(preserveWrappers) {
   var projects = [];
+  var pushProject = preserveWrappers
+    ? __atrPushProjectWrapper
+    : __atrPushUniqueProject;
   // Prefer the front Project object. app.projects may still expose an older
   // same-identity wrapper after the scratch project is recycled.
   try {
     if (app && app.project) {
-      __atrPushUniqueProject(projects, app.project);
+      pushProject(projects, app.project);
     }
   } catch (eActiveProject) {}
 
@@ -298,10 +316,9 @@ function __atrGetOpenProjects() {
       var viewIds = app.getProjectViewIDs();
       var viewCount = Number(viewIds && viewIds.length || 0);
       for (var viewIndex = 0; viewIndex < viewCount; viewIndex += 1) {
-        var viewProject = app.getProjectFromViewID(viewIds[viewIndex]);
-        if (viewProject) {
-          __atrPushUniqueProject(projects, viewProject);
-        }
+        try {
+          pushProject(projects, app.getProjectFromViewID(viewIds[viewIndex]));
+        } catch (eProjectView) {}
       }
     }
   } catch (eProjectViews) {}
@@ -310,7 +327,9 @@ function __atrGetOpenProjects() {
     if (app && app.projects) {
       var count = Number(app.projects.numProjects || app.projects.length || 0);
       for (var i = 0; i < count; i += 1) {
-        __atrPushUniqueProject(projects, app.projects[i]);
+        try {
+          pushProject(projects, app.projects[i]);
+        } catch (eProjectEntry) {}
       }
     }
   } catch (eProjects) {}
@@ -341,7 +360,7 @@ function __atrRememberImportedProject(projectObject) {
   if (!projectObject) {
     return;
   }
-  __atrPushUniqueProject(__atrImportedProjectRefs, projectObject);
+  __atrPushProjectWrapper(__atrImportedProjectRefs, projectObject);
 }
 
 function __atrPushUniqueProjectItem(items, seen, item) {
@@ -1762,6 +1781,62 @@ function __atrDescribeManagedCandidates(candidates) {
   return descriptions;
 }
 
+function __atrPushManagedCandidate(candidates, candidate) {
+  for (var i = 0; i < candidates.length; i += 1) {
+    var existing = candidates[i];
+    if (
+      existing.descriptor.project_identity === candidate.descriptor.project_identity &&
+      existing.descriptor.sequence_id &&
+      existing.descriptor.sequence_id === candidate.descriptor.sequence_id
+    ) {
+      return;
+    }
+  }
+  candidates.push(candidate);
+}
+
+function __atrRecoverImportedSequence(entry, projects) {
+  var imported = entry && entry.imported_sequence;
+  if (
+    !imported || !imported.project_identity || !imported.sequence_id ||
+    imported.project_id !== entry.project_id ||
+    imported.sequence_name !== entry.sequence_name
+  ) {
+    return null;
+  }
+  for (var i = 0; i < projects.length; i += 1) {
+    var project = projects[i];
+    if (__atrGetProjectIdentity(project) !== imported.project_identity) {
+      continue;
+    }
+    var sequence = __atrFindSequenceByIdInProject(project, imported.sequence_id);
+    if (!sequence) {
+      // A saved import receipt survives loss of the in-memory target. Opening
+      // that exact ID can restore activeSequence even when the collection is
+      // empty. Never substitute whichever timeline happens to be active.
+      try {
+        if (!project.openSequence || project.openSequence(imported.sequence_id) === false) {
+          continue;
+        }
+        sequence = __atrFindSequenceByIdInProject(project, imported.sequence_id);
+      } catch (eOpenImportedSequence) {
+        continue;
+      }
+    }
+    if (sequence && __atrGetSequenceName(sequence) === entry.sequence_name) {
+      var descriptor = __atrDescribeManagedSequence(entry.project_id, project, sequence);
+      descriptor.recovered_import = true;
+      return {
+        status: "resolved",
+        target: { project: project, sequence: sequence },
+        descriptor: descriptor,
+        projects: [],
+      };
+    }
+  }
+  return null;
+}
+
 function __atrResolveManagedSequence(entry, allowRepair) {
   var projectId = __atrSafeString(entry && entry.project_id);
   var expectedName = __atrSafeString(entry && entry.sequence_name);
@@ -1791,14 +1866,16 @@ function __atrResolveManagedSequence(entry, allowRepair) {
       };
     }
   }
-  var projects = __atrGetOpenProjects();
+  // Search every wrapper before deduplicating matches. A higher-scoring
+  // wrapper may expose another batch's active sequence while hiding ours.
+  var projects = __atrGetOpenProjects(true);
   // runScript() captures the exact Project object used by every managed
   // import. Include those references only for sequence recovery; treating them
   // as globally open would break cleanup's post-close verification.
   for (var remembered = 0;
     remembered < __atrImportedProjectRefs.length;
     remembered += 1) {
-    __atrPushUniqueProject(projects, __atrImportedProjectRefs[remembered]);
+    __atrPushProjectWrapper(projects, __atrImportedProjectRefs[remembered]);
   }
   var exactCandidates = [];
   var binCandidates = [];
@@ -1842,13 +1919,13 @@ function __atrResolveManagedSequence(entry, allowRepair) {
         ),
       };
       if (sequenceName === expectedName) {
-        exactCandidates.push(candidate);
+        __atrPushManagedCandidate(exactCandidates, candidate);
       }
       if (
         automationBin &&
         __atrSequenceBelongsToBin(sequence, automationBin, binNodeIds)
       ) {
-        binCandidates.push(candidate);
+        __atrPushManagedCandidate(binCandidates, candidate);
       }
     }
   }
@@ -1910,6 +1987,13 @@ function __atrResolveManagedSequence(entry, allowRepair) {
       candidates: __atrDescribeManagedCandidates(binCandidates),
       reason: "Multiple sequences belong to the automation bin",
     };
+  }
+
+  // Only activate a receipt in a currently open project. Remembered wrappers
+  // are useful for reads, but must not resurrect a document closed by cleanup.
+  var recovered = __atrRecoverImportedSequence(entry, __atrGetOpenProjects(true));
+  if (recovered) {
+    return recovered;
   }
 
   return {
@@ -2574,8 +2658,9 @@ function verifyImportedProjectsCleanup(localRootsJson) {
  * @param {string} managedProjectId - Optional project ID requiring sequence validation
  * @param {string} managedSequenceName - Optional expected managed sequence name
  * @param {string} managedLocalRoot - Optional downloaded project root for resolution
- * @returns {string} "OK", "OK::ATR_WARN::<warnings>" on success (non-fatal
- *   issues the script published), or "ERROR: ..." on failure
+ * @returns {string} Managed imports return "OK::ATR_RESULT::<JSON>" with the
+ *   sequence receipt and warnings. Manual scripts return "OK" or
+ *   "OK::ATR_WARN::<warnings>". Failures return "ERROR: ...".
  */
 function runScript(
   scriptPath,
@@ -2648,6 +2733,12 @@ function runScript(
     try {
       $.gc();
     } catch (eGc) {}
+    if (normalizedManagedProjectId) {
+      return "OK" + ATR_RUN_RESULT_SEPARATOR + JSON.stringify({
+        warnings: warningsText,
+        resolved_sequence: managedResolution.descriptor,
+      });
+    }
     if (warningsText) {
       return "OK" + ATR_RUN_WARNING_SEPARATOR + warningsText;
     }
@@ -2724,7 +2815,7 @@ function __atrResolvePreflightedExportTarget(descriptor) {
     return null;
   }
 
-  var openProjects = __atrGetOpenProjects();
+  var openProjects = __atrGetOpenProjects(true);
   var cached = __atrManagedExportTargetsByProjectId[projectId];
   if (
     cached &&
