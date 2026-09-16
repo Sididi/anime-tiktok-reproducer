@@ -1211,7 +1211,7 @@ class GapResolutionService:
             else:
                 continue
 
-            min_speed = cls.min_speed()
+            min_speed = min_speed_fraction
 
             # Check if this scene hits the configured floor
             if speed_ratio < min_speed:
@@ -1289,6 +1289,7 @@ class GapResolutionService:
                 "current_start": round(gap.current_start, 6),
                 "current_end": round(gap.current_end, 6),
                 "target_duration": round(gap.target_duration, 6),
+                "min_speed": str(gap.effective_speed),
             }
             for gap in gaps
         ]
@@ -2282,7 +2283,7 @@ class GapResolutionService:
         else:
             speed_frac = Fraction(1, 1)
 
-        min_speed = cls.min_speed()
+        min_speed = gap.effective_speed
         if speed_frac < min_speed or speed_frac > cls.MAX_SPEED:
             return None
 
@@ -2487,7 +2488,7 @@ class GapResolutionService:
         """Generate minimal-duration fallback windows when cut alignment is insufficient."""
         current_duration_frac = Fraction(gap.current_duration).limit_denominator(100000)
         target_duration_frac = Fraction(gap.target_duration).limit_denominator(100000)
-        min_speed = cls.min_speed()
+        min_speed = gap.effective_speed
         minimum_duration_frac = target_duration_frac * min_speed
         extra_needed_frac = minimum_duration_frac - current_duration_frac
         if extra_needed_frac <= 0:
@@ -2535,14 +2536,14 @@ class GapResolutionService:
                 gap.current_start - extra_needed,
                 gap.current_end,
                 "fallback_extend_start",
-                f"Extend start to {cls.min_speed_percent_label()} floor (-{extra_needed:.2f}s)",
+                f"Extend start to {cls._format_speed_percent(float(min_speed))} floor (-{extra_needed:.2f}s)",
                 "start",
             ),
             "end": (
                 gap.current_start,
                 gap.current_end + extra_needed,
                 "fallback_extend_end",
-                f"Extend end to {cls.min_speed_percent_label()} floor (+{extra_needed:.2f}s)",
+                f"Extend end to {cls._format_speed_percent(float(min_speed))} floor (+{extra_needed:.2f}s)",
                 "end",
             ),
         }
@@ -2560,7 +2561,7 @@ class GapResolutionService:
                 gap.current_end + half_extra,
                 "fallback_extend_both",
                 (
-                    f"Extend both to {cls.min_speed_percent_label()} floor "
+                    f"Extend both to {cls._format_speed_percent(float(min_speed))} floor "
                     f"(-{half_extra:.2f}s, +{half_extra:.2f}s)"
                 ),
             )

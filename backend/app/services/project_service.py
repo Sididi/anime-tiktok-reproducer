@@ -327,3 +327,28 @@ class ProjectService:
         if not transcription_file.exists():
             return None
         return Transcription.model_validate_json(transcription_file.read_text())
+
+    @classmethod
+    def validate_transcription_scene_alignment(
+        cls, project_id: str, transcription: "Transcription"
+    ) -> None:
+        """Reject a transcript left over from a different source scene layout.
+
+        Matching can merge, split, or move cuts while keeping consecutive scene
+        indices. Comparing indices/counts alone cannot detect stale pairings.
+        This compares original-video bounds, never generated TTS timings.
+        """
+        scenes = cls.load_scenes(project_id)
+        aligned = scenes is not None and len(scenes.scenes) == len(transcription.scenes)
+        if aligned:
+            aligned = all(
+                scene.index == transcript.scene_index
+                and abs(scene.start_time - transcript.start_time) <= 1e-4
+                and abs(scene.end_time - transcript.end_time) <= 1e-4
+                for scene, transcript in zip(scenes.scenes, transcription.scenes)
+            )
+        if not aligned:
+            raise ValueError(
+                "The transcription no longer matches the current video scene boundaries. "
+                "Re-run transcription, then regenerate the script, TTS audio, and export."
+            )

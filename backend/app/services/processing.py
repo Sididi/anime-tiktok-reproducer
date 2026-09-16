@@ -1151,7 +1151,11 @@ class ProcessingService:
 
             resolved_source = resolved_scene_sources.get(scene_trans.scene_index)
             if not resolved_source:
-                continue
+                raise ValueError(
+                    f"Cannot export scene {scene_trans.scene_index}: no resolved video source. "
+                    "The narration would have no video coverage. Check scene/match alignment "
+                    "and resolve missing matches before exporting."
+                )
 
             # start_time/end_time are authoritative final playback bounds when
             # processing has rebuilt the raw-aware timeline. Fall back to
@@ -3071,12 +3075,9 @@ class ProcessingService:
                     gaps = GapResolutionService.calculate_gaps(
                         matches,
                         transcription_data["scenes"],
-                        # Pure uses its own (deeper) floor — see
-                        # Project.resolved_min_playback_speed; keep the anime
-                        # path on the historical global floor.
-                        min_speed_factor=(
-                            project.resolved_min_playback_speed() if is_pure else None
-                        ),
+                        # Detection and JSX must use the same resolved floor,
+                        # including template overrides on anime projects.
+                        min_speed_factor=project.resolved_min_playback_speed(),
                     )
 
                 if gaps:

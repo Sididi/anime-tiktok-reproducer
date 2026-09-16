@@ -2992,6 +2992,17 @@
         perfEnd("scenes_speed");
       }
 
+      // QE speed changes can resize a clip after the pre-resize above.
+      // Restore the authoritative scene end and verify it before placing
+      // the next scene, otherwise a successful import can contain blanks.
+      var sceneEndSec = snapSecondsToFrame(s.end);
+      if (v3 && !setTrackItemEndSeconds(v3Item, sceneEndSec)) {
+        throw new Error("Could not fill V3 for scene " + s.scene_index);
+      }
+      if (v1 && !setTrackItemEndSeconds(v1Item, sceneEndSec)) {
+        throw new Error("Could not fill V1 for scene " + s.scene_index);
+      }
+
       // 4. APPLY GEOMETRY (per-source scale, pure-mode crop)
       perfStart("scenes_scale");
       applySceneGeometry(

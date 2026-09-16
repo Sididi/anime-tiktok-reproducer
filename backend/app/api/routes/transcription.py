@@ -158,6 +158,16 @@ async def confirm_transcription(project_id: str):
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    transcription = await ProjectService.aload_transcription(project_id)
+    if not transcription:
+        raise HTTPException(status_code=400, detail="No transcription found")
+    try:
+        await asyncio.to_thread(
+            ProjectService.validate_transcription_scene_alignment, project_id, transcription
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     # Check if raw scenes were detected — route to validation if so
     detection_file = ProjectService.get_project_dir(project_id) / "raw_scene_detection.json"
     if detection_file.exists():

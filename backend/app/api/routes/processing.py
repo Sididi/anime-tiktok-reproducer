@@ -122,6 +122,10 @@ def _load_transcription_for_script(project_id: str):
     transcription = ProjectService.load_transcription(project_id)
     if not transcription or not transcription.scenes:
         raise HTTPException(status_code=400, detail="No transcription found for this project")
+    try:
+        ProjectService.validate_transcription_scene_alignment(project_id, transcription)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return transcription
 
 
