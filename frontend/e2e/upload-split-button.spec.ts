@@ -575,8 +575,8 @@ async function clickTomorrow(page: import("@playwright/test").Page) {
 
 // Mocks for the manual custom-time flow. Captures the `at` sent to
 // reserve-manual so the test can assert the exact instant. free-slots returns
-// no chips (custom time doesn't need any) — the day is still selectable because
-// `isFull` only strikes days that HAVE configured-but-taken slots.
+// no chips (custom time doesn't need any) — days without configured slots
+// remain selectable.
 function installManualMocks() {
   const testWindow = window as Window &
     typeof globalThis & { __manualAt?: string };
@@ -616,7 +616,7 @@ function installManualMocks() {
 }
 
 // Mocks for the amber-chip → switch modal → reserve-anchor steal flow. Anchors a
-// taken slot (occupied by projB / "Naruto") plus a decoy free slot to tomorrow.
+// fully occupied day (its only slot is occupied by projB / "Naruto") to tomorrow.
 function installStealAnchorMocks() {
   // Paris-LOCAL hours (the test pins timezoneId Europe/Paris): computing
   // "tomorrow" in UTC breaks between 00:00–02:00 Paris, when the Paris day is
@@ -659,7 +659,6 @@ function installStealAnchorMocks() {
             taken_by_project_id: "projB",
             taken_by_title: "Naruto",
           },
-          { slot: freeIso, available: true },
         ],
       });
     }
@@ -791,7 +790,7 @@ test.describe("manual custom-time + slot switching", () => {
     expect(at).toMatch(/T15:23:00\.000Z$/);
   });
 
-  test("Amber chip opens takeover modal and reserves with a relocate steal", async ({
+  test("Fully occupied day opens amber chip takeover and reserves with a relocate steal", async ({
     page,
   }) => {
     await page.addInitScript(installEventHubMock, {});
@@ -811,7 +810,9 @@ test.describe("manual custom-time + slot switching", () => {
       .getByRole("button", { name: /Schedule for specific slot/ })
       .click();
 
-    await clickTomorrow(page);
+    const fullDay = page.getByTitle("Tous les slots sont déjà pris", { exact: true });
+    await expect(fullDay).toBeEnabled();
+    await fullDay.click();
 
     // The occupied slot renders as an amber, still-clickable chip.
     const amberChip = page.locator('button[title*="Occupé par"]');

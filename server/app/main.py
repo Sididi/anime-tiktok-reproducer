@@ -11,6 +11,8 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from app.api.facecam import router as facecam_router
+from app.services.facecam_delivery import FacecamDelivery
 from app.api.cep import router as cep_router
 from app.api.health import router as health_router
 from app.api.internal import router as internal_router
@@ -138,6 +140,7 @@ def create_app() -> FastAPI:  # noqa: PLR0915
                     store=job_store,
                     settings=settings,
                     rest_discord_client=discord,
+                    facecam_delivery=app.state.facecam,
                 )
                 await listener.start()
                 sched_task, stop_event = await _start_scheduler(discord)
@@ -166,10 +169,12 @@ def create_app() -> FastAPI:  # noqa: PLR0915
     # lifespan starts; tests that need it should either run inside `with TestClient(app)`
     # or assign `app.state.discord = AsyncMock()` directly.
     app.state.settings = settings
+    app.state.facecam = FacecamDelivery(settings, lambda: app.state.discord)
     app.state.job_store = job_store
     app.state.cep_launch_store = cep_launch_store
     app.state.cep_link = cep_link
     app.state.discord = None
+    app.include_router(facecam_router)
     app.include_router(health_router)
     app.include_router(internal_router)
     app.include_router(public_router)

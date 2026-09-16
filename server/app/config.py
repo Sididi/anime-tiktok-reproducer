@@ -43,6 +43,10 @@ class Settings:
     # Premiere Link: shared secret the CEP panel presents on /api/cep/ws.
     # Unset = the WebSocket rejects every connection (4401).
     cep_link_token: str | None = None
+    facecam_channel_id: str | None = None
+    facecam_drive_client_id: str | None = None
+    facecam_drive_client_secret: str | None = None
+    facecam_drive_refresh_token: str | None = None
 
     @classmethod
     def load(
@@ -97,4 +101,8 @@ class Settings:
                 "ATR_PFM_BASE_URL", "https://api.postforme.dev/v1"
             ),
             cep_link_token=os.environ.get("ATR_CEP_LINK_TOKEN") or None,
+            facecam_channel_id=os.environ.get("ATR_DISCORD_FACECAM_CHANNEL_ID") or None,
+            facecam_drive_client_id=os.environ.get("ATR_FACECAM_DRIVE_CLIENT_ID") or None,
+            facecam_drive_client_secret=os.environ.get("ATR_FACECAM_DRIVE_CLIENT_SECRET") or None,
+            facecam_drive_refresh_token=os.environ.get("ATR_FACECAM_DRIVE_REFRESH_TOKEN") or None,
         )

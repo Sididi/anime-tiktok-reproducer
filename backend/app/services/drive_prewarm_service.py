@@ -154,6 +154,9 @@ class DrivePrewarmService:
         """
         if not cls.is_enabled():
             return None
+        project = ProjectService.load(project_id)
+        if project is None or project.project_mode == "facecam":
+            return None
         live = cls._tasks.get(project_id)
         if live is not None and not live.done():
             return cls._states.get(project_id)

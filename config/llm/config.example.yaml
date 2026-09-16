@@ -2,15 +2,15 @@ default: gpt
 
 presets:
   gpt:
-    label: "GPT (5.5 + 5.4 Mini)"
+    label: "GPT (6 Astra + 5.6 Luna)"
     big:
-      openrouter_id: openai/gpt-5.5
+      openrouter_id: openai/gpt-6-astra
+      max_output_tokens: 4096
       thinking:
-        effort: high
+        effort: low
     light:
-      openrouter_id: openai/gpt-5.4-mini
-      thinking:
-        effort: medium
+      openrouter_id: openai/gpt-5.6-luna
+      thinking: null
 
   claude:
     label: "Claude (Sonnet 5 + Haiku 4.5)"

@@ -1,3 +1,5 @@
+# Facecam is a separate publishing type. Opt in per account with supported_types: [anime, facecam].
+# Existing anime-only accounts do not accept Facecam projects.
 # Account configuration for multi-channel upload scheduling.
 # Copy this file to config.yaml and fill in your credentials.
 #

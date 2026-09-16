@@ -47,6 +47,10 @@ class ProjectResponse(BaseModel):
     output_language: str | None
     elevenlabs_seed: int | None
     mother_project_id: str | None
+    project_mode: str = "standard"
+    source_project_id: str | None = None
+    publishing_type: str = "anime"
+    facecam_delivery: dict[str, Any] | None = None
     drive_folder_id: str | None
     drive_folder_url: str | None
     generation_discord_message_id: str | None
@@ -58,6 +62,9 @@ class ProjectResponse(BaseModel):
 
     @classmethod
     def from_project(cls, project: Project) -> "ProjectResponse":
+        if project.project_mode == "facecam":
+            from ...services.facecam_service import FacecamService
+            project.facecam_delivery = FacecamService.load(project.id).delivery
         return cls(
             id=project.id,
             tiktok_url=project.tiktok_url,
@@ -74,6 +81,10 @@ class ProjectResponse(BaseModel):
             output_language=project.output_language,
             elevenlabs_seed=project.elevenlabs_seed,
             mother_project_id=project.mother_project_id,
+            project_mode=project.project_mode,
+            source_project_id=project.source_project_id,
+            publishing_type=project.publishing_type,
+            facecam_delivery=project.facecam_delivery,
             drive_folder_id=project.drive_folder_id,
             drive_folder_url=project.drive_folder_url,
             generation_discord_message_id=project.generation_discord_message_id,

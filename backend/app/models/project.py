@@ -1,7 +1,7 @@
 from enum import Enum
 from datetime import datetime
 from pydantic import BaseModel, Field, field_validator
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 import uuid
 
 from ..config import settings
@@ -70,6 +70,9 @@ class Project(BaseModel):
     # Root project this one was duplicated from (family root, never a chain).
     # Used to cross-link duplicated projects for upload restrictions.
     mother_project_id: str | None = None
+    project_mode: Literal["standard", "facecam"] = "standard"
+    source_project_id: str | None = None
+    facecam_delivery: dict[str, Any] | None = None
     tiktok_url: str | None = None
     anime_name: str | None = None  # Selected anime from indexed library
     series_id: str | None = None
@@ -158,6 +161,10 @@ class Project(BaseModel):
         if template_value is not None:
             return template_value
         return settings.min_playback_speed_factor
+
+    @property
+    def publishing_type(self) -> str:
+        return "facecam" if self.project_mode == "facecam" else self.library_type.value
 
     def resolved_llm_preset_key(self) -> str:
         from ..services.llm_config_service import LLMConfigService

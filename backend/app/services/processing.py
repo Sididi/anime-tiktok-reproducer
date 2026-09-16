@@ -898,6 +898,8 @@ class ProcessingService:
         contiguous_audio_path: Path,
         output_audio_path: Path,
         segments: list[PlaybackAudioSegment],
+        *,
+        apply_tail_fade: bool = True,
     ) -> None:
         """Rebuild the final TTS WAV by inserting exact silences for raw scenes.
 
@@ -945,7 +947,7 @@ class ProcessingService:
                             )
                             src.setpos(start_frame)
                             frames = src.readframes(end_frame - start_frame)
-                            if position == last_audio_position:
+                            if apply_tail_fade and position == last_audio_position:
                                 frames = cls._apply_tail_fade(
                                     frames,
                                     src.getsampwidth(),
@@ -1305,7 +1307,14 @@ class ProcessingService:
                 continue
             source_geometry[clip_name] = entry
 
+        facecam = None
+        if project.project_mode == "facecam":
+            from .facecam_service import FacecamService
+            state = FacecamService.load(project.id)
+            facecam = {"camera_segments": state.prepared["camera_segments"], "cover_start": state.prepared["cover_start"], "filename": "facecam.mp4", "cover": "anime_reveal.png",
+                "scale": (state.recording or {}).get("scale", 100)}
         return cls._render_jsx_from_template(
+            facecam=facecam,
             project_id=project.id,
             scenes=scenes,
             source_audio_policies=source_audio_policies or {},
@@ -1638,12 +1647,14 @@ class ProcessingService:
         overlay_title_enabled: bool,
         overlay_category_enabled: bool,
         source_geometry: dict[str, dict[str, Any]] | None = None,
+        facecam: dict[str, Any] | None = None,
     ) -> str:
         template_path = cls.PREMIERE_JSX_TEMPLATE_PATH
         if not template_path.exists():
             raise FileNotFoundError(f"Missing Premiere JSX template: {template_path}")
 
         content = template_path.read_text(encoding="utf-8")
+        content = content.replace("var FACECAM = null;", "var FACECAM = " + json.dumps(facecam, ensure_ascii=True) + ";", 1)
 
         # Apply template-driven substitutions before dynamic ones.
         # Background prfpset name.
@@ -2900,136 +2911,149 @@ class ProcessingService:
                 "processing",
                 "auto_editor",
                 0.1,
-                "Running auto-editor on TTS audio...",
+                "Réutilisation de la voix et des coupes Facecam..." if project.project_mode == "facecam" else "Running auto-editor on TTS audio...",
             )
 
         try:
             if not resuming_after_gaps:
-                if not resuming_after_duration_warning:
-                    # Resolve auto-editor profile from voice_key if available
-                    auto_editor_profile = PRODUCTION_AUTO_EDITOR_PROFILE
-                    resolved_voice_key = project.resolved_voice_key()
-                    if resolved_voice_key:
-                        try:
-                            auto_editor_profile = VoiceConfigService.get_auto_editor_profile(resolved_voice_key)
-                        except ValueError:
-                            pass  # voice no longer in config, use default
-
-                    # Step 1: Auto-editor (generates edited audio with silences removed)
+                if project.project_mode == "facecam":
+                    from .facecam_service import FacecamService
+                    from ..models import Transcription
+                    facecam_state = FacecamService.load(project.id)
+                    prepared = facecam_state.prepared
+                    if not prepared or prepared["revision"] != facecam_state.revision:
+                        raise ValueError("Préparez l'aperçu Facecam avant le traitement.")
+                    prepared_dir = Path(prepared["directory"])
                     edited_audio_path = output_dir / "tts_edited.wav"
-                    upload_manifest = ForcedAlignmentService.load_upload_manifest(project.id)
-                    if upload_manifest and upload_manifest.get("mode") == "audio_parts":
-                        from functools import partial
-                        runner = partial(cls.run_auto_editor, profile=auto_editor_profile)
-                        prepared_audio = await ForcedAlignmentService.prepare_audio_from_parts(
-                            project_id=project.id,
-                            output_dir=output_dir,
-                            tts_speed=float(project.tts_speed or 1.0),
-                            auto_editor_runner=runner,
-                        )
-                        edited_audio_path = prepared_audio.edited_audio_path
-                    else:
-                        await cls.run_auto_editor(audio_path, edited_audio_path, profile=auto_editor_profile)
-                        prepared_audio = PreparedAlignmentAudio(
-                            mode="single_audio",
-                            edited_audio_path=edited_audio_path,
-                            segment_audio_paths=[],
-                            manifest=ForcedAlignmentService.build_single_audio_manifest(
-                                script_payload=new_script,
-                                model_id=ScriptAutomationService.resolve_tts_model_id(
-                                    voice_key=project.resolved_voice_key(),
+                    shutil.copy2(prepared_dir / "narration.wav", edited_audio_path)
+                    new_transcription = Transcription.model_validate_json((prepared_dir / "transcription.json").read_text())
+                    yield ProcessingProgress("processing", "transcription", 0.3, "Voix réelle et synchronisation Facecam réutilisées")
+                else:
+                    if not resuming_after_duration_warning:
+                        # Resolve auto-editor profile from voice_key if available
+                        auto_editor_profile = PRODUCTION_AUTO_EDITOR_PROFILE
+                        resolved_voice_key = project.resolved_voice_key()
+                        if resolved_voice_key:
+                            try:
+                                auto_editor_profile = VoiceConfigService.get_auto_editor_profile(resolved_voice_key)
+                            except ValueError:
+                                pass  # voice no longer in config, use default
+
+                        # Step 1: Auto-editor (generates edited audio with silences removed)
+                        edited_audio_path = output_dir / "tts_edited.wav"
+                        upload_manifest = ForcedAlignmentService.load_upload_manifest(project.id)
+                        if upload_manifest and upload_manifest.get("mode") == "audio_parts":
+                            from functools import partial
+                            runner = partial(cls.run_auto_editor, profile=auto_editor_profile)
+                            prepared_audio = await ForcedAlignmentService.prepare_audio_from_parts(
+                                project_id=project.id,
+                                output_dir=output_dir,
+                                tts_speed=float(project.tts_speed or 1.0),
+                                auto_editor_runner=runner,
+                            )
+                            edited_audio_path = prepared_audio.edited_audio_path
+                        else:
+                            await cls.run_auto_editor(audio_path, edited_audio_path, profile=auto_editor_profile)
+                            prepared_audio = PreparedAlignmentAudio(
+                                mode="single_audio",
+                                edited_audio_path=edited_audio_path,
+                                segment_audio_paths=[],
+                                manifest=ForcedAlignmentService.build_single_audio_manifest(
+                                    script_payload=new_script,
+                                    model_id=ScriptAutomationService.resolve_tts_model_id(
+                                        voice_key=project.resolved_voice_key(),
+                                    ),
                                 ),
+                            )
+
+                        # Duration check — warn if total estimated duration < 61s
+                        TIKTOK_MIN_DURATION_SECONDS = 61.0
+                        tts_duration = cls._probe_wav_duration(edited_audio_path)
+                        raw_scenes_duration = sum(
+                            resolved.source_duration_seconds
+                            for scene in reference_transcription.scenes
+                            if scene.is_raw
+                            for resolved in [playback_scene_sources.get(scene.scene_index)]
+                            if resolved is not None
+                        )
+                        total_estimated_duration = tts_duration + raw_scenes_duration
+
+                        if total_estimated_duration < TIKTOK_MIN_DURATION_SECONDS:
+                            # Save state so we can resume from transcription without re-running auto-editor
+                            processing_state = {
+                                "step": "duration_warning",
+                                "edited_audio_path": str(edited_audio_path),
+                                "prepared_audio": {
+                                    "mode": prepared_audio.mode,
+                                    "edited_audio_path": str(prepared_audio.edited_audio_path),
+                                    "segment_audio_paths": [str(p) for p in prepared_audio.segment_audio_paths],
+                                    "manifest": prepared_audio.manifest,
+                                },
+                            }
+                            state_path = output_dir / "processing_state.json"
+                            state_path.write_text(json.dumps(processing_state, indent=2))
+
+                            yield ProcessingProgress(
+                                "duration_warning",
+                                "auto_editor",
+                                0.2,
+                                f"Audio duration ({total_estimated_duration:.0f}s) is under 1min01",
+                                duration_warning=True,
+                                audio_duration_seconds=round(tts_duration, 2),
+                                raw_scenes_duration_seconds=round(raw_scenes_duration, 2),
+                                total_duration_seconds=round(total_estimated_duration, 2),
+                            )
+                            return  # Pause — frontend will show warning modal
+
+                    yield ProcessingProgress(
+                        "processing",
+                        "transcription",
+                        0.3,
+                        "Extracting word timings from audio...",
+                    )
+
+                    # Step 2: Run forced alignment in a worker thread
+                    loop = asyncio.get_event_loop()
+                    from .indexation_queue import indexation_queue
+
+                    async with indexation_queue.heavy_slot("forced_alignment"):
+                        alignment_future = loop.run_in_executor(
+                            heavy_executor(),
+                            lambda: ForcedAlignmentService.align_known_script(
+                                project_id=project.id,
+                                script_payload=new_script,
+                                reference_transcription=reference_transcription,
+                                prepared_audio=prepared_audio,
+                                output_dir=output_dir,
                             ),
                         )
-
-                    # Duration check — warn if total estimated duration < 61s
-                    TIKTOK_MIN_DURATION_SECONDS = 61.0
-                    tts_duration = cls._probe_wav_duration(edited_audio_path)
-                    raw_scenes_duration = sum(
-                        resolved.source_duration_seconds
-                        for scene in reference_transcription.scenes
-                        if scene.is_raw
-                        for resolved in [playback_scene_sources.get(scene.scene_index)]
-                        if resolved is not None
-                    )
-                    total_estimated_duration = tts_duration + raw_scenes_duration
-
-                    if total_estimated_duration < TIKTOK_MIN_DURATION_SECONDS:
-                        # Save state so we can resume from transcription without re-running auto-editor
-                        processing_state = {
-                            "step": "duration_warning",
-                            "edited_audio_path": str(edited_audio_path),
-                            "prepared_audio": {
-                                "mode": prepared_audio.mode,
-                                "edited_audio_path": str(prepared_audio.edited_audio_path),
-                                "segment_audio_paths": [str(p) for p in prepared_audio.segment_audio_paths],
-                                "manifest": prepared_audio.manifest,
-                            },
-                        }
-                        state_path = output_dir / "processing_state.json"
-                        state_path.write_text(json.dumps(processing_state, indent=2))
-
-                        yield ProcessingProgress(
-                            "duration_warning",
-                            "auto_editor",
-                            0.2,
-                            f"Audio duration ({total_estimated_duration:.0f}s) is under 1min01",
-                            duration_warning=True,
-                            audio_duration_seconds=round(tts_duration, 2),
-                            raw_scenes_duration_seconds=round(raw_scenes_duration, 2),
-                            total_duration_seconds=round(total_estimated_duration, 2),
-                        )
-                        return  # Pause — frontend will show warning modal
-
-                yield ProcessingProgress(
-                    "processing",
-                    "transcription",
-                    0.3,
-                    "Extracting word timings from audio...",
-                )
-
-                # Step 2: Run forced alignment in a worker thread
-                loop = asyncio.get_event_loop()
-                from .indexation_queue import indexation_queue
-
-                async with indexation_queue.heavy_slot("forced_alignment"):
-                    alignment_future = loop.run_in_executor(
-                        heavy_executor(),
-                        lambda: ForcedAlignmentService.align_known_script(
-                            project_id=project.id,
-                            script_payload=new_script,
-                            reference_transcription=reference_transcription,
-                            prepared_audio=prepared_audio,
-                            output_dir=output_dir,
-                        ),
-                    )
-                    try:
-                        alignment_result = await asyncio.shield(alignment_future)
-                        new_transcription = alignment_result.transcription
-                        cls.normalize_transcription_timings(new_transcription)
-                        new_transcription, playback_segments = cls.build_authoritative_playback_timeline(
-                            new_transcription,
-                            playback_scene_sources,
-                            contiguous_audio_duration=cls._probe_wav_duration(
-                                edited_audio_path
-                            ),
-                        )
-                        cls.rebuild_tts_audio_with_playback_segments(
-                            edited_audio_path,
-                            edited_audio_path,
-                            playback_segments,
-                        )
-                    except asyncio.CancelledError:
-                        # Preserve the queue reservation until the non-cancellable
-                        # native worker exits; otherwise a disconnect could start
-                        # a third heavyweight operation behind our back.
-                        with suppress(Exception):
-                            await asyncio.shield(alignment_future)
-                        raise
-                    finally:
-                        # A cancellation while run_in_executor is active requests
-                        # deferred unload; the worker releases on session exit.
-                        TranscriberService.unload_models()
+                        try:
+                            alignment_result = await asyncio.shield(alignment_future)
+                            new_transcription = alignment_result.transcription
+                            cls.normalize_transcription_timings(new_transcription)
+                            new_transcription, playback_segments = cls.build_authoritative_playback_timeline(
+                                new_transcription,
+                                playback_scene_sources,
+                                contiguous_audio_duration=cls._probe_wav_duration(
+                                    edited_audio_path
+                                ),
+                            )
+                            cls.rebuild_tts_audio_with_playback_segments(
+                                edited_audio_path,
+                                edited_audio_path,
+                                playback_segments,
+                            )
+                        except asyncio.CancelledError:
+                            # Preserve the queue reservation until the non-cancellable
+                            # native worker exits; otherwise a disconnect could start
+                            # a third heavyweight operation behind our back.
+                            with suppress(Exception):
+                                await asyncio.shield(alignment_future)
+                            raise
+                        finally:
+                            # A cancellation while run_in_executor is active requests
+                            # deferred unload; the worker releases on session exit.
+                            TranscriberService.unload_models()
 
                 # Save transcription for gap detection
                 transcription_timing_path = output_dir / "transcription_timing.json"
@@ -3579,7 +3603,7 @@ class ProcessingService:
             # Step 7: De-fingerprint the published TTS voiceover to avoid TikTok
             # false-positive strikes. Fail-open: never blocks completion.
             tts_final_path = output_dir / "tts_edited.wav"
-            if tts_final_path.exists() and settings.voice_defingerprint_level != "off":
+            if project.project_mode != "facecam" and tts_final_path.exists() and settings.voice_defingerprint_level != "off":
                 yield ProcessingProgress(
                     "processing",
                     "voice_defingerprint",

@@ -1,3 +1,4 @@
+import { FacecamCreateButton } from "@/components/script/FacecamCreateButton";
 import { useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
@@ -2216,6 +2217,7 @@ export function ScriptRestructurePage() {
               <CopyPlus className="h-4 w-4 mr-2" />
               Duplicate
             </Button>
+            {projectId && project?.library_type === "anime" && project.project_mode !== "facecam" && <FacecamCreateButton projectId={projectId} />}
             <Button onClick={handleContinue} disabled={!canContinue || uploading}>
               {uploading ? (
                 <>

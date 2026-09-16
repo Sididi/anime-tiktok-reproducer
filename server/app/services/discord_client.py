@@ -65,8 +65,12 @@ class DiscordClient:
         content: str | None = None,
         embed: dict | None = None,
         message_reference: dict | None = None,
+        components: list | None = None,
     ) -> str:
         body: dict[str, Any] = {}
+        if components is not None:
+            body["components"] = components
+            body["allowed_mentions"] = {"parse": []}
         if content is not None:
             body["content"] = content
         if embed is not None:
@@ -83,8 +87,12 @@ class DiscordClient:
         *,
         content: str | None = None,
         embed: dict | None = None,
+        components: list | None = None,
     ) -> None:
         body: dict[str, Any] = {}
+        if components is not None:
+            body["components"] = components
+            body["allowed_mentions"] = {"parse": []}
         if content is not None:
             body["content"] = content
         if embed is not None:

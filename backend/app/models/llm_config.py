@@ -33,6 +33,7 @@ class LLMPresetEntry(BaseModel):
 
     openrouter_id: str = Field(..., min_length=1)
     thinking: ThinkingConfig | None = None
+    max_output_tokens: int | None = Field(default=None, gt=0)
     model_config = {"extra": "forbid"}
 
 

@@ -28,6 +28,39 @@ class OpenRouterService:
     _client: OpenAI | None = None
 
     @classmethod
+    def research(cls, prompt: str, *, preset_key: str | None = None) -> dict[str, Any]:
+        """Grounded research uses Responses; preserve actual provider citations."""
+        import httpx
+        entry = cls._resolve_entry(preset_key=preset_key, tier="big")
+        body: dict[str, Any] = {
+            "model": entry.openrouter_id, "input": prompt,
+            "tools": [{"type": "openrouter:web_search", "parameters": {
+                "engine": "exa", "max_results": 5, "max_total_results": 20, "max_uses": 5,
+            }}], "max_tool_calls": 6, "max_output_tokens": entry.max_output_tokens or 8192,
+        }
+        reasoning = cls._build_reasoning(entry)
+        if reasoning:
+            body["reasoning"] = reasoning
+        with httpx.Client(timeout=settings.openrouter_timeout) as client:
+            response = client.post(settings.openrouter_base_url.rstrip("/") + "/responses",
+                headers={"Authorization": f"Bearer {settings.openrouter_api_key}"}, json=body)
+            response.raise_for_status()
+            payload = response.json()
+        texts, sources = [], {}
+        for item in payload.get("output", []):
+            for part in item.get("content", []):
+                if part.get("text"):
+                    texts.append(part["text"])
+                for annotation in part.get("annotations", []):
+                    citation = annotation.get("url_citation", annotation)
+                    url = citation.get("url", "")
+                    if url.startswith(("https://", "http://")):
+                        sources[url] = {"url": url, "title": citation.get("title") or url}
+        if not texts or not sources:
+            raise RuntimeError("La recherche n'a retourné aucune preuve web citée.")
+        return {"text": "\n".join(texts), "sources": list(sources.values())}
+
+    @classmethod
     def _get_client(cls) -> OpenAI:
         if cls._client is not None:
             return cls._client
@@ -88,8 +121,9 @@ class OpenRouterService:
             "model": entry.openrouter_id,
             "messages": messages,
         }
-        if max_output_tokens:
-            kwargs["max_tokens"] = max_output_tokens
+        token_limit = max_output_tokens or entry.max_output_tokens
+        if token_limit:
+            kwargs["max_tokens"] = token_limit
         if response_schema is not None:
             kwargs["response_format"] = {
                 "type": "json_schema",

@@ -70,6 +70,8 @@ class ProjectDuplicationService:
         source = ProjectService.load(project_id)
         if source is None:
             raise ValueError("Project not found")
+        if source.project_mode == "facecam":
+            raise ValueError("Créez un nouveau Facecam depuis le projet anime original.")
         if not variants:
             raise ValueError("At least one duplication variant is required")
 

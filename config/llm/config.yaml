@@ -2,10 +2,12 @@ default: gpt
 
 presets:
   gpt:
-    label: "GPT (5.6 Sol + Luna)"
+    label: "GPT (6 Astra + 5.6 Luna)"
     big:
-      openrouter_id: openai/gpt-5.6-sol
-      thinking: null
+      openrouter_id: openai/gpt-6-astra
+      max_output_tokens: 4096
+      thinking:
+        effort: low
     light:
       openrouter_id: openai/gpt-5.6-luna
       thinking: null

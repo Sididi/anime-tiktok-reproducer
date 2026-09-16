@@ -163,6 +163,9 @@ def _notify_drive_upload_complete(project_id: str, _folder_url: str) -> None:
         if not project:
             return
 
+        if project.project_mode == "facecam":
+            return  # Facecam delivery owns its persistent VPS task and message.
+
         if project.generation_discord_message_id:
             try:
                 DiscordService.delete_message(project.generation_discord_message_id)
@@ -1148,6 +1151,20 @@ async def process_project(project_id: str):
     # Load required files
     script_path = project_dir / "new_script.json"
     audio_path = project_dir / "new_tts.wav"
+    if project.project_mode == "facecam":
+        from ...services.facecam_service import FacecamService
+        from ...services.facecam_cover_service import FacecamCoverService
+        state = FacecamService.load(project_id)
+        if not state.prepared or state.approved_revision != state.revision:
+            raise HTTPException(400, "Validez le script et préparez l'aperçu Facecam.")
+        if state.prepared.get("preview_music_key") != project.resolved_music_key():
+            raise HTTPException(400, "La musique a changé. Préparez à nouveau l'aperçu audio.")
+        audio_path = Path(state.prepared["directory"]) / "narration.wav"
+        try:
+            await asyncio.to_thread(FacecamCoverService.ensure, project_id)
+        except Exception as exc:
+            raise HTTPException(400, str(exc)) from exc
+
 
     if not script_path.exists():
         raise HTTPException(status_code=400, detail="New script not uploaded")
@@ -1164,21 +1181,31 @@ async def process_project(project_id: str):
         raise HTTPException(status_code=400, detail="No matches found")
 
     async def stream_progress():
-        async for progress in ProcessingService.process(
-            project,
-            normalized_script.internal_payload,
-            audio_path,
-            matches.matches,
-            reference_transcription=reference_transcription,
-        ):
-            yield f"data: {json.dumps(progress.to_dict())}\n\n"
-
-            if progress.status == "complete":
-                project.phase = ProjectPhase.COMPLETE
-                await ProjectService.asave(project)
-            elif progress.status == "error":
-                # Keep phase as processing so user can retry
-                pass
+        facecam = project.project_mode == "facecam"
+        if facecam:
+            with FacecamService.lock(project_id):
+                from .facecam import _jobs
+                job = _jobs.get(project_id)
+                if project_id in FacecamService._processing or (job and not job.done()):
+                    yield 'data: ' + json.dumps({"status": "error", "error": "Une opération Facecam est déjà en cours."}) + "\n\n"
+                    return
+                FacecamService._processing.add(project_id)
+        try:
+            async for progress in ProcessingService.process(
+                project, normalized_script.internal_payload, audio_path,
+                matches.matches, reference_transcription=reference_transcription,
+            ):
+                if progress.status == "complete":
+                    if facecam:
+                        FacecamService.update(project_id, {"processed_signature": FacecamService.processing_signature(project_id)})
+                    async with ProjectService.edit_lock(project_id):
+                        current = await ProjectService.aload(project_id)
+                        current.phase = ProjectPhase.COMPLETE
+                        await ProjectService.asave(current)
+                yield f"data: {json.dumps(progress.to_dict())}\n\n"
+        finally:
+            if facecam:
+                FacecamService._processing.discard(project_id)
 
     return StreamingResponse(
         stream_progress(),
@@ -1209,15 +1236,19 @@ async def download_bundle(project_id: str):
     project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if project.project_mode == "facecam":
+        from ...services.facecam_service import FacecamService
+        if FacecamService.load(project_id).processed_signature != FacecamService.processing_signature(project_id):
+            raise HTTPException(409, "Le projet a changé. Relancez le traitement et recréez le ZIP.")
 
-    bundle_path = ProjectService.get_project_dir(project_id) / "project_bundle.zip"
+    bundle_path = ProjectService.get_project_dir(project_id) / (ExportService.output_folder_name(project) + ".zip" if project.project_mode == "facecam" else "project_bundle.zip")
 
     if not bundle_path.exists():
         raise HTTPException(status_code=404, detail="Bundle not found. Run processing first.")
 
     return FileResponse(
         path=bundle_path,
-        filename=f"atr_project_{project_id}.zip",
+        filename=bundle_path.name if project.project_mode == "facecam" else f"atr_project_{project_id}.zip",
         media_type="application/zip",
     )
 

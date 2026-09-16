@@ -12,6 +12,7 @@ from google.oauth2.credentials import Credentials
 
 from ..config import PROJECT_ROOT, settings
 from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type
+from ..publishing_types import PublishingType, coerce_publishing_type
 from .meta_token_service import MetaTokenService, MetaUploadCredentials
 
 logger = logging.getLogger("uvicorn.error")
@@ -132,7 +133,7 @@ class AccountConfig:
     name: str
     language: str
     device: str = ""
-    supported_types: list[LibraryType] = field(default_factory=lambda: [DEFAULT_LIBRARY_TYPE])
+    supported_types: list[PublishingType] = field(default_factory=lambda: [DEFAULT_LIBRARY_TYPE])
     avatar: str | None = None
     slots: list[str] = field(default_factory=list)
     youtube: AccountYouTubeConfig | None = None
@@ -323,11 +324,11 @@ class AccountService:
         slots_raw = raw.get("slots", [])
         slots = [str(s) for s in slots_raw] if isinstance(slots_raw, list) else []
         supported_types_raw = raw.get("supported_types")
-        supported_types: list[LibraryType] = []
+        supported_types: list[PublishingType] = []
         if isinstance(supported_types_raw, list):
             for item in supported_types_raw:
                 try:
-                    supported_types.append(coerce_library_type(item))
+                    supported_types.append(coerce_publishing_type(item))
                 except ValueError:
                     logger.warning(
                         "Ignoring unsupported library type %r for account %s",

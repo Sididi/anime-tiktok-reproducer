@@ -1,4 +1,4 @@
-import type { Account, LibraryType, ProjectManagerRow } from "@/types";
+import type { Account, LibraryType, PublishingType, ProjectManagerRow } from "@/types";
 
 export const LIBRARY_TYPE_OPTIONS: Array<{
   value: LibraryType;
@@ -11,7 +11,8 @@ export const LIBRARY_TYPE_OPTIONS: Array<{
   { value: "pure", label: "Pure" },
 ];
 
-const LIBRARY_TYPE_LABELS: Record<LibraryType, string> = {
+const LIBRARY_TYPE_LABELS: Record<PublishingType, string> = {
+  facecam: "Facecam",
   anime: "Anime",
   simpsons: "Simpsons",
   films_series: "Films/Séries",
@@ -23,11 +24,11 @@ export function getLibraryTypeLabel(
   libraryType: LibraryType | string | null | undefined,
 ): string {
   if (!libraryType) return "Unknown";
-  return LIBRARY_TYPE_LABELS[libraryType as LibraryType] ?? libraryType;
+  return LIBRARY_TYPE_LABELS[libraryType as PublishingType] ?? libraryType;
 }
 
 export function getSupportedTypeLabels(
-  supportedTypes: LibraryType[] | null | undefined,
+  supportedTypes: PublishingType[] | null | undefined,
 ): string {
   if (!supportedTypes || supportedTypes.length === 0) {
     return getLibraryTypeLabel("anime");
@@ -37,16 +38,16 @@ export function getSupportedTypeLabels(
 
 function accountSupportsLibraryType(
   account: Account,
-  libraryType: LibraryType,
+  libraryType: PublishingType,
 ): boolean {
   return account.supported_types.includes(libraryType);
 }
 
 export function isAccountCompatibleWithProjectRow(
   account: Account,
-  row: Pick<ProjectManagerRow, "language" | "library_type">,
+  row: Pick<ProjectManagerRow, "language" | "library_type" | "publishing_type">,
 ): boolean {
   return Boolean(row.language)
     && account.language === row.language
-    && accountSupportsLibraryType(account, row.library_type);
+    && accountSupportsLibraryType(account, row.publishing_type ?? row.library_type);
 }

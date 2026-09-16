@@ -47,6 +47,7 @@ class ReactionListener:
         store: JobStore,
         settings: Settings,
         rest_discord_client,
+        facecam_delivery=None,
     ) -> None:
         intents = discord.Intents.default()
         intents.guilds = True
@@ -61,6 +62,11 @@ class ReactionListener:
         # Cached bot user id — populated once the gateway identifies.
         # Can be overridden in tests without touching the property-locked Client.
         self._bot_user_id: int | None = None
+
+        if facecam_delivery is not None:
+            @self._client.event
+            async def on_interaction(interaction):
+                await facecam_delivery.interaction(interaction)
 
         @self._client.event
         async def on_ready():

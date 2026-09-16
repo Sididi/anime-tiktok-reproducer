@@ -6,11 +6,11 @@ import {
   MatchValidation,
   TranscriptionPage,
   RawSceneValidationPage,
-  ScriptRestructurePage,
   ProcessingPage,
   GapResolutionPage,
   PlanningPage,
 } from "@/pages";
+import { ScriptPhasePage } from "@/pages/ScriptPhasePage";
 import { DownloadProgressCard } from "@/components/DownloadProgressCard";
 
 function App() {
@@ -42,7 +42,7 @@ function App() {
         />
         <Route
           path="/project/:projectId/script"
-          element={<ScriptRestructurePage />}
+          element={<ScriptPhasePage />}
         />
         <Route
           path="/project/:projectId/processing"

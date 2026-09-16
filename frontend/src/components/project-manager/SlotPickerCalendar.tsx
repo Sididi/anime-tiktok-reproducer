@@ -12,7 +12,7 @@ interface SlotPickerCalendarProps {
    *  When undefined, every day is treated as configured. */
   daysWithSlots?: Set<string>;
   /** ISO yyyy-mm-dd of days with at least one FREE slot still bookable. When
-   *  undefined we don't strike anything based on availability. */
+   *  undefined we don't highlight full days. */
   daysWithFreeSlots?: Set<string>;
   /** ISO yyyy-mm-dd of days blocked by the 30-day duplicated-project rule. */
   blockedDays?: Set<string>;
@@ -58,10 +58,8 @@ export function SlotPickerCalendar({
   const isSelected = (d: Date) =>
     !!selectedDate && ymd(d) === ymd(selectedDate);
   const isPast = (d: Date) => ymd(d) < todayKey;
-  // A day is "full" only when slots ARE configured for it AND every one is
-  // already taken. Days where the account has no slot configured are NOT
-  // crossed — clicking them just shows an empty slot list. This matches the
-  // user-facing rule: cross past days + days with zero free slots.
+  // Full days remain selectable so occupied slots can be overridden.
+  // Days without configured slots simply show an empty slot list.
   const isFull = (d: Date) => {
     if (!daysWithSlots || !daysWithFreeSlots) return false;
     const key = ymd(d);
@@ -96,7 +94,7 @@ export function SlotPickerCalendar({
           const past = isPast(d);
           const full = isFull(d);
           const dupBlocked = isDuplicationBlocked(d);
-          const blocked = past || full || dupBlocked;
+          const blocked = past || dupBlocked;
           const offMonth = !inMonth(d);
           const sel = isSelected(d);
           const title = past
@@ -118,9 +116,11 @@ export function SlotPickerCalendar({
                   ? "bg-[hsl(var(--primary))] text-white"
                   : blocked
                     ? "text-[hsl(var(--muted-foreground))]/40 cursor-not-allowed"
-                    : offMonth
-                      ? "text-[hsl(var(--muted-foreground))]/60 hover:bg-[hsl(var(--muted))]"
-                      : "hover:bg-[hsl(var(--muted))]"
+                    : full
+                      ? "text-amber-500 hover:bg-amber-500/10"
+                      : offMonth
+                        ? "text-[hsl(var(--muted-foreground))]/60 hover:bg-[hsl(var(--muted))]"
+                        : "hover:bg-[hsl(var(--muted))]"
               }`}
             >
               <span

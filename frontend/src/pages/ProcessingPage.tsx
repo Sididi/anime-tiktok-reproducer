@@ -100,7 +100,8 @@ export function ProcessingPage() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
   const location = useLocation();
-  const { loadProject } = useProjectStore();
+  const { loadProject, project } = useProjectStore();
+  const isFacecam = project?.project_mode === "facecam";
   const hasStartedProcessing = useRef(false);
   const autoUploadAttemptedRef = useRef(false);
   const resumeAfterGapsRef = useRef(false);
@@ -571,7 +572,7 @@ export function ProcessingPage() {
         <div className="text-center space-y-2">
           <h1 className="text-2xl font-bold">
             {processingComplete
-              ? "Processing Complete"
+              ? (isFacecam ? "Projet Facecam prêt" : "Processing Complete")
               : durationWarning
                 ? "Duration Warning"
                 : gapsDetected
@@ -659,7 +660,7 @@ export function ProcessingPage() {
                         : ""
                   }`}
                 >
-                  {step.label}
+                  {isFacecam && step.id === "auto_editor" ? "Coupes de silence communes à la caméra et à la voix" : isFacecam && step.id === "transcription" ? "Synchronisation de la voix réelle" : step.label}
                 </p>
                 {step.message && (
                   <p className="text-xs text-[hsl(var(--muted-foreground))] mt-0.5">
@@ -712,8 +713,7 @@ export function ProcessingPage() {
               </Button>
             </div>
             <p className="text-xs text-center text-[hsl(var(--muted-foreground))]">
-              Drive and ZIP contain: JSX script, edited TTS audio, subtitles,
-              metadata files, overlay images, assets, and source mapping.
+              {isFacecam ? "Un seul ZIP autonome sera envoyé dans Drive : épisodes, caméra, voix réelle, musique, couverture, sous-titres, JSX et lanceur. Le monteur reçoit les instructions dans Discord." : "Drive and ZIP contain: JSX script, edited TTS audio, subtitles, metadata files, overlay images, assets, and source mapping."}
             </p>
             {driveFolderUrl && (
               <p className="text-xs text-center">
@@ -730,6 +730,7 @@ export function ProcessingPage() {
           </div>
         )}
 
+        {isFacecam && <div className="text-center"><Button variant="outline" disabled={processing || driveLoading || bundleLoading} onClick={() => navigate(`/project/${projectId}/script`)}>Revenir au script et à la livraison Facecam</Button></div>}
         {processingComplete && (
           <div className="text-center">
             <button

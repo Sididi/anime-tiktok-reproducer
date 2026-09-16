@@ -19,7 +19,13 @@ export type LibraryType =
   | "dessin_anime"
   | "pure";
 
+export type PublishingType = LibraryType | "facecam";
+
 export interface Project {
+  project_mode?: "standard" | "facecam";
+  publishing_type?: PublishingType;
+  source_project_id?: string | null;
+  facecam_delivery?: {status: string; message_id?: string} | null;
   id: string;
   tiktok_url: string | null;
   source_paths: string[];
@@ -252,6 +258,8 @@ export interface ScriptAutomationEvent {
 }
 
 export interface ProjectManagerRow {
+  project_mode?: "standard" | "facecam";
+  publishing_type?: PublishingType;
   project_id: string;
   anime_title: string | null;
   library_type: LibraryType;
@@ -387,7 +395,7 @@ export interface Account {
   slots: string[];
   slots_by_platform?: Partial<Record<Platform, string[]>>;
   max_reel_duration_seconds_by_platform?: Partial<Record<Platform, number>>;
-  supported_types: LibraryType[];
+  supported_types: PublishingType[];
 }
 
 export interface Scene {

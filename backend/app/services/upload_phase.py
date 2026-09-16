@@ -394,13 +394,31 @@ class UploadPhaseService:
                 else:
                     video_files = []
 
-        return cls._build_readiness(
+        readiness = cls._build_readiness(
             metadata_exists=metadata_exists,
             folder_id=folder_id,
             folder_url=folder_url,
             video_files=video_files,
             video_lookup_failed=video_lookup_failed,
         )
+        return cls._facecam_readiness(project, readiness)
+
+    @staticmethod
+    def _facecam_readiness(project: Project, readiness: UploadReadiness) -> UploadReadiness:
+        if project.project_mode != "facecam":
+            return readiness
+        from .facecam_delivery_service import FacecamDeliveryService
+        try:
+            task = FacecamDeliveryService.sync(project.id)
+            project.facecam_delivery = task  # response snapshot; persisted separately in Facecam state
+            if task.get("status") == "complete":
+                return readiness
+            reason = "Montage Facecam en attente de confirmation dans Discord"
+        except Exception:
+            reason = "Impossible de vérifier la livraison Facecam sur le VPS"
+        readiness.status = "orange"
+        readiness.reasons.append(reason)
+        return readiness
 
     @classmethod
     def _compute_preflight_readiness(cls, project: Project) -> UploadReadiness:
@@ -515,6 +533,8 @@ class UploadPhaseService:
                     video_files=video_files,
                     video_lookup_failed=drive_batch_lookup_failed,
                 )
+            if not upload_locked[project.id]:
+                readiness = cls._facecam_readiness(project, readiness)
             return cls._manager_row_payload(project, readiness)
 
         if not projects:
@@ -588,6 +608,9 @@ class UploadPhaseService:
             "project_id": project.id,
             "anime_title": project.anime_name,
             "library_type": project.library_type.value,
+            "project_mode": project.project_mode,
+            "publishing_type": project.publishing_type,
+            "facecam_delivery": project.facecam_delivery,
             "language": project.output_language,
             "local_size_bytes": _dir_size(project_dir) if project_dir.exists() else 0,
             **_uploaded_fields(project),
@@ -1268,9 +1291,9 @@ class UploadPhaseService:
                     f"Project language '{project.output_language}' does not match "
                     f"account language '{account.language}'"
                 )
-            if project_library_type not in account.supported_types:
+            if project.publishing_type not in account.supported_types:
                 raise ValueError(
-                    f"Project type '{project_library_type.value}' does not match "
+                    f"Project type '{project.publishing_type}' does not match "
                     f"account supported types {[item.value for item in account.supported_types]}"
                 )
         elif configured_accounts:

@@ -807,8 +807,8 @@ export function ProjectManagerModal({
         aVal = (a.language || "").toLowerCase();
         bVal = (b.language || "").toLowerCase();
       } else if (sortColumn === "library_type") {
-        aVal = getLibraryTypeLabel(a.library_type).toLowerCase();
-        bVal = getLibraryTypeLabel(b.library_type).toLowerCase();
+        aVal = getLibraryTypeLabel(a.publishing_type ?? a.library_type).toLowerCase();
+        bVal = getLibraryTypeLabel(b.publishing_type ?? b.library_type).toLowerCase();
       } else if (sortColumn === "anime_title") {
         aVal = (a.anime_title || "").toLowerCase();
         bVal = (b.anime_title || "").toLowerCase();

@@ -21,6 +21,7 @@
   var SEQUENCE_PRESET_PATH = ASSETS_DIR + "/TikTok60fps.sqpreset";
   var BORDER_IMAGE_FILENAME = "white_border_frame.png";
   var AUDIO_FILENAME = "tts_edited.wav";
+  var FACECAM = null;
   var CATEGORY_OVERLAY_FILENAME = "category_overlay.png";
   var TITLE_OVERLAY_FILENAME = "title_overlay.png";
   var MUSIC_FILENAME = "credits song for my death.wav";
@@ -2670,6 +2671,7 @@
 
     app.enableQE();
     if (!app.project) {
+      if (FACECAM) throw new Error("Ouvrez un projet Premiere avant de lancer l'import Facecam.");
       alert("Open a project.");
       return;
     }
@@ -2705,7 +2707,7 @@
 
     // --- ENSURE TRACKS (V=6, A=4+) ---
     // A4+ is reserved for raw scene audio (active, not muted)
-    ensureVideoTracks(sequence, 6);
+    ensureVideoTracks(sequence, FACECAM ? 7 : 6);
     ensureAudioTracks(sequence, rawAudioTrackDesiredCount);
     var qeSeq = null;
     try {
@@ -2733,9 +2735,9 @@
     var v4 =
       sequence.videoTracks.numTracks > 3 ? sequence.videoTracks[3] : null;
     var v5 =
-      sequence.videoTracks.numTracks > 4 ? sequence.videoTracks[4] : null;
+      sequence.videoTracks.numTracks > 4 ? sequence.videoTracks[FACECAM ? 5 : 4] : null;
     var v6 =
-      sequence.videoTracks.numTracks > 5 ? sequence.videoTracks[5] : null;
+      sequence.videoTracks.numTracks > 5 ? sequence.videoTracks[FACECAM ? 6 : 5] : null;
     var a1 = sequence.audioTracks[0];
     var a2 = sequence.audioTracks.numTracks > 1 ? sequence.audioTracks[1] : a1;
     var a3 =
@@ -3036,6 +3038,7 @@
     log("Importing TTS to A2...");
     var ttsItem = getOrImportClip(AUDIO_FILENAME);
     if (!a2 || !ttsItem) {
+      if (FACECAM) throw new Error("La piste de narration est introuvable dans le dossier extrait.");
       alert("Error: Missing TTS track or file '" + AUDIO_FILENAME + "'.");
       return;
     }
@@ -3051,6 +3054,7 @@
       findTrackItemAtStart(a2, 0, null);
     var ttsEndSec = ttsTrackItem ? getTrackItemEndSeconds(ttsTrackItem) : null;
     if (typeof ttsEndSec !== "number" || !(ttsEndSec > 0)) {
+      if (FACECAM) throw new Error("Impossible de déterminer la durée de la narration.");
       alert(
         "Error: Unable to resolve TTS end time from '" + AUDIO_FILENAME + "'.",
       );
@@ -3059,6 +3063,7 @@
     ttsEndSec = snapSecondsToFrame(ttsEndSec);
 
     var sequenceEndSec = ttsEndSec;
+    if (FACECAM) sequenceEndSec = FACECAM.cover_start + 1;
 
     // Give Premiere an early chance to materialize the border image before
     // the heavier preset and subtitle graphics work. The final call after
@@ -3108,7 +3113,7 @@
         overlayFadeIdx++
       ) {
         applyOverlayFadeOut(
-          overlayFadeTrackIndexes[overlayFadeIdx],
+          overlayFadeTrackIndexes[overlayFadeIdx] + (FACECAM ? 1 : 0),
           OVERLAY_FADE_DURATION_SEC,
           qeSeq,
         );
@@ -3195,7 +3200,7 @@
     perfStart("subtitles");
     importUnifiedSubtitles(
       sequence,
-      3,
+      FACECAM ? 4 : 3,
       SUBTITLE_MOGRT_DIR,
       SUBTITLE_SRT_PATH,
       RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR,
@@ -3204,6 +3209,7 @@
       true,
     );
     perfEnd("subtitles", "Subtitles");
+    if (FACECAM) placeFacecam(sequence);
 
     // Verify the early border after the Motion Graphics work has settled. If
     // the first import never materialized, this makes one fresh direct attempt.
@@ -3216,6 +3222,37 @@
   // ========================================================================
   // 4. HELPERS
   // ========================================================================
+
+  // Facecam master has no audio stream: inserting its picture cannot touch A1/A2/raw audio.
+  function placeFacecam(sequence) {
+    var camera = getOrImportClip(FACECAM.filename);
+    if (!camera) throw new Error("Facecam media missing: " + FACECAM.filename);
+    var track = sequence.videoTracks[3];
+    for (var i = 0; i < FACECAM.camera_segments.length; i++) {
+      var part = FACECAM.camera_segments[i];
+      var start = part.start_frame / 60;
+      var sourceIn = part.source_frame / 60;
+      var length = (part.end_frame - part.start_frame) / 60;
+      camera.setInPoint(sourceIn, 4);
+      camera.setOutPoint(sourceIn + length, 4);
+      track.overwriteClip(camera, start);
+      var item = resolvePlacedItemFast(track, start, stripKnownExtension(FACECAM.filename), TRACK_ITEM_WAIT_MAX_MS);
+      if (!item) throw new Error("Facecam clip placement failed at " + start);
+      if (!setTrackItemEndSeconds(item, part.end_frame / 60)) throw new Error("Facecam duration could not be set");
+      setScaleOnItem(item, FACECAM.scale);
+    }
+    camera.clearInPoint();
+    camera.clearOutPoint();
+    var cover = getOrImportClip(FACECAM.cover);
+    if (!cover) throw new Error("Anime cover missing");
+    var main = sequence.videoTracks[2];
+    main.overwriteClip(cover, FACECAM.cover_start);
+    var card = resolvePlacedItemFast(main, FACECAM.cover_start, stripKnownExtension(FACECAM.cover), TRACK_ITEM_WAIT_MAX_MS);
+    if (!card) throw new Error("Anime cover placement failed");
+    if (!setTrackItemEndSeconds(card, FACECAM.cover_start + 1)) throw new Error("The cover must last exactly 60 frames");
+    if (Math.round((getTrackItemEndSeconds(card) - FACECAM.cover_start) * 60) !== 60) throw new Error("Incorrect anime reveal duration");
+    setScaleOnItem(card, 100);
+  }
 
   function trimSpaces(value) {
     if (value === null || value === undefined) return "";

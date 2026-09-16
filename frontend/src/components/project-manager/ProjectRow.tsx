@@ -44,7 +44,7 @@ export function ProjectRow({
   isSelected,
   onToggleSelect,
 }: ProjectRowProps) {
-  const libraryTypeLabel = getLibraryTypeLabel(row.library_type);
+  const libraryTypeLabel = getLibraryTypeLabel(row.publishing_type ?? row.library_type);
   const compatibleAccounts = accounts.filter((account) =>
     isAccountCompatibleWithProjectRow(account, row),
   );

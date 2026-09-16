@@ -341,7 +341,7 @@ class ExportService:
     def output_folder_name(cls, project: Project) -> str:
         anime = cls.sanitize_slug(project.anime_name or "project")
         pid = re.sub(r"[^a-zA-Z0-9]+", "_", project.id).strip("_") or "unknown"
-        return f"SPM_{anime}_{pid}"
+        return f"SPM_facecam_{anime}_{pid}" if project.project_mode == "facecam" else f"SPM_{anime}_{pid}"
 
     @classmethod
     def language_to_locale(cls, language: str | None) -> str:
@@ -564,6 +564,11 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
     @classmethod
     def build_manifest(cls, project: Project, matches: list[SceneMatch]) -> tuple[str, list[ManifestEntry]]:
+        if project.project_mode == "facecam":
+            from .facecam_service import FacecamService
+            state = FacecamService.load(project.id)
+            if state.approved_revision != state.revision or state.processed_signature != FacecamService.processing_signature(project.id):
+                raise ValueError("Le projet Facecam a changé. Relancez le traitement avant l'export.")
         output_dir = cls.get_output_dir(project.id)
         if not output_dir.exists():
             raise FileNotFoundError("Processing output directory not found")
@@ -579,7 +584,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             raise FileNotFoundError("Missing subtitle file. Run processing first.")
 
         folder = cls.output_folder_name(project)
-        subtitles_archive_entry = cls._build_subtitles_archive_entry(
+        subtitles_archive_entry = None if project.project_mode == "facecam" else cls._build_subtitles_archive_entry(
             output_dir,
             relative_path=f"{folder}/subtitles/{cls.SUBTITLES_ARCHIVE_FILENAME}",
         )
@@ -622,7 +627,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
                 ManifestEntry(relative_path=f"{folder}/assets/{asset_name}", source_path=asset)
             )
 
-        launcher = assets_dir / "run_in_premiere.bat"
+        launcher = assets_dir / ("run_facecam_in_premiere.bat" if project.project_mode == "facecam" else "run_in_premiere.bat")
         if launcher.exists():
             entries.append(ManifestEntry(relative_path=f"{folder}/run_in_premiere.bat", source_path=launcher))
 
@@ -657,7 +662,19 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
         if music_path is not None:
             _add_source_file(music_path)
 
-        if subtitles_archive_entry is not None:
+        if project.project_mode == "facecam":
+            from .facecam_service import FacecamService
+            state = FacecamService.load(project.id)
+            if not state.prepared or not state.recording or not state.cover:
+                raise ValueError("Le projet Facecam doit être préparé avec son enregistrement et sa couverture.")
+            for path in (cls._collect_baked_subtitle_files(output_dir) + cls._collect_subtitle_timing_files(output_dir)):
+                entries.append(ManifestEntry(relative_path=f"{folder}/subtitles/{path.name}", source_path=path))
+            _add_source_file(Path(state.recording["directory"]) / "facecam.mp4")
+            _add_source_file(FacecamService.directory(project.id) / "anime_reveal.png")
+            original = Path(state.recording["directory"]) / state.recording["original_name"]
+            entries.append(ManifestEntry(relative_path=f"{folder}/recording/{original.name}", source_path=original))
+            entries.append(ManifestEntry(relative_path=f"{folder}/script.txt", inline_content=state.spoken_text().encode("utf-8")))
+        elif subtitles_archive_entry is not None:
             entries.append(subtitles_archive_entry)
 
         raw_scene_subtitle_root = output_dir / "raw_scene_subtitles"
@@ -681,18 +698,71 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
                 mime_type="text/plain",
             )
         )
+        if project.project_mode == "facecam":
+            entries[-1].inline_content = (
+                "PROJET FACECAM\n\n1. Installez l'extension Facecam Import (une seule fois).\n"
+                "2. Extrayez entièrement ce ZIP dans un dossier local.\n"
+                "3. Ouvrez Premiere Pro > Fenêtre > Extensions > Facecam Import.\n"
+                "4. Lancez run_in_premiere.bat, ou choisissez import_project.jsx dans le panneau.\n"
+                "La facecam est au-dessus des images anime, les sous-titres au-dessus. La voix est sur A2.\n"
+                "5. Montez puis exportez un seul MP4 dans le dossier Drive du projet.\n"
+                "6. Cliquez sur « Confirmer montage envoyé » dans Discord.\n"
+            ).encode("utf-8")
+        for entry in entries:
+            if entry.source_path is not None and not entry.source_path.is_file():
+                raise FileNotFoundError(f"Missing package asset: {entry.relative_path}")
+        if project.project_mode == "facecam":
+            cls.validate_facecam_manifest(folder, entries, jsx_path.read_text(encoding="utf-8"))
         return folder, entries
 
     @classmethod
+    def validate_facecam_manifest(cls, folder, entries, jsx):
+        """Check the canonical JSX's generated media references before delivery."""
+        paths = {entry.relative_path.removeprefix(folder + "/") for entry in entries}
+        if any(Path(p).is_absolute() or ".." in Path(p).parts for p in paths):
+            raise ValueError("Le ZIP contient un chemin externe.")
+        source_names = {Path(p).name for p in paths if p.startswith("sources/")}
+        source_stems = {Path(p).stem for p in source_names}
+        references = []
+        scene_start = re.search(r"var scenes\s*=\s*", jsx)
+        if not scene_start:
+            raise ValueError("Le JSX Facecam ne contient aucune scène.")
+        scenes, _ = json.JSONDecoder().raw_decode(jsx[scene_start.end():])
+        references.extend(s["clipName"] for s in scenes)
+        for key in ("MUSIC_FILENAME", "BORDER_IMAGE_FILENAME", "TITLE_OVERLAY_FILENAME", "CATEGORY_OVERLAY_FILENAME"):
+            if key == "BORDER_IMAGE_FILENAME" and "var WHITE_BORDER_ENABLED = false;" in jsx:
+                continue
+            if key == "TITLE_OVERLAY_FILENAME" and "var TITLE_OVERLAY_ENABLED = false;" in jsx:
+                continue
+            if key == "CATEGORY_OVERLAY_FILENAME" and "var CATEGORY_OVERLAY_ENABLED = false;" in jsx:
+                continue
+            match = re.search(r"var " + key + r'\s*=\s*("(?:[^"\\]|\\.)*")', jsx)
+            if match and json.loads(match.group(1)):
+                references.append(json.loads(match.group(1)))
+        references.extend(["facecam.mp4", "anime_reveal.png"])
+        missing = [ref for ref in references if ref not in source_names and ref not in source_stems]
+        required = {"tts_edited.wav", "subtitles/subtitle_timings.srt", "assets/TikTok60fps.sqpreset", "run_in_premiere.bat"}
+        missing.extend(sorted(required - paths))
+        if missing:
+            raise ValueError("Médias manquants dans le ZIP Facecam : " + ", ".join(missing))
+
+    @classmethod
     def build_bundle(cls, project: Project, matches: list[SceneMatch]) -> Path:
-        _, entries = cls.build_manifest(project, matches)
-        bundle_path = ProjectService.get_project_dir(project.id) / "project_bundle.zip"
-        with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        folder, entries = cls.build_manifest(project, matches)
+        bundle_path = ProjectService.get_project_dir(project.id) / (f"{folder}.zip" if project.project_mode == "facecam" else "project_bundle.zip")
+        temporary_path = bundle_path.with_suffix(".zip.partial")
+        with zipfile.ZipFile(temporary_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
             for entry in entries:
                 if entry.source_path is not None:
-                    zf.write(entry.source_path, entry.relative_path)
+                    zf.write(entry.source_path, entry.relative_path, compress_type=zipfile.ZIP_STORED if entry.source_path.suffix.lower() in {".mp4", ".mkv", ".mov", ".mp3"} else zipfile.ZIP_DEFLATED)
                 else:
                     zf.writestr(entry.relative_path, entry.inline_content or b"")
+        if project.project_mode == "facecam":
+            from .facecam_service import FacecamService
+            if FacecamService.load(project.id).processed_signature != FacecamService.processing_signature(project.id):
+                temporary_path.unlink(missing_ok=True)
+                raise ValueError("Le projet a changé pendant l'export. Relancez le traitement.")
+        temporary_path.replace(bundle_path)
         return bundle_path
 
     @classmethod
@@ -766,6 +836,9 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
         are deleted. The folder itself stays on googleapiclient, which owns
         the folder id + webViewLink contract.
         """
+        if project.project_mode == "facecam":
+            from .facecam_delivery_service import FacecamDeliveryService
+            return await FacecamDeliveryService.upload(project, matches, progress_callback)
         if not GoogleDriveService.is_configured():
             raise RuntimeError("Google Drive integration is not configured")
 

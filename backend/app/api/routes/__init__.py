@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from .facecam import router as facecam_router
 from .accounts import router as accounts_router
 from .projects import router as projects_router
 from .startup import router as startup_router
@@ -21,6 +22,7 @@ from .events import router as events_router
 # TEMPORARILY DISABLED - Subtitle video generation feature
 
 api_router = APIRouter(prefix="/api")
+api_router.include_router(facecam_router)
 api_router.include_router(events_router)
 api_router.include_router(accounts_router)
 api_router.include_router(projects_router)

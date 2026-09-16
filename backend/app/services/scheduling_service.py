@@ -653,6 +653,9 @@ class SchedulingService:
         """Enforce duplicated-project rules before persisting reservations."""
         from .project_duplication_service import UploadRestrictionService
 
+        account = AccountService.get_account(account_id)
+        if account and project.publishing_type not in account.supported_types:
+            raise SchedulingError(f"Le compte '{account_id}' n'accepte pas le type '{project.publishing_type}'.")
         UploadRestrictionService.validate_upload(project, account_id, slots)
 
     @classmethod
