@@ -35,6 +35,8 @@ def _normalize(text: str) -> str:
     out = re.sub(r"var SOURCE_FPS_DEN = \d+;", "var SOURCE_FPS_DEN = <SOURCE_FPS_DEN>;", out, count=1)
     out = re.sub(r'var MUSIC_FILENAME = "[^"]*";', 'var MUSIC_FILENAME = "<MUSIC_FILENAME>";', out, count=1)
     out = re.sub(r"var MUSIC_GAIN_DB = -?\d+(?:\.\d+)?;", "var MUSIC_GAIN_DB = <MUSIC_GAIN_DB>;", out, count=1)
+    out = re.sub(r"var VOICE_GAIN_DB = -?\d+(?:\.\d+)?;", "var VOICE_GAIN_DB = <VOICE_GAIN_DB>;", out, count=1)
+    out = re.sub(r"var RAW_AUDIO_EFFECTS = [^\n]+;", "var RAW_AUDIO_EFFECTS = <RAW_AUDIO_EFFECTS>;", out, count=1)
     out = re.sub(
         r'var SUBTITLE_SRT_PATH = ROOT_DIR \+ "[^"]*";',
         'var SUBTITLE_SRT_PATH = ROOT_DIR + "/<SUBTITLE_SRT_PATH>";',

@@ -42,6 +42,7 @@ class FacecamState(BaseModel):
     fact_revision: int | None = None
     fact_status: Literal["unchecked", "complete", "unavailable"] = "unchecked"
     fact_error: str | None = None
+    fact_context: dict[str, Any] | None = None
     findings: list[FacecamFinding] = Field(default_factory=list)
     recording: dict[str, Any] | None = None
     prepared: dict[str, Any] | None = None

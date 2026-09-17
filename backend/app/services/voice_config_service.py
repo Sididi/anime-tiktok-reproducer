@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -24,6 +25,8 @@ class VoiceEntry:
     # when an Automate run finishes generating TTS with this voice. Distinct
     # from voice_settings.speed, which is the ElevenLabs generation parameter.
     default_tts_speed: float | None = None
+    # Premiere clip gain, independent of ElevenLabs generation settings.
+    volume_db: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -184,6 +187,13 @@ class VoiceConfigService:
                         f"{AudioSpeedService.SPEED_MIN} and {AudioSpeedService.SPEED_MAX}"
                     )
 
+            volume_raw = value.get("volume_db", 0.0)
+            if isinstance(volume_raw, bool) or not isinstance(volume_raw, (int, float)):
+                raise ValueError(f"Voice '{key}' volume_db must be numeric")
+            volume_db = float(volume_raw)
+            if not math.isfinite(volume_db) or not -96.0 <= volume_db <= 15.0:
+                raise ValueError(f"Voice '{key}' volume_db must be between -96 and +15 dB")
+
             normalized_key = key.strip()
             voices[normalized_key] = VoiceEntry(
                 key=normalized_key,
@@ -194,6 +204,7 @@ class VoiceConfigService:
                 languages=languages,
                 auto_editor_overrides=auto_editor_overrides,
                 default_tts_speed=default_tts_speed,
+                volume_db=volume_db,
             )
 
         default_key = default_key.strip()

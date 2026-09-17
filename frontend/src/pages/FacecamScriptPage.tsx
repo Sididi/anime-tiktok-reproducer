@@ -108,8 +108,15 @@ export function FacecamScriptPage({project}: {project: Project}) {
       <div className="facecam-editor-layout"><FacecamEditor blocks={state.blocks} findings={visibleFindings} disabled={!!busy} onChange={edit} onFinding={setFinding}/>
         <aside className="facecam-review" aria-label="Vérification des faits"><h3>Vérification des faits</h3>
           {state.fact_status === 'unavailable' ? <p role="alert">Vérification indisponible. {state.fact_error}</p> : state.fact_revision !== state.revision || !saved ? <p>Le texte a changé ou n’a pas encore été vérifié. Relancez la vérification quand vous le souhaitez.</p> : <p>{visibleFindings.length ? `${visibleFindings.length} point(s) à examiner.` : 'Aucune anomalie signalée par la recherche.'} Les corrections restent à votre appréciation.</p>}
+          {state.fact_context && <details className="facecam-evidence-context"><summary>Sous-titres transmis à la vérification</summary><p>Horaires dans les épisodes sources · marge de {state.fact_context.padding_seconds} s. Les dialogues ne permettent pas de vérifier tous les détails visuels.</p>
+            {state.fact_context.episodes.length === 0 && <p>Aucun épisode associé disponible. Vérification web uniquement.</p>}
+            {state.fact_context.episodes.map((episode, i) => <details key={i}><summary>{episode.episode} · {episode.cues.length} réplique(s){episode.language ? ` · ${episode.language}` : ''}</summary>
+              <p>{episode.windows.map(w => `${w.start}–${w.end}`).join(', ')}</p>{episode.note && <p role="note">{episode.note}</p>}
+              <div className="facecam-evidence-cues">{episode.cues.map(c => <p key={c.id}><a href={c.source_url} target="_blank" rel="noreferrer">{c.start}–{c.end}</a><br/>{c.text}</p>)}</div>
+            </details>)}
+          </details>}
           {visibleFindings.map((f, i) => <button key={i} className={`facecam-fact-item ${f.kind}`} onClick={() => setFinding(f)}>{f.kind === 'contradiction' ? 'À corriger' : 'À vérifier'} — {f.quote}</button>)}
-          {finding && <div className="facecam-fact-detail"><strong>{finding.quote}</strong><p>{finding.explanation}</p>{finding.correction && <p><b>Suggestion :</b> {finding.correction}</p>}{finding.sources.map(s => <a key={s.url} href={s.url} target="_blank" rel="noreferrer">{s.title}<ExternalLink size={12}/></a>)}<button onClick={() => setFinding(null)} className="underline mt-3">Fermer</button></div>}
+          {finding && <div className="facecam-fact-detail"><strong>{finding.quote}</strong><p>{finding.explanation}</p>{finding.correction && <p><b>Suggestion :</b> {finding.correction}</p>}{finding.sources.map(s => <div key={s.url}><a href={s.url} target="_blank" rel="noreferrer">{s.title}<ExternalLink size={12}/></a>{s.kind === 'subtitle' && s.text && <blockquote>{s.text}</blockquote>}</div>)}<button onClick={() => setFinding(null)} className="underline mt-3">Fermer</button></div>}
         </aside></div>
     </section>}
     {state.blocks.length > 0 && <section className="facecam-card"><h2>3. Votre enregistrement</h2><p>Lisez uniquement votre narration, sans les extraits audio originaux ni le titre final. Une prise correcte suffit : les silences seront coupés et les extraits réinsérés automatiquement.</p>

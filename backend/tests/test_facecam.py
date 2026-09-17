@@ -124,6 +124,106 @@ def test_fact_checker_fails_closed_and_keeps_evidence(source,monkeypatch):
     assert FacecamService.fact_check(project.id).fact_status=='unavailable'
 
 
+def test_fact_context_preserves_between_shot_dialogue_and_uses_source_timestamps(source, monkeypatch, tmp_path):
+    from app.services.anime_library import AnimeLibraryService, SubtitleSidecarEntry
+    from app.services.facecam_fact_context import FacecamFactContext
+    project, state = draft(source)
+    reference = MatchList(matches=[SceneMatch(scene_index=i, episode=episode, start_time=start,
+        end_time=end, confidence=1, speed_ratio=1) for i, (episode,start,end) in enumerate([
+            ('episode06',120,180), ('episode06',340,360), ('episode07',10,12)])])
+    (FacecamService.directory(project.id)/'reference_matches.json').write_text(reference.model_dump_json())
+    # Approval/montage timings must not replace the immutable original source anchors.
+    ProjectService.save_matches(project.id, MatchList(matches=[]))
+    asset = tmp_path/'dialogue.srt'
+    asset.write_text('1\n00:01:28,000 --> 00:01:31,000\n<i>Frontière</i>\n\n'
+        '2\n00:02:00,000 --> 00:02:03,000\nNaruto est ici.\n\n'
+        '3\n00:04:00,000 --> 00:04:03,000\nEntre les scènes.\n\n'
+        '4\n00:06:29,000 --> 00:06:33,000\nFin du contexte.\n\n'
+        '5\n00:09:00,000 --> 00:09:03,000\nHors contexte.\n', encoding='utf-8')
+    tracks = [SubtitleSidecarEntry(stream_index=i, stream_position=i, codec_name='srt', language=lang,
+        raw_language=lang, title=None, kind='text', asset_filename=asset.name) for i,lang in enumerate(['en','fr'])]
+    monkeypatch.setattr(AnimeLibraryService, 'resolve_episode_path', lambda ep, **k: tmp_path/ep)
+    monkeypatch.setattr(AnimeLibraryService, 'load_subtitle_sidecar_entries', lambda path: tracks if path.name=='episode06' else [])
+    monkeypatch.setattr(AnimeLibraryService, 'get_subtitle_sidecar_asset_path', lambda *a: asset)
+    context = FacecamFactContext.build(project.id)
+    episode = context['episodes'][0]
+    assert episode['language'] == 'fr' and episode['status'] == 'available'
+    assert [(w['start'],w['end']) for w in episode['windows']] == [('00:01:30.000','00:06:30.000')]
+    assert [cue['text'] for cue in episode['cues']] == ['Frontière','Naruto est ici.','Entre les scènes.','Fin du contexte.']
+    assert episode['cues'][0]['start'] == '00:01:28.000'  # Preserve complete cue timestamps, not montage/clipped timing.
+    assert episode['matched_scenes'][0]['original_text'] == 'Naruto est ici.'
+    assert len(context['sources']) == 4
+    assert context['episodes'][1]['status'] == 'unavailable'
+    assert context['episodes'][1]['windows'][0]['start_seconds'] == 0
+    monkeypatch.setattr(FacecamFactContext, 'MAX_CUES', 2)
+    assert FacecamFactContext.build(project.id)['episodes'][0]['status'] == 'partial'
+
+
+def test_fact_checker_passes_episode_evidence_to_both_stages_and_serves_citations(source, monkeypatch):
+    import asyncio
+    from fastapi import HTTPException
+    from app.api.routes.facecam import fact_evidence
+    from app.services.facecam_fact_context import FacecamFactContext
+    from app.services.openrouter_service import OpenRouterService
+    project, state = draft(source)
+    subtitle = {'id':'cue1','url':f'/api/projects/{project.id}/facecam/fact-evidence/cue1',
+        'title':'Épisode 06 · 00:02:10.000–00:02:12.000','kind':'subtitle','text':'Naruto est ici.','language':'fr'}
+    context = {'padding_seconds':30,'episodes':[{'episode':'episode06','cues':[{'text':'Naruto est ici.'}]}],'sources':[subtitle]}
+    monkeypatch.setattr(FacecamFactContext,'build',lambda *a:context)
+    prompts = []
+    def research(prompt, **kwargs):
+        prompts.append(prompt)
+        return {'text':'Evidence','sources':[{'url':'https://official.example','title':'Official'}]}
+    def annotate(pid,prompt):
+        prompts.append(prompt)
+        return {'findings':[{'quote':'Naruto','kind':'contradiction','explanation':'Voir le dialogue.',
+            'source_urls':[subtitle['url'],'/api/invented']} ]}
+    monkeypatch.setattr(OpenRouterService,'research',research)
+    monkeypatch.setattr(FacecamService,'llm',annotate)
+    checked=FacecamService.fact_check(project.id)
+    assert checked.fact_context == context and checked.fact_revision==state.revision
+    assert checked.findings[0].sources == [subtitle]
+    assert all('episode06' in p and 'Naruto est ici.' in p and 'détail purement visuel' in p for p in prompts)
+    response=asyncio.run(fact_evidence(project.id,'cue1'))
+    assert 'Naruto est ici.' in response.body.decode() and '00:02:10.000' in response.body.decode()
+    with pytest.raises(HTTPException): asyncio.run(fact_evidence(project.id,'unknown'))
+
+
+def test_cover_alias_lookup_deduplicates_and_refuses_ambiguity(source, monkeypatch):
+    from app.services.facecam_cover_service import FacecamCoverService
+    import app.services.facecam_cover_service as covers
+    project,_=draft(source)
+    project.anime_name='Kill Ao (Kill Blue)'
+    ProjectService.save(project)
+    media={'id':198113,'title':{'romaji':'Kill Ao','english':'KILL BLUE','native':'キルアオ'},'synonyms':[]}
+    season2={'id':213628,'title':{'romaji':'Kill Ao 2nd Season','english':None},'synonyms':[]}
+    queries=[]
+    class Client:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self,*args): pass
+        def post(self,url,json):
+            queries.append(json['variables']['search'])
+            data=[] if queries[-1]=='Kill Ao (Kill Blue)' else [media,season2]
+            return SimpleNamespace(raise_for_status=lambda:None,json=lambda:{'data':{'Page':{'media':data}}})
+    monkeypatch.setattr(covers.httpx,'Client',Client)
+    results=FacecamCoverService.search(project.id)
+    assert queries==['Kill Ao (Kill Blue)','Kill Ao','Kill Blue']
+    assert results==[media,season2]
+    assert FacecamCoverService.exact_matches(project.anime_name,results)==[media]
+    monkeypatch.setattr(FacecamCoverService,'search',lambda *a:[media,{**media,'id':2}])
+    with pytest.raises(ValueError,match='Choisissez'): FacecamCoverService.ensure(project.id)
+    selected=[]
+    monkeypatch.setattr(FacecamCoverService,'search',lambda *a:results)
+    monkeypatch.setattr(FacecamCoverService,'select',lambda pid,mid:selected.append(mid))
+    monkeypatch.setattr(FacecamCoverService,'render',lambda pid:'cached-cover')
+    assert FacecamCoverService.ensure(project.id)=='cached-cover' and selected==[198113]
+    cached=FacecamService.directory(project.id)/'cover.jpg'
+    cached.write_bytes(b'cached')
+    FacecamService.update(project.id,{'cover':{'path':str(cached)}})
+    assert FacecamCoverService.ensure(project.id)=='cached-cover' and selected==[198113]
+
+
 def test_comparison_ignores_case_and_punctuation_but_exposes_meaningful_changes():
     assert compare_words('Naruto, le ninja !','NARUTO le ninja.') == []
     assert compare_words('Naruto devient un ninja','Naruto est un grand ninja') == [

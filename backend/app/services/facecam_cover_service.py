@@ -13,14 +13,35 @@ from .facecam_service import FacecamService
 
 
 class FacecamCoverService:
+    @staticmethod
+    def title_queries(title: str) -> list[str]:
+        """Library titles can contain both a romanized title and an English alias."""
+        aliases = [title, re.sub(r"\([^()]*\)", "", title).strip(), *re.findall(r"\(([^()]+)\)", title)]
+        return list(dict.fromkeys(alias.strip() for alias in aliases if alias.strip()))[:4]
+
+    @staticmethod
+    def normalize_title(title: str) -> str:
+        return re.sub(r"\W", "", (title or "").casefold())
+
+    @classmethod
+    def exact_matches(cls, title: str, results: list[dict]) -> list[dict]:
+        titles = {cls.normalize_title(value) for value in cls.title_queries(title)}
+        return [media for media in results if titles.intersection(
+            cls.normalize_title(value) for value in [*media["title"].values(), *media.get("synonyms", [])] if value
+        )]
+
     @classmethod
     def search(cls, project_id):
         project = FacecamService.project(project_id)
-        query = '''query($search:String){Page(perPage:8){media(search:$search,type:ANIME){id title{romaji english native} coverImage{extraLarge} siteUrl}}}'''
+        query = '''query($search:String){Page(perPage:8){media(search:$search,type:ANIME){id title{romaji english native} synonyms coverImage{extraLarge} siteUrl}}}'''
+        results = {}
         with httpx.Client(timeout=30) as client:
-            response = client.post("https://graphql.anilist.co", json={"query": query, "variables": {"search": project.anime_name}})
-            response.raise_for_status()
-            return response.json()["data"]["Page"]["media"]
+            for title in cls.title_queries(project.anime_name or ""):
+                response = client.post("https://graphql.anilist.co", json={"query": query, "variables": {"search": title}})
+                response.raise_for_status()
+                for media in response.json()["data"]["Page"]["media"]:
+                    results[media["id"]] = media
+        return list(results.values())
 
     @classmethod
     def select(cls, project_id, media_id):
@@ -58,9 +79,7 @@ class FacecamCoverService:
         if state.cover and Path(state.cover["path"]).is_file():
             return cls.render(project_id)
         results = cls.search(project_id)
-        normalize = lambda s: re.sub(r"\W", "", (s or "").casefold())
-        title = normalize(FacecamService.project(project_id).anime_name)
-        exact = [m for m in results if title in [normalize(t) for t in m["title"].values() if t]]
+        exact = cls.exact_matches(FacecamService.project(project_id).anime_name or "", results)
         if len(exact) != 1:
             raise ValueError("Choisissez la bonne couverture dans Facecam, ou importez une image, puis relancez le traitement.")
         cls.select(project_id, exact[0]["id"])

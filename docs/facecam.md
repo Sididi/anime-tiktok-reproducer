@@ -8,9 +8,13 @@ Choose/edit one of eight hooks and eight opinions, generate, edit the full scrip
 
 `facecam/state.json` stores revisioned drafts, choices, research citations, approvals, word assignments, recording hashes, the silence-cut map, alignment references, preview identity, and VPS delivery status. `facecam/reference*.json` retain the original script and matches even when approval creates extra hook/outro pipeline scenes. Research runs automatically after generation and otherwise only on request. Contradictions and uncertainty are advisory. Edited revisions lose stale annotations; failed research never counts as a successful check.
 
+Fact checks also receive the actual library subtitle dialogue from the first to the last original matched scene in each episode, padded by 30 seconds on both sides. Dialogue between selected shots is retained: scenes between 02:00 and 06:00 supply subtitles from 01:30 to 06:30. One text track is selected (French preferred, then English, then another available language). Episode names, source timestamps, original scene anchors, and complete overlapping cues go to both research and annotation steps. The panel exposes this snapshot and allows findings to cite individual dialogue excerpts. Missing/image-only subtitles and context-budget limits are disclosed. Dialogue is not proof of an unseen visual detail, and absence from an excerpt is not treated as a contradiction. Existing drafts are not automatically rechecked after this upgrade.
+
 One frame-quantized cut map drives both silent camera clips and narration. Original-dialogue gaps are inserted into this common timeline. Human speech is neither sped up nor passed through the TTS voice alteration stage. Replacing the recording or editing narration invalidates dependent results. Changing music requires a new mixed preview. Processing/export verifies the current revision and settings.
 
 The AniList identity and cover remain under `facecam/`, outside `output/`. Ambiguous searches require a selection or uploaded image. The final card is 1080×1920 with a readable title, occupies V3 for 60 frames at 60 fps, and follows all camera/narration clips.
+
+Cover lookup searches parenthesized aliases as well as the full library title (for example `Kill Ao (Kill Blue)`), deduplicates AniList identities, and auto-selects only one exact title/synonym match. Processing preflight errors display the server's corrective message and a route back to Facecam.
 
 ## Editor delivery
 

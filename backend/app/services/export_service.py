@@ -309,6 +309,7 @@ class ExportService:
         assets: list[str] = [
             "TikTok60fps.sqpreset",
             "ATR Proxy H264.epr",
+            "Raw Scene Audio.prfpset",
             template.background.prfpset,
             template.foreground.prfpset,
         ]

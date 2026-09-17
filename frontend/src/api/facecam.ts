@@ -1,11 +1,12 @@
 import type { Project } from '@/types';
 
 export interface FacecamBlock { id: string; kind: 'hook' | 'body' | 'raw' | 'opinion' | 'ending'; text: string; scene_indices: number[] }
-export interface Finding { quote: string; start: number; end: number; kind: 'contradiction' | 'uncertain'; explanation: string; correction: string; sources: {url: string; title: string}[] }
+export interface Finding { quote: string; start: number; end: number; kind: 'contradiction' | 'uncertain'; explanation: string; correction: string; sources: {url: string; title: string; kind?: string; text?: string; language?: string}[] }
 export interface FacecamState {
   revision: number; hooks: {id: string; text: string; original: boolean}[]; opinions: {id: string; text: string; original: boolean}[];
   selected_hook: string; selected_opinion: string; blocks: FacecamBlock[]; approved_revision: number | null;
   fact_revision: number | null; fact_status: 'unchecked' | 'complete' | 'unavailable'; fact_error: string | null; findings: Finding[];
+  fact_context?: {padding_seconds: number; episodes: {episode: string; status: 'available' | 'partial' | 'unavailable'; language: string | null; note: string | null; windows: {start: string; end: string}[]; cues: {id: string; start: string; end: string; text: string; source_url: string}[]}[]} | null;
   recording: {fingerprint: string; duration: number; transcript: string; differences: {kind: string; expected: string; spoken: string}[]; reviewed_revision: number | null} | null;
   prepared: {revision: number; fingerprint: string; preview_music_key?: string | null; preview_version?: string} | null; cover: {anilist_id?: number; manual?: boolean} | null;
   job: {status: string; step?: string; message?: string; error?: string} | null;

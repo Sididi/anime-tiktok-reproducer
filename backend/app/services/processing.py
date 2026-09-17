@@ -1313,8 +1313,11 @@ class ProcessingService:
             state = FacecamService.load(project.id)
             facecam = {"camera_segments": state.prepared["camera_segments"], "cover_start": state.prepared["cover_start"], "filename": "facecam.mp4", "cover": "anime_reveal.png",
                 "scale": (state.recording or {}).get("scale", 100)}
+        voice_key = project.resolved_voice_key()
+        voice_gain_db = VoiceConfigService.get_voice(voice_key).volume_db if voice_key else 0.0
         return cls._render_jsx_from_template(
             facecam=facecam,
+            voice_gain_db=voice_gain_db,
             project_id=project.id,
             scenes=scenes,
             source_audio_policies=source_audio_policies or {},
@@ -1642,6 +1645,7 @@ class ProcessingService:
         raw_scene_subtitle_mogrt_relative_dir: str,
         music_filename: str,
         music_gain_db: float,
+        voice_gain_db: float = 0.0,
         music_copyright: bool = False,
         template,  # type: ignore[no-untyped-def]
         overlay_title_enabled: bool,
@@ -1655,6 +1659,21 @@ class ProcessingService:
 
         content = template_path.read_text(encoding="utf-8")
         content = content.replace("var FACECAM = null;", "var FACECAM = " + json.dumps(facecam, ensure_ascii=True) + ";", 1)
+        from ..config import PROJECT_ROOT
+        from .premiere_audio import RAW_AUDIO_PRESET, load_raw_audio_effects
+
+        raw_audio_effects = (
+            load_raw_audio_effects(PROJECT_ROOT / "assets" / RAW_AUDIO_PRESET)
+            if any(scene.get("is_raw") for scene in scenes) else []
+        )
+        # Lambda avoids interpreting JSON's Unicode/backslash escapes as regex replacements.
+        content, replacements = re.subn(
+            r"var RAW_AUDIO_EFFECTS = \[\];",
+            lambda _: "var RAW_AUDIO_EFFECTS = " + json.dumps(raw_audio_effects, ensure_ascii=True) + ";",
+            content, count=1,
+        )
+        if replacements != 1:
+            raise RuntimeError("Failed to patch JSX template section: RAW_AUDIO_EFFECTS")
 
         # Apply template-driven substitutions before dynamic ones.
         # Background prfpset name.
@@ -1811,6 +1830,14 @@ class ProcessingService:
             label="MUSIC_GAIN_DB",
         )
         needs_no_music_export = 1 if (music_filename and music_copyright) else 0
+        if not math.isfinite(voice_gain_db) or not -96.0 <= voice_gain_db <= 15.0:
+            raise ValueError("Voice gain must be between -96 and +15 dB")
+        content = cls._replace_template_once(
+            content,
+            r"var VOICE_GAIN_DB = -?\d+(?:\.\d+)?;",
+            f"var VOICE_GAIN_DB = {float(voice_gain_db)};",
+            label="VOICE_GAIN_DB",
+        )
         content = cls._replace_template_once(
             content,
             r"var ATR_NEEDS_NO_MUSIC_EXPORT = \d;",

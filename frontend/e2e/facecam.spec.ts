@@ -61,6 +61,36 @@ test('candidate modal has eight choices per step and editable original hook',asy
   await expect(modal.locator('textarea')).toHaveValue('Ma version de l’accroche.');
 });
 
+test('processing shows the backend correction and a return to Facecam',async({page})=>{
+  await fixture(page);
+  const detail='Choisissez la bonne couverture dans Facecam, ou importez une image, puis relancez le traitement.';
+  await page.route('**/api/projects/facecam-browser/process',route=>route.fulfill({status:400,json:{detail}}));
+  await page.goto('/project/facecam-browser/processing');
+  await expect(page.getByText(detail,{exact:true})).toBeVisible();
+  await expect(page.getByText('SSE request failed with status 400',{exact:true})).toHaveCount(0);
+  await page.getByRole('button',{name:'Retour à Facecam',exact:true}).click();
+  await expect(page).toHaveURL(/\/project\/facecam-browser\/script$/);
+});
+
+test('fact review shows episode timestamps, unavailable subtitles, and cited dialogue',async({page})=>{
+  const f=await fixture(page);
+  const url='/api/projects/facecam-browser/facecam/fact-evidence/cue1';
+  f.state.fact_context={padding_seconds:30,episodes:[
+    {episode:'Episode 06',status:'available',language:'fr',note:null,windows:[{start:'00:01:30.000',end:'00:06:30.000'}],
+      cues:[{id:'cue1',start:'00:02:00.000',end:'00:02:03.000',text:'Naruto est ici.',source_url:url}]},
+    {episode:'Episode 07',status:'unavailable',language:null,note:'Aucun sous-titre textuel disponible.',windows:[],cues:[]}]};
+  f.state.findings[0].sources=[{url,title:'Episode 06 · 00:02:00.000–00:02:03.000',kind:'subtitle',text:'Naruto est ici.'}];
+  await page.reload();
+  await page.getByText('Sous-titres transmis à la vérification',{exact:true}).click();
+  await page.locator('summary').filter({hasText:'Episode 06'}).click();
+  await expect(page.getByText('00:01:30.000–00:06:30.000',{exact:true})).toBeVisible();
+  await expect(page.getByRole('link',{name:'00:02:00.000–00:02:03.000',exact:true})).toHaveAttribute('href',url);
+  await page.locator('summary').filter({hasText:'Episode 07'}).click();
+  await expect(page.getByText('Aucun sous-titre textuel disponible.',{exact:true})).toBeVisible();
+  await page.locator('.facecam-finding').click();
+  await expect(page.locator('.facecam-fact-detail blockquote')).toHaveText('Naruto est ici.');
+});
+
 test('ordinary anime creation needs only confirmation and opens an independent tab',async({page})=>{
   let creations=0;
   page.on('pageerror', error => {throw error;});

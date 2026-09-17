@@ -603,6 +603,7 @@ export function ProcessingPage() {
                 Retry
               </Button>
             )}
+            {isFacecam && <Button variant="outline" size="sm" className="mt-2 ml-2" onClick={() => navigate(`/project/${projectId}/script`)}>Retour à Facecam</Button>}
           </div>
         )}
 

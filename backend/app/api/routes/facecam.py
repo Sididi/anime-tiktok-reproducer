@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ...models.facecam import ScriptBlock
@@ -117,6 +117,15 @@ async def generate(project_id: str, request: ActionRequest):
 @router.post("/{project_id}/facecam/fact-check")
 async def fact_check(project_id: str):
     return await _job(project_id, "Vérification des faits", FacecamService.fact_check)
+
+
+@router.get("/{project_id}/facecam/fact-evidence/{source_id}")
+async def fact_evidence(project_id: str, source_id: str):
+    state = _state(project_id)
+    for source in (state.fact_context or {}).get("sources", []):
+        if source.get("id") == source_id:
+            return PlainTextResponse(f"{source['title']}\nLangue : {source['language']}\n\n{source['text']}")
+    raise HTTPException(404, "Cet extrait n'est plus disponible dans la vérification actuelle.")
 
 
 @router.post("/{project_id}/facecam/approve")

@@ -21,7 +21,19 @@ export async function readSSEStream<T extends { status?: string; error?: string 
   signalOrOptions?: AbortSignal | ReadSSEStreamOptions<T>,
 ): Promise<T | null> {
   if (!response.ok) {
-    throw new Error(`SSE request failed with status ${response.status}`);
+    let message = `SSE request failed with status ${response.status}`;
+    try {
+      const payload = await response.json();
+      const detail = payload.detail ?? payload.error ?? payload.message;
+      if (typeof detail === 'string' && detail.trim()) message = detail;
+      else if (Array.isArray(detail)) {
+        const errors = detail.map(item => item?.msg).filter((msg): msg is string => typeof msg === 'string');
+        if (errors.length) message = errors.join('; ');
+      }
+    } catch {
+      // Proxy/network errors may return HTML or an empty body.
+    }
+    throw new Error(message);
   }
 
   const reader = response.body?.getReader();

@@ -28,6 +28,8 @@
   var PROJECT_ID = "project_id";
   var BATCH_SEQUENCE_NAME = "ATR_BATCH__project_id";
   var MUSIC_GAIN_DB = -23.0;
+  var VOICE_GAIN_DB = 0.0;
+  var RAW_AUDIO_EFFECTS = [];
   // Panel-only metadata (not used by this script): 0 tells the CEP panel the
   // no-music WAV export is unnecessary (music absent or not copyrighted).
   var ATR_NEEDS_NO_MUSIC_EXPORT = 1;
@@ -747,7 +749,6 @@
   var PERF_PROFILE_ENABLED = true;
   var PERF_LOG_EACH_SUBTITLE_BATCH = 50;
   var MUTATE_TRANSIENT_A2_SCENE_AUDIO = false;
-  var AUDIO_GAIN_RAW_REFERENCE_AT_0DB = null;
   var AUDIO_GAIN_RAW_FALLBACK_AT_0DB = 0.1778279410038923;
   var SETVALUE_UPDATE_UI = false;
   var QE_EFFECT_VERIFY_SAMPLE_CLIPS = 3;
@@ -2686,6 +2687,7 @@
 
     var seqName = BATCH_SEQUENCE_NAME;
     deleteSequenceByName(seqName);
+    deleteSequenceByName("ATR_RAW_AUDIO__" + PROJECT_ID);
     var presetFile = new File(SEQUENCE_PRESET_PATH);
     var sequence;
 
@@ -3061,6 +3063,10 @@
       return;
     }
     ttsEndSec = snapSecondsToFrame(ttsEndSec);
+    if (!applyTrackItemGainDb(ttsTrackItem, VOICE_GAIN_DB)) {
+      throw new Error("Could not verify narration gain of " + VOICE_GAIN_DB + " dB on A2.");
+    }
+    log("Narration gain verified on A2: " + VOICE_GAIN_DB + " dB.");
 
     var sequenceEndSec = ttsEndSec;
     if (FACECAM) sequenceEndSec = FACECAM.cover_start + 1;
@@ -3079,6 +3085,12 @@
       qeSeq,
       qeTrackCache,
     );
+    levelRawSceneAudio(sequence, scenes, sequenceEndSec);
+    // Nest creation changes the active sequence. Never retain QE handles across it.
+    qeSeq = qe.project.getActiveSequence();
+    qeTrackCache = {};
+    QE_TRACK_RESOLVE_CACHE = {};
+    QE_TRACK_ITEM_HINTS = {};
 
     if (OVERLAY_ENABLED) {
       log("Adding overlays on V5/V6 until " + sequenceEndSec + "s...");
@@ -7017,6 +7029,281 @@
     }
   }
 
+  // Raw audio is mixed by a stereo subsequence before clip effects are applied.
+  // The original source clips remain editable inside ATR_RAW_AUDIO__<project>.
+  function rawAudioIntervals(sceneList) {
+    var intervals = [];
+    for (var i = 0; i < sceneList.length; i++) {
+      var s = sceneList[i];
+      if (!s.is_raw) continue;
+      var start = snapSecondsToFrame(s.start);
+      var end = snapSecondsToFrame(s.end);
+      if (!isFinite(start) || !isFinite(end) || start < 0 || end <= start) {
+        throw new Error("Invalid raw audio bounds for scene " + s.scene_index);
+      }
+      intervals.push({ start: start, end: end });
+    }
+    intervals.sort(function (a, b) { return a.start - b.start; });
+    var merged = [];
+    for (var j = 0; j < intervals.length; j++) {
+      var last = merged.length ? merged[merged.length - 1] : null;
+      if (last && intervals[j].start <= last.end + 0.5 / SEQ_FPS) {
+        last.end = Math.max(last.end, intervals[j].end);
+      } else {
+        merged.push(intervals[j]);
+      }
+    }
+    return merged;
+  }
+
+  function rawAudioClipSignature(clip) {
+    if (!clip || !clip.projectItem) throw new Error("Raw audio has no source item");
+    return [clip.projectItem.nodeId, clip.start.ticks, clip.end.ticks,
+      clip.inPoint.ticks, clip.outPoint.ticks].join("|");
+  }
+
+  function rawAudioSignatures(sequence, trackIndexes) {
+    var signatures = [];
+    for (var t = 0; t < trackIndexes.length; t++) {
+      var track = sequence.audioTracks[trackIndexes[t]];
+      if (!track) throw new Error("Missing raw audio track A" + (trackIndexes[t] + 1));
+      for (var c = 0; c < track.clips.numItems; c++) {
+        signatures.push(rawAudioClipSignature(track.clips[c]));
+      }
+    }
+    signatures.sort();
+    return signatures.join("\n");
+  }
+
+  function createRawAudioNest(sequence, trackIndexes, endSec) {
+    var expected = rawAudioSignatures(sequence, trackIndexes);
+    if (!expected) throw new Error("Raw scenes have no retained audio clips");
+    var targets = [];
+    var oldIn = sequence.getInPoint();
+    var oldOut = sequence.getOutPoint();
+    var nest = null;
+    try {
+      // Adobe createSubsequence(false) respects track targeting, not selection.
+      var groups = [sequence.videoTracks, sequence.audioTracks];
+      for (var g = 0; g < groups.length; g++) {
+        for (var t = 0; t < groups[g].numTracks; t++) {
+          var track = groups[g][t];
+          targets.push({ track: track, targeted: track.isTargeted() });
+          var include = false;
+          for (var index = 0; index < trackIndexes.length; index++) {
+            if (g === 1 && t === trackIndexes[index]) include = true;
+          }
+          track.setTargeted(include, true);
+        }
+      }
+      sequence.setInPoint(0);
+      sequence.setOutPoint(endSec);
+      nest = sequence.createSubsequence(false);
+      if (!nest || nest.sequenceID === sequence.sequenceID) {
+        throw new Error("Premiere could not create the raw audio subsequence");
+      }
+      nest.name = "ATR_RAW_AUDIO__" + PROJECT_ID;
+      moveItemToProjectBin(nest.projectItem);
+      var settings = nest.getSettings();
+      if (Number(settings.audioChannelType) !== 1 || Number(settings.audioChannelCount) !== 2) {
+        throw new Error("Raw audio nest must have a stereo master (2 channels)");
+      }
+      for (var v = 0; v < nest.videoTracks.numTracks; v++) {
+        if (nest.videoTracks[v].clips.numItems) {
+          throw new Error("Premiere included video in the raw audio nest");
+        }
+      }
+      var nestTrackIndexes = [];
+      for (var ni = 0; ni < nest.audioTracks.numTracks; ni++) nestTrackIndexes.push(ni);
+      if (rawAudioSignatures(nest, nestTrackIndexes) !== expected) {
+        throw new Error("Raw audio nest differs from the retained sources/timing; import stopped");
+      }
+      for (var a = 0; a < nest.audioTracks.numTracks; a++) {
+        nest.audioTracks[a].setMute(0);
+      }
+      return nest;
+    } finally {
+      sequence.setInPoint(Number(oldIn));
+      sequence.setOutPoint(Number(oldOut));
+      for (var k = 0; k < targets.length; k++) {
+        targets[k].track.setTargeted(targets[k].targeted, true);
+      }
+      app.project.openSequence(sequence.sequenceID);
+    }
+  }
+
+  function findRawAudioEffectComponent(clip, spec) {
+    for (var i = 0; i < clip.components.numItems; i++) {
+      var component = clip.components[i];
+      if (String(component.matchName).toLowerCase() === spec.matchName.toLowerCase()) {
+        return component;
+      }
+      for (var n = 0; n < spec.names.length; n++) {
+        if (component.displayName === spec.names[n]) return component;
+      }
+    }
+    return null;
+  }
+
+  function resolveRawAudioEffect(spec) {
+    var names = [spec.matchName].concat(spec.names);
+    for (var i = 0; i < names.length; i++) {
+      try {
+        var effect = qe.project.getAudioEffectByName(names[i]);
+        if (effect) return effect;
+      } catch (eLookup) {}
+    }
+    throw new Error("Premiere audio effect unavailable: " + spec.names[0]);
+  }
+
+  function writeRawAudioEffectParameters(component, spec) {
+    var properties = component.properties;
+    if (!properties || properties.numItems !== spec.params.length) {
+      throw new Error("Unexpected property layout for " + spec.names[0] +
+        " (expected " + spec.params.length + ", got " +
+        (properties ? properties.numItems : "none") + ")");
+    }
+    for (var i = 0; i < spec.params.length; i++) {
+      var param = spec.params[i];
+      // The preset and runtime component share parameter indices. Prefer a
+      // localized name match; exact property count guards the index fallback.
+      var prop = properties[param.index];
+      for (var p = 0; p < properties.numItems; p++) {
+        if (properties[p].displayName === param.name) { prop = properties[p]; break; }
+      }
+      if (prop.isTimeVarying && prop.isTimeVarying()) prop.setTimeVarying(false);
+      if (!setPropertyValueFast(prop, param.value)) {
+        throw new Error("Cannot set " + spec.names[0] + ": " + param.name);
+      }
+      var actual = Number(prop.getValue());
+      if (!isFinite(actual) || Math.abs(actual - Number(param.value)) > 0.00001) {
+        throw new Error("Audio effect rejected " + param.name + ": requested " +
+          param.value + ", read back " + actual);
+      }
+    }
+  }
+
+  function applyRawAudioEffects(sequence, trackIndex, clip, effects) {
+    for (var e = 0; e < RAW_AUDIO_EFFECTS.length; e++) {
+      var spec = RAW_AUDIO_EFFECTS[e];
+      // QE references can become invalid after any effect insertion; reacquire.
+      var qeTrack = qe.project.getActiveSequence().getAudioTrackAt(trackIndex);
+      var qeClip = null;
+      for (var i = 0; i < qeTrack.numItems; i++) {
+        var candidate = qeTrack.getItemAt(i);
+        var ticks = getQEItemStartTicks(candidate);
+        if (candidate && candidate.addAudioEffect && ticks !== null &&
+            Math.abs(ticks - Number(clip.start.ticks)) < secondsToTicks(0.5 / SEQ_FPS) &&
+            candidate.name === clip.name) {
+          qeClip = candidate;
+          break;
+        }
+      }
+      if (!qeClip) throw new Error("Could not resolve nested raw audio in QE at " + clip.start.seconds);
+      var before = clip.components.numItems;
+      qeClip.addAudioEffect(effects[e]);
+      var component = null;
+      for (var wait = 0; wait <= 1000; wait += 25) {
+        component = findRawAudioEffectComponent(clip, spec);
+        if (component && clip.components.numItems === before + 1) break;
+        $.sleep(25);
+      }
+      if (!component || clip.components.numItems !== before + 1) {
+        throw new Error("Premiere did not add " + spec.names[0] + " to nested raw audio");
+      }
+      writeRawAudioEffectParameters(component, spec);
+    }
+  }
+
+  function retainedRawAudioTracks(sequence) {
+    var indexes = [];
+    // repairRawAudioPlacement may leave a 5.1 block beyond the reserved zone
+    // when QE cannot move it. Follow the actual retained subclips, not A4 alone.
+    for (var t = RAW_AUDIO_TRACK_START_INDEX; t < sequence.audioTracks.numTracks; t++) {
+      var clips = sequence.audioTracks[t].clips;
+      var rawCount = 0;
+      for (var c = 0; c < clips.numItems; c++) {
+        var name = clips[c].projectItem ? String(clips[c].projectItem.name) : "";
+        if (name.indexOf(RAW_AUDIO_SUBCLIP_PREFIX) === 0) rawCount++;
+      }
+      if (clips.numItems && rawCount !== clips.numItems) {
+        throw new Error("Raw audio area A" + (t + 1) + " contains unrelated audio");
+      }
+      if (rawCount) {
+        indexes.push(t);
+      }
+    }
+    return indexes;
+  }
+
+  function levelRawSceneAudio(sequence, sceneList, endSec) {
+    var intervals = rawAudioIntervals(sceneList);
+    if (!intervals.length) return;
+    if (RAW_AUDIO_EFFECTS.length !== 2) throw new Error("Missing compiled Raw Scene Audio preset");
+    var effects = [];
+    for (var e = 0; e < RAW_AUDIO_EFFECTS.length; e++) effects.push(resolveRawAudioEffect(RAW_AUDIO_EFFECTS[e]));
+    var rawTracks = retainedRawAudioTracks(sequence);
+    // Check each raw scene before replacing any clips. Placement failures must
+    // not turn into a successful import containing silent raw scenes.
+    for (var s = 0; s < sceneList.length; s++) {
+      if (!sceneList[s].is_raw) continue;
+      var found = false;
+      for (var rt = 0; rt < rawTracks.length; rt++) {
+        var rawClip = findTrackItemAtStart(sequence.audioTracks[rawTracks[rt]],
+          snapSecondsToFrame(sceneList[s].start), buildRawAudioSubclipName(sceneList[s]));
+        if (rawClip) {
+          if (getTrackItemEndSeconds(rawClip) < snapSecondsToFrame(sceneList[s].end) - 0.5 / SEQ_FPS) {
+            throw new Error("Truncated raw audio channel for scene " + sceneList[s].scene_index);
+          }
+          found = true;
+        }
+      }
+      if (!found) {
+        throw new Error("Incomplete retained raw audio for scene " + sceneList[s].scene_index);
+      }
+    }
+    var nest = createRawAudioNest(sequence, rawTracks, endSec);
+    // The validated nest now owns an editable copy of every original clip.
+    // If Premiere rejects any subsequent operation, throw so the panel cannot
+    // export an incomplete mix. The original audio remains available in nest.
+    try {
+      for (var t = 0; t < rawTracks.length; t++) {
+        clearTrackClips(sequence.audioTracks[rawTracks[t]]);
+        if (sequence.audioTracks[rawTracks[t]].clips.numItems) throw new Error("Could not clear original raw audio track A" + (rawTracks[t] + 1));
+      }
+      var outputTrack = sequence.audioTracks[RAW_AUDIO_TRACK_START_INDEX];
+      outputTrack.setMute(0);
+      for (var r = 0; r < intervals.length; r++) {
+        var span = intervals[r];
+        nest.projectItem.setInPoint(span.start, 2);
+        nest.projectItem.setOutPoint(span.end, 2);
+        outputTrack.overwriteClip(nest.projectItem, span.start);
+        var clip = resolvePlacedItemFast(outputTrack, span.start, nest.name, TRACK_ITEM_WAIT_MAX_MS);
+        if (!clip || !clip.projectItem || clip.projectItem.nodeId !== nest.projectItem.nodeId) {
+          throw new Error("Premiere inserted source clips instead of a nest; enable inserting sequences as nests");
+        }
+        if (Math.abs(clip.inPoint.seconds - span.start) > 0.5 / SEQ_FPS ||
+            Math.abs(clip.start.seconds - span.start) > 0.5 / SEQ_FPS ||
+            !setTrackItemEndSeconds(clip, span.end)) {
+          throw new Error("Nested raw audio timing mismatch at " + span.start);
+        }
+        if (!applyTrackItemGainDb(clip, 0)) throw new Error("Could not set nested audio to unity gain");
+        applyRawAudioEffects(sequence, RAW_AUDIO_TRACK_START_INDEX, clip, effects);
+      }
+      if (outputTrack.clips.numItems !== intervals.length) throw new Error("Unexpected nested raw audio clip count");
+      for (var extra = RAW_AUDIO_TRACK_START_INDEX + 1; extra < sequence.audioTracks.numTracks; extra++) {
+        if (sequence.audioTracks[extra].clips.numItems) throw new Error("Nested audio spilled across multiple output tracks");
+      }
+      log("Raw audio: " + intervals.length + " stereo region(s), Dynamics Processing then Hard Limiter verified. Originals: " + nest.name);
+    } catch (err) {
+      throw new Error("Raw audio leveling failed: " + err + ". Original clips retained in " + nest.name);
+    } finally {
+      nest.projectItem.clearInPoint();
+      nest.projectItem.clearOutPoint();
+      app.project.openSequence(sequence.sequenceID);
+    }
+  }
+
   function scoreAudioGainProperty(prop) {
     if (!prop) return -1;
     var propName = prop.displayName
@@ -7078,7 +7365,7 @@
     }
     if (!volumeComponent || !volumeComponent.properties) {
       log(
-        "Warning: Music gain skipped for '" +
+        "Warning: Audio gain skipped for '" +
           itemName +
           "' (no Volume component).",
       );
@@ -7099,42 +7386,28 @@
 
     if (!targetProp || targetScore < 0) {
       log(
-        "Warning: Music gain skipped for '" +
+        "Warning: Audio gain skipped for '" +
           itemName +
           "' (no safe Level/Gain property found).",
       );
       return false;
     }
 
-    var refRaw = AUDIO_GAIN_RAW_REFERENCE_AT_0DB;
-    if (!(typeof refRaw === "number" && isFinite(refRaw) && refRaw > 0)) {
-      try {
-        if (targetProp.getValue) {
-          var rawCandidate = targetProp.getValue();
-          if (typeof rawCandidate === "string") {
-            rawCandidate = parseFloat(rawCandidate);
-          }
-          if (
-            typeof rawCandidate === "number" &&
-            isFinite(rawCandidate) &&
-            rawCandidate > 0
-          ) {
-            refRaw = rawCandidate;
-          }
-        }
-      } catch (eRefRead) {}
-    }
-    if (!(typeof refRaw === "number" && isFinite(refRaw) && refRaw > 0)) {
-      refRaw = AUDIO_GAIN_RAW_FALLBACK_AT_0DB;
-    }
-    AUDIO_GAIN_RAW_REFERENCE_AT_0DB = refRaw;
+    // Premiere's normalized clip Volume: unity is 10^(-15/20), +15 dB is 1.
+    // Use an absolute reference, never an already-adjusted clip's current gain.
+    var refRaw = AUDIO_GAIN_RAW_FALLBACK_AT_0DB;
+    try {
+      if (targetProp.isTimeVarying && targetProp.isTimeVarying()) {
+        targetProp.setTimeVarying(false);
+      }
+    } catch (eTimeVarying) { return false; }
 
     var rawTarget = refRaw * Math.pow(10, gainDb / 20);
     if (
       !(typeof rawTarget === "number" && isFinite(rawTarget) && rawTarget > 0)
     ) {
       log(
-        "Warning: Music gain skipped for '" +
+        "Warning: Audio gain skipped for '" +
           itemName +
           "' (invalid raw target from " +
           gainDb +
@@ -7148,7 +7421,7 @@
         ? targetProp.displayName.toString()
         : "unknown-property";
       log(
-        "Warning: Music gain write failed on '" +
+        "Warning: Audio gain write failed on '" +
           itemName +
           "' property '" +
           targetName +
@@ -7158,26 +7431,14 @@
     }
 
     try {
-      if (targetProp.getValue) {
-        var readBack = targetProp.getValue();
-        if (typeof readBack === "string") {
-          readBack = parseFloat(readBack);
-        }
-        if (
-          typeof readBack !== "number" ||
-          !isFinite(readBack) ||
-          readBack <= 0
-        ) {
-          log(
-            "Warning: Music gain readback looks invalid on '" +
-              itemName +
-              "' after write (value: " +
-              readBack +
-              ").",
-          );
-        }
+      var readBack = Number(targetProp.getValue());
+      var actualDb = 20 * Math.log(readBack / refRaw) / Math.LN10;
+      if (!isFinite(actualDb) || Math.abs(actualDb - gainDb) > 0.05) {
+        log("Error: Audio gain clamped or rejected for '" + itemName +
+          "': requested " + gainDb + " dB, read back " + actualDb + " dB.");
+        return false;
       }
-    } catch (eReadBack) {}
+    } catch (eReadBack) { return false; }
     return true;
   }
 
