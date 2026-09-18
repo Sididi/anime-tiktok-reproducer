@@ -1,4 +1,4 @@
-# Premiere narration gain and raw-scene leveling
+# Premiere narration gain and raw-scene effects
 
 Each entry in `config/voices/config.yaml` accepts `volume_db`, alongside
 `display_name`. Its default is `0`; supported values are -96 through +15 dB.
@@ -15,70 +15,72 @@ and stops if Premiere clamps or rejects it instead of accepting the setting.
 
 ## Raw scenes
 
-The original language/channel selection and raw-scene source timing remain in
-the existing placement path. The importer finds the resulting raw subclips
-across all tracks from A4 onward, including 5.1 blocks that could not be moved
-into the usual reserved zone.
+The existing importer selects the source language/channels and places raw-scene
+audio. An optional final pass applies the effects from
+`assets/Raw Scene Audio.prfpset` directly to those audible clips, across all
+tracks from A4 onward. The muted source copy on A1, narration, and music are
+excluded. This pass does not move clips, change their source/timeline timing,
+adjust their gain, or create sequences or nests. It does not introduce raw-audio
+duration/completeness checks that can stop an import.
 
-It creates `ATR_RAW_AUDIO__<project_id>`, a stereo subsequence containing only
-those clips. Source references and in/out/timeline timing must match exactly;
-video, narration, or music in that subsequence causes the import to stop.
-Original source clips remain editable inside it. The main timeline gets stereo
-audio nests on A4 for the raw regions. Adjacent raw scenes share one region so
-the dynamics processor is not restarted at every cut. No WAV excerpts or
-measurement renders are created.
+The backend reads the preset's saved effect order and parameter values without
+rewriting them. For the supplied file, Hard Limiter precedes Dynamics Processing.
+Mono, stereo, and 5.1 clips use their corresponding saved variants; individually
+split source channels use the mono variant. The saved limiter values differ
+between variants. The dynamics curve and channel-linking settings also remain
+exactly as saved. This is per-clip processing: it does not guarantee equal scene
+loudness or a common ceiling for the combined mix.
 
-Effects run on the stereo nests, after Premiere's downmix:
+The normalized parameter values are embedded in the generated JSX. The preset
+file is included in new bundles when available, but the JSX does not require it
+at import time. If it is missing or unsupported at generation time, the JSX
+imports with the original audio and reports a warning.
 
-1. **Dynamics Processing** uses a linked stereo, piecewise linear leveling curve.
-2. **Hard Limiter** uses the stereo values from `assets/Raw Scene Audio.prfpset`,
-   exported for the requested -10 dB ceiling and 0 dB input boost.
+Effect insertion follows the working video-preset path: resolve display-name
+candidates, call QE, and verify the standard DOM component count increased.
+A truthy lookup or insertion return is insufficient. Candidates that do nothing
+fall through to the next alias or matching audio-catalog entry. The appended
+component receives the saved values without requiring its runtime name to equal
+the XML UUID or localized label. DOM and QE clip references are reacquired after
+mutations; observed runtime identities are retained for retry protection.
 
-The initial dynamics curve is defined in
-`backend/app/services/premiere_audio.py`:
+This approach is also used by the public
+[Premiere CLI audio-effect implementation](https://github.com/stefanwebb/premiere-cli/blob/main/src/premiere_cli/panel/host/commands/apply-audio-effect.jsx)
+and [IronFX preset component insertion](https://github.com/IronVisuals/IronFX/blob/main/jsx/IronFX.jsx).
+If insertion still fails, the warning reports each candidate, its return value,
+before/after component counts, and the actual component identities.
 
-| Input (dB) | Output (dB) |
-|---:|---:|
-| -100 | -100 |
-| -60 | -60 |
-| -40 | -18 |
-| -20 | -12 |
-| 0 | -10 |
+## Nonfatal preset failures
 
-This is an initial listening-test setting. It brings dialogue toward the target
-while leaving the deepest noise floor alone; it does not normalize each scene's
-exact peak to -10 dB or hold silence at that level. Overlapping music can make
-the master meter exceed the raw-audio target.
+Effect lookup, channel compatibility, parameter layout, and readback failures
+produce warnings and continue with the next clip. Newly added effects stay
+bypassed until all saved parameters have been written and verified. If applying
+the pair fails, the importer disables effects added by that attempt, with
+removal as a fallback when supported. Existing components are not rewritten.
+Repeated application skips clips that already have either preset effect, avoiding
+duplicate processing.
 
-The exported file contains stereo/mono/5.1 alternatives and lists the limiter
-first. The backend selects only the stereo records, reverses the effect order,
-and configures the dynamics curve. Normalized parameter values are embedded in
-the JSX, so exporting the original sample unchanged would not apply this curve.
-The sample `.prfpset` is also included in new bundles. It is not rewritten.
+If Premiere rejects both disabling and removing an added effect, the warning
+identifies the affected clip for inspection; the import and batch still continue.
+Original media, cuts, and clip gain are retained in all these paths. Warnings
+are returned through the existing CEP import receipt, not as failed imports.
+This behavior applies to the optional raw preset; unrelated import failures
+keep their existing handling.
 
-## Premiere validation still required
+## Premiere validation
 
-Local tests exercise parsing, generation, gain math, readback failures and nest
-isolation using a simulated host. They cannot verify Premiere's QE operations or
-its DSP. First validate on Premiere Pro 2025 before using batch export:
+Local tests exercise preset parsing, JSX generation, direct clip application,
+channel variants, partial failures, retries, and unchanged clip timing/gain using
+a simulated host. They do not run Premiere or verify its audio output.
 
-1. Regenerate/import a project containing stereo and 5.1 raw scenes. Verify
-   the nested sequence contains the correct language and every retained channel,
-   with no shifted cuts. The main sequence must remain the active export target.
-2. Inspect the A4 nest's Effect Controls: Dynamics Processing precedes Hard
-   Limiter; its graph matches the table above. Check the limiter displays -10 dB
-   and 0 dB input boost. These UI checks also validate the serialized control
-   mappings on the installed Premiere version.
-3. Mute music and narration, then audition quiet and loud raw scenes. Listen for
-   pumping/background noise, check stereo balance and watch the master meter.
-4. Test a voice at +7 dB and +15 dB; confirm A2's Volume shows those values. Set
-   it back to 0 if the boost is not wanted. Check music retains its configured gain.
-5. Check a no-raw-scene project: it must create no raw-audio subsequence.
+On Premiere, import a project containing raw scenes and check:
 
-An unsupported effect layout, rejected value, or failed nest operation stops
-the import with an error. If failure happens after nesting, the original raw
-clips are retained in `ATR_RAW_AUDIO__<project_id>` for inspection. Send the
-error and `[ATR]` log when a Premiere-specific check fails.
-
-References: [Adobe's sequence/subsequence sample](https://github.com/Adobe-CEP/Samples/blob/master/PProPanel/jsx/PPRO/Premiere.jsx)
-and [Adobe's audio effects reference](https://helpx.adobe.com/premiere/desktop/add-audio-effects/apply-audio-effects/audio-effects-library.html).
+1. The original raw clips remain on their existing tracks, with the correct
+   language/channels and cuts. No `ATR_RAW_AUDIO__` sequence is created.
+2. Effect Controls show Hard Limiter followed by Dynamics Processing on each
+   supported raw clip. Compare their settings with manually applying the same
+   preset to a clip of the same channel type.
+3. Audition quiet and loud scenes with music/narration muted, then in the full
+   mix. Check transitions, background noise, and channel balance.
+4. Any raw-preset warning leaves the project imported and eligible for the rest
+   of batch processing. A no-raw project skips the preset pass entirely.

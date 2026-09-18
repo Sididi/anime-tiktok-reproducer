@@ -163,6 +163,25 @@ class OpenRouterService:
                 f"(model={entry.openrouter_id})"
             ) from exc
 
+        # OpenRouter can send an error in an HTTP 200 body after sending
+        # keep-alive bytes. The SDK then builds a completion with choices=None
+        # instead of raising an API error; preserve the provider's explanation.
+        error = (response.model_extra or {}).get("error")
+        if error:
+            if isinstance(error, dict):
+                detail = error.get("message") or "Provider returned an error"
+                code = error.get("code")
+                if code is not None:
+                    detail = f"{detail} (code={code})"
+            else:
+                detail = str(error)
+            raise RuntimeError(
+                f"OpenRouter error (model={entry.openrouter_id}): {detail}"
+            )
+        if not response.choices:
+            raise RuntimeError(
+                f"OpenRouter response contained no choices (model={entry.openrouter_id})"
+            )
         choice = response.choices[0]
         text = (choice.message.content or "").strip()
         if not text:

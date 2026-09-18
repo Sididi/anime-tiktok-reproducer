@@ -207,7 +207,8 @@ def test_jsx_border_failure_is_nonfatal_and_silent():
     assert "throw new Error" not in border_fn
     assert "recordImportWarning(" not in border_fn
     assert "function recordImportWarning(" not in jsx
-    assert "__ATR_IMPORT_WARNINGS__" not in jsx
+    assert "__ATR_IMPORT_WARNINGS__" not in border_fn
+    assert "warnRawAudioPreset(" not in border_fn
     assert "function pruneExtraBorderClips(" in jsx
     assert "Border image skipped: V2 track unavailable." in border_fn
     assert "not found in /sources" in border_fn

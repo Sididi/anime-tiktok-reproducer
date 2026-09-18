@@ -5,6 +5,10 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import httpx
+import pytest
+from openai import OpenAI
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.models.llm_config import (
@@ -22,7 +26,30 @@ def _make_chat_response(text: str) -> MagicMock:
     choice.message = msg
     resp = MagicMock()
     resp.choices = [choice]
+    resp.model_extra = {}
     return resp
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"error": {"message": "Provider unavailable", "code": 503}},
+         "Provider unavailable (code=503)"),
+        ({"error": "Upstream failure", "choices": None}, "Upstream failure"),
+        ({"choices": None}, "response contained no choices"),
+        ({"choices": []}, "response contained no choices"),
+    ],
+)
+def test_http_200_error_or_missing_choices_is_actionable(monkeypatch, payload, expected):
+    # Exercise the real SDK decoder: HTTP 200 errors do not raise APIError.
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    with OpenAI(api_key="test", http_client=httpx.Client(transport=transport)) as client:
+        monkeypatch.setattr(OpenRouterService, "_get_client", classmethod(lambda cls: client))
+        entry = LLMPresetEntry(openrouter_id="openai/gpt-6-astra", thinking=None)
+        with pytest.raises(RuntimeError) as exc_info:
+            OpenRouterService._chat("hello", entry=entry)
+    assert expected in str(exc_info.value)
+    assert "model=openai/gpt-6-astra" in str(exc_info.value)
 
 
 def test_build_reasoning_anthropic():

@@ -309,10 +309,13 @@ class ExportService:
         assets: list[str] = [
             "TikTok60fps.sqpreset",
             "ATR Proxy H264.epr",
-            "Raw Scene Audio.prfpset",
             template.background.prfpset,
             template.foreground.prfpset,
         ]
+        # The JSX embeds the preset. A missing optional audio preset must not
+        # prevent exporting a project with its original raw audio.
+        if (cls.get_assets_dir() / "Raw Scene Audio.prfpset").is_file():
+            assets.append("Raw Scene Audio.prfpset")
         if template.overlay.enabled:
             if template.overlay.title.prfpset:
                 assets.append(template.overlay.title.prfpset)

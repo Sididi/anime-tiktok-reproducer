@@ -3,7 +3,7 @@ default_voice_key: sebastien
 voices:
   victor:
     display_name: "Victor"
-    volume_db: 0.0  # Premiere gain (-96 to +15 dB)
+    volume_db: 0.0 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "GPAQQPp9dazaB2bl4zg9"
     model_id: "eleven_multilingual_v2"
     languages: ["fr"]
@@ -34,7 +34,7 @@ voices:
 
   maxime:
     display_name: "Maxime"
-    volume_db: 0.0  # Premiere gain (-96 to +15 dB)
+    volume_db: 0.0 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "5Qfm4RqcAer0xoyWtoHC"
     model_id: "eleven_multilingual_v2"
     languages: ["fr"]
@@ -50,7 +50,7 @@ voices:
 
   luca:
     display_name: "Luca"
-    volume_db: 0.0  # Premiere gain (-96 to +15 dB)
+    volume_db: 0.0 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "Ndm6bI6wo3Ycnlx1PPZS"
     model_id: "eleven_v3"
     languages: ["fr", "en"]
@@ -66,7 +66,7 @@ voices:
 
   nicolas_petit:
     display_name: "Nicolas Petit"
-    volume_db: 0.0  # Premiere gain (-96 to +15 dB)
+    volume_db: 5.5 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "AmMsHJaCw4BtwV3KoUXF"
     model_id: "eleven_v3"
     languages: ["fr"]
@@ -83,7 +83,7 @@ voices:
 
   adam:
     display_name: "Adam"
-    volume_db: 0.0  # Premiere gain (-96 to +15 dB)
+    volume_db: 0.0 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "93nuHbke4dTER9x2pDwE"
     model_id: "eleven_multilingual_v2"
     languages: ["fr"]
@@ -99,7 +99,7 @@ voices:
 
   sebastien:
     display_name: "Sébastien"
-    volume_db: 0.0  # Premiere gain (-96 to +15 dB)
+    volume_db: 6.0 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "BUJMBsQ3Oq4cEeWSb48y"
     model_id: "eleven_v3"
     languages: ["fr"]
@@ -117,7 +117,7 @@ voices:
 
   paul_k:
     display_name: "Paul K."
-    volume_db: 0.0  # Premiere gain (-96 to +15 dB)
+    volume_db: 0.0 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "ecxPjiGTvAfpGEams6ec"
     model_id: "eleven_v3"
     languages: ["fr"]
@@ -133,7 +133,7 @@ voices:
 
   noe:
     display_name: "Noé"
-    volume_db: 0.0  # Premiere gain (-96 to +15 dB)
+    volume_db: 0.0 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "7pDdnNI6PhXmAp0pXFZm"
     model_id: "eleven_v3"
     languages: ["fr"]

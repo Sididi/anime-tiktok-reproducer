@@ -1662,9 +1662,18 @@ class ProcessingService:
         from ..config import PROJECT_ROOT
         from .premiere_audio import RAW_AUDIO_PRESET, load_raw_audio_effects
 
-        raw_audio_effects = (
-            load_raw_audio_effects(PROJECT_ROOT / "assets" / RAW_AUDIO_PRESET)
-            if any(scene.get("is_raw") for scene in scenes) else []
+        raw_audio_effects = []
+        raw_audio_warning = ""
+        if any(scene.get("is_raw") for scene in scenes):
+            try:
+                raw_audio_effects = load_raw_audio_effects(PROJECT_ROOT / "assets" / RAW_AUDIO_PRESET)
+            except Exception as exc:
+                raw_audio_warning = f"Raw audio preset unavailable; original audio retained: {exc}"
+                logger.warning("%s", raw_audio_warning)
+        content = content.replace(
+            'var RAW_AUDIO_PRESET_WARNING = "";',
+            "var RAW_AUDIO_PRESET_WARNING = " + json.dumps(raw_audio_warning, ensure_ascii=True) + ";",
+            1,
         )
         # Lambda avoids interpreting JSON's Unicode/backslash escapes as regex replacements.
         content, replacements = re.subn(

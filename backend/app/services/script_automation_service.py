@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import re
 import secrets
 import uuid
@@ -32,6 +33,7 @@ from .voice_config_service import VoiceConfigService, VoiceEntry
 
 _SENTENCE_END_RE = re.compile(r"[.!?…][\"')\]]*\s*$")
 _SENTENCE_BOUNDARY_RE = re.compile(r"[.!?…][\"')\]]*(?:\s+|$)")
+logger = logging.getLogger(__name__)
 
 
 class ScriptAutomationService:
@@ -1289,6 +1291,7 @@ class ScriptAutomationService:
             )
             yield complete_payload
         except Exception as exc:
+            logger.exception("Script automation failed for project %s", project_id)
             yield {
                 "event": "error",
                 "status": "error",
