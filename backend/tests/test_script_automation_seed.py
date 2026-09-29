@@ -43,8 +43,10 @@ def test_generate_and_store_elevenlabs_seed_persists_exact_value(
 def test_v2_sends_seed_and_keeps_request_stitching():
     kwargs = ScriptAutomationService._tts_seed_and_continuity_kwargs(
         seed=123,
-        is_v3_model=False,
-        previous_request_id="request-1",
+        model_id="eleven_multilingual_v2",
+        previous_request_ids=["older", "request-1"],
+        previous_text="Before.",
+        next_text="After.",
     )
 
     assert kwargs == {
@@ -56,8 +58,35 @@ def test_v2_sends_seed_and_keeps_request_stitching():
 def test_v3_sends_seed_without_unsupported_request_stitching():
     kwargs = ScriptAutomationService._tts_seed_and_continuity_kwargs(
         seed=456,
-        is_v3_model=True,
-        previous_request_id="request-1",
+        model_id="eleven_v3",
+        previous_request_ids=["request-1"],
+        previous_text="Before.",
+        next_text="After.",
     )
 
     assert kwargs == {"seed": 456}
+
+
+def test_v4_sends_three_nearest_previous_requests_and_following_text():
+    kwargs = ScriptAutomationService._tts_seed_and_continuity_kwargs(
+        seed=0,
+        model_id="eleven_v4",
+        previous_request_ids=["old", "first", "second", "nearest"],
+        previous_text="Before.",
+        next_text="After.",
+    )
+    assert kwargs == {
+        "seed": 0,
+        "previous_request_ids": ["first", "second", "nearest"],
+        "next_text": "After.",
+    }
+
+
+def test_v4_uses_previous_text_when_request_id_is_missing():
+    kwargs = ScriptAutomationService._tts_seed_and_continuity_kwargs(
+        seed=123,
+        model_id="eleven_v4",
+        previous_request_ids=[],
+        previous_text="Before.",
+    )
+    assert kwargs == {"seed": 123, "previous_text": "Before."}

@@ -1,7 +1,7 @@
 """Persisted editorial state; offsets and revisions refer to the spoken document."""
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 
 ENDING = "Le nom de l’anime c’est :"
@@ -11,6 +11,26 @@ class FacecamCandidate(BaseModel):
     id: str
     text: str = Field(min_length=1)
     original: bool = False
+
+
+class StoryClip(BaseModel):
+    """Word bounds index the immutable source scene, never generated French words."""
+    model_config = ConfigDict(extra="forbid")
+    scene_index: StrictInt
+    start_word: StrictInt | None = None
+    end_word: StrictInt | None = None
+
+
+class StoryArc(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    id: str = ""  # Assigned by the application after validation.
+    title: str = Field(min_length=1)
+    premise: str = Field(min_length=1)
+    ending: str = Field(min_length=1)
+    steps: list[str] = Field(min_length=1, max_length=6)
+    omitted: list[str] = Field(default_factory=list)
+    clips: list[StoryClip] = Field(min_length=1)
+    raw_duration_seconds: float = 0
 
 
 class ScriptBlock(BaseModel):
@@ -32,6 +52,11 @@ class FacecamFinding(BaseModel):
 
 class FacecamState(BaseModel):
     revision: int = 0
+    stories: list[StoryArc] = Field(default_factory=list)
+    stories_fingerprint: str | None = None
+    selected_story_id: str | None = None
+    montage_map: list[dict[str, Any]] = Field(default_factory=list)
+    estimated_duration_seconds: float | None = None
     hooks: list[FacecamCandidate] = Field(default_factory=list)
     opinions: list[FacecamCandidate] = Field(default_factory=list)
     selected_hook: str = ""

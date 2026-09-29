@@ -23,6 +23,8 @@ A web application to remaster TikTok videos featuring anime content for other sh
 - **SSE Progress Streaming** - Real-time progress updates for long-running operations
 - **Premiere Pro Integration** - Automated JSX script generation for project setup
 
+ElevenLabs narration supports [opt-in Eleven v4 per voice, with seeded generation and block continuity](docs/elevenlabs-v4.md).
+
 ## Architecture
 
 ```

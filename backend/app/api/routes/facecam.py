@@ -32,6 +32,11 @@ class ActionRequest(BaseModel):
     opinion: str = ""
 
 
+class StoryRequest(BaseModel):
+    revision: int
+    story_id: str
+
+
 def _state(project_id):
     try:
         return FacecamService.load(project_id)
@@ -103,6 +108,21 @@ async def save_draft(project_id: str, request: DraftRequest):
 @router.post("/{project_id}/facecam/candidates/{kind}")
 async def candidates(project_id: str, kind: Literal["hooks", "opinions"]):
     return await _job(project_id, "Génération des propositions", FacecamService.candidates, kind)
+
+
+@router.post("/{project_id}/facecam/stories/analyze")
+async def analyze_stories(project_id: str, request: ActionRequest):
+    return await _job(project_id, "Détection des histoires", FacecamService.analyze_stories, request.revision)
+
+
+@router.put("/{project_id}/facecam/story")
+async def select_story(project_id: str, request: StoryRequest):
+    if project_id in _jobs and not _jobs[project_id].done():
+        raise HTTPException(409, "Attendez la fin de l'opération Facecam.")
+    try:
+        return await asyncio.to_thread(FacecamService.select_story, project_id, request.revision, request.story_id)
+    except ValueError as exc:
+        raise HTTPException(409 if isinstance(exc, StaleFacecamRevision) else 400, str(exc)) from exc
 
 
 @router.post("/{project_id}/facecam/generate")

@@ -5,3 +5,38 @@
 .facecam-evidence-cues { max-height: 18rem; overflow-y: auto; }
 .facecam-evidence-cues a { text-decoration: underline; }
 .facecam-fact-detail blockquote { border-left: 2px solid currentColor; padding-left: .75rem; margin: .5rem 0; }
+.facecam-skip-opinion { display: block; width: 100%; padding: 17px; margin-bottom: 12px; text-align: left; border: 1px solid hsl(var(--border)); border-radius: 10px; font-size: 14px; line-height: 1.6; }
+.facecam-skip-opinion span { display: block; font-size: 12px; opacity: .7; margin-top: 4px; }
+.facecam-skip-opinion[aria-pressed=true] { border-color: #818cf8; background: #6366f117; }
+.facecam-stories { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 16px; }
+.facecam-stories article { padding: 20px; border: 1px solid hsl(var(--border)); border-radius: 12px; }
+.facecam-stories article.selected { border-color: #818cf8; background: #6366f10b; }
+.facecam-stories h3 { display: flex; align-items: center; gap: 8px; }
+.facecam-stories ol, .facecam-stories ul { padding-left: 20px; margin: 12px 0; font-size: 13px; line-height: 1.7; }
+.facecam-stories ol { list-style: decimal; }
+.facecam-stories ul { list-style: disc; }
+.facecam-stories details { margin: 16px 0; font-size: 12px; }
+.facecam-stories summary { cursor: pointer; }
+.facecam-steps { flex-wrap: wrap; }
+.facecam-workspace { display: grid; gap: 24px; align-items: start; }
+.facecam-workspace-content { min-width: 0; }
+.facecam-workspace-with-video { grid-template-columns: minmax(0, 1fr) 300px; }
+.facecam-workspace-with-video .facecam-workspace-content { grid-column: 1; grid-row: 1; }
+.facecam-workspace-with-video .facecam-editor-layout { grid-template-columns: minmax(0, 1fr); }
+.facecam-source {
+  grid-column: 2; grid-row: 1; position: sticky; top: 16px; margin-top: 22px;
+  min-width: 0; border: 1px solid hsl(var(--border)); border-radius: 16px;
+  background: hsl(var(--card)); overflow: hidden; z-index: 20;
+}
+.facecam-source[hidden] { display: none; }
+.facecam-source header { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px 8px 16px; }
+.facecam-source h2 { font-size: 14px; font-weight: 600; }
+.facecam-source-player { height: min(52dvh, 460px); }
+.facecam-source p { font-size: 12px; line-height: 1.5; opacity: .7; padding: 12px 16px; }
+@media (max-width: 850px) {
+  .facecam-workspace-with-video { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .facecam-workspace-with-video .facecam-workspace-content { grid-column: 1; grid-row: 2; }
+  .facecam-source { grid-column: 1; top: 8px; box-shadow: 0 8px 24px #0003; }
+  .facecam-source-player { height: min(28dvh, 220px); }
+  .facecam-source p { display: none; }
+}

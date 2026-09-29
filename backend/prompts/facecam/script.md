@@ -1,16 +1,39 @@
-Tu écris une présentation d'anime en français destinée à être lue par un vrai créateur face caméra.
-Le texte doit sembler écrit et pensé en français : oral, précis, clair, phrases naturelles, pas d'emphase creuse.
-Réécris le récit de façon indépendante, par idées et macro-séquences, jamais par traduction phrase à phrase.
-Change la construction des phrases, les transitions et la manière d'exposer les enjeux. Évite les formulations,
-les métaphores et les enchaînements distinctifs du script source. Conserve les faits, la chronologie et les
-ancrages visuels. Ne promets pas une absence de plagiat. La seule exception de traduction proche est
-l'accroche explicitement choisie par l'utilisateur.
-Conserve les noms propres des personnages et des lieux; utilise des pronoms seulement quand ils restent clairs.
-Ne révèle pas le titre de l'anime dans le récit. N'invente ni détails, ni causalités, ni expériences personnelles.
-Vise une longueur du corps proche de celle de l'original; aucune contrainte artificielle scène par scène ni débit TTS.
-L'accroche et le point de vue sélectionnés seront ajoutés séparément : ne les répète pas dans le corps.
-Enlève du récit la première phrase d'accroche originale pour éviter de la répéter.
-Les scènes raw sont des extraits audio originaux : ne les raconte pas en double et ne déplace pas la narration
-à travers ces frontières. Chaque bloc body couvre les indices fournis, sans découpage en scènes dans sa prose.
+Écris le corps d'une présentation de fiction face caméra à partir de la fiche factuelle fournie.
+Le créateur a choisi hook et, éventuellement, opinion : ils encadreront automatiquement le corps.
+Ne les recopie pas. Si opinion est vide, aucun point de vue ne sera ajouté : n'en invente pas,
+n'ajoute ni avis personnel ni bilan subjectif, et termine directement le récit avant la révélation du titre.
+La phrase de révélation du titre sera également ajoutée automatiquement.
+
+Si selected_story est présent, raconte uniquement cette histoire et termine sur son point d'arrivée.
+La sélection des images est déjà faite : ne réintroduis pas les branches et détails écartés.
+Une phrase peut couvrir plusieurs plans ; elle n'a pas à décrire chaque geste à l'écran.
+body_budget donne le nombre de mots réservé au corps, après déduction de l'accroche, de l'opinion
+éventuelle et de l'annonce du titre. Vise cette fourchette et ne dépasse jamais son maximum.
+Le budget tient compte des extraits audio conservés et de la carte finale pour viser 65 à 70 secondes.
+Si les faits sont trop minces, reste plus court plutôt que répéter ou inventer pour remplir le temps.
+
+Avant d'écrire, détermine la promesse exacte du hook, les faits qui y répondent et la progression qui
+fait monter l'enjeu. Choisis un fil conducteur concret, éclairé aussi par l'opinion si elle est sélectionnée,
+et organise les faits en quelques grands mouvements (souvent deux à quatre, selon leur richesse).
+Lorsqu'elle est présente, l'opinion donne un regard au récit entier, elle n'est pas un avis interchangeable collé à la fin.
+Écris ensuite un récit continu par macro-séquences. On doit avoir envie de savoir
+ce que le personnage va faire, pas seulement constater ce que chaque plan montre.
+Le début prolonge immédiatement l'accroche : pas de deuxième départ ni de répétition du même fait.
+Introduis seulement le contexte nécessaire. Condense les actions secondaires, développe le choix ou
+la conséquence qui donne son intérêt à la scène. Conserve les actions indispensables aux ancrages
+visuels, leur chronologie et leurs relations réelles. Une simple succession reste une succession.
+Si une opinion est sélectionnée, prépare une transition naturelle vers elle sans la paraphraser à l'avance.
+Finis le corps sur la situation concrète atteinte, pas sur un deuxième bilan de ce qui vient d'être raconté.
+
+La longueur respecte le budget et les faits disponibles, jamais le nombre de mots du texte
+source. N'étire pas un récit mince pour atteindre un quota et ne compresse pas les faits au point de
+perdre leurs liens. Évite la récitation exhaustive et les relances automatiques à chaque phrase.
+Chaque bloc body couvre ses indices, mais sa prose ne se découpe pas plan par plan.
+Le timeline fixe les frontières raw : ne déplace aucun fait à travers un extrait original ; prépare
+sa compréhension avant, reprends sa conséquence après sans raconter une deuxième fois le dialogue.
+Ne résume pas le dernier bloc par un faux cliffhanger si ses faits donnent déjà une résolution.
+
+Relis silencieusement : accroche payée, progression claire, titre absent, pas de fait inventé,
+pas de faux vécu, pas de doublon hook/opinion/raw, phrases lisibles à voix haute et blocs préservés.
 Retourne uniquement {"blocks":[{"id":"identifiant body fourni","text":"paragraphes du récit"}]}.
-Conserve exactement tous les identifiants body, dans l'ordre. Pas de markdown ni de commentaire autour du JSON.
+Conserve exactement tous les identifiants body, dans l'ordre. Pas de markdown ni de commentaire.

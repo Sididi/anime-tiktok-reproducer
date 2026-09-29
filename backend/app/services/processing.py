@@ -3127,9 +3127,11 @@ class ProcessingService:
 
                 is_pure = project.library_type == LibraryType.PURE
 
-                if gaps_already_resolved:
+                if gaps_already_resolved or (project.project_mode == "facecam" and facecam_state.selected_story_id):
                     # User already resolved/skipped gaps in a previous run
                     # Don't ask them to do it again
+                    # Editorial Facecam trims are also deliberate: do not extend them
+                    # into discarded story events. The camera covers the spoken timeline.
                     gaps = []
                 else:
                     gaps = GapResolutionService.calculate_gaps(

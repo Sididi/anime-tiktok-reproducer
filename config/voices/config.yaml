@@ -1,4 +1,4 @@
-default_voice_key: sebastien
+default_voice_key: nicolas_petit
 
 voices:
   victor:
@@ -68,7 +68,8 @@ voices:
     display_name: "Nicolas Petit"
     volume_db: 5.5 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "AmMsHJaCw4BtwV3KoUXF"
-    model_id: "eleven_v3"
+    #model_id: "eleven_v3"
+    model_id: "eleven_v4"
     languages: ["fr"]
     voice_settings:
       stability: 0.5

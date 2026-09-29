@@ -202,6 +202,7 @@ class FacecamMediaService:
         write_text_atomic(work / "transcription.json", transcription.model_dump_json())
         prepared = {"revision": state.revision, "fingerprint": state.recording["fingerprint"], "directory": str(work),
             "keep_frames": [list(interval) for interval in keep], "camera_segments": clips, "cover_start": end,
+            "duration_seconds": end + 1,
             "alignment_path": str(ForcedAlignmentService.report_path(work)),
             "scenes": [{"kind": "cover", "start_frame": round(end * FPS), "duration_frames": FPS}]}
         return FacecamService.update(project_id, {"prepared": prepared}, state.revision)

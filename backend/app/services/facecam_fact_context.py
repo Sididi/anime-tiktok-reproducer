@@ -49,7 +49,10 @@ class FacecamFactContext:
         reference = FacecamService.directory(project_id) / "reference_matches.json"
         matches = (MatchList.model_validate_json(reference.read_text()) if reference.exists()
                    else ProjectService.load_matches(project_id))
-        original = {s.scene_index: s.text for s in FacecamService.reference(project_id).scenes}
+        transcription = FacecamService.reference(project_id)
+        if FacecamService.load(project_id).selected_story_id:
+            transcription, matches, _ = FacecamService.montage_reference(project_id)
+        original = {s.scene_index: s.text for s in transcription.scenes}
         episodes = {}
         for match in matches.matches if matches else []:
             if not match.episode or not all(math.isfinite(t) for t in (match.start_time, match.end_time)) or match.end_time <= match.start_time:

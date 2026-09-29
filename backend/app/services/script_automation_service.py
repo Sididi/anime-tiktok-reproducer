@@ -43,13 +43,13 @@ class ScriptAutomationService:
     MAX_OVERLAY_TITLE_CHARS = 45
 
     TTS_TARGET = 625
-    TTS_V3_TARGET = 550
+    TTS_EXPRESSIVE_TARGET = 550
     TTS_MIN = 500
     TTS_SOFT_MAX = 750
     TTS_HARD_MAX = 800
-    # Delivery instruction prepended to every eleven_v3 request. Audio tags in
-    # brackets are interpreted by v3, not spoken, so transcripts stay clean.
-    V3_CONTROL_PREFIX = "[TikTok narrator, energetic, rapid]"
+    # Delivery instruction for expressive models; kept out of transcripts and
+    # neighboring text context. V4 has no generation speed setting.
+    NARRATION_CONTROL_PREFIX = "[TikTok narrator, energetic, rapid]"
 
     @classmethod
     def _generate_and_store_elevenlabs_seed(cls, project_id: str) -> int:
@@ -98,13 +98,26 @@ class ScriptAutomationService:
     def _tts_seed_and_continuity_kwargs(
         *,
         seed: int,
-        is_v3_model: bool,
-        previous_request_id: str | None,
+        model_id: str,
+        previous_request_ids: list[str],
+        previous_text: str | None = None,
+        next_text: str | None = None,
     ) -> dict[str, Any]:
         """Build model-compatible seed and request-stitching arguments."""
         kwargs: dict[str, Any] = {"seed": seed}
-        if not is_v3_model and previous_request_id:
-            kwargs["previous_request_ids"] = [previous_request_id]
+        if model_id.startswith("eleven_v3"):
+            return kwargs
+        if model_id != "eleven_v4":
+            # Preserve the existing v2 generation policy.
+            if previous_request_ids:
+                kwargs["previous_request_ids"] = previous_request_ids[-1:]
+            return kwargs
+        if previous_request_ids:
+            kwargs["previous_request_ids"] = previous_request_ids[-3:]
+        elif previous_text:
+            kwargs["previous_text"] = previous_text
+        if next_text:
+            kwargs["next_text"] = next_text
         return kwargs
 
     @classmethod
@@ -276,8 +289,8 @@ class ScriptAutomationService:
     @classmethod
     def resolve_tts_target(cls, model_id: str | None = None) -> int:
         normalized_model = cls.resolve_tts_model_id(model_id=model_id).lower()
-        if normalized_model.startswith("eleven_v3"):
-            return cls.TTS_V3_TARGET
+        if normalized_model.startswith("eleven_v3") or normalized_model == "eleven_v4":
+            return cls.TTS_EXPRESSIVE_TARGET
         return cls.TTS_TARGET
 
     @classmethod
@@ -1108,7 +1121,7 @@ class ScriptAutomationService:
                 cls._persist_run_voice_key(project_id, voice_key)
                 effective_model = cls.resolve_tts_model_id(model_id=voice.model_id)
                 normalized_model = effective_model.lower()
-                is_v3_model = normalized_model.startswith("eleven_v3")
+                uses_audio_tags = normalized_model.startswith("eleven_v3") or normalized_model == "eleven_v4"
                 prepared_tts = cls.prepare_tts_payload(
                     script_payload=script_payload,
                     target_language=target_language,
@@ -1127,8 +1140,9 @@ class ScriptAutomationService:
 
                 extension = cls._output_extension()
                 part_paths: list[Path] = []
-                previous_request_id: str | None = None
+                previous_request_ids: list[str] = []
                 elevenlabs_seed = cls._generate_and_store_elevenlabs_seed(project_id)
+                generation_records: list[dict[str, Any]] = []
 
                 for idx, chunk in enumerate(chunks, start=1):
                     segment_char_count = len(chunk)
@@ -1146,7 +1160,7 @@ class ScriptAutomationService:
                     )
 
                     outgoing_text = (
-                        f"{cls.V3_CONTROL_PREFIX} {chunk}" if is_v3_model else chunk
+                        f"{cls.NARRATION_CONTROL_PREFIX} {chunk}" if uses_audio_tags else chunk
                     )
                     synthesize_kwargs: dict[str, Any] = {
                         "voice_id": voice.elevenlabs_voice_id,
@@ -1158,10 +1172,14 @@ class ScriptAutomationService:
                     synthesize_kwargs.update(
                         cls._tts_seed_and_continuity_kwargs(
                             seed=elevenlabs_seed,
-                            is_v3_model=is_v3_model,
-                            previous_request_id=previous_request_id,
+                            model_id=effective_model,
+                            previous_request_ids=previous_request_ids,
+                            previous_text=chunks[idx - 2] if idx > 1 else None,
+                            next_text=chunks[idx] if idx < len(chunks) else None,
                         )
                     )
+                    if normalized_model == "eleven_v4":
+                        synthesize_kwargs["language_code"] = prepared_tts["language"]
 
                     synthesis_result = await asyncio.to_thread(
                         ElevenLabsService.synthesize,
@@ -1172,7 +1190,21 @@ class ScriptAutomationService:
                         if isinstance(synthesis_result, bytes)
                         else synthesis_result.audio_bytes
                     )
-                    previous_request_id = getattr(synthesis_result, "request_id", None) or None
+                    request_id = getattr(synthesis_result, "request_id", None) or None
+                    if request_id:
+                        previous_request_ids = [*previous_request_ids, request_id][-3:]
+                    else:
+                        # An older audio ID is not the immediately preceding part.
+                        previous_request_ids = []
+                    generation_records.append({
+                        "part_id": str(idx),
+                        "request_id": request_id,
+                        "synthesis_arguments": synthesize_kwargs,
+                    })
+                    (run_dir / "tts_manifest.json").write_text(
+                        json.dumps(generation_records, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
                     if cls._is_pcm_format():
                         audio_bytes = cls._wrap_pcm_for_settings(audio_bytes)
                     part_path = parts_dir / f"part_{idx}.{extension}"

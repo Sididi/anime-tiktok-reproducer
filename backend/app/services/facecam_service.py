@@ -154,16 +154,115 @@ class FacecamService:
         return transcription
 
     @classmethod
-    def skeleton(cls, project_id: str) -> list[ScriptBlock]:
+    def source_matches(cls, project_id):
+        from ..models import MatchList
+        return MatchList.model_validate_json((cls.directory(project_id) / "reference_matches.json").read_text())
+
+    @classmethod
+    def selected_story(cls, project_id, state=None):
+        from .facecam_story_service import FacecamStoryService
+        state = state or cls.load(project_id)
+        if not state.selected_story_id:
+            return None
+        if state.stories_fingerprint != FacecamStoryService.fingerprint(cls.reference(project_id), cls.source_matches(project_id)):
+            raise ValueError("La source a changé. Relancez l'analyse des histoires avant de continuer.")
+        story = next((s for s in state.stories if s.id == state.selected_story_id), None)
+        if story is None:
+            raise ValueError("Choisissez une histoire avant de continuer.")
+        return story
+
+    @classmethod
+    def montage_reference(cls, project_id):
+        from .facecam_story_service import FacecamStoryService
+        reference, matches = cls.reference(project_id), cls.source_matches(project_id)
+        story = cls.selected_story(project_id)
+        if story:
+            return FacecamStoryService.project(reference, matches, story)
+        mapping = [{"source_scene_index": s.scene_index, "source_start": s.start_time, "source_end": s.end_time}
+                   for s in reference.scenes]
+        return reference, matches, mapping
+
+    @classmethod
+    def analyze_stories(cls, project_id: str, revision: int):
+        from .facecam_narration_service import FacecamNarrationService
+        from .facecam_story_service import FacecamStoryService
+        state = cls.load(project_id)
+        if state.revision != revision:
+            raise StaleFacecamRevision("Le script a changé. Rechargez la version actuelle.")
+        reference, matches = cls.reference(project_id), cls.source_matches(project_id)
+        fingerprint = FacecamStoryService.fingerprint(reference, matches)
+        if state.stories and state.stories_fingerprint == fingerprint:
+            return state
+        match_map = {m.scene_index: m for m in matches.matches}
+        payload = {"anime": cls.project(project_id).anime_name, "target_seconds": [65, 70], "scenes": [
+            {"scene_index": s.scene_index, "text": s.text, "raw": s.is_raw,
+             "source_duration": s.duration,
+             "raw_duration": match_map[s.scene_index].end_time - match_map[s.scene_index].start_time if s.is_raw else 0,
+             "words": [{"index": i, "text": w.text} for i, w in enumerate(s.words)]}
+            for s in reference.scenes]}
+        result = cls.llm(project_id, FacecamNarrationService.prompt("stories") + "\n" + json.dumps(payload, ensure_ascii=False))
+        stories = FacecamStoryService.validate(result, reference, matches)
+        with cls.lock(project_id):
+            # Never overwrite a draft edited while detection was running.
+            if fingerprint != FacecamStoryService.fingerprint(cls.reference(project_id), cls.source_matches(project_id)):
+                raise ValueError("La source a changé pendant l'analyse. Relancez la détection des histoires.")
+            values = {"stories": stories, "stories_fingerprint": fingerprint, "selected_story_id": None}
+            if state.selected_story_id:
+                # A changed source invalidates an earlier selection even before its replacement is chosen.
+                values.update({"revision": revision + 1, "approved_revision": None, "prepared": None,
+                               "processed_signature": None, "assignment": [], "montage_map": []})
+            state = cls.update(project_id, values, revision)
+            if "revision" in values:
+                cls.invalidate_output(project_id)
+            if len(stories) == 1 and not state.blocks:
+                return cls.select_story(project_id, state.revision, stories[0].id)
+            return state
+
+    @classmethod
+    def select_story(cls, project_id: str, revision: int, story_id: str):
+        from .facecam_story_service import FacecamStoryService
+        with cls.lock(project_id):
+            state = cls.load(project_id)
+            if state.revision != revision:
+                raise StaleFacecamRevision("Le script a changé. Rechargez la version actuelle.")
+            if story_id not in {s.id for s in state.stories}:
+                raise ValueError("Cette histoire n'existe pas dans l'analyse.")
+            if state.stories_fingerprint != FacecamStoryService.fingerprint(cls.reference(project_id), cls.source_matches(project_id)):
+                raise ValueError("La source a changé. Relancez l'analyse des histoires.")
+            if state.selected_story_id == story_id:
+                return state
+            recording = {**state.recording, "reviewed_revision": None} if state.recording else None
+            state = cls.update(project_id, {
+                "selected_story_id": story_id, "revision": revision + 1,
+                "hooks": [], "opinions": [], "selected_hook": "", "selected_opinion": "", "blocks": [],
+                "approved_revision": None, "assignment": [], "montage_map": [], "estimated_duration_seconds": None,
+                "findings": [], "fact_context": None, "fact_revision": None, "fact_status": "unchecked", "fact_error": None,
+                "prepared": None, "processed_signature": None, "recording": recording,
+            }, revision)
+            cls.invalidate_output(project_id)
+            return state
+
+    @classmethod
+    def require_story(cls, project_id):
+        state = cls.load(project_id)
+        # Existing drafts remain usable without silently replacing their montage.
+        if not state.selected_story_id and (state.stories or not state.blocks):
+            raise ValueError("Analysez la source et choisissez l'histoire à raconter avant l'accroche.")
+        return cls.selected_story(project_id, state)
+
+    @classmethod
+    def skeleton(cls, project_id: str, *, include_opinion: bool = True) -> list[ScriptBlock]:
         blocks = [ScriptBlock(id="hook", kind="hook")]
-        for scene in cls.reference(project_id).scenes:
+        for scene in cls.montage_reference(project_id)[0].scenes:
             if scene.is_raw:
                 blocks.append(ScriptBlock(id=f"raw-{scene.scene_index}", kind="raw", scene_indices=[scene.scene_index]))
             elif blocks[-1].kind == "body":
                 blocks[-1].scene_indices.append(scene.scene_index)
             else:
                 blocks.append(ScriptBlock(id=f"body-{scene.scene_index}", kind="body", scene_indices=[scene.scene_index]))
-        blocks += [ScriptBlock(id="opinion", kind="opinion"), ScriptBlock(id="ending", kind="ending", text=ENDING)]
+        if include_opinion:
+            blocks.append(ScriptBlock(id="opinion", kind="opinion"))
+        blocks.append(ScriptBlock(id="ending", kind="ending", text=ENDING))
         return blocks
 
     @classmethod
@@ -171,7 +270,7 @@ class FacecamService:
         project = cls.project(project_id)
         return {"anime": project.anime_name, "scenes": [
             {"scene_index": s.scene_index, "text": s.text, "raw": s.is_raw,
-             "duration": s.end_time - s.start_time} for s in cls.reference(project_id).scenes
+             "duration": s.end_time - s.start_time} for s in cls.montage_reference(project_id)[0].scenes
         ]}
 
     @classmethod
@@ -180,28 +279,38 @@ class FacecamService:
         return LLMService.generate_json_value(prompt, preset_key=project.resolved_llm_preset_key(), tier="big")
 
     @classmethod
+    def narrative_context(cls, project_id: str) -> dict:
+        from .facecam_narration_service import FacecamNarrationService
+        from .facecam_story_service import FacecamStoryService
+        story = cls.require_story(project_id)
+        context = FacecamNarrationService.brief(cls.directory(project_id), cls.context(project_id),
+                                              cls.skeleton(project_id), lambda prompt: cls.llm(project_id, prompt))
+        if story:
+            context["selected_story"] = story.model_dump(include={"title", "premise", "ending", "steps", "omitted"})
+            context["budget"] = FacecamStoryService.budget(story)
+        return context
+
+    @classmethod
     def candidates(cls, project_id: str, kind: str) -> FacecamState:
+        from .facecam_narration_service import FacecamNarrationService
+        if kind not in {"hooks", "opinions"}:
+            raise ValueError("Type de proposition Facecam inconnu.")
         state = cls.load(project_id)
-        context = cls.context(project_id)
-        instructions = (
-            "Propose exactement 8 accroches orales françaises distinctes. La première est la première phrase "
-            "originale simplement traduite/adaptée; les sept autres changent réellement l'angle. "
-            "Ne révèle pas le titre. N'invente aucun fait."
-            if kind == "hooks" else
-            "Propose exactement 8 phrases françaises de point de vue, une seule phrase par candidat. "
-            "Varie analyse narrative, interprétation et opinion personnelle; ne prétends jamais à une expérience "
-            "personnelle réelle. Chaque phrase conclura le récit avant la révélation du titre."
-        )
-        result = cls.llm(project_id, instructions + '\nRetourne {"candidates":["...", ...]}.\n' + json.dumps(context, ensure_ascii=False))
-        texts = result.get("candidates", [])
-        if len(texts) != 8 or any(not isinstance(t, str) or not t.strip() for t in texts) or len({t.strip().casefold() for t in texts}) != 8:
+        context = cls.narrative_context(project_id)
+        if kind == "opinions":
+            context["selected_hook"] = state.selected_hook
+        instructions = FacecamNarrationService.prompt("narration") + "\n" + FacecamNarrationService.prompt(kind)
+        result = cls.llm(project_id, instructions + "\n" + json.dumps(context, ensure_ascii=False))
+        texts = result.get("candidates", []) if isinstance(result, dict) else []
+        if not isinstance(texts, list) or len(texts) != 8 or any(not isinstance(t, str) or not t.strip() for t in texts) or len({" ".join(t.split()).casefold() for t in texts}) != 8:
             raise ValueError("La génération doit proposer huit candidats distincts. Réessayez.")
-        candidates = [FacecamCandidate(id=f"{kind}-{i}", text=t.strip(), original=kind == "hooks" and i == 0) for i, t in enumerate(texts)]
+        candidates = [FacecamCandidate(id=f"{kind}-{i}", text=t.strip()) for i, t in enumerate(texts)]
         return cls.update(project_id, {kind: candidates}, state.revision)
 
     @classmethod
     def save_draft(cls, project_id: str, revision: int, blocks: list[ScriptBlock], hook: str, opinion: str):
-        expected = cls.skeleton(project_id)
+        # Selections can change before regeneration; validate the actual draft layout.
+        expected = cls.skeleton(project_id, include_opinion=any(b.kind == "opinion" for b in blocks))
         if [(b.id, b.kind, b.scene_indices) for b in blocks] != [(b.id, b.kind, b.scene_indices) for b in expected]:
             raise ValueError("Les repères des extraits audio originaux doivent être conservés.")
         for block in blocks:
@@ -221,26 +330,59 @@ class FacecamService:
             state = cls.update(project_id, {
                 "blocks": blocks, "selected_hook": hook, "selected_opinion": opinion,
                 "revision": revision + 1, "approved_revision": None, "assignment": [],
-                "prepared": None, "processed_signature": None, "recording": recording,
+                "prepared": None, "processed_signature": None, "recording": recording, "montage_map": [],
+                "estimated_duration_seconds": cls.estimate_duration(project_id, blocks),
             }, revision)
             cls.invalidate_output(project_id)
             return state
 
     @classmethod
+    def estimate_duration(cls, project_id, blocks):
+        from .facecam_story_service import FacecamStoryService
+        story = cls.selected_story(project_id)
+        if not story:
+            return None
+        return round(sum(len(b.text.split()) for b in blocks if b.kind != "raw") / FacecamStoryService.WORDS_PER_SECOND
+                     + story.raw_duration_seconds + FacecamStoryService.COVER_SECONDS, 2)
+
+    @classmethod
     def generate(cls, project_id: str, hook: str, opinion: str, revision: int):
-        if not hook.strip() or not opinion.strip():
-            raise ValueError("Choisissez une accroche et un point de vue.")
-        blocks = cls.skeleton(project_id)
-        context = cls.context(project_id)
-        prompt = (Path(__file__).parents[2] / "prompts" / "facecam" / "script.md").read_text()
-        result = cls.llm(project_id, prompt + "\n" + json.dumps({
+        from .facecam_narration_service import FacecamNarrationService
+        hook, opinion = hook.strip(), opinion.strip()
+        if not hook:
+            raise ValueError("Choisissez une accroche.")
+        if cls.load(project_id).revision != revision:
+            raise StaleFacecamRevision("Le script a changé. Rechargez la version actuelle.")
+        blocks = cls.skeleton(project_id, include_opinion=bool(opinion))
+        context = cls.narrative_context(project_id)
+        budget = context.get("budget")
+        if budget:
+            fixed_words = len((hook + " " + opinion + " " + ENDING).split())
+            if fixed_words >= budget["max_words"] - 30:
+                raise ValueError("L'accroche et le point de vue laissent trop peu de place au récit. Raccourcissez-les.")
+            context["body_budget"] = {"min_words": max(0, budget["min_words"] - fixed_words),
+                                      "max_words": budget["max_words"] - fixed_words}
+        prompt = FacecamNarrationService.prompt("narration") + "\n" + FacecamNarrationService.prompt("script")
+        request = prompt + "\n" + json.dumps({
             **context, "hook": hook, "opinion": opinion,
             "blocks": [b.model_dump() for b in blocks if b.kind == "body"],
-        }, ensure_ascii=False))
-        bodies = result.get("blocks", [])
-        if [b.get("id") for b in bodies] != [b.id for b in blocks if b.kind == "body"]:
+        }, ensure_ascii=False)
+        result = cls.llm(project_id, request)
+        # A targeted retry prevents a verbose model from silently ignoring the time budget.
+        if budget and isinstance(result, dict) and isinstance(result.get("blocks"), list):
+            word_count = sum(len(b.get("text", "").split()) for b in result["blocks"]
+                             if isinstance(b, dict) and isinstance(b.get("text"), str))
+            if word_count > context["body_budget"]["max_words"]:
+                result = cls.llm(project_id, request + "\nLe brouillon dépasse le budget. Supprime les détails secondaires, "
+                    "conserve la progression et le point d'arrivée. Respecte impérativement body_budget.max_words.\n"
+                    + json.dumps({"draft": result}, ensure_ascii=False))
+        bodies = result.get("blocks", []) if isinstance(result, dict) else []
+        if (not isinstance(bodies, list) or any(not isinstance(b, dict) or not isinstance(b.get("text"), str) for b in bodies)
+                or [b.get("id") for b in bodies] != [b.id for b in blocks if b.kind == "body"]):
             raise ValueError("La génération n'a pas respecté les extraits originaux. Réessayez.")
         by_id = {b["id"]: b.get("text", "").strip() for b in bodies}
+        if budget and sum(len(t.split()) for t in by_id.values()) > context["body_budget"]["max_words"]:
+            raise ValueError("Le récit dépasse encore le budget d'une minute. Relancez la rédaction.")
         for block in blocks:
             if block.kind == "body":
                 block.text = by_id[block.id]
@@ -343,10 +485,10 @@ class FacecamService:
             raise StaleFacecamRevision("Le script a changé.")
         if not state.blocks or any(not b.text.strip() for b in state.blocks if b.kind != "raw"):
             raise ValueError("Complétez l'accroche, le récit et le point de vue avant de valider.")
-        reference = cls.reference(project_id)
+        cls.require_story(project_id)
+        reference, matches, montage_map = cls.montage_reference(project_id)
         scene_map = {s.scene_index: s for s in reference.scenes}
-        from ..models import SceneTranscription, MatchList
-        matches = MatchList.model_validate_json((cls.directory(project_id) / "reference_matches.json").read_text())
+        from ..models import SceneTranscription
         match_map = {m.scene_index: m for m in matches.matches}
         matches.matches = [match_map[s.scene_index] for s in reference.scenes]
         leading_raw = reference.scenes[0].is_raw
@@ -377,8 +519,15 @@ class FacecamService:
         pipeline_reference.scenes.append(SceneTranscription(scene_index=outro_index, text=outro_text,
             start_time=end, end_time=end + duration))
         last = matches.matches[-1]
-        matches.matches.append(last.model_copy(update={"scene_index": outro_index,
-            "start_time": last.end_time, "end_time": last.end_time + duration, "speed_ratio": 1.0}))
+        if state.selected_story_id:
+            last_pos = max(i for i, s in enumerate(reference.scenes) if not s.is_raw)
+            # Reuse a selected illustration; never resurrect the excluded next action for the outro.
+            matches.matches.append(matches.matches[last_pos].model_copy(deep=True, update={"scene_index": outro_index}))
+            montage_map.append({**montage_map[last_pos], "kind": "outro"})
+        else:
+            matches.matches.append(last.model_copy(update={"scene_index": outro_index,
+                "start_time": last.end_time, "end_time": last.end_time + duration, "speed_ratio": 1.0}))
+            montage_map.append({"source_scene_index": None, "kind": "outro"})
         if leading_raw:
             # An opening original-dialogue scene must remain after the selected hook.
             hook_duration = max(1.0, len(state.blocks[0].text.split()) / 2.7)
@@ -386,15 +535,30 @@ class FacecamService:
             for scene in pipeline_reference.scenes:
                 scene.start_time += hook_duration
                 scene.end_time += hook_duration
-            matches.matches.insert(0, first.model_copy(update={"start_time": max(0, first.start_time - hook_duration),
-                "end_time": max(hook_duration, first.start_time), "speed_ratio": 1.0}))
+            if state.selected_story_id:
+                first_pos = next(i for i, s in enumerate(reference.scenes) if not s.is_raw)
+                matches.matches.insert(0, matches.matches[first_pos].model_copy(deep=True))
+                montage_map.insert(0, {**montage_map[first_pos], "kind": "hook"})
+            else:
+                matches.matches.insert(0, first.model_copy(update={"start_time": max(0, first.start_time - hook_duration),
+                    "end_time": max(hook_duration, first.start_time), "speed_ratio": 1.0}))
+                montage_map.insert(0, {"source_scene_index": None, "kind": "hook"})
             pipeline_reference.scenes.insert(0, SceneTranscription(scene_index=0, text=state.blocks[0].text,
                 start_time=0, end_time=hook_duration))
             assignment.insert(0, {"scene_index": 0, "text": state.blocks[0].text})
-            for index, (scene, match, assigned) in enumerate(zip(pipeline_reference.scenes, matches.matches, assignment, strict=True)):
-                scene.scene_index = match.scene_index = assigned["scene_index"] = index
+        cursor = 0.0
+        for index, (scene, match, assigned, origin) in enumerate(zip(pipeline_reference.scenes, matches.matches, assignment, montage_map, strict=True)):
+            scene.scene_index = match.scene_index = assigned["scene_index"] = index
+            origin["output_scene_index"] = index
+            origin.setdefault("kind", "raw" if scene.is_raw else "body")
+            # The new pipeline is contiguous; immutable source clocks live only in montage_map.
+            length, shift = scene.duration, cursor - scene.start_time
+            scene.start_time, scene.end_time = cursor, cursor + length
+            scene.words = [w.model_copy(update={"start": w.start + shift, "end": w.end + shift}) for w in scene.words]
+            cursor += length
         with cls.lock(project_id):
-            state = cls.update(project_id, {"approved_revision": revision, "assignment": assignment, "prepared": None, "processed_signature": None}, revision)
+            state = cls.update(project_id, {"approved_revision": revision, "assignment": assignment,
+                "montage_map": montage_map, "prepared": None, "processed_signature": None}, revision)
             cls.invalidate_output(project_id)
             ProjectService.save_transcription(project_id, pipeline_reference)
             from ..models import Scene, SceneList

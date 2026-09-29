@@ -56,6 +56,121 @@ def range_model(pid, prompt):
     return {'ranges':[{'scene_index':i, 'start':pos*count//len(indices), 'end':(pos+1)*count//len(indices)} for pos,i in enumerate(indices)]}
 
 
+def narrative_brief():
+    return {'premise': 'Un jeune garçon souhaite devenir ninja.', 'protagonist': 'Naruto',
+        'sections': [{'id': 'body-0', 'facts': [{'scene_indices': [0], 'text': 'Naruto arrive.'}]},
+                     {'id': 'body-2', 'facts': [{'scene_indices': [2], 'text': 'Naruto devient ninja.'}]}],
+        'uncertainties': []}
+
+
+def test_narrative_brief_is_shared_but_source_prose_never_reaches_writer(source, monkeypatch):
+    project, initial = draft(source)  # A pre-selection draft remains compatible.
+    prompts = []
+    def generate(pid, prompt):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            assert 'Naruto est ici.' in prompt
+            return narrative_brief()
+        assert 'Naruto est ici.' not in prompt
+        assert 'Dialogue original.' in prompt  # The protected insert remains context.
+        if len(prompts) in {2, 3}:
+            return {'candidates': [f'Proposition distincte {i}.' for i in range(8)]}
+        return {'blocks': [{'id': 'body-0', 'text': 'Naruto arrive avec un objectif.'},
+                           {'id': 'body-2', 'text': 'Il devient finalement ninja.'}]}
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    hooks = FacecamService.candidates(project.id, 'hooks')
+    assert len(hooks.hooks) == 8 and not any(h.original for h in hooks.hooks)
+    FacecamService.update(project.id, {'selected_hook': 'Une accroche choisie.'})
+    FacecamService.candidates(project.id, 'opinions')
+    assert 'Une accroche choisie.' in prompts[-1]
+    state = FacecamService.generate(project.id, 'Une accroche choisie.', 'Un avis précis.', initial.revision)
+    assert len(prompts) == 4  # One extraction shared by all three writing steps.
+    assert [b.id for b in state.blocks] == ['hook', 'body-0', 'raw-1', 'body-2', 'opinion', 'ending']
+    assert state.blocks[2].text == '' and state.blocks[-1].text == ENDING
+    assert state.blocks[0].text == 'Une accroche choisie.'
+
+
+@pytest.mark.parametrize('opinion', ['', '   '])
+def test_optional_opinion_can_be_generated_edited_approved_and_restored(source, monkeypatch, opinion):
+    project = FacecamService.create(source.id)
+    monkeypatch.setattr(FacecamService, 'narrative_context', lambda *a: narrative_brief())
+    prompts = []
+    def write_body(pid, prompt):
+        prompts.append(prompt)
+        return {'blocks': [{'id': 'body-0', 'text': 'Naruto arrive avec un objectif.'},
+                           {'id': 'body-2', 'text': 'Il devient finalement ninja.'}]}
+    monkeypatch.setattr(FacecamService, 'llm', write_body)
+    state = FacecamService.generate(project.id, 'Une accroche choisie.', opinion, 0)
+    assert json.loads(prompts[-1].splitlines()[-1])['opinion'] == ''
+    assert [b.id for b in state.blocks] == ['hook', 'body-0', 'raw-1', 'body-2', 'ending']
+    assert FacecamService.load(project.id).selected_opinion == ''
+    state.blocks[1].text = 'Naruto poursuit son objectif.'
+    state = FacecamService.save_draft(project.id, state.revision, state.blocks, state.selected_hook, '')
+    # Skipping an opinion must never allow an original audio marker to disappear.
+    with pytest.raises(ValueError, match='repères'):
+        FacecamService.save_draft(project.id, state.revision,
+            [b for b in state.blocks if b.kind != 'raw'], state.selected_hook, '')
+    monkeypatch.setattr(FacecamService, 'llm', range_model)
+    state = FacecamService.approve(project.id, state.revision)
+    assert state.approved_revision == state.revision
+    assert state.assignment[-1]['text'] == ENDING
+    assert ProjectService.load_transcription(project.id).scenes[-1].text == ENDING
+    monkeypatch.setattr(FacecamService, 'llm', write_body)
+    state = FacecamService.generate(project.id, state.selected_hook, 'Un avis précis.', state.revision)
+    assert state.blocks[-2].kind == 'opinion' and state.blocks[-2].text == 'Un avis précis.'
+
+
+@pytest.mark.parametrize('indices', [[0, 1], [2], [0, 0], [True]])
+def test_narrative_brief_rejects_crossed_raw_boundaries_missing_or_duplicate_plans(source, monkeypatch, indices):
+    project, initial = draft(source)
+    value = narrative_brief()
+    value['sections'][0]['facts'][0]['scene_indices'] = indices
+    monkeypatch.setattr(FacecamService, 'llm', lambda *a: value)
+    with pytest.raises(ValueError):
+        FacecamService.generate(project.id, 'Accroche.', 'Opinion.', initial.revision)
+    assert FacecamService.load(project.id).revision == initial.revision
+    assert not (FacecamService.directory(project.id) / 'narrative_brief.json').exists()
+
+
+def test_narrative_brief_cache_invalidates_on_reference_change_and_corruption(source, monkeypatch):
+    project, _ = draft(source)
+    calls = []
+    monkeypatch.setattr(FacecamService, 'llm', lambda pid, prompt: calls.append(prompt) or narrative_brief())
+    FacecamService.narrative_context(project.id)
+    FacecamService.narrative_context(project.id)
+    assert len(calls) == 1
+    path = FacecamService.directory(project.id) / 'reference.json'
+    reference = FacecamService.reference(project.id)
+    reference.scenes[0].text = 'Naruto arrive au village.'
+    path.write_text(reference.model_dump_json())
+    FacecamService.narrative_context(project.id)
+    assert len(calls) == 2 and 'Naruto arrive au village.' in calls[-1]
+    (path.parent / 'narrative_brief.json').write_text('{partial')
+    FacecamService.narrative_context(project.id)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize('result', [None, [], {'blocks': None}, {'blocks': ['bad']},
+    {'blocks': [{'id': 'body-0', 'text': 12}]},
+    {'blocks': [{'id': 'body-2', 'text': 'Fin'}, {'id': 'body-0', 'text': 'Début'}]}])
+def test_malformed_narration_does_not_replace_draft(source, monkeypatch, result):
+    project, state = draft(source)
+    monkeypatch.setattr(FacecamService, 'narrative_context', lambda *a: narrative_brief())
+    monkeypatch.setattr(FacecamService, 'llm', lambda *a: result)
+    with pytest.raises(ValueError):
+        FacecamService.generate(project.id, 'Accroche.', 'Opinion.', state.revision)
+    assert FacecamService.load(project.id).blocks == state.blocks
+
+
+def test_stale_generation_is_rejected_before_calling_model(source, monkeypatch):
+    project, state = draft(source)
+    def unexpected(*args):
+        raise AssertionError('Stale generation must not call the model')
+    monkeypatch.setattr(FacecamService, 'llm', unexpected)
+    with pytest.raises(StaleFacecamRevision):
+        FacecamService.generate(project.id, 'Accroche.', 'Opinion.', state.revision - 1)
+
+
 def test_copy_is_independent_french_minimal_and_resets_integrations(source):
     project = FacecamService.create(source.id)
     assert (project.project_mode, project.publishing_type, project.library_type.value) == ('facecam','facecam','anime')

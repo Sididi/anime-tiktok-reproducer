@@ -125,6 +125,7 @@ dev = { depends-on = ["backend"] }
 # Anime searcher CLI
 anime-search = { cmd = "python -m anime_searcher.cli", cwd = "modules/anime_searcher" }
 benchmark-anime-index = { cmd = "python -m anime_searcher.benchmark", cwd = "modules/anime_searcher" }
+measure-anime-index = { cmd = "python -m anime_searcher.measure", cwd = "modules/anime_searcher" }
 
 # Bounded hierarchical matcher evaluator (see docs/MATCHER_V2.md)
 evaluate-matching-v2 = { cmd = "python scripts/evaluate_matching_v2.py" }

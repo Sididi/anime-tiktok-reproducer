@@ -1,6 +1,25 @@
 # Low-impact indexing
 
-Why the desktop used to freeze during series indexing, and how the fix works.
+Earlier mitigations for desktop stalls during series indexing.
+
+**Finalized (2026-09-29):** [production decisions](indexing-final-decisions-2026-09-29.md)
+retain the three memory optimizations, remove the FFmpeg filter/output cap
+experiment, and apply `blur-method = "none";` to the user's Picom configuration.
+Picom was reloaded; the existing transparency settings were preserved.
+
+**Measurement update (2026-09-21):** the user still reproduces severe lag during
+SSCD encoding with these settings active. Treat the historical diagnosis and
+speed estimates below as hypotheses, not proof that responsiveness is fixed.
+Use the [measurement command](indexing-measurements.md) to record throughput,
+X-server latency, effective scopes, memory pressure and thermal behavior.
+
+**Follow-up (2026-09-22):** the user confirmed that disabling Picom's
+`dual_kawase` blur improved external-screen responsiveness while retaining
+transparency, identifying blur as the practical trigger. Keep
+`blur-method = "none";` in Picom for this remedy. The indexing algorithm and
+its resource settings were unchanged. See the
+[recorded findings](indexing-findings-2026-09-21.md) for the comparisons and
+remaining measurement limits.
 
 ## Diagnosis (2026-08-31, i9-14900HX / 32 threads, 31 GiB RAM, RTX 4070 Laptop, single NVMe)
 
@@ -8,7 +27,8 @@ Four compounding causes, none of them "the indexer is slow":
 
 1. **CPU thread storm at normal priority.** Fast mode runs up to 2 jobs × 4
    file workers = 8 ffmpeg processes, each defaulting to ~one thread per core
-   (≈32), plus transform pools — hundreds of runnable threads at nice 0.
+   (≈32), plus transform pools — hundreds of threads at nice 0. Thread count
+   alone does not establish how many are runnable.
    Plain `nice` would not have helped: processes live in cgroups (autogroup
    is bypassed), so only cgroup weights count.
 2. **Page-cache eviction.** One observed backend worker had pushed 107 GB of
@@ -36,12 +56,12 @@ transient scope:
 systemd-run --user --scope --collect -p CPUWeight=idle -p MemoryHigh=10G -p IOWeight=50 <cmd>
 ```
 
-- `CPUWeight=idle` → cgroup `cpu.idle=1`: the subtree may use **every idle
-  core** (zero throughput loss on an unloaded machine) but yields instantly
-  when an interactive task wants CPU.
-- `MemoryHigh=10G` → the kernel reclaims the *scope's own* page cache and
-  anon memory first; streaming a series can no longer evict the desktop's
-  working set.
+- `CPUWeight=idle` → cgroup `cpu.idle=1`: the group has very low CPU scheduling
+  priority relative to its peers. This does not control GPU scheduling or
+  guarantee desktop latency or unchanged throughput.
+- `MemoryHigh=10G` → exceeding the threshold subjects that scope to reclaim and
+  throttling. It does not reserve RAM for desktop applications or guarantee
+  that their working sets remain resident.
 - `IOWeight` is inert until the optional root setup (below) enables the io
   controller.
 - `systemd-run --scope` **execs the payload in place**, so PIDs, process
@@ -51,6 +71,9 @@ Settings (env prefix `ATR_`): `low_impact_media_jobs` (default on),
 `low_impact_cpu_weight` (`idle`, or `1..10000` for proportional sharing),
 `low_impact_memory_high`, `low_impact_io_weight`. If `systemd-run --user` is
 unavailable the wrapper is a no-op.
+
+These distinctions follow the [kernel's cgroup v2 documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+for `cpu.idle`, `memory.high` and memory protection.
 
 ### Page-cache hygiene
 
@@ -67,15 +90,17 @@ unavailable the wrapper is a no-op.
   `ANIME_SEARCHER_DECODE_THREADS`). Verified byte-identical output on both
   the CPU path and the `hevc_cuvid` NVDEC path (md5 over rawvideo rgb24).
   8 frame threads decode far faster than the embed stage consumes.
+  This input-side decoder option does not cap FFmpeg's filter or output pools;
+  measured NVDEC processes can still contain 88 threads each.
 - CPU libx264 import fallback: `-threads 16` (x264 `veryfast` gains ~nothing
   past 16; this is an encode, not part of any bit-identity contract).
 
 ## Expected speed impact
 
-≈0% with the desktop idle (idle-class scheduling only matters under
-contention; thread caps stay above the pipeline's consumption rate; fadvise
-touches data that is never re-read). Under active desktop CPU load, indexing
-now yields — by design.
+The earlier estimate of approximately zero speed loss has not been established
+by sustained, thermally comparable trials. The current acceptance requirement
+is no more than 10% throughput loss. Compare completed, identical workloads and
+record both starting temperatures and throttling before assessing that limit.
 
 ## Optional root setup
 
@@ -87,9 +112,14 @@ now yields — by design.
 
 ## Residual GPU stutter
 
-If light stutter remains on the **external monitor only** while indexing,
-that is SSCD/NVENC competing with the reverse-PRIME scanout on the 4070 —
-there is no NVIDIA knob to deprioritize CUDA vs display. Mitigations trade
-indexing speed (smaller batch, fp16 is forbidden) and are deliberately not
-applied; report whether it is still noticeable after this fix before
-considering them.
+On 2026-09-22 the user clarified that only the external monitor lags during
+frame embedding; the integrated panel works normally. This supersedes the
+earlier description of both monitors lagging. The measured
+path uses NVDEC and SSCD inference, not NVENC video encoding. Long X-server
+round trips alongside short scheduler wake-up delays make the shared display
+path a useful investigation target, but do not isolate a driver, compositor or
+GPU scheduling cause. The external screen uses NVIDIA Reverse PRIME with
+PRIME Synchronization enabled; the integrated panel uses Intel. GPU contention,
+display synchronization and thermal behavior need controlled experiments.
+No smaller-batch or reduced-precision mitigation is enabled by
+the measurement tooling.

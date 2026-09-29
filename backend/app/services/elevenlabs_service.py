@@ -87,7 +87,11 @@ class ElevenLabsService:
         output_format: str | None = None,
         voice_settings: dict[str, Any] | None = None,
         previous_request_ids: list[str] | None = None,
+        next_request_ids: list[str] | None = None,
+        previous_text: str | None = None,
+        next_text: str | None = None,
         seed: int | None = None,
+        language_code: str | None = None,
     ) -> SynthesisResult:
         if not voice_id.strip():
             raise ValueError("voice_id is required")
@@ -97,33 +101,62 @@ class ElevenLabsService:
             raise ValueError("TTS text cannot be empty")
 
         selected_model = (model_id or settings.elevenlabs_model_id).strip()
+        if selected_model == "eleven_v4_turbo":
+            raise ValueError("eleven_v4_turbo requires the realtime Dialogue WebSocket; use eleven_v4")
+        is_v4 = selected_model == "eleven_v4"
         selected_format = (output_format or settings.elevenlabs_output_format).strip()
         accept_header = "audio/mpeg" if selected_format.lower().startswith("mp3") else "*/*"
 
-        body: dict[str, Any] = {
-            "text": clean_text,
-            "model_id": selected_model,
-            "voice_settings": voice_settings
-            or {
+        body: dict[str, Any] = {"model_id": selected_model}
+        if is_v4:
+            # Dialogue's documented reliability limit is lower than the model's
+            # advertised 10k limit. Our narration chunks are already below 800.
+            if len(clean_text) > 2000:
+                raise ValueError("Eleven v4 dialogue text must be at most 2000 characters per request")
+            endpoint = "text-to-dialogue"
+            body["inputs"] = [{"text": clean_text, "voice_id": voice_id.strip()}]
+            configured_settings = voice_settings or {}
+            # Keep the existing YAML schema; Dialogue uses a different wire name.
+            body["settings"] = {
+                "stability": configured_settings.get("stability", 0.5),
+                "similarity": configured_settings.get("similarity_boost", 0.75),
+            }
+        else:
+            endpoint = f"text-to-speech/{voice_id.strip()}"
+            body["text"] = clean_text
+            body["voice_settings"] = voice_settings or {
                 "stability": 0.45,
                 "similarity_boost": 0.8,
                 "style": 0.0,
                 "speed": 1.0,
                 "use_speaker_boost": True,
-            },
-        }
-        clean_previous_request_ids = [
-            request_id.strip()
-            for request_id in previous_request_ids or []
-            if isinstance(request_id, str) and request_id.strip()
-        ]
-        if clean_previous_request_ids:
-            body["previous_request_ids"] = clean_previous_request_ids
+            }
+        # Prefer audio context over text for each side; never send competing
+        # context for the same side. V3 does not support request stitching.
+        if not selected_model.startswith("eleven_v3"):
+            for key, ids, context, text_key in (
+                ("previous_request_ids", previous_request_ids, previous_text, "previous_text"),
+                ("next_request_ids", next_request_ids, next_text, "future_text" if is_v4 else "next_text"),
+            ):
+                clean_ids = [item.strip() for item in ids or [] if isinstance(item, str) and item.strip()]
+                if len(clean_ids) > 3:
+                    raise ValueError(f"{key} supports at most 3 request IDs")
+                if clean_ids:
+                    body[key] = clean_ids
+                elif context and context.strip():
+                    context = context.strip()
+                    if is_v4:
+                        context = context[-100:] if text_key == "previous_text" else context[:100]
+                    body[text_key] = context
         if seed is not None:
-            body["seed"] = int(seed)
+            if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= 2**32 - 1:
+                raise ValueError("seed must be an integer between 0 and 4294967295")
+            body["seed"] = seed
+        if language_code and selected_model != "eleven_multilingual_v2":
+            body["language_code"] = language_code
 
         response = requests.post(
-            f"{cls._BASE_URL}/text-to-speech/{voice_id}",
+            f"{cls._BASE_URL}/{endpoint}",
             params={"output_format": selected_format},
             headers=cls._headers(accept=accept_header),
             json=body,
