@@ -11,6 +11,7 @@ import {
   PlanningPage,
 } from "@/pages";
 import { ScriptPhasePage } from "@/pages/ScriptPhasePage";
+import { FacecamPrompterPage } from "@/pages/FacecamPrompterPage";
 import { DownloadProgressCard } from "@/components/DownloadProgressCard";
 
 function App() {
@@ -18,6 +19,7 @@ function App() {
     <BrowserRouter>
       <DownloadProgressCard />
       <Routes>
+        <Route path="/project/:projectId/prompter" element={<FacecamPrompterPage />} />
         <Route path="/" element={<ProjectSetup />} />
         <Route path="/planning" element={<PlanningPage />} />
         <Route

@@ -1,0 +1,20 @@
+.prompter-display { position: fixed; inset: 0; z-index: 100; background: #080808; color: #fff; font-family: Arial, sans-serif; }
+.prompter-viewport { position: absolute; inset: 0; overflow-y: auto; scrollbar-width: none; overscroll-behavior: contain; overflow-anchor: none; }
+.prompter-viewport::-webkit-scrollbar { display: none; }
+.prompter-viewport:focus-visible { outline: 2px solid #78e4c2; outline-offset: -2px; }
+.prompter-script { position: relative; padding: 38dvh 8% 65dvh; font-size: var(--prompter-font-size); line-height: 1.5; font-weight: 500; overflow-wrap: anywhere; }
+.prompter-script p { margin: 0 0 1.2em; white-space: pre-wrap; }
+.prompter-script.is-mirrored { transform: scaleX(-1); }
+.prompter-raw, .prompter-end { font-size: .48em; line-height: 1.5; letter-spacing: .04em; color: #f5c875; border-block: 1px solid #f5c87555; padding: .7em 0; margin: 1em 0 2em; }
+.prompter-end { color: #78e4c2; border-color: #78e4c255; }
+.prompter-guide { position: absolute; pointer-events: none; top: calc(38% - .08em); left: 2%; color: #78e4c2; font-size: 44px; line-height: 1; }
+.prompter-toolbar { position: absolute; top: 0; left: 0; right: 0; padding: 10px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: linear-gradient(#080808 80%, #08080800); font-size: 14px; transition: opacity .2s; }
+.prompter-toolbar button, .prompter-empty button { display: inline-flex; justify-content: center; align-items: center; min-width: 40px; min-height: 40px; padding: 6px; border: 1px solid #ffffff40; border-radius: 6px; background: #171717; cursor: pointer; }
+.prompter-toolbar button:disabled { opacity: .35; cursor: default; }
+.prompter-toolbar button:focus-visible, .prompter-empty button:focus-visible { outline: 2px solid #78e4c2; outline-offset: 2px; }
+.prompter-notice { margin-left: auto; color: #78e4c2; }
+.prompter-footer { position: absolute; bottom: 0; left: 0; right: 0; font-size: 12px; text-align: center; color: #aaa; background: linear-gradient(#08080800, #080808 40%); padding-top: 12px; }
+.prompter-footer progress { display: block; width: 100%; height: 3px; margin-top: 8px; accent-color: #78e4c2; }
+.prompter-display.is-playing .prompter-toolbar:not(:hover):not(:focus-within), .prompter-display.is-playing .prompter-footer span { opacity: 0; }
+.prompter-empty { position: absolute; inset: 20% 10%; display: grid; gap: 24px; align-content: center; justify-items: center; text-align: center; font-size: 24px; }
+@media (max-width: 600px) { .prompter-notice { width: 100%; text-align: center; } .prompter-script { padding-inline: 10%; } .prompter-footer span { font-size: 10px; } }

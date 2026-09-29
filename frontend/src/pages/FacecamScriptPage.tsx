@@ -6,6 +6,7 @@ import { ProjectManagedVideoPlayer } from '@/components/video/ProjectManagedVide
 import type { ManagedVideoPlayerHandle } from '@/components/video/ManagedVideoPlayer';
 import { FacecamEditor } from '@/components/script/FacecamEditor';
 import { FacecamStories } from '@/components/script/FacecamStories';
+import { FacecamPrompter } from '@/components/script/FacecamPrompter';
 import { MetadataEditorModal } from '@/components/script/MetadataEditorModal';
 import { facecamRequest, uploadFacecam, type FacecamBlock, type FacecamState, type Finding } from '@/api/facecam';
 import type { PlatformMetadata, Project } from '@/types';
@@ -159,7 +160,8 @@ export function FacecamScriptPage({project}: {project: Project}) {
           {finding && <div className="facecam-fact-detail"><strong>{finding.quote}</strong><p>{finding.explanation}</p>{finding.correction && <p><b>Suggestion :</b> {finding.correction}</p>}{finding.sources.map(s => <div key={s.url}><a href={s.url} target="_blank" rel="noreferrer">{s.title}<ExternalLink size={12}/></a>{s.kind === 'subtitle' && s.text && <blockquote>{s.text}</blockquote>}</div>)}<button onClick={() => setFinding(null)} className="underline mt-3">Fermer</button></div>}
         </aside></div>
     </section>}
-    {state.blocks.length > 0 && <section className="facecam-card"><h2>4. Votre enregistrement</h2><p>Lisez uniquement votre narration, sans les extraits audio originaux ni le titre final. Une prise correcte suffit : les silences seront coupés et les extraits réinsérés automatiquement.</p>
+    <section className="facecam-card" hidden={!state.blocks.length}><h2>4. Votre enregistrement</h2><p>Lisez uniquement votre narration, sans les extraits audio originaux ni le titre final. Une prise correcte suffit : les silences seront coupés et les extraits réinsérés automatiquement.</p>
+      <FacecamPrompter projectId={id} title={project.anime_name || 'Facecam'} revision={state.revision} blocks={state.blocks} saved={saved} busy={!!busy} prepare={flush}/>
       <label className={`facecam-upload ${!approved || busy ? 'disabled' : ''}`}><Upload size={24}/><span>{state.recording ? 'Remplacer l’enregistrement' : 'Importer votre vidéo'}<small>MP4 ou MOV avec son</small></span><input type="file" accept="video/mp4,video/quicktime,.mp4,.mov" disabled={!approved || busy} onChange={e => {const file = e.target.files?.[0]; if(file) void importFile(file, 'recording'); e.target.value = '';}}/></label>
       {!approved && <p>Validez votre script avant d’importer une vidéo.</p>}{upload !== null && <progress max={100} value={upload} aria-label="Envoi du fichier"/>}
       {state.recording && <div className="facecam-recording"><video controls src={`/api/projects/${id}/facecam/recording?v=${state.recording.fingerprint}`} preload="metadata"/>
@@ -171,7 +173,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
       {state.recording && <div className="mt-5 flex flex-wrap items-center gap-4"><Button disabled={busy || !approved || state.recording.reviewed_revision !== state.revision} onClick={() => void action('/preview')}>Préparer l’aperçu audio</Button>{previewReady && <audio controls src={`/api/projects/${id}/facecam/preview?r=${state.revision}&v=${state.prepared?.preview_version}`} preload="metadata"/>}</div>}
       {previewReady && state.prepared?.duration_seconds != null && <p>Durée montée, carte finale comprise : {state.prepared.duration_seconds.toFixed(1)} s.
         {state.prepared.duration_seconds <= 60 ? ' Le montage ne dépasse pas encore une minute : ajustez le récit et enregistrez une nouvelle prise.' : state.prepared.duration_seconds > 70 ? ' Le montage dépasse la cible de 65–70 s.' : ''}</p>}
-    </section>}
+    </section>
     <section className="facecam-card"><h2>Finition et publication</h2><div className="facecam-settings">
       {settings && <><label>Musique<select disabled={busy} value={settings.music_key || ''} onChange={e => void updateSetting('music_key', e.target.value)}>{settings.music.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label></>}
       <div><h3>Couverture finale</h3><p>Récupérée automatiquement au traitement. Vous pouvez aussi la choisir ici.</p><div className="flex gap-3 flex-wrap"><Button variant="outline" disabled={busy} onClick={() => {setError(''); facecamRequest<Cover[]>(id, '/covers').then(setCovers).catch(e => setError(e.message));}}>Choisir la couverture</Button><label className="facecam-file-button">Importer une image<input type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} onChange={e => {const file=e.target.files?.[0]; if(file) void importFile(file,'cover');}}/></label></div>
