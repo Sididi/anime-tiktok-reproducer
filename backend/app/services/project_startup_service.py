@@ -264,6 +264,7 @@ class ProjectStartupService:
     async def _reset_project_startup_state(self, project_id: str) -> None:
         from .downloader import DownloaderService
         from .project_service import ProjectService
+        from ..models.cleanup import CleanupState
         from ..models.project import ProjectPhase
 
         project = await ProjectService.aload(project_id)
@@ -296,7 +297,13 @@ class ProjectStartupService:
         project.video_width = None
         project.video_height = None
         project.original_video_path = None
-        project.cleanup = None
+        # A download retry invalidates rendered cleanup output, but the user's
+        # normalized rectangles still apply to the same source video.
+        if project.cleanup is not None:
+            project.cleanup = CleanupState(
+                zones=project.cleanup.zones,
+                clean_feed_rect=project.cleanup.clean_feed_rect,
+            )
         await ProjectService.asave(project)
 
     async def _run_job(self, project_id: str, job_id: str) -> None:

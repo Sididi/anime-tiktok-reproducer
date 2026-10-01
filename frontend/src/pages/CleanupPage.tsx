@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -24,7 +25,7 @@ import { Button } from "@/components/ui";
 import { readSSEStream } from "@/utils/sse";
 import { getEventHub } from "@/utils/eventHub";
 import { useProjectStore } from "@/stores/projectStore";
-import type { CleanFeedRect, CleanupState, CleanupZone } from "@/types";
+import type { CleanFeedRect, CleanupState, CleanupZone, ProjectStartupJob } from "@/types";
 
 const MIN_ZONE_SIZE = 0.02;
 // Sentinel selection id for the clean-feed rectangle (not a cleanup zone).
@@ -70,7 +71,8 @@ function applyDrag<T extends { x: number; y: number; w: number; h: number }>(
   dx: number,
   dy: number,
 ): T {
-  let { x, y, w, h } = original;
+  let { x, y } = original;
+  const { w, h } = original;
   if (mode === "move") {
     x = clamp01(Math.min(x + dx, 1 - w));
     y = clamp01(Math.min(y + dy, 1 - h));
@@ -87,8 +89,12 @@ function applyDrag<T extends { x: number; y: number; w: number; h: number }>(
 
 export function CleanupPage() {
   const { projectId } = useParams<{ projectId: string }>();
+  return projectId ? <CleanupEditor key={projectId} projectId={projectId} /> : null;
+}
+
+function CleanupEditor({ projectId }: { projectId: string }) {
   const navigate = useNavigate();
-  const { project, loadProject } = useProjectStore();
+  const { project, loadProject, error: projectError } = useProjectStore();
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -113,9 +119,15 @@ export function CleanupPage() {
   const [continuing, setContinuing] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [startupJob, setStartupJob] = useState<ProjectStartupJob | null>(null);
+  const [retryingDownload, setRetryingDownload] = useState(false);
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [videoReady, setVideoReady] = useState(false);
 
-  zonesRef.current = zones;
-  cleanFeedRectRef.current = cleanFeedRect;
+  useLayoutEffect(() => {
+    zonesRef.current = zones;
+    cleanFeedRectRef.current = cleanFeedRect;
+  }, [zones, cleanFeedRect]);
   const fps = project?.video_fps || 30;
   const running = cleanupState?.status === "running";
   const complete = cleanupState?.status === "complete";
@@ -124,17 +136,70 @@ export function CleanupPage() {
 
   useEffect(() => {
     if (!projectId) return;
+    let active = true;
     loadProject(projectId);
     api
       .getCleanupState(projectId)
       .then((state) => {
+        if (!active) return;
         setCleanupState(state);
         setZones(state.zones);
         setCleanFeedRect(state.clean_feed_rect ?? null);
       })
-      .catch((err) => setError((err as Error).message));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId]);
+      .catch((err) => {
+        if (active) setError((err as Error).message);
+      });
+    return () => { active = false; };
+  }, [projectId, loadProject]);
+
+  // Failed downloads leave the project in setup. Show the persisted startup
+  // error here too, and refresh the editor when a retry finishes in any tab.
+  useEffect(() => {
+    if (!projectId) return;
+    let active = true;
+    const unsubscribe = getEventHub().subscribe<ProjectStartupJob>(
+      "startup_jobs",
+      { projectId },
+      (event) => {
+        const job = event.kind === "snapshot"
+          ? event.items[event.items.length - 1]?.data
+          : event.item.data;
+        if (!job) return;
+        setStartupJob(job);
+        if (job.status === "complete") {
+          void loadProject(projectId);
+          api.getCleanupState(projectId).then((state) => {
+            if (!active) return;
+            setCleanupState(state);
+            setZones(state.zones);
+            setCleanFeedRect(state.clean_feed_rect ?? null);
+          }).catch((err) => {
+            if (active) setError((err as Error).message);
+          });
+        }
+      },
+    );
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [projectId, loadProject]);
+
+  const retryDownload = async () => {
+    if (!projectId) return;
+    setRetryingDownload(true);
+    setError(null);
+    try {
+      const job = await api.retryProjectStartup(projectId);
+      setStartupJob((current) =>
+        current && current.updated_at > job.updated_at ? current : job,
+      );
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setRetryingDownload(false);
+    }
+  };
 
   // Live job progress arrives over the shared event-hub stream (one
   // connection for the whole browser) instead of a per-tab SSE socket.
@@ -453,6 +518,48 @@ export function CleanupPage() {
 
   if (!projectId) return null;
 
+  if (project?.id !== projectId) {
+    return <div className="p-4" role="status">{projectError || "Loading project…"}</div>;
+  }
+
+  if (!project.video_path || videoError) {
+    const downloading = retryingDownload || startupJob?.status === "queued" || startupJob?.status === "running";
+    return (
+      <div className="min-h-screen bg-[hsl(var(--background))] text-[hsl(var(--foreground))] p-4">
+        <h1 className="text-xl font-bold mb-4">Cleanup — video unavailable</h1>
+        <div className="max-w-xl border border-[hsl(var(--border))] rounded p-4 flex flex-col gap-3">
+          <p role="status">
+            {videoError || (downloading
+              ? startupJob?.message || "Preparing download…"
+              : "The source video has not been downloaded. Retry the download before editing cleanup zones.")}
+          </p>
+          {!videoError && !downloading && startupJob?.error && (
+            <p role="alert" className="text-sm text-[hsl(var(--destructive))] break-words">{startupJob.error}</p>
+          )}
+          {!videoError && /log\s?in|authentication|cookies/i.test(startupJob?.error || "") && (
+            <p className="text-sm">Sign in to TikTok in the browser configured for downloads, then retry.</p>
+          )}
+          {project.tiktok_url && (
+            <a href={project.tiktok_url} target="_blank" rel="noreferrer" className="underline">Open source on TikTok</a>
+          )}
+          {videoError ? (
+            <Button onClick={() => {
+              setVideoError(null);
+              setVideoReady(false);
+              setFrameBox(null);
+            }}>Reload video</Button>
+          ) : (
+            <Button disabled={downloading || !project.tiktok_url} onClick={() => void retryDownload()}>
+              {downloading ? <><Loader2 className="h-4 w-4 animate-spin mr-1" /> Downloading…</> : "Retry download"}
+            </Button>
+          )}
+          {error && <p role="alert" className="text-sm text-[hsl(var(--destructive))]">{error}</p>}
+          <Button variant="outline" onClick={() => navigate("/")}>Back to projects</Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[hsl(var(--background))] text-[hsl(var(--foreground))] p-4 flex flex-col gap-4">
       <div className="flex items-center justify-between">
@@ -466,16 +573,27 @@ export function CleanupPage() {
         </div>
       </div>
 
-      <div className="flex gap-4 flex-1 min-h-0">
+      <fieldset disabled={!videoReady} className="flex gap-4 flex-1 min-h-0 min-w-0">
         {/* Player + overlay */}
         <div className="flex flex-col items-center gap-2">
           <div className="relative bg-black rounded overflow-hidden" style={{ height: "70vh", aspectRatio: "9 / 16" }}>
             <video
               ref={videoRef}
-              src={api.getVideoUrl(projectId)}
+              // HEVC downloads can load as audio-only without firing onError.
+              // This endpoint passes through H.264 or caches a compatible proxy.
+              src={api.getProjectPreviewUrl(projectId)}
               className="h-full w-full object-contain"
               controls={false}
-              onLoadedMetadata={recomputeFrameBox}
+              onLoadedMetadata={() => {
+                const video = videoRef.current;
+                if (!video?.videoWidth || !video.videoHeight) {
+                  setVideoError("The browser could not decode the video track. Reload the video to try again.");
+                  return;
+                }
+                recomputeFrameBox();
+              }}
+              onLoadedData={() => setVideoReady(true)}
+              onError={() => setVideoError("The video could not be loaded. Reload the video to try again.")}
               crossOrigin="anonymous"
             />
             <div ref={overlayRef} className="absolute inset-0">
@@ -555,6 +673,11 @@ export function CleanupPage() {
                 );
               })}
             </div>
+            {!videoReady && (
+              <div role="status" className="absolute inset-0 flex items-center justify-center gap-2 text-white">
+                <Loader2 className="h-4 w-4 animate-spin" /> Preparing video…
+              </div>
+            )}
           </div>
 
           {/* Transport */}
@@ -781,7 +904,7 @@ export function CleanupPage() {
             <div className="text-sm text-[hsl(var(--destructive))]">{error}</div>
           )}
         </div>
-      </div>
+      </fieldset>
     </div>
   );
 }

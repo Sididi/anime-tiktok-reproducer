@@ -442,6 +442,17 @@ Beyond `threshold` and `margin`, the most useful knobs to evaluate for ElevenLab
 
 - Update yt-dlp: `pixi update yt-dlp`
 - Check TikTok URL format
+- If TikTok requires login, sign in using your local browser and set
+  `ATR_YTDLP_COOKIES_FROM_BROWSER=chrome` (or `firefox`) in `.env`. Restart the
+  backend, then use **Retry download** on the cleanup page for Pure projects
+  or **Relancer** in the startup panel.
+
+**Blank video on the Pure cleanup page**
+
+- Failed downloads show the startup error and a retry button before the editor opens.
+- Cleanup uses the browser preview endpoint, which converts unsupported formats
+  such as HEVC to a cached H.264 preview. The original download remains the source
+  for cleanup processing. Wait for **Preparing video…** to finish on first load.
 
 **Matching returns no results**
 

@@ -1,7 +1,7 @@
 """Pure-mode cleanup routes: zones, preview, full inpainting job."""
 
-import json
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
@@ -114,6 +114,11 @@ async def cancel_cleanup(project_id: str) -> dict:
 async def skip_cleanup(project_id: str) -> dict:
     """Continue without cleaning: the raw download stays the project video."""
     project = _require_pure(project_id)
+    if not project.video_path or not Path(project.video_path).is_file():
+        raise HTTPException(
+            status_code=400,
+            detail="Download the source video before continuing",
+        )
     state = project.cleanup
     if state is not None and state.status == "running":
         raise HTTPException(
