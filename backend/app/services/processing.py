@@ -718,6 +718,7 @@ class ProcessingService:
         resolved_scene_sources: dict[int, ResolvedSceneSource] | None = None,
         *,
         contiguous_audio_duration: float | None = None,
+        preserve_audio_start: bool = False,
     ) -> tuple[Transcription, list[PlaybackAudioSegment]]:
         """Convert aligned TTS timings into the final playback timeline.
 
@@ -745,6 +746,8 @@ class ProcessingService:
             ),
             None,
         )
+        first_spoken_scene_index = next((scene.scene_index for scene in transcription.scenes
+                                        if not scene.is_raw and scene.words), None)
 
         transformed_scenes: list[SceneTranscription] = []
         playback_segments: list[PlaybackAudioSegment] = []
@@ -785,6 +788,10 @@ class ProcessingService:
 
             if scene.words:
                 source_start = float(scene.words[0].start)
+                if preserve_audio_start and scene.scene_index == first_spoken_scene_index:
+                    # Facecam already trimmed silence with protected word margins.
+                    # Keep the first consonant even if the aligner starts it late.
+                    source_start = 0.0
                 source_end = float(
                     adjusted_ends.get(scene.scene_index, scene.words[-1].end)
                 )
@@ -900,6 +907,7 @@ class ProcessingService:
         segments: list[PlaybackAudioSegment],
         *,
         apply_tail_fade: bool = True,
+        exact_sample_boundaries: bool = False,
     ) -> None:
         """Rebuild the final TTS WAV by inserting exact silences for raw scenes.
 
@@ -945,6 +953,11 @@ class ProcessingService:
                                 frame_rate,
                                 total_frames,
                             )
+                            if exact_sample_boundaries:
+                                # Shared Facecam boundaries must round identically
+                                # on both sides: floor/ceil duplicates join samples.
+                                start_frame = max(0, min(total_frames, round(segment.source_start * frame_rate)))
+                                end_frame = max(start_frame, min(total_frames, round(segment.source_end * frame_rate)))
                             src.setpos(start_frame)
                             frames = src.readframes(end_frame - start_frame)
                             if apply_tail_fade and position == last_audio_position:
@@ -2954,10 +2967,11 @@ class ProcessingService:
             if not resuming_after_gaps:
                 if project.project_mode == "facecam":
                     from .facecam_service import FacecamService
+                    from .facecam_auto_editor import prepared_is_current
                     from ..models import Transcription
                     facecam_state = FacecamService.load(project.id)
                     prepared = facecam_state.prepared
-                    if not prepared or prepared["revision"] != facecam_state.revision:
+                    if not prepared_is_current(facecam_state):
                         raise ValueError("Préparez l'aperçu Facecam avant le traitement.")
                     prepared_dir = Path(prepared["directory"])
                     edited_audio_path = output_dir / "tts_edited.wav"

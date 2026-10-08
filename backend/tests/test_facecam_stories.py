@@ -255,8 +255,11 @@ async def test_processing_keeps_editorial_cuts_instead_of_extending_them(project
         scene.start_time, scene.end_time = i * 5, (i + 1) * 5
         scene.words = [Word(text='Voix', start=i * 5, end=(i + 1) * 5)]
     (work / 'transcription.json').write_text(transcription.model_dump_json())
+    from app.services.facecam_auto_editor import settings_signature
     FacecamService.update(project.id, {'selected_story_id': state.selected_story_id if selected else None,
-        'prepared': {'revision': state.revision, 'directory': str(work)}})
+        'recording': {'fingerprint': 'test'},
+        'prepared': {'revision': state.revision, 'directory': str(work), 'fingerprint': 'test',
+                     'auto_editor_signature': settings_signature(state.auto_editor)}})
     async def fps(*a, **k):
         return 24.0
     monkeypatch.setattr(ProcessingService, 'detect_first_source_fps', fps)

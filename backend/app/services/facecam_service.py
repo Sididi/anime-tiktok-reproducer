@@ -30,6 +30,7 @@ class FacecamService:
         state, project = cls.load(project_id), cls.project(project_id)
         return hashlib.sha256(json.dumps({
             "revision": state.revision, "prepared": state.prepared, "cover": state.cover,
+            "auto_editor": state.auto_editor.model_dump(),
             "music": project.resolved_music_key(), "template": project.template,
         }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 

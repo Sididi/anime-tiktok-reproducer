@@ -11,7 +11,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from ...models.facecam import ScriptBlock
+from ...models.facecam import FacecamAutoEditorSettings, ScriptBlock
 from ...services.facecam_service import FacecamService, StaleFacecamRevision
 from ...services.project_service import ProjectService
 
@@ -35,6 +35,11 @@ class ActionRequest(BaseModel):
 class StoryRequest(BaseModel):
     revision: int
     story_id: str
+
+
+class PreviewRequest(BaseModel):
+    revision: int
+    auto_editor: FacecamAutoEditorSettings
 
 
 def _state(project_id):
@@ -207,15 +212,28 @@ async def recording(project_id: str):
 
 
 @router.post("/{project_id}/facecam/preview")
-async def preview(project_id: str):
+async def preview(project_id: str, request: PreviewRequest | None = None):
     from ...services.facecam_media_service import FacecamMediaService
+    # Save the exact settings used by the job, after checking the editor revision
+    # and before returning its state to the browser. Repeated clicks cannot race.
+    with FacecamService.lock(project_id):
+        state = _state(project_id)
+        if project_id in FacecamService._processing or (project_id in _jobs and not _jobs[project_id].done()):
+            raise HTTPException(409, "Attendez la fin de l'opération Facecam.")
+        if request:
+            if request.revision != state.revision:
+                raise HTTPException(409, "Le script a changé. Rechargez la version actuelle.")
+            if request.auto_editor != state.auto_editor:
+                FacecamService.update(project_id, {"auto_editor": request.auto_editor, "processed_signature": None}, request.revision)
+                FacecamService.invalidate_output(project_id)
     return await _job(project_id, "Préparation de la voix et de l'aperçu", FacecamMediaService.preview, heavy=True)
 
 
 @router.get("/{project_id}/facecam/preview")
 async def preview_audio(project_id: str):
+    from ...services.facecam_auto_editor import prepared_is_current
     state = _state(project_id)
-    if not state.prepared:
+    if not prepared_is_current(state) or not state.prepared.get("preview_version"):
         raise HTTPException(404, "Préparez l'aperçu.")
     path = Path(state.prepared["directory"]) / "preview.wav"
     if not path.exists():
@@ -323,6 +341,7 @@ async def settings(project_id: str):
     llm = LLMConfigService.get_config()
     music = MusicConfigService.get_config()
     return {"llm_preset": project.resolved_llm_preset_key(), "music_key": project.resolved_music_key(),
+        "auto_editor_defaults": FacecamAutoEditorSettings().model_dump(),
         "models": [{"key": k, "label": v.label} for k, v in llm.presets.items()],
         "music": [{"key": k, "label": v.display_name} for k, v in music.musics.items()]}
 

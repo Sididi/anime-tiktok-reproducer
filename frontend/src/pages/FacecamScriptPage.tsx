@@ -7,12 +7,13 @@ import type { ManagedVideoPlayerHandle } from '@/components/video/ManagedVideoPl
 import { FacecamEditor } from '@/components/script/FacecamEditor';
 import { FacecamStories } from '@/components/script/FacecamStories';
 import { FacecamPrompter } from '@/components/script/FacecamPrompter';
+import { FacecamAutoEditor } from '@/components/script/FacecamAutoEditor';
 import { MetadataEditorModal } from '@/components/script/MetadataEditorModal';
-import { facecamRequest, uploadFacecam, type FacecamBlock, type FacecamState, type Finding } from '@/api/facecam';
+import { DEFAULT_FACECAM_AUTO_EDITOR, facecamRequest, sameAutoEditorSettings, uploadFacecam, type FacecamAutoEditorSettings, type FacecamBlock, type FacecamState, type Finding } from '@/api/facecam';
 import type { PlatformMetadata, Project } from '@/types';
 import './facecam.css';
 
-interface Settings {llm_preset: string; music_key: string | null; models: {key: string; label: string}[]; music: {key: string; label: string}[]}
+interface Settings {llm_preset: string; music_key: string | null; models: {key: string; label: string}[]; music: {key: string; label: string}[]; auto_editor_defaults?: FacecamAutoEditorSettings}
 interface Cover {id: number; title: {romaji: string; english: string | null}; coverImage: {extraLarge: string}}
 
 export function FacecamScriptPage({project}: {project: Project}) {
@@ -22,6 +23,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const [hook, setHook] = useState(''), [opinion, setOpinion] = useState(''), [stage, setStage] = useState<'hooks' | 'opinions'>('hooks');
   const [finding, setFinding] = useState<Finding | null>(null), [covers, setCovers] = useState<Cover[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null), [upload, setUpload] = useState<number | null>(null);
+  const [autoEditorDraft, setAutoEditorDraft] = useState<FacecamAutoEditorSettings | null>(null);
   const [metadata, setMetadata] = useState<PlatformMetadata | null>(null), [metadataOpen, setMetadataOpen] = useState(false);
   const [delivery, setDelivery] = useState<{status: string} | null>(project.facecam_delivery ?? null);
   const [sourceOpen, setSourceOpen] = useState(false), [sourceLoaded, setSourceLoaded] = useState(false);
@@ -110,12 +112,27 @@ export function FacecamScriptPage({project}: {project: Project}) {
     try {setSettings(await facecamRequest<Settings>(id, '/settings', 'PUT', {[key]: value}));}
     catch(e) {setError((e as Error).message);} finally {setWorking(false);}
   }
+  async function preparePreview() {
+    setWorking(true); setError('');
+    try {
+      await flush();
+      const current = stateRef.current;
+      const next = await facecamRequest(id, '/preview', 'POST', {
+        revision: current?.revision, auto_editor: autoEditorDraft ?? current?.auto_editor ?? DEFAULT_FACECAM_AUTO_EDITOR,
+      });
+      apply(next); setAutoEditorDraft(null);
+    } catch (e) {setError((e as Error).message);} finally {setWorking(false);}
+  }
   if (!state) return <div className="p-8">{error || 'Chargement de Facecam…'}</div>;
   const visibleFindings = state.fact_revision === state.revision && saved ? state.findings : [];
   const options = stage === 'hooks' ? state.hooks : state.opinions;
   const selection = stage === 'hooks' ? hook : opinion;
   const select = stage === 'hooks' ? setHook : setOpinion;
-  const previewReady = approved && state.prepared?.revision === state.revision && state.prepared?.preview_music_key === settings?.music_key;
+  const autoEditor = autoEditorDraft ?? state.auto_editor ?? DEFAULT_FACECAM_AUTO_EDITOR;
+  const autoEditorDirty = !sameAutoEditorSettings(autoEditor, state.auto_editor ?? DEFAULT_FACECAM_AUTO_EDITOR);
+  const previewReady = approved && !!state.prepared?.preview_version && !!state.prepared?.auto_editor_signature
+    && state.prepared.revision === state.revision && state.prepared.fingerprint === state.recording?.fingerprint
+    && state.prepared.preview_music_key === settings?.music_key && sameAutoEditorSettings(autoEditor, state.prepared.auto_editor);
   const storyReady = !!state.selected_story_id || (!state.stories?.length && state.blocks.length > 0);
   const wordCount = state.blocks.filter(b => b.kind !== 'raw').reduce((n, b) => n + (b.text.trim() ? b.text.trim().split(/\s+/).length : 0), 0);
   return <main className="facecam-page">
@@ -170,7 +187,12 @@ export function FacecamScriptPage({project}: {project: Project}) {
           {state.recording.reviewed_revision !== state.revision && <Button variant="outline" disabled={busy || !approved} onClick={() => void action('/recording/review', {})}>J’ai vérifié les différences</Button>}
           <p className="text-sm">Modifiez le script si votre lecture a changé, ou acceptez les écarts de transcription après écoute.</p>
         </div></div>}
-      {state.recording && <div className="mt-5 flex flex-wrap items-center gap-4"><Button disabled={busy || !approved || state.recording.reviewed_revision !== state.revision} onClick={() => void action('/preview')}>Préparer l’aperçu audio</Button>{previewReady && <audio controls src={`/api/projects/${id}/facecam/preview?r=${state.revision}&v=${state.prepared?.preview_version}`} preload="metadata"/>}</div>}
+      {state.recording && <>
+        <FacecamAutoEditor value={autoEditor} defaults={settings?.auto_editor_defaults ?? DEFAULT_FACECAM_AUTO_EDITOR} disabled={!!busy}
+          pending={autoEditorDirty} onChange={setAutoEditorDraft}/>
+        <div className="mt-5 flex flex-wrap items-center gap-4"><Button disabled={busy || !approved || state.recording.reviewed_revision !== state.revision} onClick={() => void preparePreview()}>Préparer l’aperçu audio</Button>{previewReady && <audio key={state.prepared?.preview_version} controls aria-label="Aperçu audio Facecam" src={`/api/projects/${id}/facecam/preview?r=${state.revision}&v=${state.prepared?.preview_version}`} preload="metadata"/>}</div>
+      </>}
+      {previewReady && state.prepared?.cut_report && <p>{state.prepared.cut_report.removed_seconds.toFixed(1)} s de pauses retirées · {state.prepared.cut_report.cut_count} coupes · {state.prepared.cut_report.protected_word_count} mots protégés.</p>}
       {previewReady && state.prepared?.duration_seconds != null && <p>Durée montée, carte finale comprise : {state.prepared.duration_seconds.toFixed(1)} s.
         {state.prepared.duration_seconds <= 60 ? ' Le montage ne dépasse pas encore une minute : ajustez le récit et enregistrez une nouvelle prise.' : state.prepared.duration_seconds > 70 ? ' Le montage dépasse la cible de 65–70 s.' : ''}</p>}
     </section>

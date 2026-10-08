@@ -50,6 +50,15 @@ class FacecamFinding(BaseModel):
     sources: list[dict[str, str]] = Field(default_factory=list)
 
 
+class FacecamAutoEditorSettings(BaseModel):
+    """Real-voice silence detection; word protection is always enabled."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    noise_threshold_db: float = Field(default=-26, ge=-60, le=-15)
+    min_silence_ms: int = Field(default=120, ge=80, le=1000)
+    margin_before_ms: int = Field(default=30, ge=0, le=300)
+    margin_after_ms: int = Field(default=50, ge=0, le=500)
+
+
 class FacecamState(BaseModel):
     revision: int = 0
     stories: list[StoryArc] = Field(default_factory=list)
@@ -70,6 +79,7 @@ class FacecamState(BaseModel):
     fact_context: dict[str, Any] | None = None
     findings: list[FacecamFinding] = Field(default_factory=list)
     recording: dict[str, Any] | None = None
+    auto_editor: FacecamAutoEditorSettings = Field(default_factory=FacecamAutoEditorSettings)
     prepared: dict[str, Any] | None = None
     processed_signature: str | None = None
     delivery: dict[str, Any] | None = None

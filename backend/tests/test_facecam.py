@@ -347,7 +347,7 @@ def test_comparison_ignores_case_and_punctuation_but_exposes_meaningful_changes(
 
 def test_camera_cut_map_composes_raw_gap_without_drift():
     keep=keep_intervals(4,[(1,2)])
-    assert keep==[(0,71),(115,240)]
+    assert keep==[(0,63),(118,240)]
     clean=sum(b-a for a,b in keep)/60
     playback=[SimpleNamespace(kind='audio',source_start=0,source_end=1,duration=1),
         SimpleNamespace(kind='silence',duration=2), SimpleNamespace(kind='audio',source_start=1,source_end=clean,duration=clean-1)]
@@ -517,12 +517,15 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
         text=assigned[scene.scene_index];words=text.split();start=index*2/len(narrated);end=(index+1)*2/len(narrated)
         scene.text=text;scene.start_time=start;scene.end_time=end
         scene.words=[Word(text=w,start=start+(end-start)*i/len(words),end=start+(end-start)*(i+1)/len(words)) for i,w in enumerate(words)]
+    align_calls=[]
     def align(**kwargs):
+        align_calls.append(kwargs['edited_audio_path'])
         assert kwargs['manifest']['mode']=='single_audio'
         assert all(part['text'] for part in kwargs['manifest']['segments'])
         return SimpleNamespace(transcription=aligned,report={"status":"complete"})
     monkeypatch.setattr(ForcedAlignmentService,'_align_single_audio',align)
     monkeypatch.setattr(TranscriberService,'model_session',lambda:contextlib.nullcontext())
+    monkeypatch.setattr(FacecamMediaService,'speech_timing',lambda root:{'words':[{'start':0,'end':2,'text':'Voix'}]})
     monkeypatch.setattr(media,'probe',lambda path:{'format':{'duration':60}})
     result=FacecamMediaService.prepare(project.id)
     work=Path(result.prepared['directory']);transcription=Transcription.model_validate_json((work/'transcription.json').read_text())
@@ -536,6 +539,24 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     assert 0<=result.prepared['cover_start']-voice_duration<1/60
     assert result.prepared['scenes'][-1]['duration_frames']==60
     assert FacecamMediaService.prepare(project.id).prepared==result.prepared
+    assert len(align_calls)==1
+    # Changing only the tuning must rebuild audio/alignment/camera without a new
+    # recording, script revision, approval, or discrepancy review.
+    from app.models.facecam import FacecamAutoEditorSettings
+    stale_processing=ProcessingService.get_output_dir(project.id)/'processing_state.json'
+    stale_processing.parent.mkdir(exist_ok=True)
+    stale_processing.write_text('{}')
+    FacecamService.update(project.id,{'auto_editor':FacecamAutoEditorSettings(min_silence_ms=200)})
+    updated=FacecamMediaService.prepare(project.id)
+    assert len(align_calls)==2
+    assert not stale_processing.exists()
+    assert updated.revision==result.revision
+    assert updated.approved_revision==result.approved_revision
+    assert updated.recording==result.recording
+    assert updated.prepared['directory']!=result.prepared['directory']
+    assert updated.prepared['auto_editor_signature']!=result.prepared['auto_editor_signature']
+    assert updated.prepared['cut_report']['clipped_word_count']==0
+    assert (work/'narration.wav').is_file()
 
 
 def test_facecam_schedule_requires_explicit_account_optin(source,monkeypatch):

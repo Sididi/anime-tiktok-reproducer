@@ -16,6 +16,7 @@ from pathlib import Path
 from ..models import Transcription
 from .facecam_service import FacecamService
 from .atomic_files import write_text_atomic
+from .facecam_auto_editor import keep_intervals, prepared_is_current, protected_spans, settings_signature, verify_speech_retained
 
 FPS = 60
 RATE = 48000
@@ -41,23 +42,6 @@ def compare_words(expected: str, actual: str) -> list[dict]:
     a, b = words(expected), words(actual)
     return [{"kind": tag, "expected": " ".join(a[i:j]), "spoken": " ".join(b[k:l])}
             for tag, i, j, k, l in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes() if tag != "equal"]
-
-
-def keep_intervals(duration: float, silences: list[tuple[float, float]]) -> list[tuple[int, int]]:
-    """Return source frame intervals. Keep breath margins; hard cuts only."""
-    cuts, cursor = [], 0
-    total = math.floor(duration * FPS)
-    for start, end in sorted(silences):
-        cut_start = max(0, math.ceil((start + 0.18) * FPS))
-        cut_end = min(total, math.floor((end - 0.08) * FPS))
-        if cut_end <= cut_start:
-            continue
-        if cut_start > cursor:
-            cuts.append((cursor, cut_start))
-        cursor = max(cursor, cut_end)
-    if cursor < total:
-        cuts.append((cursor, total))
-    return [(a, b) for a, b in cuts if b > a]
 
 
 def camera_segments(keep: list[tuple[int, int]], playback: list) -> list[dict]:
@@ -112,6 +96,7 @@ class FacecamMediaService:
         from .transcriber import TranscriberService
         with TranscriberService.model_session():
             words, _ = TranscriberService._transcribe_sync(root / "voice.wav", "fr", "large-v3")
+            cls.save_speech_timing(root, words, TranscriberService._last_unrecovered_gaps)
         spoken = " ".join(str(w.get("word", w.get("text", ""))) for w in words)
         differences = compare_words(state.spoken_text(), spoken)
         result = FacecamService.update(project_id, {"prepared": None, "processed_signature": None, "recording": {
@@ -129,6 +114,28 @@ class FacecamMediaService:
             raise ValueError("Importez votre enregistrement.")
         return FacecamService.update(project_id, {"recording": {**state.recording, "reviewed_revision": revision}, "prepared": None}, revision)
 
+    @staticmethod
+    def save_speech_timing(root: Path, words: list[dict], uncertain_spans: list):
+        write_text_atomic(root / "speech_timing.json", json.dumps({
+            "version": 1, "words": words, "uncertain_spans": uncertain_spans,
+        }, ensure_ascii=False))
+
+    @classmethod
+    def speech_timing(cls, root: Path) -> dict:
+        """Analyze old recordings once; tuning never reuses timings from cut audio."""
+        from .transcriber import TranscriberService
+        path = root / "speech_timing.json"
+        if not path.exists():
+            with TranscriberService.model_session():
+                words, _ = TranscriberService._transcribe_sync(root / "voice.wav", "fr", "large-v3")
+                cls.save_speech_timing(root, words, TranscriberService._last_unrecovered_gaps)
+        timing = json.loads(path.read_text())
+        if not timing.get("words"):
+            raise ValueError("Aucune parole détectée dans l'enregistrement.")
+        # Missing or malformed timings must never silently disable word protection.
+        protected_spans(timing["words"], timing.get("uncertain_spans", []))
+        return timing
+
     @classmethod
     def prepare(cls, project_id: str):
         from .forced_alignment import ForcedAlignmentService
@@ -140,13 +147,20 @@ class FacecamMediaService:
             raise ValueError("Validez le script et importez un enregistrement.")
         if state.recording.get("reviewed_revision") != state.revision:
             raise ValueError("Vérifiez les différences entre votre script et votre enregistrement.")
-        if state.prepared and state.prepared.get("revision") == state.revision and state.prepared.get("fingerprint") == state.recording["fingerprint"]:
+        if prepared_is_current(state) and all((Path(state.prepared["directory"]) / name).is_file()
+                                             for name in ("narration.wav", "transcription.json", "voice_clean.wav")):
             return state
         root = Path(state.recording["directory"])
-        work = root / f"revision-{state.revision}"
+        # Never overwrite the last playable preview if analysis or alignment fails.
+        signature = settings_signature(state.auto_editor)
+        work = root / f"revision-{state.revision}-{signature}-{uuid.uuid4().hex[:8]}"
         work.mkdir(exist_ok=True)
         wav = root / "voice.wav"
-        detection = ffmpeg(["-i", str(wav), "-af", "silencedetect=noise=-35dB:d=0.35", "-f", "null", "-"])
+        timing = cls.speech_timing(root)
+        speech = protected_spans(timing["words"], timing.get("uncertain_spans", []))
+        tuning = state.auto_editor
+        detection = ffmpeg(["-i", str(wav), "-af",
+            f"silencedetect=noise={tuning.noise_threshold_db}dB:d={tuning.min_silence_ms / 1000}", "-f", "null", "-"])
         silence_start, silences = None, []
         for line in detection.stderr.decode(errors="replace").splitlines():
             match = re.search(r"silence_start: ([\d.]+)", line)
@@ -160,15 +174,19 @@ class FacecamMediaService:
         duration = min(duration, float(probe(root / "facecam.mp4")["format"]["duration"]))
         if silence_start is not None:
             silences.append((silence_start, duration))
-        keep = keep_intervals(duration, silences)
+        keep = keep_intervals(duration, silences, tuning, speech)
+        verify_speech_retained(keep, speech, duration)
         if not keep:
             raise ValueError("Aucune parole détectée dans l'enregistrement.")
         clean = work / "voice_clean.wav"
         with wave.open(str(wav), "rb") as src, wave.open(str(clean), "wb") as dst:
             dst.setparams(src.getparams())
+            frame_size = src.getnchannels() * src.getsampwidth()
             for start, end in keep:
                 src.setpos(start * (RATE // FPS))
-                dst.writeframes(src.readframes((end - start) * (RATE // FPS)))
+                sample_count = (end - start) * (RATE // FPS)
+                frames = src.readframes(sample_count)
+                dst.writeframes(frames + b"\x00" * (sample_count * frame_size - len(frames)))
         payload = {"language": "fr", "scenes": state.assignment}
         # One contiguous known-text segment per narration block, without any TTS normalization.
         manifest = cls.manifest(payload)
@@ -194,18 +212,35 @@ class FacecamMediaService:
         resolved = ProcessingService.resolve_scene_sources(matches, ProcessingService._build_source_rate(source_fps), library_type=project.library_type)
         # Do not shift only word timings: source_start must stay in the clean WAV's coordinate system.
         transcription, playback = ProcessingService.build_authoritative_playback_timeline(
-            alignment.transcription, resolved, contiguous_audio_duration=ProcessingService._probe_wav_duration(clean))
+            alignment.transcription, resolved, contiguous_audio_duration=ProcessingService._probe_wav_duration(clean),
+            preserve_audio_start=True)
         output_voice = work / "narration.wav"
-        ProcessingService.rebuild_tts_audio_with_playback_segments(clean, output_voice, playback, apply_tail_fade=False)
+        ProcessingService.rebuild_tts_audio_with_playback_segments(clean, output_voice, playback,
+            apply_tail_fade=False, exact_sample_boundaries=True)
         clips = camera_segments(keep, playback)
         end = math.ceil(ProcessingService._probe_wav_duration(output_voice) * FPS - 1e-7) / FPS
         write_text_atomic(work / "transcription.json", transcription.model_dump_json())
+        cut_report = {"source_duration_seconds": duration,
+            "clean_duration_seconds": sum(b - a for a, b in keep) / FPS,
+            "removed_seconds": max(0, duration - sum(b - a for a, b in keep) / FPS),
+            "cut_count": len(keep) - 1 + int(keep[0][0] > 0) + int(keep[-1][1] < math.ceil(duration * FPS - 1e-7)),
+            "protected_word_count": len(timing["words"]), "clipped_word_count": 0,
+            "uncertain_span_count": len(timing.get("uncertain_spans", []))}
+        write_text_atomic(work / "cut_report.json", json.dumps(cut_report, indent=2))
         prepared = {"revision": state.revision, "fingerprint": state.recording["fingerprint"], "directory": str(work),
+            "auto_editor": tuning.model_dump(), "auto_editor_signature": signature, "cut_report": cut_report,
             "keep_frames": [list(interval) for interval in keep], "camera_segments": clips, "cover_start": end,
             "duration_seconds": end + 1,
             "alignment_path": str(ForcedAlignmentService.report_path(work)),
             "scenes": [{"kind": "cover", "start_frame": round(end * FPS), "duration_frames": FPS}]}
-        return FacecamService.update(project_id, {"prepared": prepared}, state.revision)
+        with FacecamService.lock(project_id):
+            current = FacecamService.load(project_id)
+            if current.auto_editor != tuning or not current.recording or current.recording["fingerprint"] != state.recording["fingerprint"]:
+                raise ValueError("Les réglages ou l'enregistrement ont changé. Préparez à nouveau l'aperçu.")
+            if current.revision != state.revision:
+                raise ValueError("Le script a changé. Préparez à nouveau l'aperçu.")
+            FacecamService.invalidate_output(project_id)
+            return FacecamService.update(project_id, {"prepared": prepared, "processed_signature": None}, state.revision)
 
     @staticmethod
     def manifest(payload):

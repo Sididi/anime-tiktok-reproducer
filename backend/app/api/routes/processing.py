@@ -1154,9 +1154,12 @@ async def process_project(project_id: str):
     if project.project_mode == "facecam":
         from ...services.facecam_service import FacecamService
         from ...services.facecam_cover_service import FacecamCoverService
+        from ...services.facecam_auto_editor import prepared_is_current
         state = FacecamService.load(project_id)
         if not state.prepared or state.approved_revision != state.revision:
             raise HTTPException(400, "Validez le script et préparez l'aperçu Facecam.")
+        if not prepared_is_current(state) or not state.prepared.get("preview_version"):
+            raise HTTPException(400, "Les réglages de coupe ont changé. Préparez à nouveau l'aperçu audio.")
         if state.prepared.get("preview_music_key") != project.resolved_music_key():
             raise HTTPException(400, "La musique a changé. Préparez à nouveau l'aperçu audio.")
         audio_path = Path(state.prepared["directory"]) / "narration.wav"
