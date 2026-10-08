@@ -20,6 +20,9 @@ _PLATFORM_DISPLAY = {
     "facebook": "Facebook",
     "instagram": "Instagram",
     "tiktok": "TikTok",
+    "dailymotion": "Dailymotion",
+    "snapchat": "Snapchat",
+    "bilibili": "Bilibili",
 }
 
 _STATUS_EMOJI = {

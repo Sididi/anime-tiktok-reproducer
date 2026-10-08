@@ -2,7 +2,8 @@
 """Copy a project's generated script to the clipboard.
 
 Resolves the raw script saved during the `/script` phase for a given project id
-and pushes it to the system clipboard. Mirrors the backend resolution order used
+(or the TikTok URL the project was uploaded to) and pushes it to the system
+clipboard. Mirrors the backend resolution order used
 by `GET /script/latest-generation`:
 
   1. The most recently modified automation run -> script_automation_runs/<run>/script.json
@@ -16,6 +17,11 @@ Usage (from repo root):
     pixi run python scripts/copy_project_script.py <project_id>
     pixi run python scripts/copy_project_script.py <project_id> --json
     pixi run python scripts/copy_project_script.py <project_id> --stdout
+    pixi run python scripts/copy_project_script.py https://www.tiktok.com/@animespm4/video/7668466849704709409
+
+A TikTok URL is matched by video id against the project's *uploaded* TikTok URL
+(`tiktok_pfm.url` / `upload_last_result` tiktok entry), never the source
+`tiktok_url`. Projects published in manual TikTok mode have no stored URL.
 
 Clipboard backends (Arch Linux): wl-copy (Wayland), xclip or xsel (X11).
 """
@@ -24,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -41,13 +48,14 @@ EDITED_AUDIO_FILENAME = "tts_edited.wav"  # post-auto-editor audio
 # Mirrors backend/app/config.py:cep_trigger_url_template
 DEFAULT_LINK_TEMPLATE = "http://localhost:48653/p/{project_id}"
 
-# TikTok demonetisation appeal message. {cuts}, {duration} and {interval} are
-# filled with the real montage cut count, post-auto-editor video duration and
-# average seconds-per-cut. Everything else is copied verbatim.
+# TikTok demonetisation appeal message. {video_url}, {cuts}, {duration},
+# {interval} and {signature} are filled with the uploaded TikTok URL, real
+# montage cut count, post-auto-editor video duration, average seconds-per-cut
+# and the project's account ("<account name> - @<tiktok handle>"). Everything else is copied verbatim.
 CONTEST_MESSAGE_TEMPLATE = """\
 Bonjour,
 
-Je suis résident français (Espace Économique Européen) et je demande formellement une révision humaine de la démonétisation appliquée à la vidéo https://www.tiktok.com/@animespm4/video/7644259243973037334 pour motif de "contenu de faible qualité".
+Je suis résident français (Espace Économique Européen) et je demande formellement une révision humaine de la démonétisation appliquée à la vidéo {video_url} pour motif de "contenu de faible qualité".
 
 En tant que résident EEE, je fais valoir mes droits sous l'Article 17 du Digital Services Act (Règlement UE 2022/2065) : TikTok est légalement tenu de fournir une motivation claire, précise et spécifique justifiant cette restriction. La mention générique "contenu de faible qualité" ne satisfait pas à cette obligation légale. Je demande également, conformément aux garanties applicables aux décisions restreignant la monétisation d'un contenu, que cette révision ne soit pas fondée uniquement sur un traitement automatisé.
 
@@ -73,9 +81,13 @@ Je demande :
 En l'absence d'une réponse motivée précise, j'exercerai mon droit d'escalade auprès d'un organisme de règlement extrajudiciaire certifié sous le DSA (Appeals Centre Europe, appealscentre.eu), conformément à l'Article 21 du Règlement UE 2022/2065.
 
 Cordialement,
-AnimeSPM - @AnimeSPM4"""
+{signature}"""
+VIDEO_URL_PLACEHOLDER = "<URL de la vidéo TikTok>"
+SIGNATURE_PLACEHOLDER = "<Nom du compte> - @<compte TikTok>"
 # Mirrors backend/app/services/project_service.py
-_VALID_ID = __import__("re").compile(r"[a-zA-Z0-9_-]+$")
+_VALID_ID = re.compile(r"[a-zA-Z0-9_-]+$")
+_TIKTOK_VIDEO_ID_RE = re.compile(r"tiktok\.com/.*?/video/(\d+)")
+_TIKTOK_HANDLE_RE = re.compile(r"tiktok\.com/@([A-Za-z0-9_.]+)/video/")
 
 
 def _projects_dir() -> Path:
@@ -91,6 +103,137 @@ def _validate_project_id(project_id: str) -> None:
         raise SystemExit(
             f"Invalid project id {project_id!r}: must be alphanumeric/hyphen/underscore."
         )
+
+
+def _tiktok_video_id(url: str | None) -> str | None:
+    match = _TIKTOK_VIDEO_ID_RE.search(url or "")
+    return match.group(1) if match else None
+
+
+def uploaded_tiktok_urls(project: dict) -> list[str]:
+    """The project's published TikTok URLs (PFM state + upload_last_result)."""
+    urls: list[str] = []
+    pfm = project.get("tiktok_pfm")
+    if isinstance(pfm, dict) and pfm.get("url"):
+        urls.append(str(pfm["url"]))
+    result = project.get("upload_last_result")
+    entries = result.get("platforms") if isinstance(result, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and entry.get("platform") == "tiktok" and entry.get("url"):
+            urls.append(str(entry["url"]))
+    return [u for u in dict.fromkeys(urls) if _tiktok_video_id(u)]
+
+
+def _load_project_json(project_dir: Path) -> dict:
+    try:
+        data = json.loads((project_dir / "project.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_project_ref(ref: str) -> str:
+    """Return a project id from either a project id or an uploaded TikTok URL."""
+    if "tiktok.com" not in ref:
+        return ref
+    video_id = _tiktok_video_id(ref)
+    if video_id is None:
+        raise SystemExit(
+            f"Unsupported TikTok URL {ref!r}: expected .../@<account>/video/<id> "
+            "(short vm.tiktok.com links must be opened first)."
+        )
+    projects_dir = _projects_dir()
+    matches = sorted(
+        d.name
+        for d in projects_dir.iterdir()
+        if d.is_dir()
+        and any(
+            _tiktok_video_id(u) == video_id
+            for u in uploaded_tiktok_urls(_load_project_json(d))
+        )
+    ) if projects_dir.is_dir() else []
+    if not matches:
+        raise SystemExit(
+            f"No project under {projects_dir} was uploaded to TikTok video {video_id}. "
+            "(Manual TikTok mode uploads store no URL: pass the project id instead.)"
+        )
+    if len(matches) > 1:
+        raise SystemExit(
+            f"TikTok video {video_id} matches several projects: {', '.join(matches)}. "
+            "Pass the project id instead."
+        )
+    return matches[0]
+
+
+def _accounts_config_path() -> Path:
+    """Mirrors backend/app/config.py:accounts_config_path (ATR_ override)."""
+    override = os.getenv("ATR_ACCOUNTS_CONFIG_PATH")
+    if override:
+        return Path(override).expanduser()
+    return REPO_ROOT / "config" / "accounts" / "config.yaml"
+
+
+def account_display_name(account_id: str) -> str | None:
+    """The account's `name` from config/accounts/config.yaml (templates honored)."""
+    import yaml
+
+    path = _accounts_config_path()
+    try:
+        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    raw = (config.get("accounts") or {}).get(account_id)
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("name"):
+        return str(raw["name"])
+    templates = config.get("templates") or {}
+    names = raw.get("template") or []
+    for name in reversed([names] if isinstance(names, str) else names):
+        template = templates.get(name)
+        if isinstance(template, dict) and template.get("name"):
+            return str(template["name"])
+    return None
+
+
+def _tiktok_handle(urls: list[str]) -> str | None:
+    for url in urls:
+        match = _TIKTOK_HANDLE_RE.search(url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def account_tiktok_handle(account_id: str, preferred_urls: list[str]) -> str | None:
+    """TikTok handle from the given URLs, else from any sibling project of the account."""
+    handle = _tiktok_handle(preferred_urls)
+    if handle:
+        return handle
+    projects_dir = _projects_dir()
+    if not projects_dir.is_dir():
+        return None
+    for project_dir in sorted(projects_dir.iterdir(), key=lambda d: d.name):
+        if not project_dir.is_dir():
+            continue
+        project = _load_project_json(project_dir)
+        if project.get("scheduled_account_id") != account_id:
+            continue
+        handle = _tiktok_handle(uploaded_tiktok_urls(project))
+        if handle:
+            return handle
+    return None
+
+
+def build_signature(project: dict, video_url: str | None) -> str | None:
+    """'<account name> - @<tiktok handle>' for the project's scheduled account."""
+    urls = [video_url] if video_url else []
+    account_id = project.get("scheduled_account_id")
+    if not account_id:
+        handle = _tiktok_handle(urls)
+        return f"@{handle}" if handle else None
+    name = account_display_name(str(account_id)) or str(account_id)
+    handle = account_tiktok_handle(str(account_id), urls)
+    return f"{name} - @{handle}" if handle else name
 
 
 def _latest_run_script(project_dir: Path) -> tuple[dict, str] | None:
@@ -214,11 +357,15 @@ def format_cut_interval_fr(seconds: float, cuts: int) -> str:
     return f"{floored:.1f}".replace(".", ",")
 
 
-def build_contest_message(project_dir: Path) -> str:
-    """Fill the appeal message with the project's real cut count and duration."""
+def build_contest_message(
+    project_dir: Path, video_url: str | None, signature: str | None
+) -> str:
+    """Fill the appeal message with the video URL, cut count, duration and account."""
     cuts = count_montage_cuts(project_dir)
     seconds = video_duration_seconds(project_dir)
     return CONTEST_MESSAGE_TEMPLATE.format(
+        video_url=video_url or VIDEO_URL_PLACEHOLDER,
+        signature=signature or SIGNATURE_PLACEHOLDER,
         cuts=cuts,
         duration=format_duration_fr(seconds),
         interval=format_cut_interval_fr(seconds, cuts),
@@ -261,7 +408,11 @@ def copy_to_clipboard(text: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Copy a project's saved script to the clipboard.")
-    parser.add_argument("project_id", help="Project id (12-char hex, e.g. 6f284c2cb490)")
+    parser.add_argument(
+        "project",
+        help="Project id (12-char hex, e.g. 6f284c2cb490) or the uploaded TikTok video URL "
+        "(e.g. https://www.tiktok.com/@animespm4/video/7668466849704709409)",
+    )
     parser.add_argument("--json", action="store_true", help="Copy the raw script JSON instead of plain text (no link prepended).")
     parser.add_argument("--no-link", action="store_true", help="Do not prepend the generation link to the text output.")
     parser.add_argument("--stdout", action="store_true", help="Print to stdout instead of the clipboard.")
@@ -270,7 +421,8 @@ def main() -> None:
 
     load_dotenv(args.env_file)
 
-    script_json, source = resolve_script(args.project_id)
+    project_id = resolve_project_ref(args.project.strip())
+    script_json, source = resolve_script(project_id)
 
     if args.json:
         payload = json.dumps(script_json, ensure_ascii=False, indent=2)
@@ -279,13 +431,32 @@ def main() -> None:
         text = script_to_text(script_json)
         if not text:
             raise SystemExit(
-                f"Script for {args.project_id!r} has no scene text (source: {source})."
+                f"Script for {project_id!r} has no scene text (source: {source})."
             )
-        project_dir = _projects_dir() / args.project_id
+        project_dir = _projects_dir() / project_id
+        project = _load_project_json(project_dir)
+        if "tiktok.com" in args.project:
+            video_url = args.project.strip()
+        else:
+            known = uploaded_tiktok_urls(project)
+            video_url = known[0] if known else None
+        if video_url is None:
+            print(
+                f"Warning: no uploaded TikTok URL stored for {project_id}; "
+                f"appeal message uses the {VIDEO_URL_PLACEHOLDER!r} placeholder.",
+                file=sys.stderr,
+            )
+        signature = build_signature(project, video_url)
+        if signature is None:
+            print(
+                f"Warning: no account tied to {project_id}; appeal message uses the "
+                f"{SIGNATURE_PLACEHOLDER!r} placeholder.",
+                file=sys.stderr,
+            )
         blocks: list[str] = []
         if not args.no_link:
-            blocks.append(generation_link(args.project_id))
-        blocks.append(build_contest_message(project_dir))
+            blocks.append(generation_link(project_id))
+        blocks.append(build_contest_message(project_dir, video_url, signature))
         blocks.append(text)
         payload = "\n------\n".join(blocks)
         kind = "appeal + script" if args.no_link else "link + appeal + script"
@@ -298,7 +469,7 @@ def main() -> None:
 
     tool = copy_to_clipboard(payload)
     print(
-        f"Copied {kind} for project {args.project_id} to clipboard "
+        f"Copied {kind} for project {project_id} to clipboard "
         f"({len(payload)} chars, via {tool}, source: {source})."
     )
 

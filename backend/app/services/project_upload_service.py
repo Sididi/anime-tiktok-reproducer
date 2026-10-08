@@ -12,7 +12,7 @@ from typing import Any
 from .executors import run_heavy
 from ..config import settings
 from ..models.project_upload import ProjectUploadJob
-from .account_service import AccountConfig, AccountService
+from .account_service import ADDITIONAL_PLATFORMS, AccountConfig, AccountService, validate_account_publishers
 from .atomic_files import write_text_atomic
 from .event_hub import event_hub
 from .project_service import ProjectService
@@ -57,6 +57,9 @@ def _platforms_to_reserve(
         platforms.append("instagram")
     if account.slots_for("tiktok"):
         platforms.append("tiktok")
+    for platform in ADDITIONAL_PLATFORMS:
+        if _requested(platform) and account.slots_for(platform):
+            platforms.append(platform)
     return platforms
 
 
@@ -218,6 +221,11 @@ class ProjectUploadService:
         if existing and existing.status in {"queued", "running"}:
             return existing
 
+        if account_id:
+            account = AccountService.get_account(account_id)
+            if account is not None:
+                validate_account_publishers(account, platforms)
+
         job = existing or ProjectUploadJob(project_id=project_id)
         if existing is not None:
             job.job_id = uuid.uuid4().hex[:16]
@@ -326,6 +334,7 @@ class ProjectUploadService:
             if request.account_id:
                 account = AccountService.get_account(request.account_id)
                 if account is not None:
+                    validate_account_publishers(account, request.platforms)
                     platforms_to_reserve = _platforms_to_reserve(account, request.platforms)
                     if request.immediate:
                         # Urgent-immediate: these platforms publish right now —

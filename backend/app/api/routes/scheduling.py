@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from ...config import settings as app_settings
 from ...models import Project
-from ...services.account_service import AccountService
+from ...services.account_service import ADDITIONAL_PLATFORMS, AccountService
 from ...services.project_service import ProjectService
 from ...services.scheduling_service import SchedulingService, StealSpec
 
@@ -25,7 +25,7 @@ router = APIRouter(
     dependencies=[Depends(_require_v2)],
 )
 
-Platform = Literal["youtube", "facebook", "instagram", "tiktok"]
+Platform = Literal["youtube", "facebook", "instagram", "tiktok", "dailymotion", "snapchat", "bilibili"]
 
 
 class PlanningEvent(BaseModel):
@@ -123,6 +123,10 @@ def _vps_event_status(project: Project, platform: str) -> tuple[str, str | None]
         return "running", None
 
     if project.final_upload_discord_message_id:
+        if platform in ADDITIONAL_PLATFORMS:
+            # These queues can be manual, blocked by provider approval, or
+            # awaiting moderation. Elapsed time does not prove publication.
+            return "dispatched", None
         # Dispatched to the VPS, no news: presumed on track / published.
         sched = (project.platform_schedules or {}).get(platform)
         if sched is not None:
@@ -150,7 +154,7 @@ def _project_event_status(project: Project, platform: str) -> tuple[str, str | N
         if pfm_status is not None:
             return pfm_status
         return _vps_event_status(project, platform)
-    if platform == "instagram":
+    if platform in ("instagram", "dailymotion", "snapchat", "bilibili"):
         return _vps_event_status(project, platform)
     if platform == "facebook":
         # Long-range (>29d) holds live on the VPS: once its status cache has
@@ -257,7 +261,7 @@ async def list_events(
     accounts = AccountService.all_accounts()
     wanted_platforms = (
         [p.strip() for p in platforms.split(",") if p.strip()]
-        if platforms else ["youtube", "facebook", "instagram", "tiktok"]
+        if platforms else ["youtube", "facebook", "instagram", "tiktok", "dailymotion", "snapchat", "bilibili"]
     )
     events: list[dict] = []
     now = datetime.now(tz=range_start.tzinfo if range_start else timezone.utc)
@@ -321,7 +325,7 @@ async def free_slots_range(
         raise HTTPException(422, "range_too_large")
     wanted_platforms = (
         [p.strip() for p in platforms.split(",") if p.strip()]
-        if platforms else ["youtube", "facebook", "instagram", "tiktok"]
+        if platforms else ["youtube", "facebook", "instagram", "tiktok", "dailymotion", "snapchat", "bilibili"]
     )
 
     def _collect() -> dict[str, list[dict]]:
@@ -403,6 +407,11 @@ def _notify_displaced(project_id: str, platform: str, new_scheduled_at: datetime
     if project is None:
         return "skipped"
     result = PlatformRescheduleService.notify(project, platform, new_scheduled_at)
+    if platform in ADDITIONAL_PLATFORMS:
+        SchedulingService.track_additional_reschedule_notification(
+            project_id, platform, new_scheduled_at, result.status, result.error,
+        )
+        return result.status
     if result.status == "pending_retry":
         pending = dict(project.reschedule_pending or {})
         pending[platform] = {
@@ -559,7 +568,15 @@ def _notify_cancellation(project_id: str, platform: str) -> str:
     project = ProjectService.load(project_id)
     if project is None:
         return "skipped"
-    return PlatformRescheduleService.cancel(project, platform).status
+    result = PlatformRescheduleService.cancel(project, platform)
+    if platform in ADDITIONAL_PLATFORMS and result.status == "pending_retry":
+        # Keep the reservation visible while the remote job may still publish.
+        # Otherwise a failed cancellation would appear to have succeeded.
+        raise HTTPException(
+            409 if result.conflict else 503,
+            result.error or "The server could not cancel this publishing job; retry later",
+        )
+    return result.status
 
 
 @router.delete("/projects/{project_id}/platforms/{platform}", status_code=204)
@@ -575,6 +592,8 @@ async def delete_all(project_id: str):
         raise HTTPException(404, "Project not found")
     for platform in list(project.platform_schedules.keys()):
         await asyncio.to_thread(_notify_cancellation, project_id, platform)
+        # A later failure must retain only the still-active reservations.
+        await asyncio.to_thread(SchedulingService.cancel_platform_slot, project_id, platform)
     await asyncio.to_thread(SchedulingService.cancel_all_slots, project_id)
 
 

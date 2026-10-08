@@ -5,6 +5,7 @@ import { Button } from "@/components/ui";
 import { api } from "@/api/client";
 import { getEventHub } from "@/utils/eventHub";
 import { confirmTikTokPrecedence } from "@/utils/tiktokPrecedence";
+import { scheduledPlatformsForAccount } from "@/utils/scheduling";
 import { AccountSelectorDropdown } from "./AccountSelectorDropdown";
 import { AccountPickerPopup } from "./AccountPickerPopup";
 import { CopyrightMusicModal } from "./CopyrightMusicModal";
@@ -34,7 +35,6 @@ import type {
   Account,
   CopyrightCheckResult,
   FacebookCheckResult,
-  Platform,
   ProjectManagerRow,
   ProjectUploadJob,
   UploadDurationStrategy,
@@ -1422,9 +1422,9 @@ export function ProjectManagerModal({
               mode="anchor"
               projectId={schedulingForProject.row.project_id}
               accountId={schedulingForProject.accountId}
-              platformsForAnchor={
-                ["tiktok", "youtube", "facebook", "instagram"] as Platform[]
-              }
+              platformsForAnchor={scheduledPlatformsForAccount(
+                accounts.find((account) => account.id === schedulingForProject.accountId),
+              )}
               onClose={() => setSchedulingForProject(null)}
               onConfirm={async (payload) => {
                 const ctx = schedulingForProject;
@@ -1463,9 +1463,8 @@ export function ProjectManagerModal({
                 const ctx = urgentForProject;
                 setUrgentForProject(null);
                 const acct = accounts.find((a) => a.id === ctx.accountId);
-                const hasOtherPlatforms = (
-                  ["youtube", "facebook", "instagram"] as Platform[]
-                ).some((p) => (acct?.slots_by_platform?.[p]?.length ?? 0) > 0);
+                const hasOtherPlatforms = scheduledPlatformsForAccount(acct)
+                  .some((platform) => platform !== "tiktok");
                 if (plan.tiktokOnly && hasOtherPlatforms) {
                   // Let the user schedule the other platforms first; every
                   // mutation stays deferred to the final confirm.
@@ -1497,13 +1496,12 @@ export function ProjectManagerModal({
                 const acct = accounts.find(
                   (a) => a.id === urgentOthersPicker.accountId,
                 );
-                return ((["youtube", "facebook", "instagram"] as Platform[]).find(
-                  (p) => (acct?.slots_by_platform?.[p]?.length ?? 0) > 0,
-                ) ?? "youtube") as Platform;
+                return scheduledPlatformsForAccount(acct)
+                  .find((platform) => platform !== "tiktok") ?? "youtube";
               })()}
-              platformsForAnchor={
-                ["youtube", "facebook", "instagram"] as Platform[]
-              }
+              platformsForAnchor={scheduledPlatformsForAccount(
+                accounts.find((account) => account.id === urgentOthersPicker.accountId),
+              ).filter((platform) => platform !== "tiktok")}
               onClose={() => setUrgentOthersPicker(null)}
               onConfirm={async (payload) => {
                 const ctx = urgentOthersPicker;

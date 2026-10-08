@@ -466,3 +466,13 @@ Beyond `threshold` and `margin`, the most useful knobs to evaluate for ElevenLab
 ## Contributing
 
 [Contributing guidelines]
+
+### Additional publishing platforms
+
+Dailymotion, Snapchat Spotlight, and Bilibili use the existing VPS scheduler with per-platform slots, cancellation, rescheduling, and separate manual-upload reminders. Only these three new platforms require an explicit account block (including blocks inherited from a selected template). YouTube, Facebook, Instagram, and TikTok retain their existing configuration behavior. API access requires the platform credentials/approvals described in these guides; manual mode needs no paid publishing service.
+
+- [Dailymotion setup](docs/setup-dailymotion.md)
+- [Snapchat setup](docs/setup-snapchat.md)
+- [Bilibili setup](docs/setup-bilibili.md)
+
+After updating, install the VPS dependencies (`cd server && uv sync`) and restart the backend and VPS. Keep the VPS running for due uploads/reminders.

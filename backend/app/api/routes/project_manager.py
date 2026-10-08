@@ -25,7 +25,7 @@ router = APIRouter(prefix="/project-manager", tags=["project-manager"])
 
 class UploadProjectRequest(BaseModel):
     account_id: str | None = None
-    platforms: list[Literal["youtube", "facebook", "instagram"]] | None = None
+    platforms: list[Literal["youtube", "facebook", "instagram", "dailymotion", "snapchat", "bilibili"]] | None = None
     facebook_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
     instagram_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
     youtube_strategy: Literal["auto", "cut", "sped_up", "skip"] | None = None
@@ -37,7 +37,7 @@ class UploadProjectRequest(BaseModel):
     # TikTok-only toggle (other platforms keep/reuse their reservations).
     immediate: bool = False
     immediate_platforms: (
-        list[Literal["youtube", "facebook", "instagram", "tiktok"]] | None
+        list[Literal["youtube", "facebook", "instagram", "tiktok", "dailymotion", "snapchat", "bilibili"]] | None
     ) = None
 
 
@@ -108,7 +108,7 @@ async def run_upload_phase(
             immediate_platforms=req.immediate_platforms,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404 if str(exc) == "Project not found" else 400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return job.model_dump(mode="json")
@@ -383,3 +383,76 @@ async def copyright_video(project_id: str):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
+
+
+@router.post("/projects/{project_id}/platforms/{platform}/retry")
+async def retry_additional_platform(project_id: str, platform: str) -> dict:
+    """Retry a failed VPS publisher while retaining duplicate-prevention state."""
+    from ...config import settings
+    from ...services.account_service import ADDITIONAL_PLATFORMS, AccountService
+    import httpx
+
+    if platform not in ADDITIONAL_PLATFORMS:
+        raise HTTPException(400, "Unsupported publisher")
+    project = await ProjectService.aload(project_id)
+    if project is None:
+        raise HTTPException(404, "Project not found")
+    account = AccountService.get_account(project.scheduled_account_id or "")
+    config = getattr(account, platform, None) if account else None
+    if config is None:
+        raise HTTPException(400, "Publisher account is not configured")
+    if not settings.tiktok_server_base_url or not settings.tiktok_server_internal_token:
+        raise HTTPException(503, "VPS is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{settings.tiktok_server_base_url.rstrip('/')}/api/internal/jobs/{project_id}/platforms/{platform}/retry",
+                headers={"Authorization": f"Bearer {settings.tiktok_server_internal_token}"},
+                json={"credentials": config.credentials},
+            )
+        if response.status_code in (404, 409):
+            raise HTTPException(response.status_code, "VPS retry rejected; verify the job state and destination identity")
+        response.raise_for_status()
+    except httpx.HTTPError:
+        raise HTTPException(503, "Could not retry VPS publishing job") from None
+    from ...services.vps_status_sync_service import VpsStatusSyncService
+    VpsStatusSyncService.request_sync()
+    return {"status": "pending", "platform": platform}
+
+
+class ReconcilePublisherRequest(BaseModel):
+    outcome: Literal["published", "not_published"]
+    confirm: bool = False
+    resource_id: str | None = None
+
+
+@router.post("/projects/{project_id}/platforms/{platform}/reconcile")
+async def reconcile_additional_platform(
+    project_id: str, platform: str, req: ReconcilePublisherRequest
+) -> dict:
+    """Record an operator's provider-side check after an ambiguous submission."""
+    from ...config import settings
+    from ...services.account_service import ADDITIONAL_PLATFORMS
+    from ...services.vps_status_sync_service import VpsStatusSyncService
+    import httpx
+
+    if platform not in ADDITIONAL_PLATFORMS:
+        raise HTTPException(400, "Unsupported publisher")
+    if await ProjectService.aload(project_id) is None:
+        raise HTTPException(404, "Project not found")
+    if not settings.tiktok_server_base_url or not settings.tiktok_server_internal_token:
+        raise HTTPException(503, "VPS is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{settings.tiktok_server_base_url.rstrip('/')}/api/internal/jobs/{project_id}/platforms/{platform}/reconcile",
+                headers={"Authorization": f"Bearer {settings.tiktok_server_internal_token}"},
+                json=req.model_dump(),
+            )
+        if response.status_code in (400, 404, 409, 422):
+            raise HTTPException(response.status_code, "Reconciliation rejected; verify the failed job, confirmation and remote video ID")
+        response.raise_for_status()
+    except httpx.HTTPError:
+        raise HTTPException(503, "Could not reconcile VPS publishing job") from None
+    VpsStatusSyncService.request_sync()
+    return response.json()

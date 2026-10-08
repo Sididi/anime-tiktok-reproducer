@@ -29,6 +29,7 @@ import discord
 from app.config import Settings
 from app.models.job import Job, PlatformStatus
 from app.services.embed_builder import build_embed
+from app.services import additional_publishers
 from app.services.job_store import JobStore
 from app.services.reminder_service import cleanup_reminder
 
@@ -94,6 +95,10 @@ class ReactionListener:
         job = await self._find_job_by_message(str(payload.message_id))
         if job is None:
             return
+        for platform, message_id in job.publisher_reminders.items():
+            if message_id == str(payload.message_id):
+                await additional_publishers.acknowledge(job, platform, self._store, self._settings, self._rest)
+                return
         if not job.tiktok_manual:
             logger.debug(
                 "✅ reaction on %s ignored: job %s is not in manual TikTok mode",
@@ -161,6 +166,8 @@ class ReactionListener:
         """Match the message_id against any job's discord_message_id or reminder_message_id."""
         for j in await self._store.list_all():
             if j.discord_message_id == message_id:
+                return j
+            if message_id in j.publisher_reminders.values():
                 return j
             if j.reminder_message_id == message_id:
                 return j

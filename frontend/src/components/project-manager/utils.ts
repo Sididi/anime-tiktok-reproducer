@@ -12,17 +12,23 @@ export function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[idx]}`;
 }
 
-export function formatScheduledAt(isoString: string | null): string {
+export function formatDateTime(isoString: string | null): string {
   if (!isoString) return "";
   const date = new Date(isoString);
   if (isNaN(date.getTime())) return "";
-  const now = new Date();
-  if (date <= now) return "Uploaded";
   const day = date.getDate();
   const month = date.toLocaleString("en", { month: "short" });
   const hours = date.getHours().toString().padStart(2, "0");
   const minutes = date.getMinutes().toString().padStart(2, "0");
   return `${day} ${month} ${hours}:${minutes}`;
+}
+
+export function formatScheduledAt(isoString: string | null): string {
+  if (!isoString) return "";
+  const date = new Date(isoString);
+  if (isNaN(date.getTime())) return "";
+  if (date <= new Date()) return "Uploaded";
+  return formatDateTime(isoString);
 }
 
 export function statusCircleClasses(

@@ -3,12 +3,13 @@ import { motion } from "framer-motion";
 import { Zap } from "lucide-react";
 import { Button } from "@/components/ui";
 import { api } from "@/api/client";
-import type {
-  Platform,
-  UrgentCollisionItem,
-  UrgentCollisionProject,
-  UrgentPreview,
-  UrgentShiftSpec,
+import {
+  ALL_PLATFORMS,
+  type Platform,
+  type UrgentCollisionItem,
+  type UrgentCollisionProject,
+  type UrgentPreview,
+  type UrgentShiftSpec,
 } from "@/types";
 import type { UrgentPlan } from "./types";
 import { PLATFORM_SHORT } from "@/components/planning/platformColors";
@@ -314,9 +315,7 @@ export function UrgentImmediateModal({
             projectId={retiming.project.project_id}
             accountId={retiming.project.account_id}
             platform={retiming.kind === "platform" ? retiming.item.platform : undefined}
-            platformsForAnchor={
-              ["tiktok", "youtube", "facebook", "instagram"] as Platform[]
-            }
+            platformsForAnchor={[...ALL_PLATFORMS]}
             initialIso={retiming.item.suggested_slot ?? undefined}
             onClose={() => setRetiming(null)}
             onConfirm={async (payload) => {

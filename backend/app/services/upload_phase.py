@@ -20,7 +20,7 @@ from ..config import settings
 from ..library_types import coerce_library_type
 from ..utils.video_color import ensure_bt709_tags
 from ..models import Project
-from .account_service import AccountConfig, AccountService
+from .account_service import ADDITIONAL_PLATFORMS, AccountConfig, AccountService, validate_account_publishers
 from .discord_service import DiscordService
 from .drive_prewarm_service import DrivePrewarmService
 from .drive_shared_sources import DriveSharedSources
@@ -189,7 +189,7 @@ def _dir_size(path: Path) -> int:
 
 class UploadPhaseService:
     """Project manager view, upload execution, and managed delete flow."""
-    _SUPPORTED_PLATFORMS = ("youtube", "facebook", "instagram")
+    _SUPPORTED_PLATFORMS = ("youtube", "facebook", "instagram", *ADDITIONAL_PLATFORMS)
     _INSTAGRAM_DRIVE_FILENAME = "output_instagram.mp4"
     _FACEBOOK_DRIVE_FILENAME = "facebook_upload.mp4"
     # Meta's scheduled_publish_time window (~30 days documented; 29 kept as a
@@ -698,6 +698,9 @@ class UploadPhaseService:
                     and account.tiktok.post_for_me_account_id
                 ):
                     skips[platform] = cls._tiktok_manual_result()
+            elif platform in ADDITIONAL_PLATFORMS:
+                if account is None or getattr(account, platform) is None:
+                    reason = default_detail
             if reason is not None:
                 skips[platform] = PlatformUploadResult(
                     platform=platform,
@@ -956,7 +959,7 @@ class UploadPhaseService:
     @classmethod
     def _normalize_platforms(cls, platforms: list[str] | None) -> tuple[str, ...]:
         if platforms is None:
-            return cls._SUPPORTED_PLATFORMS
+            return ("youtube", "facebook", "instagram")
         normalized: list[str] = []
         for platform in platforms:
             key = str(platform).strip().lower()
@@ -1299,6 +1302,21 @@ class UploadPhaseService:
         elif configured_accounts:
             raise ValueError("account_id is required when accounts are configured")
 
+        if platforms is None and account:
+            requested_platforms += tuple(p for p in ADDITIONAL_PLATFORMS if getattr(account, p) is not None and account.slots_for(p))
+        publisher_payloads = {}
+        if account:
+            validate_account_publishers(account, requested_platforms)
+            for platform in ADDITIONAL_PLATFORMS:
+                config = getattr(account, platform)
+                if platform in requested_platforms and config is not None:
+                    publisher_payloads[platform] = {
+                        "mode": config.mode, "credentials": dict(config.credentials),
+                        "description": "", "video_url": None,
+                    }
+        if publisher_payloads and not DiscordService.is_configured():
+            raise ValueError("The VPS server must be configured for Dailymotion, Snapchat and Bilibili scheduling")
+
         facebook_max_duration = float(
             account.max_reel_duration_for("facebook") if account else 90
         )
@@ -1325,7 +1343,9 @@ class UploadPhaseService:
 
         # Calculate per-platform scheduled times if account has slots for that platform.
         if account and account_id:
-            for _platform in ("youtube", "facebook", "instagram", "tiktok"):
+            for _platform in ("youtube", "facebook", "instagram", "tiktok", *ADDITIONAL_PLATFORMS):
+                if _platform in ADDITIONAL_PLATFORMS and _platform not in requested_platforms:
+                    continue
                 if _platform in immediate:
                     # Immediate platforms publish now: no scheduled_at at all
                     # (YT public, FB direct publish, TT instant PFM post).
@@ -1340,6 +1360,15 @@ class UploadPhaseService:
                         account_id, _platform, project_id=project_id
                     )
                 platform_scheduled_at[_platform] = _sched
+
+        bilibili_payload = publisher_payloads.get("bilibili")
+        if bilibili_payload and bilibili_payload["mode"] == "api":
+            target = platform_scheduled_at.get("bilibili") or datetime.now(timezone.utc)
+            if float(bilibili_payload["credentials"].get("expires_at") or 0) <= target.timestamp() + 300:
+                raise ValueError(
+                    "Bilibili OAuth token expires before the selected publication time; "
+                    "renew authorization or use manual mode before scheduling this upload"
+                )
 
         # Facebook long-range routing: Meta's scheduled_publish_time only
         # accepts targets within ~29 days. Beyond that the upload is DEFERRED
@@ -1377,12 +1406,27 @@ class UploadPhaseService:
         GoogleDriveService.set_public_read(drive_video_id)
         drive_video_url = readiness.drive_video_web_url or GoogleDriveService.get_web_view_url(drive_video_id)
         direct_drive_download = GoogleDriveService.get_direct_download_url(drive_video_id)
+        for platform, payload in publisher_payloads.items():
+            payload["credentials"].setdefault("title", metadata.youtube.title)
+            payload["credentials"].setdefault("tags", metadata.youtube.tags)
+            # Spotlight descriptions have a documented 160-character ceiling.
+            payload["description"] = metadata.youtube.title[:160] if platform == "snapchat" else metadata.youtube.description
+            payload["video_url"] = direct_drive_download
+            if platform in immediate:
+                platform_scheduled_at[platform] = datetime.now(timezone.utc)
 
         vps_platforms = cls._vps_platforms(requested_platforms, account, tiktok_payload)
         tiktok_enrolled = cls._tiktok_enrolled(account, tiktok_payload)
         results_by_platform: dict[str, PlatformUploadResult] = dict(
             cls._compute_upfront_skips(requested_platforms, account)
         )
+        for platform, payload in publisher_payloads.items():
+            results_by_platform[platform] = PlatformUploadResult(
+                platform=platform, status="pending", detail=(
+                    "Scheduled manual upload reminder" if payload["mode"] == "manual"
+                    else "Queued for publishing by the VPS"
+                ),
+            )
         tiktok_manual = tiktok_enrolled and tiktok_payload is None
         if tiktok_manual:
             # Manual mode: the row stays pending on the VPS job; the server
@@ -1478,6 +1522,27 @@ class UploadPhaseService:
                 emit_progress(0.30, "download", "Downloading final video from Drive...")
             cls._stage_source_video(project_id, readiness, local_video_path)
 
+            if publisher_payloads.get("snapchat", {}).get("mode") == "api":
+                # Fail at upload time instead of discovering a duration problem
+                # days later when the VPS dispatches. Manual uploads stay under
+                # the operator's control; the server still validates full media.
+                probe, probe_error = SocialUploadService._probe_media(video_path=local_video_path)
+                duration = probe.duration_seconds if probe is not None else None
+                snapchat_error = None
+                if probe_error or duration is None:
+                    snapchat_error = (
+                        "Could not verify Snapchat Spotlight video duration: "
+                        f"{probe_error or 'duration is unavailable'}"
+                    )
+                elif not 6 <= duration <= 60:
+                    snapchat_error = "Snapchat Spotlight requires a video between 6 and 60 seconds"
+                if snapchat_error:
+                    publisher_payloads.pop("snapchat")
+                    results_by_platform["snapchat"] = PlatformUploadResult(
+                        platform="snapchat", status="failed", detail=snapchat_error,
+                    )
+                    emit_platform_result(results_by_platform["snapchat"], update_discord=False)
+
             # TikTok deliberately keeps the ORIGINAL copyrighted audio: capture
             # the pre-remux file for the PFM media staging before
             # local_video_path is swapped to the copyright-replaced variant.
@@ -1496,6 +1561,19 @@ class UploadPhaseService:
                 cls._replace_video_audio(local_video_path, audio_path, replaced_video)
                 local_video_path = replaced_video
                 force_local_upload = True
+
+            if force_local_upload and publisher_payloads:
+                artifact = GoogleDriveService.upsert_local_file(
+                    parent_id=readiness.drive_folder_id, filename="output_publishers.mp4",
+                    local_path=local_video_path,
+                    chunksize=settings.drive_upload_chunk_mb * 1024 * 1024,
+                )
+                artifact_id = str(artifact.get("id") or "")
+                if not artifact_id:
+                    raise RuntimeError("Prepared publisher video upload returned no Drive file ID")
+                GoogleDriveService.set_public_read(artifact_id)
+                for payload in publisher_payloads.values():
+                    payload["video_url"] = GoogleDriveService.get_direct_download_url(artifact_id)
 
             # Extract the chosen thumbnail frame once for image-native platforms
             # (YouTube, Facebook). Extracted from the ORIGINAL output video, so
@@ -1875,6 +1953,7 @@ class UploadPhaseService:
                         # Manual TikTok mode: the server posts the T-5 reminder.
                         tiktok_manual=tiktok_manual,
                         facebook=fb_payload,
+                        publishers=publisher_payloads,
                         platform_scheduled_at=platform_scheduled_at,
                         platform_statuses=seeded_statuses,
                     )
@@ -1885,6 +1964,13 @@ class UploadPhaseService:
                         exc_info=True,
                     )
                     job_response = None
+
+                if publisher_payloads and job_response is None:
+                    for platform in publisher_payloads:
+                        results_by_platform[platform] = PlatformUploadResult(
+                            platform=platform, status="failed", detail="VPS rejected or could not persist the publishing job; no schedule confirmed",
+                        )
+                        emit_platform_result(results_by_platform[platform], update_discord=False)
 
                 if job_response is not None:
                     discord_message_id = job_response.get("discord_message_id")
@@ -2767,7 +2853,7 @@ class UploadPhaseService:
                 pending_platform_set.update(str(item) for item in requested)
             if not pending_platform_set:
                 pending_platform_set.update(
-                    ("youtube", "facebook", "instagram", "tiktok")
+                    ("youtube", "facebook", "instagram", "tiktok", "dailymotion", "snapchat", "bilibili")
                 )
         pending_platforms = sorted(pending_platform_set)
         if pending_platforms and not confirmed:
@@ -2821,8 +2907,13 @@ class UploadPhaseService:
             archive_result = GoogleDriveService.archive_project_folder(drive_folder_id)
 
         cancellation_status: dict[str, str] = {}
-        server_platforms = {"instagram", "tiktok"}.intersection(pending_platforms)
-        if server_platforms or (
+        server_platforms = {"instagram", "tiktok", *ADDITIONAL_PLATFORMS}.intersection(pending_platforms)
+        has_publisher_job = any(
+            item.get("platform") in ADDITIONAL_PLATFORMS
+            for item in ((project.upload_last_result or {}).get("platforms") or [])
+            if isinstance(item, dict)
+        )
+        if has_publisher_job or server_platforms or (
             pending_platforms and project.final_upload_discord_message_id
         ):
             server_result = PlatformRescheduleService.delete_server_job(project)
@@ -2830,7 +2921,7 @@ class UploadPhaseService:
                 cancellation_status[platform] = server_result.status
             if server_result.status == "pending_retry":
                 raise RuntimeError(
-                    "Could not remove the pending Instagram/TikTok server job: "
+                    "Could not remove the pending platform server job: "
                     f"{server_result.error or 'unknown error'}"
                 )
 

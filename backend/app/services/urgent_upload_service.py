@@ -23,7 +23,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .account_service import AccountService
+from .account_service import ADDITIONAL_PLATFORMS, AccountService
 from .platform_reschedule_service import PlatformRescheduleService
 from .project_service import ProjectService
 from .scheduling_service import (
@@ -370,6 +370,11 @@ class UrgentUploadService:
         if project is None:
             return "skipped"
         result = PlatformRescheduleService.notify(project, platform, new_scheduled_at)
+        if platform in ADDITIONAL_PLATFORMS:
+            SchedulingService.track_additional_reschedule_notification(
+                project_id, platform, new_scheduled_at, result.status, result.error,
+            )
+            return result.status
         if result.status == "pending_retry":
             pending = dict(project.reschedule_pending or {})
             pending[platform] = {

@@ -31,6 +31,52 @@ class JobStore:
         # Post for Me post. Media staging and result polling deliberately stay
         # outside this lock because they can take many minutes.
         self._tiktok_publish_transitions: dict[str, asyncio.Lock] = {}
+        self._publisher_transitions: dict[str, asyncio.Lock] = {}
+        self._publisher_activities: dict[tuple[str, str], asyncio.Lock] = {}
+        self._publisher_embeds: dict[str, asyncio.Lock] = {}
+
+    def publisher_lock(self, project_id: str) -> asyncio.Lock:
+        """Brief project guard for claiming publisher activities or replacing a job."""
+        return self._publisher_transitions.setdefault(project_id, asyncio.Lock())
+
+    def publisher_platform_lock(self, project_id: str, platform: str) -> asyncio.Lock:
+        """Long operations on one platform never block a different platform."""
+        return self._publisher_activities.setdefault((project_id, platform), asyncio.Lock())
+
+    def publisher_embed_lock(self, project_id: str) -> asyncio.Lock:
+        return self._publisher_embeds.setdefault(project_id, asyncio.Lock())
+
+    def publisher_busy(self, project_id: str, platforms: set[str] | None = None) -> bool:
+        return any(
+            lock.locked() and pid == project_id and (platforms is None or platform in platforms)
+            for (pid, platform), lock in self._publisher_activities.items()
+        )
+
+    @contextlib.asynccontextmanager
+    async def publisher_activity(
+        self, project_id: str, platform: str, *, wait: bool = False,
+    ) -> AsyncIterator[bool]:
+        """Claim a platform under the project guard, then release the guard.
+
+        Acknowledgments wait outside the project guard so they cannot deadlock
+        whole-job mutations or lose a reaction to a just-created reminder.
+        Scheduler duplicates simply skip an already-active platform.
+        """
+        lock = self.publisher_platform_lock(project_id, platform)
+        while True:
+            async with self.publisher_lock(project_id):
+                if not lock.locked():
+                    await lock.acquire()
+                    break
+            if not wait:
+                yield False
+                return
+            async with lock:
+                pass
+        try:
+            yield True
+        finally:
+            lock.release()
 
     @contextlib.asynccontextmanager
     async def tiktok_publish_transition(
@@ -78,18 +124,32 @@ class JobStore:
             d = jobs.get(project_id)
             return Job.from_dict(d) if d else None
 
-    async def update(self, project_id: str, **fields) -> Job:
+    async def update(self, project_id: str, *, merge_maps: tuple[str, ...] = (), **fields) -> Job:
         valid = {f.name for f in _dc_fields(Job)}
         unknown = set(fields) - valid
         if unknown:
             raise ValueError(f"Unknown Job field(s): {sorted(unknown)}")
+        if set(merge_maps) - {
+            "platform_scheduled_at", "platform_statuses", "publisher_payloads",
+            "publisher_states", "publisher_reminders",
+        }:
+            raise ValueError("Unsupported Job map merge")
         async with self._lock:
             jobs = self._read()
             if project_id not in jobs:
                 raise KeyError(project_id)
             job = Job.from_dict(jobs[project_id])
             for k, v in fields.items():
-                setattr(job, k, v)
+                resolved = v
+                if k in merge_maps:
+                    merged = dict(getattr(job, k))
+                    for key, value in v.items():
+                        if value is None:
+                            merged.pop(key, None)
+                        else:
+                            merged[key] = value
+                    resolved = merged
+                setattr(job, k, resolved)
             job.updated_at = datetime.now(tz=UTC)
             jobs[project_id] = job.to_dict()
             self._write(jobs)

@@ -41,6 +41,7 @@ from app.models.job import (
     TikTokPublishState,
 )
 from app.services.embed_builder import build_embed
+from app.services import additional_publishers
 from app.services.facebook_publisher import (
     create_facebook_scheduled_post,
     retime_facebook_scheduled_post,
@@ -98,6 +99,8 @@ _IN_FLIGHT: dict[tuple[str, str], asyncio.Task] = {}
 
 def _dispatch_worthwhile(job: Job, platform: str) -> bool:
     """Cheap pre-checks so terminal/misconfigured jobs never spawn a task."""
+    if platform in additional_publishers.PLATFORMS:
+        return additional_publishers.worthwhile(job, platform)
     status = job.platform_statuses.get(platform, PlatformStatus(status="pending"))
     if platform == "tiktok" and job.tiktok_manual:
         return (
@@ -181,7 +184,10 @@ async def dispatch_due_actions(
             # if platform == "tiktok":
             #     dispatcher = _dispatch_tiktok_publish
             # elif platform == "instagram":
-            if platform == "tiktok" and job.tiktok_manual:
+            if platform in additional_publishers.PLATFORMS:
+                async def dispatcher(j, st, cfg, dc, target=platform):
+                    await additional_publishers.dispatch(j, target, st, cfg, dc)
+            elif platform == "tiktok" and job.tiktok_manual:
                 # Manual TikTok mode: single Discord reminder at sched - 5 min.
                 dispatcher = _dispatch_tiktok_reminder
             elif platform == "instagram":
@@ -218,6 +224,8 @@ def _platform_due_time(job: Job, platform: str) -> datetime:
     server-side at sched via scheduled_at); result polling from sched.
     Facebook long-range holds convert at sched - FACEBOOK_CONVERT_LEAD_DAYS.
     The stored times are never mutated."""
+    if platform in additional_publishers.PLATFORMS:
+        return additional_publishers.due_at(job, platform)
     if platform == "facebook" and job.facebook_payload:
         sched = _normalize_utc(job.platform_scheduled_at.get(platform) or job.slot_time)
         return sched - timedelta(days=FACEBOOK_CONVERT_LEAD_DAYS)

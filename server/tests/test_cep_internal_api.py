@@ -55,6 +55,15 @@ def test_requires_bearer(monkeypatch, example_yaml, example_env, tmp_server_dir)
 def test_post_while_disconnected_stores_and_marks_waiting(
     monkeypatch, example_yaml, example_env, tmp_server_dir
 ):
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            requested = datetime.fromisoformat(LAUNCH_PAYLOAD["requested_at"])
+            return requested.astimezone(tz) if tz else requested.replace(tzinfo=None)
+
+    # This fixture's fixed August launch must still be inside its seven-day
+    # delivery window, regardless of the calendar date when the suite runs.
+    monkeypatch.setattr("app.api.internal.datetime", FrozenDateTime)
     app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
     with TestClient(app) as client:
         r = client.post("/api/internal/cep/launches", json=LAUNCH_PAYLOAD, headers=INTERNAL_AUTH)

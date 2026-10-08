@@ -5,6 +5,7 @@ import clsx from "clsx";
 import { api } from "@/api/client";
 import type { Account, Platform } from "@/types";
 import { fmtTime, relativeDayLabel } from "@/utils/parisTime";
+import { scheduledPlatformsForAccount } from "@/utils/scheduling";
 import { SlotPickerPopover } from "@/components/project-manager/SlotPickerPopover";
 import { planningKeys, useEligibleProjects } from "./data/queries";
 import { PLATFORM_SHORT, platformBgHsl, platformTranslucentHsl } from "./platformColors";
@@ -270,7 +271,7 @@ export function QuickAssignPanel({
           projectId={selectedId}
           accountId={account.id}
           initialIso={slot}
-          platformsForAnchor={["tiktok", "youtube", "facebook", "instagram"]}
+          platformsForAnchor={scheduledPlatformsForAccount(account)}
           onClose={() => setFullPickerOpen(false)}
           onConfirm={async (payload) => {
             let done = false;

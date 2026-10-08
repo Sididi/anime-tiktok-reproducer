@@ -23,6 +23,9 @@
   --platform-facebook: 220 76% 50%;
   --platform-instagram: 35 91% 55%;
   --platform-tiktok: 330 81% 60%;
+  --platform-dailymotion: 190 85% 43%;
+  --platform-snapchat: 55 90% 48%;
+  --platform-bilibili: 160 65% 43%;
 }
 
 * {

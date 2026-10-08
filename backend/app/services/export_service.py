@@ -277,7 +277,7 @@ class _RcloneDriveProgressAdapter:
 
 
 class ExportService:
-    IGNORED_UPLOAD_VIDEO_FILENAMES = {"output_instagram.mp4"}
+    IGNORED_UPLOAD_VIDEO_FILENAMES = {"output_instagram.mp4", "output_publishers.mp4"}
 
     @classmethod
     def filter_upload_video_candidates(cls, files: list[dict[str, Any]]) -> list[dict[str, Any]]:

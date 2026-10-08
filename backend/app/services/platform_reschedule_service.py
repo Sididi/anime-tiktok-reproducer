@@ -11,7 +11,7 @@ from googleapiclient.discovery import build
 
 from ..config import settings
 from ..models import Project
-from .account_service import AccountService
+from .account_service import ADDITIONAL_PLATFORMS, AccountService
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -23,6 +23,7 @@ NotificationStatus = Literal["ok", "pending_retry", "skipped"]
 class NotificationResult:
     status: NotificationStatus
     error: str | None = None
+    conflict: bool = False
 
 
 class PlatformRescheduleService:
@@ -75,6 +76,8 @@ class PlatformRescheduleService:
     def notify(
         cls, project: Project, platform: str, new_scheduled_at: datetime
     ) -> NotificationResult:
+        if platform in ADDITIONAL_PLATFORMS:
+            return cls._notify_publisher(project, platform, new_scheduled_at)
         # TikTok is published via Post for Me; the backend owns the scheduled
         # post (project.tiktok_pfm) since the 2026-08 migration. Rescheduling
         # updates the PFM post directly (legacy VPS-relayed projects still
@@ -112,6 +115,8 @@ class PlatformRescheduleService:
 
     @classmethod
     def cancel(cls, project: Project, platform: str) -> NotificationResult:
+        if platform in ADDITIONAL_PLATFORMS:
+            return cls._notify_publisher(project, platform, None)
         # TikTok cancel: delete the backend-owned PFM post (see _cancel_tiktok).
         if platform == "tiktok":
             try:
@@ -143,6 +148,34 @@ class PlatformRescheduleService:
             )
             return NotificationResult(status="pending_retry", error=str(exc))
         return NotificationResult(status="skipped")
+
+    @classmethod
+    def _notify_publisher(cls, project: Project, platform: str, scheduled_at: datetime | None) -> NotificationResult:
+        # No URL exists until the VPS actually submits the video. Pending rows
+        # still require remote cancellation/rescheduling.
+        if not cls._server_base_url() or not settings.tiktok_server_internal_token:
+            if project.upload_completed_at:
+                return NotificationResult(status="pending_retry", error="VPS configuration missing")
+            return NotificationResult(status="skipped")
+        try:
+            headers = {"Authorization": f"Bearer {settings.tiktok_server_internal_token}"}
+            base = f"{cls._server_base_url()}/api/internal/jobs/{project.id}"
+            if scheduled_at is None:
+                response = httpx.post(f"{base}/platforms/{platform}/cancel", headers=headers, timeout=20.0)
+            else:
+                response = httpx.patch(f"{base}/slot", json={
+                    "platform_scheduled_at": {platform: scheduled_at.isoformat()}
+                }, headers=headers, timeout=20.0)
+            if response.status_code == 404:
+                if scheduled_at is None or not project.upload_completed_at:
+                    return NotificationResult(status="skipped")
+                return NotificationResult(status="pending_retry", error="VPS publishing job not found")
+            if response.status_code == 409:
+                return NotificationResult(status="pending_retry", error="VPS publisher has started; inspect the remote submission before changing its schedule", conflict=True)
+            response.raise_for_status()
+            return NotificationResult(status="ok")
+        except Exception as exc:
+            return NotificationResult(status="pending_retry", error=f"VPS publisher update failed ({type(exc).__name__})")
 
     _FB_GRAPH_VERSION = "v25.0"
 

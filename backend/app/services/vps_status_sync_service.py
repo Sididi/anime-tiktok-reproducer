@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # tiktok kept for legacy pre-PFM-migration jobs; facebook covers the
 # long-range (>29d) server holds (2026-08 redesign).
-VPS_PLATFORMS = ("instagram", "tiktok", "facebook")
+VPS_PLATFORMS = ("instagram", "tiktok", "facebook", "dailymotion", "snapchat", "bilibili")
 
 _MIN_SYNC_INTERVAL_SECONDS = 60.0
 

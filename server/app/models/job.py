@@ -249,6 +249,9 @@ class Job:
     tiktok_publish_state: TikTokPublishState | None = None
     facebook_payload: dict | None = None
     facebook_publish_state: FacebookPublishState | None = None
+    publisher_payloads: dict[str, dict] = field(default_factory=dict, repr=False)
+    publisher_states: dict[str, dict] = field(default_factory=dict)
+    publisher_reminders: dict[str, str] = field(default_factory=dict)
     platform_scheduled_at: dict[str, datetime] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
@@ -294,6 +297,9 @@ class Job:
                 if self.facebook_publish_state
                 else None
             ),
+            "publisher_payloads": self.publisher_payloads,
+            "publisher_states": self.publisher_states,
+            "publisher_reminders": self.publisher_reminders,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
@@ -334,6 +340,9 @@ class Job:
             facebook_publish_state=FacebookPublishState.from_dict(
                 d.get("facebook_publish_state")
             ),
+            publisher_payloads=dict(d.get("publisher_payloads") or {}),
+            publisher_states=dict(d.get("publisher_states") or {}),
+            publisher_reminders=dict(d.get("publisher_reminders") or {}),
             created_at=datetime.fromisoformat(d["created_at"]),
             updated_at=datetime.fromisoformat(d["updated_at"]),
         )

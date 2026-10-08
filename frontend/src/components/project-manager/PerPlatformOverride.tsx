@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { api } from "@/api/client";
-import type { Platform, FreeSlot } from "@/types";
+import { NON_TIKTOK_PLATFORMS, type Platform, type FreeSlot } from "@/types";
 import { PLATFORM_LABELS } from "@/components/planning/platformColors";
 
 interface PerPlatformOverrideProps {
@@ -13,8 +13,6 @@ interface PerPlatformOverrideProps {
   platforms: Platform[]; // platforms the project will reserve
   onStealRequest?: (platform: Platform, slotIso: string) => void;
 }
-
-const NON_TT_PLATFORMS: Platform[] = ["youtube", "facebook", "instagram"];
 
 export function PerPlatformOverride({
   accountId, anchorIso, resolved, overrides, onChangeOverride, platforms, onStealRequest,
@@ -29,7 +27,7 @@ export function PerPlatformOverride({
     let cancelled = false;
     (async () => {
       const next: Record<Platform, FreeSlot[]> = {} as Record<Platform, FreeSlot[]>;
-      for (const platform of NON_TT_PLATFORMS) {
+      for (const platform of NON_TIKTOK_PLATFORMS) {
         if (!platforms.includes(platform)) continue;
         const r = await api.listFreeSlots({
           account_id: accountId,
@@ -56,12 +54,12 @@ export function PerPlatformOverride({
       </button>
       {open && (
         <div className="mt-2 space-y-1.5">
-          {NON_TT_PLATFORMS.filter((p) => platforms.includes(p)).map((p) => {
+          {NON_TIKTOK_PLATFORMS.filter((p) => platforms.includes(p)).map((p) => {
             const slots = slotsByPlatform[p] ?? [];
             const current = overrides[p] ?? resolved[p]?.slot ?? "";
             return (
               <div key={p} className="flex items-center gap-2 text-xs">
-                <span className="w-20">{PLATFORM_LABELS[p]}</span>
+                <span className="w-20 shrink-0">{PLATFORM_LABELS[p]}</span>
                 <select
                   className="flex-1 rounded border border-[hsl(var(--border))] bg-[hsl(var(--card))] px-2 py-1 text-xs"
                   value={current}

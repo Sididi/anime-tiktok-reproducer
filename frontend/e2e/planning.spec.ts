@@ -198,19 +198,64 @@ function defaultState(): MockState {
   };
 }
 
-async function openPlanning(page: Page, state: MockState, accountId = "acc_a") {
+async function openPlanning(
+  page: Page,
+  state: MockState,
+  accountId = "acc_a",
+  platforms = ["youtube", "facebook", "instagram", "tiktok"],
+) {
   await installMocks(page, state);
-  await page.addInitScript((acc) => {
+  await page.addInitScript(({ acc, platforms }) => {
     localStorage.setItem("atr.planning.account_id", acc);
     localStorage.setItem(
       "atr.planning.platforms",
-      JSON.stringify(["youtube", "facebook", "instagram", "tiktok"]),
+      JSON.stringify(platforms),
     );
-  }, accountId);
+  }, { acc: accountId, platforms });
   await page.goto("/planning");
 }
 
 test.describe("Planning board", () => {
+  for (const [platform, label, short] of [
+    ["dailymotion", "Dailymotion", "DM"],
+    ["snapchat", "Snapchat", "SC"],
+    ["bilibili", "Bilibili", "BI"],
+  ]) {
+    test(`${label} pending uploads can be rescheduled and canceled`, async ({ page }) => {
+      const state = defaultState();
+      state.events = [{ ...makeEvents()[0], platform }];
+      await openPlanning(page, state, "acc_a", [platform]);
+
+      const card = page.getByTestId("planning-event-card");
+      await expect(card).toContainText(short);
+      await card.click();
+      const panel = page.getByTestId("planning-details-panel");
+      await expect(panel).toContainText(label);
+      await panel.getByRole("button", { name: "Déplacer" }).click();
+      const slotLabel = new Intl.DateTimeFormat("fr-FR", {
+        hour: "2-digit", minute: "2-digit", timeZone: "Europe/Paris",
+      }).format(new Date(SLOT_GHOST));
+      await page.getByRole("button", { name: slotLabel, exact: true }).click();
+      const moved = page.waitForRequest((request) =>
+        request.method() === "PATCH"
+        && request.url().endsWith(`/projects/p1/platforms/${platform}`),
+      );
+      await page.getByRole("button", { name: "Schedule", exact: true }).click();
+      await moved;
+      await expect.poll(() => state.patchBodies.length).toBe(1);
+      expect(state.patchBodies[0]).toMatchObject({ new_slot: SLOT_GHOST });
+
+      await panel.getByRole("button", { name: "Annuler", exact: true }).click();
+      const canceled = page.waitForRequest((request) =>
+        request.method() === "DELETE"
+        && request.url().endsWith(`/projects/p1/platforms/${platform}`),
+      );
+      await page.getByRole("button", { name: "Annuler le créneau" }).click();
+      await canceled;
+      await expect.poll(() => state.deleteCount).toBe(1);
+    });
+  }
+
   test("renders grouped event cards and free-slot ghosts", async ({ page }) => {
     const state = defaultState();
     await openPlanning(page, state);

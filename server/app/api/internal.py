@@ -1,16 +1,19 @@
 """Internal API routes consumed by the main backend."""
+
 from __future__ import annotations
 
 import logging
 import secrets
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from app.auth.dependencies import require_internal_token
 from app.models.job import Job, PlatformStatus
+from app.services import additional_publishers
 from app.services.embed_builder import build_embed
 from app.services.post_for_me_publisher import delete_tiktok_post
 from app.services.reminder_scheduler import TIKTOK_MANUAL_REMINDER_LEAD_MINUTES
@@ -77,6 +80,13 @@ class InitialPlatformStatus(BaseModel):
     detail: str | None = None
 
 
+class PublisherPayload(BaseModel):
+    mode: Literal["api", "manual"]
+    credentials: dict[str, Any] = Field(default_factory=dict, repr=False)
+    description: str = ""
+    video_url: str | None = None
+
+
 class CreateJobRequest(BaseModel):
     project_id: str
     account_id: str
@@ -94,6 +104,21 @@ class CreateJobRequest(BaseModel):
     # Me id → the server posts one reminder at sched - 5 min and the ✅
     # reaction listener marks the row posted.
     tiktok_manual: bool = False
+    publishers: dict[Literal["dailymotion", "snapchat", "bilibili"], PublisherPayload] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="after")
+    def validate_publishers(self):
+        if not set(self.publishers).issubset(self.platforms_requested):
+            raise ValueError("Publisher payloads must belong to requested platforms")
+        if any(
+            (self.platform_statuses or {}).get(p) is not None
+            and self.platform_statuses[p].status != "pending"
+            for p in self.publishers
+        ):
+            raise ValueError("New publisher jobs must start pending")
+        return self
 
 
 class CreateJobResponse(BaseModel):
@@ -192,6 +217,7 @@ def _job_payload_changed(
         or job.description != req.description
         or job.drive_video_url != req.drive_video_url
         or job.platforms_requested != list(req.platforms_requested)
+        or job.publisher_payloads != {p: v.model_dump() for p, v in req.publishers.items()}
         or job.tiktok_manual != req.tiktok_manual
         or job.instagram_payload != instagram_payload
         or job.facebook_payload != facebook_payload
@@ -200,8 +226,86 @@ def _job_payload_changed(
     )
 
 
+@asynccontextmanager
+async def _publisher_lock(
+    request: Request, project_id: str, *, platforms: set[str] | None = None,
+    include_fallback_slots: bool = False,
+):
+    store = request.app.state.job_store
+    project_lock = store.publisher_lock(project_id)
+    if project_lock.locked():
+        raise HTTPException(409, "Publisher operation in progress; retry after it completes")
+    claimed = []
+    try:
+        async with project_lock:
+            if platforms is None:
+                if store.publisher_busy(project_id):
+                    raise HTTPException(
+                        409, "Publisher operation in progress; retry after it completes"
+                    )
+                # Whole-job replacement/deletion excludes every publisher.
+                yield
+                return
+            affected = set(platforms)
+            if include_fallback_slots:
+                job = await store.get(project_id)
+                if job:
+                    affected.update(
+                        p for p in job.publisher_payloads if p not in job.platform_scheduled_at
+                    )
+            if not affected:
+                # Metadata-only slot changes still exclude whole-job deletion.
+                affected.add("__job_fields__")
+            if store.publisher_busy(project_id, affected):
+                raise HTTPException(
+                    409, "Publisher operation in progress; retry after it completes"
+                )
+            for platform in sorted(affected):
+                lock = store.publisher_platform_lock(project_id, platform)
+                await lock.acquire()
+                claimed.append(lock)
+        # Provider/Discord calls can take time: only the affected platform locks
+        # remain held, while other publishers can upload or mutate their jobs.
+        yield
+    finally:
+        for lock in reversed(claimed):
+            lock.release()
+
+
 @router.post("/jobs", response_model=CreateJobResponse)
 async def create_job(req: CreateJobRequest, request: Request) -> CreateJobResponse:
+    async with _publisher_lock(request, req.project_id):
+        existing = await request.app.state.job_store.get(req.project_id)
+        if (
+            existing
+            and existing.publisher_payloads
+            and _job_payload_changed(
+                existing, req, _instagram_payload(req), _tiktok_payload(req), _facebook_payload(req)
+            )
+        ):
+            # Never erase a submitted/uncertain checkpoint through a job upsert.
+            if any(existing.publisher_states.values()) or any(
+                existing.platform_statuses.get(p, PlatformStatus(status="pending")).status
+                == "uploaded"
+                for p in existing.publisher_payloads
+            ):
+                raise HTTPException(
+                    409,
+                    "Existing publisher submission must be reconciled before replacing this job",
+                )
+            for platform in list(existing.publisher_reminders):
+                await additional_publishers.cleanup_reminder(
+                    existing,
+                    platform,
+                    request.app.state.job_store,
+                    request.app.state.settings,
+                    request.app.state.discord,
+                )
+                existing = await request.app.state.job_store.get(req.project_id)
+        return await _create_job(req, request)
+
+
+async def _create_job(req: CreateJobRequest, request: Request) -> CreateJobResponse:
     settings = request.app.state.settings
     store = request.app.state.job_store
     discord = request.app.state.discord
@@ -236,8 +340,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
 
             state = existing.tiktok_publish_state
             if (
-                _tiktok_target(existing.tiktok_payload)
-                != _tiktok_target(tiktok_payload)
+                _tiktok_target(existing.tiktok_payload) != _tiktok_target(tiktok_payload)
                 and state is not None
                 and state.post_id
                 and state.stage != "failed"
@@ -262,7 +365,9 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
                 except Exception as e:
                     logger.warning(
                         "PFM scheduled-post delete failed for %s (post_id=%s): %s",
-                        req.project_id, state.post_id, e,
+                        req.project_id,
+                        state.post_id,
+                        e,
                     )
 
             updated = await store.update(
@@ -283,6 +388,9 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
                 tiktok_publish_state=None,
                 facebook_payload=facebook_payload,
                 facebook_publish_state=None,
+                publisher_payloads={p: v.model_dump() for p, v in req.publishers.items()},
+                publisher_states=existing.publisher_states,
+                publisher_reminders=existing.publisher_reminders,
             )
 
     if updated is not None:
@@ -320,6 +428,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
         instagram_payload=instagram_payload,
         tiktok_payload=tiktok_payload,
         facebook_payload=facebook_payload,
+        publisher_payloads={p: v.model_dump() for p, v in req.publishers.items()},
         created_at=now,
         updated_at=now,
     )
@@ -327,9 +436,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
     embed_msg_id: str | None = None
     try:
         embed = build_embed(job, settings.accounts, settings.public_base_url)
-        embed_msg_id = await discord.post_message(
-            settings.discord.upload_channel_id, embed=embed
-        )
+        embed_msg_id = await discord.post_message(settings.discord.upload_channel_id, embed=embed)
         job.discord_message_id = embed_msg_id
     except Exception as e:
         logger.warning("Embed post failed for %s: %s", job.project_id, e)
@@ -341,9 +448,7 @@ async def create_job(req: CreateJobRequest, request: Request) -> CreateJobRespon
 
 
 @router.post("/jobs/{project_id}/platform-status")
-async def platform_status(
-    project_id: str, req: PlatformStatusRequest, request: Request
-) -> dict:
+async def platform_status(project_id: str, req: PlatformStatusRequest, request: Request) -> dict:
     settings = request.app.state.settings
     store = request.app.state.job_store
     discord = request.app.state.discord
@@ -359,9 +464,7 @@ async def platform_status(
 
     job.platform_statuses[req.platform] = new_status
     fields: dict[str, object] = {"platform_statuses": job.platform_statuses}
-    tiktok_terminal = req.platform == "tiktok" and req.status in (
-        "uploaded", "skipped", "failed"
-    )
+    tiktok_terminal = req.platform == "tiktok" and req.status in ("uploaded", "skipped", "failed")
     if tiktok_terminal:
         # Manual TikTok mode: a terminal row (backend cancel, external ack)
         # means the reminder is moot — never fire it, drop it if posted.
@@ -398,9 +501,7 @@ class FacebookHoldRequest(BaseModel):
 
 
 @router.post("/jobs/{project_id}/facebook-hold")
-async def facebook_hold(
-    project_id: str, req: FacebookHoldRequest, request: Request
-) -> dict:
+async def facebook_hold(project_id: str, req: FacebookHoldRequest, request: Request) -> dict:
     settings = request.app.state.settings
     store = request.app.state.job_store
 
@@ -453,9 +554,38 @@ async def facebook_hold(
 
 
 @router.patch("/jobs/{project_id}/slot")
-async def update_job_slot(
-    project_id: str, req: UpdateSlotRequest, request: Request
-) -> dict:
+async def update_job_slot(project_id: str, req: UpdateSlotRequest, request: Request) -> dict:
+    async with _publisher_lock(
+        request, project_id, platforms=set(req.platform_scheduled_at or {}),
+        include_fallback_slots=req.slot_time is not None,
+    ):
+        store = request.app.state.job_store
+        job = await store.get(project_id)
+        if job:
+            affected = set(req.platform_scheduled_at or {})
+            if req.slot_time is not None:
+                affected.update(
+                    p for p in job.publisher_payloads if p not in job.platform_scheduled_at
+                )
+            for platform in affected:
+                if platform not in job.publisher_payloads:
+                    continue
+                status = job.platform_statuses.get(platform)
+                if additional_publishers.submission_locked(
+                    platform, job.publisher_states.get(platform, {})
+                ) or (status and status.status == "uploaded"):
+                    raise HTTPException(
+                        409,
+                        f"{platform} has started publishing; its submission cannot be rescheduled",
+                    )
+                await additional_publishers.cleanup_reminder(
+                    job, platform, store, request.app.state.settings, request.app.state.discord
+                )
+                job = await store.get(project_id)
+        return await _update_job_slot(project_id, req, request)
+
+
+async def _update_job_slot(project_id: str, req: UpdateSlotRequest, request: Request) -> dict:
     store = request.app.state.job_store
     job = await store.get(project_id)
     if job is None:
@@ -467,9 +597,7 @@ async def update_job_slot(
     if req.platform_scheduled_at is not None:
         # Merge into the existing per-platform map so partial updates (e.g.
         # moving only the TikTok slot) don't wipe other platforms' entries.
-        merged = dict(job.platform_scheduled_at or {})
-        merged.update(dict(req.platform_scheduled_at))
-        fields["platform_scheduled_at"] = merged
+        fields["platform_scheduled_at"] = dict(req.platform_scheduled_at)
     if req.reminder_cancelled is not None:
         fields["reminder_cancelled"] = req.reminder_cancelled
     rearm_reminder = False
@@ -498,7 +626,7 @@ async def update_job_slot(
             },
             "reminder_cancelled": job.reminder_cancelled,
         }
-    updated = await store.update(project_id, **fields)
+    updated = await store.update(project_id, merge_maps=("platform_scheduled_at",), **fields)
     if rearm_reminder:
         await cleanup_reminder(
             request.app.state.discord, store, request.app.state.settings, updated
@@ -514,8 +642,117 @@ async def update_job_slot(
     }
 
 
+@router.post("/jobs/{project_id}/platforms/{platform}/cancel")
+async def cancel_publisher(project_id: str, platform: str, request: Request) -> dict:
+    if platform not in additional_publishers.PLATFORMS:
+        raise HTTPException(400, "Unsupported publisher")
+    async with _publisher_lock(request, project_id, platforms={platform}):
+        store = request.app.state.job_store
+        job = await store.get(project_id)
+        if job is None or platform not in job.publisher_payloads:
+            raise HTTPException(404, "Publisher job not found")
+        status = job.platform_statuses.get(platform)
+        if status and status.status == "skipped":
+            return {"status": "cancelled"}
+        if additional_publishers.submission_locked(
+            platform, job.publisher_states.get(platform, {})
+        ) or (status and status.status == "uploaded"):
+            raise HTTPException(
+                409, "Publishing has started; inspect/remove the remote post before cancelling"
+            )
+        try:
+            await additional_publishers.cancel_staged(job, platform)
+        except Exception:
+            raise HTTPException(
+                502, "Could not delete staged remote video; cancellation not confirmed"
+            ) from None
+        job = await store.update(
+            project_id,
+            platform_statuses={platform: PlatformStatus(status="skipped", detail="cancelled")},
+            publisher_states={platform: None},
+            merge_maps=("platform_statuses", "publisher_states"),
+        )
+        await additional_publishers.cleanup_reminder(
+            job, platform, store, request.app.state.settings, request.app.state.discord
+        )
+        await additional_publishers.update_embed(
+            job, request.app.state.settings, request.app.state.discord, store=store
+        )
+        return {"status": "cancelled"}
+
+
+class RetryPublisherRequest(BaseModel):
+    credentials: dict[str, Any] | None = Field(default=None, repr=False)
+
+
+@router.post("/jobs/{project_id}/platforms/{platform}/retry")
+async def retry_publisher(
+    project_id: str, platform: str, req: RetryPublisherRequest, request: Request
+) -> dict:
+    if platform not in additional_publishers.PLATFORMS:
+        raise HTTPException(400, "Unsupported publisher")
+    async with _publisher_lock(request, project_id, platforms={platform}):
+        store = request.app.state.job_store
+        job = await store.get(project_id)
+        if job is None or platform not in job.publisher_payloads:
+            raise HTTPException(404, "Publisher job not found")
+        status = job.platform_statuses.get(platform)
+        if status is None or status.status != "failed":
+            raise HTTPException(409, "Only failed publisher jobs can be retried")
+        if req.credentials is not None:
+            payload = dict(job.publisher_payloads[platform])
+            original = payload.get("credentials") or {}
+            # A rotated authorization can change; the destination cannot.
+            for key in ("client_id", "profile_id", "mid", "openid"):
+                if original.get(key) != req.credentials.get(key):
+                    raise HTTPException(409, "Cannot change publisher identity while retrying")
+            payload["credentials"] = {**original, **req.credentials}
+            job = await store.update(
+                project_id, publisher_payloads={platform: payload},
+                merge_maps=("publisher_payloads",),
+            )
+        # Preserve checkpoints. The adapter reconciles known IDs or refuses to
+        # resubmit an unknown outcome, including after this explicit retry.
+        job = await store.merge_platform_status(
+            project_id, platform, PlatformStatus(status="pending")
+        )
+        await additional_publishers.update_embed(
+            job, request.app.state.settings, request.app.state.discord, store=store
+        )
+        return {"status": "pending"}
+
+
 @router.delete("/jobs/{project_id}", status_code=204)
 async def delete_job(project_id: str, request: Request) -> None:
+    async with _publisher_lock(request, project_id):
+        job = await request.app.state.job_store.get(project_id)
+        if job:
+            for platform, state in job.publisher_states.items():
+                status = job.platform_statuses.get(platform)
+                if additional_publishers.submission_locked(platform, state) and (
+                    not status or status.status != "uploaded"
+                ):
+                    raise HTTPException(
+                        409, "Unresolved remote submission; reconcile before deleting job"
+                    )
+                if not status or status.status != "uploaded":
+                    try:
+                        await additional_publishers.cancel_staged(job, platform)
+                    except Exception:
+                        raise HTTPException(502, "Could not delete staged remote video") from None
+            for platform in list(job.publisher_reminders):
+                await additional_publishers.cleanup_reminder(
+                    job,
+                    platform,
+                    request.app.state.job_store,
+                    request.app.state.settings,
+                    request.app.state.discord,
+                )
+                job = await request.app.state.job_store.get(project_id)
+        await _delete_job(project_id, request)
+
+
+async def _delete_job(project_id: str, request: Request) -> None:
     settings = request.app.state.settings
     store = request.app.state.job_store
     discord = request.app.state.discord
@@ -526,9 +763,7 @@ async def delete_job(project_id: str, request: Request) -> None:
 
     if job.discord_message_id:
         try:
-            await discord.delete_message(
-                settings.discord.upload_channel_id, job.discord_message_id
-            )
+            await discord.delete_message(settings.discord.upload_channel_id, job.discord_message_id)
         except Exception as e:
             logger.warning("Embed delete failed for %s: %s", project_id, e)
     await cleanup_reminder(discord, store, settings, job)
@@ -549,7 +784,9 @@ async def delete_job(project_id: str, request: Request) -> None:
         except Exception as e:
             logger.warning(
                 "PFM scheduled-post delete failed for %s (post_id=%s): %s",
-                project_id, state.post_id, e,
+                project_id,
+                state.post_id,
+                e,
             )
 
     await store.delete(project_id)
@@ -632,9 +869,7 @@ async def patch_discord_message(
     settings = request.app.state.settings
     discord = request.app.state.discord
     channel_id = req.channel_id or settings.discord.upload_channel_id
-    await discord.edit_message(
-        channel_id, message_id, content=req.content, embed=req.embed
-    )
+    await discord.edit_message(channel_id, message_id, content=req.content, embed=req.embed)
     return {"ok": True}
 
 
@@ -670,9 +905,7 @@ def _job_status_projection(job: Job) -> dict:
             for platform, scheduled_at in job.platform_scheduled_at.items()
         },
         "platforms_requested": list(job.platforms_requested),
-        "platform_statuses": {
-            p: ps.to_dict() for p, ps in job.platform_statuses.items()
-        },
+        "platform_statuses": {p: ps.to_dict() for p, ps in job.platform_statuses.items()},
         "reminder_cancelled": job.reminder_cancelled,
         "tiktok_manual": job.tiktok_manual,
         # Long-range Facebook hold: the native post id once created/known, so
@@ -696,8 +929,96 @@ async def list_job_statuses(request: Request) -> dict:
 
     store = request.app.state.job_store
     jobs = await store.list_all()
-    _status_snapshot = {
-        "jobs": {job.project_id: _job_status_projection(job) for job in jobs}
-    }
+    _status_snapshot = {"jobs": {job.project_id: _job_status_projection(job) for job in jobs}}
     _status_snapshot_at = now
     return _status_snapshot
+
+
+class ReconcilePublisherRequest(BaseModel):
+    """An operator explicitly reports what they verified in the provider Studio."""
+
+    outcome: Literal["published", "not_published"]
+    confirm: Literal[True]
+    resource_id: str | None = Field(default=None, max_length=200)
+
+
+@router.post("/jobs/{project_id}/platforms/{platform}/reconcile")
+async def reconcile_publisher(  # noqa: PLR0912 - provider-specific recovery states
+    project_id: str,
+    platform: str,
+    req: ReconcilePublisherRequest,
+    request: Request,
+) -> dict:
+    if platform not in additional_publishers.PLATFORMS:
+        raise HTTPException(400, "Unsupported publisher")
+    async with _publisher_lock(request, project_id, platforms={platform}):
+        store = request.app.state.job_store
+        job = await store.get(project_id)
+        if job is None or platform not in job.publisher_payloads:
+            raise HTTPException(404, "Publisher job not found")
+        if job.publisher_payloads[platform].get("mode") != "api":
+            raise HTTPException(409, "Manual publishers use their reminder acknowledgment")
+        previous = job.platform_statuses.get(platform)
+        if previous is None or previous.status != "failed":
+            raise HTTPException(409, "Only failed publisher jobs can be reconciled")
+
+        state = dict(job.publisher_states.get(platform) or {})
+        now = datetime.now(UTC)
+        if req.outcome == "published":
+            resource_id = str(req.resource_id or state.get("resource_id") or "").strip()
+            valid_id = resource_id and all(
+                c.isascii() and (c.isalnum() or c in "-_") for c in resource_id
+            )
+            if not valid_id:
+                raise HTTPException(400, "A valid provider resource_id is required for publication")
+            url = None
+            if platform == "bilibili":
+                if not resource_id.startswith("BV"):
+                    raise HTTPException(400, "Bilibili resource_id must be a BV video ID")
+                state.update(resource_id=resource_id, submission_started=True)
+                url = f"https://www.bilibili.com/video/{resource_id}"
+            else:
+                state.update(stage="submitted", resource_id=resource_id)
+                if platform == "dailymotion":
+                    url = f"https://www.dailymotion.com/video/{resource_id}"
+                elif platform == "snapchat":
+                    url = f"https://www.snapchat.com/spotlight/{resource_id}"
+                state["url"] = url
+            status = PlatformStatus(
+                status="uploaded",
+                url=url,
+                detail="Publication verified manually in the provider Studio",
+                completed_at=now,
+                attempts=previous.attempts,
+            )
+        else:
+            if req.resource_id is not None:
+                raise HTTPException(400, "Do not supply resource_id for not_published")
+            state.pop("url", None)
+            if platform == "bilibili":
+                state.pop("resource_id", None)
+                state["submission_started"] = False
+            elif platform == "snapchat":
+                state.pop("resource_id", None)
+                state["stage"] = "media_ready" if state.get("media_id") else "pending"
+            else:
+                # Preserve a known private video so retry can reconcile it.
+                # A lost create response has no recoverable ID; the operator
+                # must remove any private orphan before permitting a new one.
+                state["stage"] = "private" if state.get("resource_id") else "pending"
+            status = PlatformStatus(
+                status="failed",
+                attempts=previous.attempts,
+                detail="Operator confirmed no publication; retry or cancel is now available",
+            )
+        state.update(reconciled_at=now.isoformat(), reconciled_outcome=req.outcome)
+        job = await store.update(
+            project_id,
+            publisher_states={platform: state},
+            platform_statuses={platform: status},
+            merge_maps=("publisher_states", "platform_statuses"),
+        )
+        await additional_publishers.update_embed(
+            job, request.app.state.settings, request.app.state.discord, store=store
+        )
+        return {"status": status.status, "outcome": req.outcome, "url": status.url}

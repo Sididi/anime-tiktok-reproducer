@@ -8,7 +8,7 @@ from threading import Lock
 from zoneinfo import ZoneInfo
 
 from ..models import PlatformSchedule, Project
-from .account_service import AccountService
+from .account_service import ADDITIONAL_PLATFORMS, AccountService
 from .project_service import ProjectService
 from .scheduling_errors import (
     SchedulingConflictError,
@@ -166,6 +166,81 @@ class SchedulingService:
     _reservation_lock = Lock()
 
     # ------------------------------------------------------------------ helpers
+
+    @classmethod
+    def track_additional_reschedule_notification(
+        cls, project_id: str, platform: str, target: datetime,
+        status: str, error: str | None = None,
+    ) -> None:
+        """Apply a notification result only to the still-current schedule."""
+        with cls._reservation_lock:
+            project = ProjectService.load(project_id)
+            if project is None:
+                return
+            current = project.platform_schedules.get(platform)
+            if current is None or cls._normalize_utc_datetime(current.scheduled_at) != cls._normalize_utc_datetime(target):
+                return
+            pending = dict(project.reschedule_pending or {})
+            if status == "ok":
+                if platform not in pending:
+                    return
+                pending.pop(platform)
+            elif status == "pending_retry":
+                pending[platform] = {
+                    "target_scheduled_at": target, "retries": 0, "last_error": error,
+                    "last_attempt_at": datetime.now(timezone.utc),
+                }
+            else:
+                return
+            project.reschedule_pending = pending
+            ProjectService.save(project)
+
+    @classmethod
+    def _guard_additional_reschedules(
+        cls,
+        changes: list[tuple[Project, str, PlatformSchedule | None, PlatformSchedule]],
+    ) -> None:
+        """Confirm editable VPS schedules before committing local moves.
+
+        Definite remote conflicts must leave the original reservations intact.
+        Transient failures retain the existing route/retry-loop behavior. If a
+        later change in a batch conflicts, restore earlier remote changes too.
+        The caller owns rollback of any provisional local reservations.
+        """
+        from .platform_reschedule_service import PlatformRescheduleService
+
+        attempted: list[tuple[Project, str, PlatformSchedule]] = []
+        for project, platform, original, target in changes:
+            if platform not in ADDITIONAL_PLATFORMS or original is None:
+                continue
+            if original.scheduled_at == target.scheduled_at:
+                continue
+            result = PlatformRescheduleService.notify(project, platform, target.scheduled_at)
+            if result.conflict:
+                for previous, previous_platform, previous_schedule in reversed(attempted):
+                    restored = PlatformRescheduleService.notify(
+                        previous, previous_platform, previous_schedule.scheduled_at,
+                    )
+                    if restored.status != "pending_retry":
+                        continue
+                    # A lost compensation response must not strand the remote
+                    # job on a target that the local operation rejected.
+                    saved = ProjectService.load(previous.id)
+                    if saved is not None:
+                        pending = dict(saved.reschedule_pending or {})
+                        pending[previous_platform] = {
+                            "target_scheduled_at": previous_schedule.scheduled_at,
+                            "retries": 0,
+                            "last_error": restored.error,
+                            "last_attempt_at": datetime.now(timezone.utc),
+                        }
+                        saved.reschedule_pending = pending
+                        ProjectService.save(saved)
+                raise SchedulingConflictError(
+                    f"{platform} has started publishing; its reservation was not moved"
+                )
+            if result.status != "skipped":
+                attempted.append((project, platform, original))
 
     @classmethod
     def _earliest_allowed_publish_time(cls) -> datetime:
@@ -544,7 +619,7 @@ class SchedulingService:
 
     # ---------------------------------------------------------------- anchoring
 
-    _OTHER_PLATFORMS_FOR_ANCHOR: tuple[str, ...] = ("youtube", "facebook", "instagram")
+    _OTHER_PLATFORMS_FOR_ANCHOR: tuple[str, ...] = ("youtube", "facebook", "instagram", "dailymotion", "snapchat", "bilibili")
 
     @classmethod
     def _is_slot_in_account_config(
@@ -808,6 +883,7 @@ class SchedulingService:
         overrides: dict[str, datetime] | None = None,
         steals: dict[str, StealSpec] | None = None,
         allow_before_tiktok: bool = False,
+        _previous_schedules: dict[str, PlatformSchedule] | None = None,
     ) -> tuple[dict[str, PlatformSchedule], dict[str, SwitchResult]]:
         """Reserve TT (anchor) + each other configured platform on `project`.
 
@@ -878,10 +954,9 @@ class SchedulingService:
                         item_platform
                     )
 
-            for platform, plan in steal_plans:
-                cls._apply_displacements(platform, plan.displaced, now_utc)
-
             try:
+                for platform, plan in steal_plans:
+                    cls._apply_displacements(platform, plan.displaced, now_utc)
                 resolution = cls.resolve_anchor(
                     account_id, anchor, overrides, project_id=project_id
                 )
@@ -903,6 +978,18 @@ class SchedulingService:
                     account_id,
                     [resolved.slot for resolved in resolution.resolved.values()],
                 )
+                schedules = dict(project.platform_schedules or {})
+                originals = _previous_schedules if _previous_schedules is not None else schedules
+                changes = []
+                for platform, resolved in resolution.resolved.items():
+                    target = PlatformSchedule(slot=resolved.slot, scheduled_at=resolved.scheduled_at)
+                    changes.append((project, platform, originals.get(platform), target))
+                    schedules[platform] = target
+                for (proj_id, platform), original in displacement_snapshots.items():
+                    moved = ProjectService.load(proj_id)
+                    if moved is not None and platform in moved.platform_schedules:
+                        changes.append((moved, platform, original, moved.platform_schedules[platform]))
+                cls._guard_additional_reschedules(changes)
             except Exception:
                 # Roll back every displaced move so the conflict leaves no
                 # partial write on disk.
@@ -920,11 +1007,6 @@ class SchedulingService:
                     ProjectService.save(moved)
                 raise
 
-            schedules = dict(project.platform_schedules or {})
-            for platform, resolved in resolution.resolved.items():
-                schedules[platform] = PlatformSchedule(
-                    slot=resolved.slot, scheduled_at=resolved.scheduled_at
-                )
             project.platform_schedules = schedules
             project.scheduled_account_id = account_id
             cls._recompute_aggregates(project)
@@ -967,10 +1049,14 @@ class SchedulingService:
             if project.scheduled_account_id and project.scheduled_account_id != account_id:
                 project.platform_schedules = {}
             schedules = dict(project.platform_schedules or {})
+            changes = []
             for platform in platforms:
-                schedules[platform] = PlatformSchedule(
+                target = PlatformSchedule(
                     slot=at_utc, scheduled_at=at_utc, manual=True
                 )
+                changes.append((project, platform, schedules.get(platform), target))
+                schedules[platform] = target
+            cls._guard_additional_reschedules(changes)
             project.platform_schedules = schedules
             project.scheduled_account_id = account_id
             cls._recompute_aggregates(project)
@@ -1072,17 +1158,28 @@ class SchedulingService:
                 raise SchedulingLockedError("timing_locked")
             # Drop existing per-platform reservations so resolve_anchor sees
             # the slots as free in this pool.
+            previous = dict(project.platform_schedules or {})
             project.platform_schedules = {}
             ProjectService.save(project)
 
-        return cls.reserve_anchor(
-            project_id=project_id,
-            account_id=account_id,
-            tiktok_slot=tiktok_slot,
-            overrides=overrides,
-            steals=steals,
-            allow_before_tiktok=allow_before_tiktok,
-        )
+        try:
+            return cls.reserve_anchor(
+                project_id=project_id,
+                account_id=account_id,
+                tiktok_slot=tiktok_slot,
+                overrides=overrides,
+                steals=steals,
+                allow_before_tiktok=allow_before_tiktok,
+                _previous_schedules=previous,
+            )
+        except Exception:
+            with cls._reservation_lock:
+                restored = ProjectService.load(project_id)
+                if restored is not None:
+                    restored.platform_schedules = previous
+                    cls._recompute_aggregates(restored)
+                    ProjectService.save(restored)
+            raise
 
     @classmethod
     def reschedule_platform(
@@ -1139,6 +1236,7 @@ class SchedulingService:
                     slot=slot,
                     scheduled_at=cls._scheduled_at_for(project_id, slot, now_utc),
                 )
+                cls._guard_additional_reschedules([(project, platform, old, new_sched)])
                 schedules[platform] = new_sched
                 project.platform_schedules = schedules
                 cls._recompute_aggregates(project)
@@ -1184,7 +1282,7 @@ class SchedulingService:
 
     # ----------------------------------------------------------------- cascade
 
-    _CASCADE_PLATFORMS: tuple[str, ...] = ("tiktok", "youtube", "facebook", "instagram")
+    _CASCADE_PLATFORMS: tuple[str, ...] = ("tiktok", "youtube", "facebook", "instagram", "dailymotion", "snapchat", "bilibili")
 
     @classmethod
     def _platforms_for_project(cls, project_id: str, account_id: str) -> list[str]:
@@ -1589,14 +1687,27 @@ class SchedulingService:
                 raise SchedulingConflictError("tiktok_precedence")
 
             now_utc = datetime.now(timezone.utc)
+            switcher_target = PlatformSchedule(
+                slot=slot_utc, scheduled_at=cls._scheduled_at_for(project_id, slot_utc, now_utc),
+            )
+            changes = [(switcher, platform, switcher.platform_schedules.get(platform), switcher_target)]
+            for item in plan.displaced:
+                moved = ProjectService.load(item.project_id)
+                if moved is None:
+                    continue
+                moved_platform = item.platform or platform
+                target = PlatformSchedule(
+                    slot=item.to_slot,
+                    scheduled_at=cls._scheduled_at_for(item.project_id, item.to_slot, now_utc),
+                )
+                changes.append((moved, moved_platform, moved.platform_schedules.get(moved_platform), target))
+            cls._guard_additional_reschedules(changes)
             cls._apply_displacements(platform, plan.displaced, now_utc)
 
             if switcher.scheduled_account_id and switcher.scheduled_account_id != account_id:
                 switcher.platform_schedules = {}
             schedules = dict(switcher.platform_schedules or {})
-            schedules[platform] = PlatformSchedule(
-                slot=slot_utc, scheduled_at=cls._scheduled_at_for(project_id, slot_utc, now_utc)
-            )
+            schedules[platform] = switcher_target
             switcher.platform_schedules = schedules
             switcher.scheduled_account_id = account_id
             cls._recompute_aggregates(switcher)
@@ -1622,6 +1733,21 @@ class SchedulingService:
                 raise SchedulingNotFoundError("Urgent project not found")
 
             now_utc = datetime.now(timezone.utc)
+
+            changes = []
+            for plat in result.per_platform:
+                target = PlatformSchedule(slot=plat.target_slot, scheduled_at=plat.target_scheduled_at)
+                changes.append((urgent, plat.platform, urgent.platform_schedules.get(plat.platform), target))
+                for item in plat.displaced:
+                    moved = ProjectService.load(item.project_id)
+                    if moved is None:
+                        continue
+                    target = PlatformSchedule(
+                        slot=item.to_slot,
+                        scheduled_at=cls._scheduled_at_for(item.project_id, item.to_slot, now_utc),
+                    )
+                    changes.append((moved, plat.platform, moved.platform_schedules.get(plat.platform), target))
+            cls._guard_additional_reschedules(changes)
 
             # 1. Move displaced projects in REVERSE order of their cascade chain.
             #    Walking from the farthest-pushed back to the closest avoids

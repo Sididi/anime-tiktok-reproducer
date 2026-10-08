@@ -3,6 +3,7 @@ import { Button } from "@/components/ui";
 import { UploadSplitButton } from "./UploadSplitButton";
 import {
   formatBytes,
+  formatDateTime,
   formatScheduledAt,
   getLibraryTypeLabel,
   statusCircleClasses,
@@ -103,7 +104,9 @@ export function ProjectRow({
             row.uploaded_status === "publish_error"
               ? `Échec de publication — ${row.publish_error_detail ?? "voir Discord"}`
               : row.uploaded
-                ? "Uploaded"
+                ? row.scheduled_at
+                  ? `Uploaded ${formatDateTime(row.scheduled_at)}`
+                  : "Uploaded"
                 : row.uploaded_status === "orange"
                   ? "Scheduled"
                   : "Not uploaded"

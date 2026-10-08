@@ -51,7 +51,11 @@ def _swallow(label: str):
                 # whole afternoon (2026-08-27): always show the server's body.
                 body = ""
                 try:
-                    body = (e.response.text or "").strip()[:300]
+                    body = (
+                        "publisher job rejected; credentials omitted"
+                        if kwargs.get("publishers")
+                        else (e.response.text or "").strip()[:300]
+                    )
                 except Exception:
                     pass
                 logger.warning(
@@ -127,6 +131,7 @@ class DiscordService:
         platform_scheduled_at: dict[str, datetime] | None = None,
         platform_statuses: dict[str, dict[str, Any]] | None = None,
         tiktok_manual: bool = False,
+        publishers: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         body = {
             "project_id": project_id,
@@ -139,6 +144,8 @@ class DiscordService:
         }
         if instagram is not None:
             body["instagram"] = instagram
+        if publishers:
+            body["publishers"] = publishers
         if tiktok is not None:
             body["tiktok"] = tiktok
         if facebook is not None:

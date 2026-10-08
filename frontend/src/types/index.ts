@@ -578,14 +578,26 @@ export interface Transcription {
   unrecovered_gaps?: [number, number][];
 }
 
-export type Platform = "youtube" | "facebook" | "instagram" | "tiktok";
+export type Platform =
+  | "youtube"
+  | "facebook"
+  | "instagram"
+  | "tiktok"
+  | "dailymotion"
+  | "snapchat"
+  | "bilibili";
 
 export const ALL_PLATFORMS: readonly Platform[] = [
   "youtube",
   "facebook",
   "instagram",
   "tiktok",
+  "dailymotion",
+  "snapchat",
+  "bilibili",
 ] as const;
+
+export const NON_TIKTOK_PLATFORMS = ALL_PLATFORMS.filter((platform) => platform !== "tiktok");
 
 export interface PlanningEvent {
   project_id: string;
@@ -597,7 +609,7 @@ export interface PlanningEvent {
   slot: string;            // ISO; clean time (no jitter), shown to user
   scheduled_at: string;    // ISO with jitter; hidden from UI
   drive_folder_url: string | null;
-  /** "dispatched" = handed to the VPS scheduler (IG/TT), awaiting publish. */
+  /** "dispatched" = handed to the VPS scheduler, awaiting publish. */
   status: "scheduled" | "dispatched" | "running" | "complete" | "failed";
   posted_url?: string | null;
   manual: boolean;

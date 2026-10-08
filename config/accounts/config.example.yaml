@@ -2,9 +2,12 @@
 # Existing anime-only accounts do not accept Facecam projects.
 # Account configuration for multi-channel upload scheduling.
 # Copy this file to config.yaml and fill in your credentials.
+# Only Dailymotion, Snapchat, and Bilibili require explicit account blocks.
+# The four original platforms retain their existing defaults.
 #
 # Global credentials (Meta app_id/secret, Google OAuth client, Discord, Drive)
-# stay in .env. Only per-account tokens go here.
+# stay in .env. Per-account tokens and the new direct-publisher credentials
+# are configured below; never commit the private config.yaml.
 
 # --- Optional templates -----------------------------------------------------
 #
@@ -56,7 +59,7 @@ accounts:
       - "anime"
     avatar: "anime_fr.jpg"       # filename in <repo>/server/avatars/ (served by VPS)
     device: "iphone_13_pro"     # optional: label shown in the Discord embed (legacy manual-post field)
-    # Upload slots in UTC (HH:MM). Shared by every platform on this account.
+    # Upload slots in Europe/Paris local time (HH:MM). Shared by enrolled platforms.
     slots:
       - "14:00"
       - "18:00"
@@ -132,3 +135,39 @@ accounts:
   #     facebook_page_id: "789..."
   #     facebook_page_access_token: "EAA..."
   #     instagram_business_account_id: "012..."
+
+# New destinations are opt-in: omitting their block disables them. Add these
+# blocks INSIDE an account above. All slot times are Europe/Paris wall time.
+# Manual mode is free and needs no platform API credentials. A separate
+# Discord reminder at T-5 minutes is acknowledged with ✅ for each platform.
+#
+#    dailymotion:
+#      mode: manual             # api after obtaining a private Studio API key
+#      identity: "my-channel"   # same identity shares slots across accounts
+#      slots: ["18:00"]         # omit to inherit this account's top-level slots
+#      # client_id: "..."
+#      # client_secret: "..."
+#      # profile_id: "..."
+#      # category: shortfilms
+#      # is_for_kids: false
+#    snapchat:
+#      mode: manual             # api only after Public Profile API approval
+#      identity: "my-profile"
+#      slots: ["18:00"]
+#      # client_id: "..."
+#      # client_secret: "..."
+#      # refresh_token: "..."
+#      # profile_id: "..."
+#      # locale: fr_FR
+#    bilibili:
+#      mode: manual             # api requires bilibili.com Open Platform approval
+#      identity: "my-bilibili-mid"
+#      slots: ["18:00"]
+#      # openid: "..."       # from the authorized Bilibili OAuth result
+#      # client_id: "..."
+#      # client_secret: "..."
+#      # access_token: "..."
+#      # expires_at: 0           # absolute Unix timestamp from OAuth response
+#      # category_id: 0          # choose from your approved account's categories
+#      # copyright: 1            # 1 original, 2 repost (requires source URL)
+# Setup: docs/setup-dailymotion.md, docs/setup-snapchat.md, docs/setup-bilibili.md

@@ -394,7 +394,7 @@ export function SlotPickerPopover(props: SlotPickerPopoverProps) {
                   return next;
                 })
               }
-              platforms={platformsForAnchor}
+              platforms={platformsForAnchor.filter((p) => resolveResult.resolved[p] !== undefined)}
               onStealRequest={(p, iso) => setSwitchTarget({ platform: p, slotIso: iso })}
             />
           </>

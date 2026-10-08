@@ -5,6 +5,9 @@ const HSL_TUPLES: Record<Platform, string> = {
   facebook: "var(--platform-facebook)",
   instagram: "var(--platform-instagram)",
   tiktok: "var(--platform-tiktok)",
+  dailymotion: "var(--platform-dailymotion)",
+  snapchat: "var(--platform-snapchat)",
+  bilibili: "var(--platform-bilibili)",
 };
 
 export function platformBgHsl(platform: Platform): string {
@@ -20,6 +23,9 @@ export const PLATFORM_LABELS: Record<Platform, string> = {
   facebook: "Facebook",
   instagram: "Instagram",
   tiktok: "TikTok",
+  dailymotion: "Dailymotion",
+  snapchat: "Snapchat",
+  bilibili: "Bilibili",
 };
 
 export const PLATFORM_SHORT: Record<Platform, string> = {
@@ -27,4 +33,7 @@ export const PLATFORM_SHORT: Record<Platform, string> = {
   facebook: "FB",
   instagram: "IG",
   tiktok: "TT",
+  dailymotion: "DM",
+  snapchat: "SC",
+  bilibili: "BI",
 };

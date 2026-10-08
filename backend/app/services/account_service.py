@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import mimetypes
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -18,7 +20,8 @@ from .meta_token_service import MetaTokenService, MetaUploadCredentials
 logger = logging.getLogger("uvicorn.error")
 
 
-PLATFORM_KEYS: tuple[str, ...] = ("youtube", "facebook", "instagram", "tiktok")
+ADDITIONAL_PLATFORMS: tuple[str, ...] = ("dailymotion", "snapchat", "bilibili")
+PLATFORM_KEYS: tuple[str, ...] = ("youtube", "facebook", "instagram", "tiktok", *ADDITIONAL_PLATFORMS)
 PostForMeTikTokPlatform = Literal["tiktok", "tiktok_business"]
 _POST_FOR_ME_TIKTOK_PLATFORMS = frozenset(("tiktok", "tiktok_business"))
 
@@ -128,6 +131,71 @@ class AccountMetaConfig:
 
 
 @dataclass
+class AccountPublisherConfig:
+    mode: Literal["api", "manual"] = "manual"
+    slots: list[str] | None = None
+    identity: str | None = None
+    credentials: dict[str, Any] = field(default_factory=dict, repr=False)
+
+
+def validate_publisher_config(platform: str, config: AccountPublisherConfig) -> None:
+    """Reject incomplete API setup before reserving or queuing publication.
+
+    Manual reminders require no provider credentials. Do not validate while
+    parsing accounts: a broken new integration must not hide existing accounts.
+    Error messages identify fields, never their potentially secret values.
+    """
+    if config.mode == "manual":
+        return
+    label = {"dailymotion": "Dailymotion", "snapchat": "Snapchat", "bilibili": "Bilibili"}[platform]
+    credentials = config.credentials
+    required = {
+        "dailymotion": ("client_id", "client_secret", "profile_id"),
+        "snapchat": ("client_id", "client_secret", "profile_id", "refresh_token"),
+        "bilibili": ("client_id", "client_secret", "access_token", "openid"),
+    }[platform]
+    missing = [key for key in required if not str(credentials.get(key) or "").strip()]
+    if missing:
+        raise ValueError(
+            f"{label} API configuration is incomplete: missing {', '.join(missing)}. "
+            f"Complete setup using docs/setup-{platform}.md or select mode: manual."
+        )
+    if platform == "dailymotion" and not isinstance(credentials.get("is_for_kids", False), bool):
+        raise ValueError("Dailymotion is_for_kids must be a YAML boolean (true or false)")
+    if platform != "bilibili":
+        return
+    try:
+        expires_at = float(credentials.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    if not math.isfinite(expires_at) or expires_at <= time.time() + 300:
+        raise ValueError(
+            "Bilibili expires_at must be a future Unix timestamp at least five minutes away; "
+            "renew OAuth authorization and update access_token and expires_at before uploading."
+        )
+    for key, allowed in (("category_id", None), ("copyright", {1, 2})):
+        raw = credentials.get(key)
+        try:
+            number = int(str(raw)) if not isinstance(raw, bool) else 0
+        except (TypeError, ValueError):
+            number = 0
+        if number <= 0 or (allowed is not None and number not in allowed):
+            requirement = "a positive category ID" if key == "category_id" else "1 (original) or 2 (repost)"
+            raise ValueError(f"Bilibili {key} must be {requirement}")
+        if key == "copyright" and number == 2 and not str(credentials.get("source") or "").strip():
+            raise ValueError("Bilibili reposts require source in the account configuration")
+
+
+def validate_account_publishers(account: AccountConfig, platforms: list[str] | tuple[str, ...] | None = None) -> None:
+    requested = {str(platform).strip().lower() for platform in platforms} if platforms is not None else None
+    for platform in ADDITIONAL_PLATFORMS:
+        config = getattr(account, platform)
+        selected = platform in requested if requested is not None else bool(account.slots_for(platform))
+        if config is not None and selected:
+            validate_publisher_config(platform, config)
+
+
+@dataclass
 class AccountConfig:
     id: str
     name: str
@@ -141,15 +209,25 @@ class AccountConfig:
     facebook: AccountFacebookConfig | None = None
     instagram: AccountInstagramConfig | None = None
     tiktok: AccountTikTokConfig | None = None
+    dailymotion: AccountPublisherConfig | None = None
+    snapchat: AccountPublisherConfig | None = None
+    bilibili: AccountPublisherConfig | None = None
 
     def slots_for(self, platform: str) -> list[str]:
         """Return slot strings for a platform with replace-semantics.
 
         A per-platform `slots` list (even empty) completely replaces the top-level
         `slots:`. A platform block without `slots` (or no platform block at all)
-        inherits the top-level list.
+        inherits the top-level list for the four original platforms. The three
+        additional platforms require their own config block.
         """
         override: list[str] | None = None
+        if platform in ADDITIONAL_PLATFORMS:
+            config = getattr(self, platform)
+            # New destinations require explicit account enrollment.
+            if config is None:
+                return []
+            return list(config.slots) if config.slots is not None else list(self.slots)
         if platform == "youtube" and self.youtube is not None:
             override = self.youtube.slots
         elif platform == "facebook" and self.facebook is not None:
@@ -190,6 +268,9 @@ class AccountConfig:
         non-None key. None means the account is always alone in its pool for that
         platform.
         """
+        if platform in ADDITIONAL_PLATFORMS:
+            config = getattr(self, platform)
+            return f"{platform}:{config.identity}" if config and config.identity else None
         if platform == "youtube":
             cid = self.youtube.channel_id if self.youtube else None
             return f"youtube:{cid}" if cid else None
@@ -338,6 +419,20 @@ class AccountService:
         if not supported_types:
             supported_types = [DEFAULT_LIBRARY_TYPE]
 
+        publishers = {}
+        for platform in ADDITIONAL_PLATFORMS:
+            block = raw.get(platform)
+            if block is None:
+                continue
+            if not isinstance(block, dict) or block.get("mode", "manual") not in {"api", "manual"}:
+                raise ValueError(f"Invalid {platform} config for account {account_id}")
+            credentials = {k: v for k, v in block.items() if k not in {"mode", "slots", "identity"}}
+            identity = block.get("identity") or block.get("profile_id") or block.get("openid") or block.get("mid")
+            publishers[platform] = AccountPublisherConfig(
+                mode=block.get("mode", "manual"), slots=_normalize_slots(block.get("slots")),
+                identity=str(identity) if identity else None, credentials=credentials,
+            )
+
         return AccountConfig(
             id=account_id,
             name=str(raw.get("name", account_id)),
@@ -351,6 +446,7 @@ class AccountService:
             facebook=facebook,
             instagram=instagram,
             tiktok=tiktok,
+            **publishers,
         )
 
     @classmethod

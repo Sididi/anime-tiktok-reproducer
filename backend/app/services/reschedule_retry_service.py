@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
+from .account_service import ADDITIONAL_PLATFORMS
 from .platform_reschedule_service import PlatformRescheduleService
 from .project_service import ProjectService
 
@@ -62,7 +63,8 @@ class RescheduleRetryService:
         # and pre-filtered to the few projects with something pending.
         projects = await asyncio.to_thread(ProjectService.list_with_reschedule_pending)
         for project in projects:
-            pending = dict(project.reschedule_pending or {})
+            original = {platform: dict(entry) for platform, entry in (project.reschedule_pending or {}).items()}
+            pending = {platform: dict(entry) for platform, entry in original.items()}
             if not pending:
                 continue
             updated = False
@@ -72,11 +74,22 @@ class RescheduleRetryService:
                 target = cls._coerce_dt(entry.get("target_scheduled_at"))
                 if target is None:
                     continue
+                notify_project = project
+                if platform in ADDITIONAL_PLATFORMS:
+                    fresh = await ProjectService.aload(project.id)
+                    schedule = fresh.platform_schedules.get(platform) if fresh is not None else None
+                    if schedule is None or cls._coerce_dt(schedule.scheduled_at) != target:
+                        pending.pop(platform, None)
+                        updated = True
+                        continue
+                    if fresh.reschedule_pending.get(platform) != original[platform]:
+                        continue  # Another edit has replaced this retry.
+                    notify_project = fresh
                 if now_utc - last_attempt < cls._backoff_for_retries(retries):
                     continue
 
                 result = await asyncio.to_thread(
-                    PlatformRescheduleService.notify, project, platform, target
+                    PlatformRescheduleService.notify, notify_project, platform, target
                 )
                 if result.status == "ok":
                     pending.pop(platform, None)
@@ -115,7 +128,15 @@ class RescheduleRetryService:
                     fresh = await ProjectService.aload(project.id)
                     if fresh is None:
                         continue
-                    fresh.reschedule_pending = pending
+                    merged = dict(fresh.reschedule_pending or {})
+                    for platform, previous_entry in original.items():
+                        if merged.get(platform) != previous_entry:
+                            continue  # Preserve a retry added/replaced during notify.
+                        if platform in pending:
+                            merged[platform] = pending[platform]
+                        else:
+                            merged.pop(platform, None)
+                    fresh.reschedule_pending = merged
                     await ProjectService.asave(fresh)
 
     @classmethod
