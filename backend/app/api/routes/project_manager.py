@@ -139,11 +139,19 @@ async def list_project_upload_jobs():
 async def delete_managed_project(project_id: str, confirmed: bool = False):
     """Archive and delete a project, requiring confirmation while scheduled."""
     try:
-        return await asyncio.to_thread(
-            UploadPhaseService.managed_delete,
-            project_id,
-            confirmed=confirmed,
-        )
+        from ...services.temporary_source_service import TemporarySourceService
+        from ...services.project_startup_service import project_startup_queue
+        from ...utils.file_tasks import file_io
+        async with TemporarySourceService.deleting_project(project_id):
+            result = await file_io(
+                UploadPhaseService.managed_delete,
+                project_id,
+                confirmed=confirmed,
+            )
+        if result.get("local_deleted"):
+            await project_startup_queue.remove_project_jobs(project_id)
+            await project_upload_queue.remove_project_jobs(project_id)
+        return result
     except PendingProjectDeletionRequiresConfirmation as exc:
         raise HTTPException(
             status_code=409,

@@ -129,6 +129,14 @@ class SceneDetectorService:
                         timeout=cls.HEARTBEAT_INTERVAL_SECONDS,
                     )
                     break
+                except asyncio.CancelledError:
+                    # Keep the native detector (and its optional SSCD work)
+                    # inside the caller's lifetime before a project is deleted.
+                    try:
+                        await detect_future
+                    except Exception:
+                        pass
+                    raise
                 except asyncio.TimeoutError:
                     heartbeat_count += 1
                     heartbeat_progress = min(0.9, 0.05 + (heartbeat_count * 0.03))
@@ -172,19 +180,19 @@ class SceneDetectorService:
             raise RuntimeError("Video file not found")
 
         if threshold is None:
-            threshold = cls.default_threshold(project.library_type)
+            threshold = cls.default_threshold(project.media_library)
 
-        if project.library_type == LibraryType.PURE:
+        if project.uses_identity_source:
             # Pure has no indexed library: no SSCD merge-direction tiebreak.
             library_path = None
-            library_type = project.library_type
+            library_type = project.media_library
             anime_name = None
         else:
             from .anime_library import AnimeLibraryService
 
-            library_path = AnimeLibraryService.get_library_path(project.library_type)
-            library_type = project.library_type
-            anime_name = project.anime_name
+            library_path = AnimeLibraryService.get_library_path(project.media_library)
+            library_type = project.media_library
+            anime_name = project.media_series_name
 
         project.phase = ProjectPhase.SCENE_DETECTION
         await ProjectService.asave(project)

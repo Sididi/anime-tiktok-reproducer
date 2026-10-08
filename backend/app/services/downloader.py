@@ -7,12 +7,14 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator
+from urllib.parse import urlsplit
 
 from ..config import settings
 from ..utils.media_binaries import (
     get_media_subprocess_env,
     get_ytdlp_ffmpeg_location,
     get_ytdlp_binary,
+    get_ytdlp_js_runtime,
     is_media_binary_override_error,
 )
 from ..utils.subprocess_runner import CommandTimeoutError, run_command, terminate_process
@@ -76,6 +78,10 @@ class DownloaderService:
         "b"
     )
     AUDIO_RECOVERY_FORMAT_SELECTOR = "play/download/b[acodec!=none]/b"
+    # A strict cap on every fallback; prefer copy/remux-ready codecs at the
+    # best available resolution rather than transcoding an entire long video.
+    SOURCE_FORMAT_SELECTOR = "bv*[height<=1080]+ba/b[height<=1080]"
+    SOURCE_FORMAT_SORT = "res,vcodec:h264,acodec:aac"
     AUDIO_REQUIRED_ERROR_MESSAGE = (
         "Downloaded video has no audio stream. "
         "This TikTok may not have audio or the audio stream is unavailable. "
@@ -87,6 +93,12 @@ class DownloaderService:
         """Get the output path for a downloaded video."""
         return settings.projects_dir / project_id / "tiktok.mp4"
 
+    @staticmethod
+    def is_youtube_url(url: str | None) -> bool:
+        hostname = (urlsplit(url).hostname or "").lower() if url else ""
+        return any(hostname == domain or hostname.endswith("." + domain)
+                   for domain in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
+
     @classmethod
     def _build_download_command(
         cls,
@@ -96,7 +108,14 @@ class DownloaderService:
         format_selector: str,
         write_info_json: bool = False,
         load_info_json: Path | None = None,
+        use_browser_cookies: bool = True,
     ) -> list[str]:
+        is_youtube = cls.is_youtube_url(url)
+        if is_youtube:
+            # YouTube requests must never use the logged-in browser account.
+            # TikTok and other sites retain their configured authentication.
+            use_browser_cookies = False
+            format_selector = cls.SOURCE_FORMAT_SELECTOR
         cmd = [
             get_ytdlp_binary(),
             "--no-warnings",
@@ -111,17 +130,30 @@ class DownloaderService:
             str(output_path),
             "--force-overwrites",
         ]
+        if is_youtube:
+            # Prevent a global yt-dlp config from restoring authentication or
+            # overriding the source policy with custom downloader arguments.
+            cmd.append("--ignore-config")
+        if format_selector == cls.SOURCE_FORMAT_SELECTOR:
+            cmd.extend(["--format-sort", cls.SOURCE_FORMAT_SORT])
         if write_info_json:
             cmd.append("--write-info-json")
         if load_info_json is not None:
             cmd.extend(["--load-info-json", str(load_info_json)])
-        elif settings.ytdlp_cookies_from_browser:
+        elif use_browser_cookies and settings.ytdlp_cookies_from_browser:
             cmd.extend(
                 [
                     "--cookies-from-browser",
                     settings.ytdlp_cookies_from_browser,
                 ]
             )
+        if not use_browser_cookies:
+            # Also override cookies set in the user's yt-dlp config file.
+            cmd.extend(["--no-cookies", "--no-cookies-from-browser"])
+        if is_youtube:
+            runtime = get_ytdlp_js_runtime()
+            if runtime:
+                cmd.extend(["--js-runtimes", runtime])
         ffmpeg_location = get_ytdlp_ffmpeg_location()
         if ffmpeg_location is not None:
             cmd.extend(["--ffmpeg-location", ffmpeg_location])
@@ -149,7 +181,7 @@ class DownloaderService:
         info_json_path: Path | None = None,
     ) -> list[str]:
         return cls._build_download_command(
-            None if info_json_path is not None else url,
+            url,
             output_path,
             format_selector=cls.AUDIO_RECOVERY_FORMAT_SELECTOR,
             load_info_json=info_json_path,
@@ -221,6 +253,26 @@ class DownloaderService:
             *cmd[1:],
         ]
 
+    @staticmethod
+    def _needs_anonymous_youtube_fallback(cmd: list[str], stderr: str) -> bool:
+        # YouTube's logged-in player sometimes rejects otherwise public
+        # videos. Retry this precise error without cookies, once per command.
+        return (
+            "[youtube]" in stderr.lower()
+            and "the page needs to be reloaded" in stderr.lower()
+            and "--no-cookies-from-browser" not in cmd
+        )
+
+    @staticmethod
+    def _build_anonymous_command(cmd: list[str]) -> list[str]:
+        anonymous = list(cmd)
+        for option in ("--cookies-from-browser", "--cookies"):
+            while option in anonymous:
+                index = anonymous.index(option)
+                del anonymous[index:index + 2]
+        anonymous[1:1] = ["--no-cookies", "--no-cookies-from-browser"]
+        return anonymous
+
     @classmethod
     async def _stream_download_command_with_retries(
         cls,
@@ -245,7 +297,11 @@ class DownloaderService:
 
             if (
                 result is None
-                or not cls._is_retryable_extraction_failure(result)
+                or not (
+                    cls._is_retryable_extraction_failure(result)
+                    or (result.returncode not in (None, 0)
+                        and cls._needs_anonymous_youtube_fallback(active_cmd, result.stderr))
+                )
                 or attempt >= len(retry_delays)
             ):
                 if result is not None:
@@ -253,12 +309,16 @@ class DownloaderService:
                 return
 
             cls._cleanup_paths(cleanup_path)
-            if cls._needs_no_impersonation_fallback(result):
+            anonymous_fallback = cls._needs_anonymous_youtube_fallback(active_cmd, result.stderr)
+            if anonymous_fallback:
+                active_cmd = cls._build_anonymous_command(active_cmd)
+            elif cls._needs_no_impersonation_fallback(result):
                 active_cmd = cls._build_no_impersonation_command(cmd)
             yield DownloadProgress(
                 "downloading",
                 0,
-                f"{retry_message} ({attempt + 1}/{len(retry_delays)})...",
+                ("YouTube session failed; retrying without browser cookies..."
+                 if anonymous_fallback else f"{retry_message} ({attempt + 1}/{len(retry_delays)})..."),
             )
             await asyncio.sleep(retry_delays[attempt])
 
@@ -490,6 +550,11 @@ class DownloaderService:
         cls,
         url: str,
         project_id: str,
+        *,
+        output_path: Path | None = None,
+        require_audio: bool = True,
+        format_selector: str | None = None,
+        use_browser_cookies: bool = True,
     ) -> AsyncIterator[DownloadProgress]:
         """
         Download a TikTok video and yield progress updates.
@@ -503,7 +568,7 @@ class DownloaderService:
         """
         yield DownloadProgress("starting", 0, "Preparing download...")
 
-        output_path = cls.get_output_path(project_id)
+        output_path = output_path or cls.get_output_path(project_id)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         recovery_path = output_path.with_name(f"{output_path.stem}.recovery{output_path.suffix}")
         mux_path = output_path.with_name(f"{output_path.stem}.muxed{output_path.suffix}")
@@ -512,8 +577,14 @@ class DownloaderService:
 
         try:
             primary_result: _DownloadCommandResult | None = None
+            primary_command = cls._build_download_command(
+                url, output_path,
+                format_selector=format_selector or cls.PRIMARY_FORMAT_SELECTOR,
+                write_info_json=True,
+                use_browser_cookies=use_browser_cookies,
+            )
             async for event in cls._stream_download_command_with_retries(
-                cls._build_primary_download_command(url, output_path),
+                primary_command,
                 progress_message_prefix="Downloading",
                 retry_message="TikTok did not return video data; retrying",
                 cleanup_path=output_path,
@@ -559,7 +630,7 @@ class DownloaderService:
                 return
 
             has_audio = await cls._has_audio_stream(output_path)
-            if has_audio is False:
+            if has_audio is False and require_audio:
                 yield DownloadProgress("downloading", 0.0, "Recovering audio track...")
 
                 recovery_result: _DownloadCommandResult | None = None

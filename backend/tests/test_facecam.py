@@ -391,7 +391,8 @@ def test_phone_stream_offsets_are_preserved_in_silent_camera_and_voice(source,mo
     assert (root/'original.mov').exists()
 
 
-def test_package_expands_subtitles_and_contains_original_media(source,monkeypatch,tmp_path):
+@pytest.mark.parametrize('retimed', [False, True])
+def test_package_expands_subtitles_and_contains_original_media(source,monkeypatch,tmp_path,retimed):
     from app.services.export_service import ExportService
     from app.services.facecam_cover_service import FacecamCoverService
     from PIL import Image
@@ -399,7 +400,12 @@ def test_package_expands_subtitles_and_contains_original_media(source,monkeypatc
     project,state=draft(source)
     root=FacecamService.directory(project.id)/'recordings'/'test';root.mkdir(parents=True)
     for name in ['facecam.mp4','original.mov']:(root/name).write_bytes(b'media')
-    FacecamService.update(project.id,{'approved_revision':state.revision,'prepared':{'revision':state.revision,'fingerprint':'test'},
+    prepared={'revision':state.revision,'fingerprint':'test'}
+    if retimed:
+        work=root/'retimed';work.mkdir()
+        (work/'facecam.mp4').write_bytes(b'retimed camera')
+        prepared['camera_path']=str(work/'facecam.mp4')
+    FacecamService.update(project.id,{'approved_revision':state.revision,'prepared':prepared,
         'recording':{'directory':str(root),'original_name':'original.mov','fingerprint':'test'}})
     picture=io.BytesIO();Image.new('RGB',(200,300),'red').save(picture,'PNG')
     FacecamCoverService.store(project.id,picture.getvalue(),{'manual':True})
@@ -426,6 +432,7 @@ def test_package_expands_subtitles_and_contains_original_media(source,monkeypatc
             assert folder+name in names
         assert not any(name.endswith('.zip') for name in names)
         assert archive.read(folder+'script.txt').decode()==state.spoken_text()
+        assert archive.read(folder+'sources/facecam.mp4')==(b'retimed camera' if retimed else b'media')
     FacecamService.save_draft(project.id,state.revision,state.blocks,'','')
     with pytest.raises(ValueError,match='Relancez'): ExportService.build_bundle(project,[])
 
@@ -494,13 +501,15 @@ def test_responses_preserves_provider_citations_and_omits_sampling(monkeypatch):
     assert OpenRouterService.research('Verify')['sources']==[{'url':'https://example.org/source','title':'Evidence'}]
 
 
-def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,monkeypatch):
+@pytest.mark.parametrize('speed', [1.0, 1.25])
+def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,monkeypatch,speed):
     import array, contextlib, math, wave
     from app.models import Word
     from app.services.processing import ProcessingService
     from app.services.forced_alignment import ForcedAlignmentService
     from app.services.transcriber import TranscriberService
     from app.services import facecam_media_service as media
+    from app.models.facecam import FacecamAutoEditorSettings
     project,state=draft(source)
     monkeypatch.setattr(FacecamService,'llm',range_model)
     state=FacecamService.approve(project.id,state.revision)
@@ -508,13 +517,25 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     with wave.open(str(root/'voice.wav'),'wb') as wav:
         wav.setparams((1,2,48000,0,'NONE','not compressed'))
         wav.writeframes(array.array('h',(int(8000*math.sin(2*math.pi*440*i/48000)) for i in range(96000))).tobytes())
-    FacecamService.update(project.id,{'recording':{'fingerprint':'test','directory':str(root),'reviewed_revision':state.revision}})
+    FacecamService.update(project.id,{'recording':{'fingerprint':'test','directory':str(root),'reviewed_revision':state.revision},
+        'auto_editor':FacecamAutoEditorSettings(speed=speed)})
+    # Source timing/cuts are always at native speed. Only the subsequent audio
+    # and camera clocks change, before alignment and native raw-dialogue inserts.
+    clean_duration=2/speed
+    if speed!=1.0:
+        def retime(clean,camera,work,requested):
+            assert requested==speed
+            voice=work/'voice_speed.wav';video=work/'facecam.mp4';video.write_bytes(b'retimed')
+            with wave.open(str(clean)) as src,wave.open(str(voice),'wb') as dst:
+                dst.setparams(src.getparams());dst.writeframes(src.readframes(round(clean_duration*48000)))
+            return voice,video,1/speed
+        monkeypatch.setattr(FacecamMediaService,'apply_speed',retime)
     reference=ProjectService.load_transcription(project.id)
     aligned=reference.model_copy(deep=True)
     narrated=[s for s in aligned.scenes if not s.is_raw]
     assigned={a['scene_index']:a['text'] for a in state.assignment}
     for index,scene in enumerate(narrated):
-        text=assigned[scene.scene_index];words=text.split();start=index*2/len(narrated);end=(index+1)*2/len(narrated)
+        text=assigned[scene.scene_index];words=text.split();start=index*clean_duration/len(narrated);end=(index+1)*clean_duration/len(narrated)
         scene.text=text;scene.start_time=start;scene.end_time=end
         scene.words=[Word(text=w,start=start+(end-start)*i/len(words),end=start+(end-start)*(i+1)/len(words)) for i,w in enumerate(words)]
     align_calls=[]
@@ -522,6 +543,7 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
         align_calls.append(kwargs['edited_audio_path'])
         assert kwargs['manifest']['mode']=='single_audio'
         assert all(part['text'] for part in kwargs['manifest']['segments'])
+        assert kwargs['edited_audio_path'].name==('voice_speed.wav' if speed!=1.0 else 'voice_clean.wav')
         return SimpleNamespace(transcription=aligned,report={"status":"complete"})
     monkeypatch.setattr(ForcedAlignmentService,'_align_single_audio',align)
     monkeypatch.setattr(TranscriberService,'model_session',lambda:contextlib.nullcontext())
@@ -533,20 +555,21 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     assert abs((raw.end_time-raw.start_time)-2)<1/60
     clips=result.prepared['camera_segments']
     assert all(c['end_frame']/60<=raw.start_time+1/60 or c['start_frame']/60>=raw.end_time-1/60 for c in clips)
-    assert sum(c['end_frame']-c['start_frame'] for c in clips)==120
+    assert sum(c['end_frame']-c['start_frame'] for c in clips)==round(clean_duration*60)
+    assert result.prepared['camera_time_scale']==1/speed
+    assert Path(result.prepared['camera_path'])==(work/'facecam.mp4' if speed!=1.0 else root/'facecam.mp4')
     voice_duration=ProcessingService._probe_wav_duration(work/'narration.wav')
-    assert abs(voice_duration-4)<1/60
+    assert abs(voice_duration-(clean_duration+2))<1/60
     assert 0<=result.prepared['cover_start']-voice_duration<1/60
     assert result.prepared['scenes'][-1]['duration_frames']==60
     assert FacecamMediaService.prepare(project.id).prepared==result.prepared
     assert len(align_calls)==1
     # Changing only the tuning must rebuild audio/alignment/camera without a new
     # recording, script revision, approval, or discrepancy review.
-    from app.models.facecam import FacecamAutoEditorSettings
     stale_processing=ProcessingService.get_output_dir(project.id)/'processing_state.json'
     stale_processing.parent.mkdir(exist_ok=True)
     stale_processing.write_text('{}')
-    FacecamService.update(project.id,{'auto_editor':FacecamAutoEditorSettings(min_silence_ms=200)})
+    FacecamService.update(project.id,{'auto_editor':FacecamAutoEditorSettings(min_silence_ms=200,speed=speed)})
     updated=FacecamMediaService.prepare(project.id)
     assert len(align_calls)==2
     assert not stale_processing.exists()

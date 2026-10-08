@@ -6,8 +6,10 @@ from typing import Any
 
 from ...library_types import DEFAULT_LIBRARY_TYPE, LibraryType
 from ...models import Project, ProjectPhase
+from ...models.temporary_source import TemporarySource, TemporarySourceInput
 from ...services import LibraryHydrationService, ProjectService
 from ...services.project_locks import project_edit_locked
+from ...utils.file_tasks import file_io
 from ...services.drive_prewarm_service import DrivePrewarmService
 from ...services.project_duplication_service import (
     DuplicationVariant,
@@ -23,6 +25,7 @@ class CreateProjectRequest(BaseModel):
     anime_name: str | None = None
     series_id: str | None = None
     library_type: LibraryType = DEFAULT_LIBRARY_TYPE
+    temporary_source: TemporarySourceInput | None = None
 
 
 class UpdateProjectRequest(BaseModel):
@@ -44,6 +47,8 @@ class ProjectResponse(BaseModel):
     anime_name: str | None
     series_id: str | None
     library_type: LibraryType
+    temporary_source: TemporarySource | None = None
+    uses_identity_source: bool = False
     output_language: str | None
     elevenlabs_seed: int | None
     mother_project_id: str | None
@@ -78,6 +83,8 @@ class ProjectResponse(BaseModel):
             anime_name=project.anime_name,
             series_id=project.series_id,
             library_type=project.library_type,
+            temporary_source=project.temporary_source,
+            uses_identity_source=project.uses_identity_source,
             output_language=project.output_language,
             elevenlabs_seed=project.elevenlabs_seed,
             mother_project_id=project.mother_project_id,
@@ -99,12 +106,21 @@ class ProjectResponse(BaseModel):
 @router.post("", response_model=ProjectResponse)
 async def create_project(request: CreateProjectRequest) -> ProjectResponse:
     """Create a new project."""
+    if request.temporary_source is not None:
+        from ...services.temporary_source_service import TemporarySourceService
+        try:
+            if request.library_type != LibraryType.PURE or request.series_id:
+                raise ValueError("Temporary sources require Pure mode without a catalog series")
+            await asyncio.to_thread(TemporarySourceService.validate_input, request.temporary_source)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     project = ProjectService.create(
         tiktok_url=request.tiktok_url,
         source_path=request.source_path,
         anime_name=request.anime_name,
         series_id=request.series_id,
         library_type=request.library_type,
+        temporary_source=request.temporary_source,
     )
     return ProjectResponse.from_project(project)
 
@@ -163,8 +179,10 @@ async def duplicate_project(
 @router.delete("/{project_id}")
 async def delete_project(project_id: str) -> dict:
     """Delete a project."""
-    if not ProjectService.delete(project_id):
-        raise HTTPException(status_code=404, detail="Project not found")
+    from ...services.temporary_source_service import TemporarySourceService
+    async with TemporarySourceService.deleting_project(project_id):
+        if not await file_io(ProjectService.delete, project_id):
+            raise HTTPException(status_code=404, detail="Project not found")
     from ...services.project_startup_service import project_startup_queue
     from ...services.project_upload_service import project_upload_queue
 
@@ -181,6 +199,8 @@ async def update_project(project_id: str, request: UpdateProjectRequest) -> Proj
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    if project.temporary_source is not None and (request.series_id is not None or request.library_type not in (None, LibraryType.PURE)):
+        raise HTTPException(status_code=400, detail="A temporary source cannot be converted to a catalog project")
     if request.anime_name is not None:
         project.anime_name = request.anime_name
     if request.series_id is not None:

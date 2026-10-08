@@ -15,6 +15,7 @@ from .executors import run_heavy
 from ..config import settings
 from ..models import MatchList, Project, SceneList
 from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
+from ..utils.file_tasks import file_io, wait_for_worker
 from .anime_library import AnimeLibraryService
 from .project_service import ProjectService
 
@@ -119,6 +120,7 @@ class MatchPlaybackService:
     STREAM_COPY_PIX_FMTS = {"yuv420p", "yuvj420p"}
     _SOURCE_WEB_COMPAT_CACHE_MAX = 256
     _prepare_locks: dict[str, asyncio.Lock] = {}
+    _clip_tasks: dict[str, set[asyncio.Task]] = {}
     _nvenc_checked = False
     _nvenc_available = False
     _full_gpu_checked = False
@@ -260,7 +262,7 @@ class MatchPlaybackService:
             return source_path
 
         source_dirs: list[Path] = []
-        library_root = AnimeLibraryService.get_library_path(project.library_type)
+        library_root = AnimeLibraryService.get_library_path(project.media_library)
         if project.source_paths:
             source_dirs = [Path(src) for src in project.source_paths]
         elif library_root.exists():
@@ -279,12 +281,12 @@ class MatchPlaybackService:
         found_path: Path | None = None
         if library_root.exists():
             manifest = await AnimeLibraryService.ensure_episode_manifest(
-                library_type=project.library_type,
+                library_type=project.media_library,
             )
             candidate = AnimeLibraryService.resolve_episode_path(
                 decoded_path,
                 manifest,
-                library_type=project.library_type,
+                library_type=project.media_library,
             )
             if candidate and cls._is_path_allowed(candidate, source_dirs):
                 found_path = candidate
@@ -1339,18 +1341,18 @@ class MatchPlaybackService:
 
                 try:
                     if output_path.exists() and output_path.stat().st_size > 0:
-                        duration = await run_heavy(
+                        duration = await wait_for_worker(run_heavy(
                             cls._get_clip_duration_sync,
                             project_id,
                             plan.clip_id,
-                        )
+                        ))
                         return _ClipJobResult(plan=plan, encoded=False, duration=duration)
 
-                    duration = await run_heavy(
+                    duration = await wait_for_worker(run_heavy(
                         cls._encode_clip_sync,
                         project_id=project_id,
                         plan=plan,
-                    )
+                    ))
                     return _ClipJobResult(plan=plan, encoded=True, duration=duration)
                 except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
                     return _ClipJobResult(plan=plan, encoded=False, duration=None, error=str(exc))
@@ -1369,8 +1371,20 @@ class MatchPlaybackService:
             await run_heavy(cls._is_full_gpu_available_sync)
 
         tasks = [asyncio.create_task(run_one(plan)) for plan in ordered_plans]
-        for completed in asyncio.as_completed(tasks):
-            yield await completed
+        active = cls._clip_tasks.setdefault(project_id, set())
+        active.update(tasks)
+        for task in tasks:
+            task.add_done_callback(active.discard)
+        try:
+            for completed in asyncio.as_completed(tasks):
+                yield await completed
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if not active:
+                cls._clip_tasks.pop(project_id, None)
 
     @classmethod
     def _build_scene_entry(
@@ -1578,7 +1592,7 @@ class MatchPlaybackService:
         fingerprint = cls._build_fingerprint(project, scenes, matches, source_by_episode)
         existing_manifest = await asyncio.to_thread(cls._load_manifest_sync, project_id, fingerprint)
         if not force and await asyncio.to_thread(cls._validate_manifest_sync, project_id, existing_manifest):
-            await asyncio.to_thread(cls._save_active_fingerprint, project_id, fingerprint)
+            await file_io(cls._save_active_fingerprint, project_id, fingerprint)
             yield PlaybackPrepareProgress(
                 status="complete",
                 progress=1.0,
@@ -1712,14 +1726,14 @@ class MatchPlaybackService:
             )
             return
 
-        await asyncio.to_thread(cls._save_manifest_sync, project_id, fingerprint, manifest)
-        await asyncio.to_thread(cls._save_active_fingerprint, project_id, fingerprint)
+        await file_io(cls._save_manifest_sync, project_id, fingerprint, manifest)
+        await file_io(cls._save_active_fingerprint, project_id, fingerprint)
 
         keep = {fingerprint}
         active = cls._load_active_fingerprint(project_id)
         if active:
             keep.add(active)
-        await asyncio.to_thread(cls._gc_cache_sync, project_id, keep)
+        await file_io(cls._gc_cache_sync, project_id, keep)
 
         yield PlaybackPrepareProgress(
             status="complete",
@@ -1881,7 +1895,7 @@ class MatchPlaybackService:
             and isinstance(existing_manifest, dict)
         ):
             scene_asset = cls._extract_scene_asset(existing_manifest, scene_index)
-            await asyncio.to_thread(cls._save_active_fingerprint, project_id, fingerprint)
+            await file_io(cls._save_active_fingerprint, project_id, fingerprint)
             yield PlaybackPrepareProgress(
                 status="complete",
                 progress=1.0,
@@ -2012,9 +2026,9 @@ class MatchPlaybackService:
             )
             return
 
-        await asyncio.to_thread(cls._save_manifest_sync, project_id, fingerprint, manifest)
-        await asyncio.to_thread(cls._save_active_fingerprint, project_id, fingerprint)
-        await asyncio.to_thread(cls._gc_cache_sync, project_id, {fingerprint})
+        await file_io(cls._save_manifest_sync, project_id, fingerprint, manifest)
+        await file_io(cls._save_active_fingerprint, project_id, fingerprint)
+        await file_io(cls._gc_cache_sync, project_id, {fingerprint})
 
         scene_asset = cls._extract_scene_asset(manifest, scene_index)
         yield PlaybackPrepareProgress(

@@ -27,6 +27,14 @@ export function FacecamAutoEditor({value, defaults, disabled, pending, onChange}
         disabled={disabled} value={value[control.key]} onChange={event => onChange({...value, [control.key]: Number(event.target.value)})}/>
       <small id={`auto-editor-${control.key}`}>{control.help}</small>
     </label>)}</div>
+    <label className="facecam-auto-editor-speed">
+      <span>Vitesse de la voix<output>{value.speed.toFixed(2)}×</output></span>
+      <input type="range" aria-label="Vitesse de la voix" aria-describedby="auto-editor-speed" min="0.9" max="1.5" step="0.01"
+        disabled={disabled} value={value.speed} onChange={event => onChange({...value, speed: Number(event.target.value)})}/>
+      <small id="auto-editor-speed">{value.speed === 1.0
+        ? '1,00× : vitesse originale, aucun traitement de vitesse.'
+        : 'La voix et la caméra changent de vitesse ensemble. La hauteur de la voix est conservée.'}</small>
+    </label>
     <p role="status">{pending ? 'Réglages modifiés : préparez l’aperçu audio pour les enregistrer et recalculer les coupes.' : 'Ces réglages sont enregistrés avec le projet lors de la préparation de l’aperçu audio.'}</p>
   </div>;
 }

@@ -21,7 +21,7 @@ from typing import Any, AsyncIterator
 from PIL import Image
 
 from ..config import settings
-from ..library_types import LibraryType, coerce_library_type, resolve_scoped_library_path
+from ..library_types import LibraryType, LibrarySelection, LocalLibrary, coerce_library_type, resolve_scoped_library_path
 from ..utils.media_binaries import (
     get_media_subprocess_env,
     is_media_binary_override_error,
@@ -29,6 +29,8 @@ from ..utils.media_binaries import (
 )
 from ..utils.low_impact import copy_file_drop_cache, wrap_low_impact
 from ..utils.subprocess_runner import CommandTimeoutError, run_command, terminate_process
+from ..utils.file_tasks import file_io
+from .atomic_files import write_text_atomic
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -257,6 +259,7 @@ class AnimeLibraryService:
     _episode_manifest_locks: dict[str, asyncio.Lock] = {}
     _preview_generation_lock: asyncio.Lock | None = None
     _preview_generation_inflight: set[str] = set()
+    _preview_generation_tasks: dict[str, asyncio.Task] = {}
     _preview_proxy_locks_guard = threading.Lock()
     _preview_proxy_locks: dict[str, threading.Lock] = {}
     _LANGUAGE_ALIASES = {
@@ -344,9 +347,11 @@ class AnimeLibraryService:
     @classmethod
     def get_library_path(
         cls,
-        library_type: LibraryType | str | None = None,
+        library_type: LibrarySelection = None,
     ) -> Path:
         """Get the scoped typed library path from settings."""
+        if isinstance(library_type, LocalLibrary):
+            return library_type.path
         return resolve_scoped_library_path(cls.get_library_root(), library_type)
 
     @staticmethod
@@ -725,15 +730,23 @@ class AnimeLibraryService:
         library_type: LibraryType | str | None = None,
     ) -> Path:
         """Get path for cached episode index manifest."""
+        if isinstance(library_type, LocalLibrary):
+            return library_type.path / ".episodes.json"
         scoped_type = coerce_library_type(library_type).value
         return settings.cache_dir / f"episodes_manifest__{scoped_type}.json"
+
+    @classmethod
+    def _manifest_cache_key(cls, library_type: LibrarySelection) -> str:
+        if isinstance(library_type, LocalLibrary):
+            return str(library_type.path.resolve())
+        return coerce_library_type(library_type).value
 
     @classmethod
     def _get_manifest_lock(
         cls,
         library_type: LibraryType | str | None = None,
     ) -> asyncio.Lock:
-        scoped_type = coerce_library_type(library_type).value
+        scoped_type = cls._manifest_cache_key(library_type)
         lock = cls._episode_manifest_locks.get(scoped_type)
         if lock is None:
             lock = asyncio.Lock()
@@ -817,8 +830,7 @@ class AnimeLibraryService:
         library_type: LibraryType | str | None = None,
     ) -> dict:
         """Scan library once and build fast stem -> path index."""
-        scoped_type = coerce_library_type(library_type)
-        library_path = cls.get_library_path(scoped_type)
+        library_path = cls.get_library_path(library_type)
         episodes: list[str] = []
         by_stem: dict[str, list[str]] = {}
 
@@ -846,10 +858,12 @@ class AnimeLibraryService:
             "by_stem": by_stem,
         }
 
-        manifest_path = cls.get_episode_manifest_path(scoped_type)
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(json.dumps(manifest, indent=2))
-        cls._episode_manifest_cache[scoped_type.value] = manifest
+        manifest_path = cls.get_episode_manifest_path(library_type)
+        write_text_atomic(
+            manifest_path, json.dumps(manifest, indent=2),
+            create_parent=not isinstance(library_type, LocalLibrary),
+        )
+        cls._episode_manifest_cache[cls._manifest_cache_key(library_type)] = manifest
         return manifest
 
     @classmethod
@@ -858,12 +872,12 @@ class AnimeLibraryService:
         library_type: LibraryType | str | None = None,
     ) -> dict | None:
         """Load cached episode manifest if present."""
-        scoped_type = coerce_library_type(library_type)
-        cached = cls._episode_manifest_cache.get(scoped_type.value)
+        cache_key = cls._manifest_cache_key(library_type)
+        cached = cls._episode_manifest_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        manifest_path = cls.get_episode_manifest_path(scoped_type)
+        manifest_path = cls.get_episode_manifest_path(library_type)
         if not manifest_path.exists():
             return None
 
@@ -871,7 +885,7 @@ class AnimeLibraryService:
             manifest = json.loads(manifest_path.read_text())
             if not isinstance(manifest.get("by_stem"), dict):
                 return None
-            cls._episode_manifest_cache[scoped_type.value] = manifest
+            cls._episode_manifest_cache[cache_key] = manifest
             return manifest
         except (json.JSONDecodeError, OSError):
             return None
@@ -894,7 +908,7 @@ class AnimeLibraryService:
                 manifest = await asyncio.to_thread(cls._load_episode_manifest_sync, library_type)
                 if manifest is not None:
                     return manifest
-            return await asyncio.to_thread(cls._scan_library_episodes_sync, library_type)
+            return await file_io(cls._scan_library_episodes_sync, library_type)
 
     @classmethod
     def resolve_episode_path(
@@ -2878,6 +2892,14 @@ class AnimeLibraryService:
     def get_preview_proxy_path(cls, source_path: Path) -> Path:
         """Compute the expected proxy path for a source file."""
         key = cls._build_preview_proxy_key(source_path)
+        # Project-owned sources keep even their browser proxies with the
+        # project so normal deletion cannot leave media in the global cache.
+        try:
+            parts = source_path.resolve().relative_to(settings.projects_dir.resolve()).parts
+        except ValueError:
+            parts = ()
+        if len(parts) > 2 and parts[1] == "temporary_source":
+            return settings.projects_dir / parts[0] / "temporary_source" / "previews" / f"{key}.mp4"
         return cls.get_preview_proxy_dir() / f"{key}.mp4"
 
     @staticmethod
@@ -3099,9 +3121,8 @@ class AnimeLibraryService:
         if cls.is_browser_preview_compatible(source_path):
             return source_path
 
-        preview_dir = cls.get_preview_proxy_dir()
-        preview_dir.mkdir(parents=True, exist_ok=True)
         proxy_path = cls.get_preview_proxy_path(source_path)
+        proxy_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = proxy_path.with_suffix(".tmp.mp4")
         lock = cls._get_preview_proxy_lock(source_path)
         with lock:
@@ -3282,18 +3303,28 @@ class AnimeLibraryService:
         key = str(source_path.resolve())
         lock = cls._get_preview_generation_lock()
         async with lock:
+            try:
+                parts = Path(key).relative_to(settings.projects_dir.resolve()).parts
+            except ValueError:
+                parts = ()
+            if len(parts) > 2 and parts[1] == "temporary_source":
+                from .temporary_source_service import TemporarySourceService
+                if (parts[0] in TemporarySourceService._deleting
+                        or not (settings.projects_dir / parts[0] / "project.json").is_file()):
+                    return
             if key in cls._preview_generation_inflight:
                 return
             cls._preview_generation_inflight.add(key)
 
         async def _run() -> None:
             try:
-                await asyncio.to_thread(cls.ensure_preview_proxy_sync, source_path)
+                await file_io(cls.ensure_preview_proxy_sync, source_path)
             finally:
                 async with lock:
                     cls._preview_generation_inflight.discard(key)
+                    cls._preview_generation_tasks.pop(key, None)
 
-        asyncio.create_task(_run())
+        cls._preview_generation_tasks[key] = asyncio.create_task(_run())
 
     @classmethod
     async def wait_for_preview_proxy(
@@ -3666,7 +3697,7 @@ class AnimeLibraryService:
                         f"Failed to normalize audio for {source_path.name}: {normalize_error}"
                     )
             else:
-                await asyncio.to_thread(copy_file_drop_cache, source_path, preferred_dest)
+                await file_io(copy_file_drop_cache, source_path, preferred_dest)
 
         # Extract subtitles to sidecar.  Always attempt extraction regardless
         # of transform type — remux/transcode strip subtitle streams and even
@@ -3694,7 +3725,7 @@ class AnimeLibraryService:
                 await asyncio.to_thread(source_path.unlink)
 
         if actual_dest.exists():
-            await asyncio.to_thread(
+            await file_io(
                 cls._record_source_import_manifest_sync,
                 source_path,
                 actual_dest,
@@ -3876,7 +3907,7 @@ class AnimeLibraryService:
     async def index_anime(
         cls,
         source_folder: Path,
-        library_type: LibraryType | str | None = None,
+        library_type: LibrarySelection = None,
         anime_name: str | None = None,
         fps: float = 2.0,
         batch_size: int = 64,
@@ -3908,7 +3939,7 @@ class AnimeLibraryService:
             Progress updates during copying and indexing.
         """
         scoped_type = coerce_library_type(library_type)
-        library_path = cls.get_library_path(scoped_type)
+        library_path = cls.get_library_path(library_type)
         searcher_path = cls.get_anime_searcher_path()
 
         library_path.mkdir(parents=True, exist_ok=True)
@@ -3921,7 +3952,7 @@ class AnimeLibraryService:
         existing_series_fps = await asyncio.to_thread(
             cls._get_indexed_series_fps_sync,
             anime_name,
-            scoped_type,
+            library_type,
         )
         is_existing_series = existing_series_fps is not None
         if existing_series_fps is not None:
@@ -4073,7 +4104,7 @@ class AnimeLibraryService:
         cmd = [
             "pixi", "run", "--locked",
             "python", "-m", "anime_searcher.cli",
-            "index", str(cls.get_library_root()),
+            "index", str(library_path.parent),
             "--type", scoped_type.value,
             "--fps", str(effective_fps),
             "--series", anime_name,
@@ -4106,7 +4137,7 @@ class AnimeLibraryService:
             if progress.status == "error":
                 return
 
-        await cls.ensure_episode_manifest(force_refresh=True, library_type=scoped_type)
+        await cls.ensure_episode_manifest(force_refresh=True, library_type=library_type)
         completion_warnings = list(skipped_warnings)
         if searcher_metadata.retry_warning and searcher_metadata.retry_warning not in completion_warnings:
             completion_warnings.append(searcher_metadata.retry_warning)

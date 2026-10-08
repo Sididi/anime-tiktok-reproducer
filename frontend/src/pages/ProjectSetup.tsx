@@ -23,6 +23,7 @@ import type {
   IndexationJob,
   ProjectStartupJob,
   SeriesDeleteReferencingProject,
+  TemporarySourceInput,
 } from "@/types";
 
 /** Visible-tab fallback poll of the startup-job registry (the live stream is
@@ -39,6 +40,10 @@ export function ProjectSetup() {
   const [searchQuery, setSearchQuery] = useState("");
   // Pure mode reproduces one of our own tiktoks from its output: no series.
   const isPure = selectedLibraryType === "pure";
+  const [temporarySourceKind, setTemporarySourceKind] = useState<"url" | "folder">("url");
+  const [temporarySourceValue, setTemporarySourceValue] = useState("");
+  const [temporarySourceFps, setTemporarySourceFps] = useState<1 | 2 | 4>(2);
+  const [showTemporaryFolderBrowser, setShowTemporaryFolderBrowser] = useState(false);
 
   // TikTok URL + Start flow
   const [tiktokUrl, setTiktokUrl] = useState("");
@@ -351,12 +356,16 @@ export function ProjectSetup() {
         animeName,
         seriesId,
         selectedLibraryType,
+        isPure && temporarySourceValue.trim()
+          ? {kind: temporarySourceKind, value: temporarySourceValue.trim(), fps: temporarySourceFps} satisfies TemporarySourceInput
+          : undefined,
       );
       if (popup) {
         startupTabsRef.current.set(job.project_id, popup);
       }
       upsertStartupJob(job);
       setTiktokUrl("");
+      setTemporarySourceValue("");
     } catch (err) {
       if (popup && !popup.closed) {
         popup.close();
@@ -371,6 +380,9 @@ export function ProjectSetup() {
     selectedSource,
     selectedLibraryType,
     isPure,
+    temporarySourceKind,
+    temporarySourceValue,
+    temporarySourceFps,
     sources,
     loadSources,
     upsertStartupJob,
@@ -677,9 +689,46 @@ export function ProjectSetup() {
       )}
 
       {isPure && (
-        <div className="flex-1 flex items-center justify-center text-sm text-[hsl(var(--muted-foreground))] px-4 text-center">
-          Pure mode: the project is built from the TikTok itself — no series
-          needed. Paste the TikTok URL below and start.
+        <div className="flex-1 flex items-center justify-center overflow-y-auto px-4 py-6">
+          <div className="w-full max-w-xl space-y-4 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-6">
+            <div>
+              <h2 className="font-semibold">Mode Pure</h2>
+              <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">Reproduis un TikTok à partir de sa vidéo, ou retrouve ses plans dans une source originale.</p>
+            </div>
+            <label htmlFor="temporary-source" className="block text-sm font-medium">Source originale <span className="text-[hsl(var(--muted-foreground))] font-normal">— facultative</span></label>
+            <div className="flex gap-2">
+              {(["url", "folder"] as const).map(kind => (
+                <button key={kind} type="button" disabled={processing} aria-pressed={temporarySourceKind === kind}
+                  onClick={() => { setTemporarySourceKind(kind); setTemporarySourceValue(""); }}
+                  className={`rounded-md px-3 py-2 text-sm ${temporarySourceKind === kind ? "bg-[hsl(var(--primary))] text-white" : "bg-[hsl(var(--secondary))]"}`}>
+                  {kind === "url" ? "Lien vidéo" : "Dossier local"}
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-2">
+              <input id="temporary-source" type={temporarySourceKind === "url" ? "url" : "text"} value={temporarySourceValue}
+                onChange={event => setTemporarySourceValue(event.target.value)} disabled={processing}
+                placeholder={temporarySourceKind === "url" ? "https://www.youtube.com/watch?v=…" : "/chemin/vers/les/videos"}
+                className="min-w-0 flex-1 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--background))] px-3 py-2 text-sm" />
+              {temporarySourceKind === "folder" && <button type="button" disabled={processing} onClick={() => setShowTemporaryFolderBrowser(true)} className="rounded-md bg-[hsl(var(--secondary))] px-3 py-2 text-sm">Parcourir</button>}
+              {temporarySourceValue && <button type="button" disabled={processing} onClick={() => setTemporarySourceValue("")} className="text-sm text-[hsl(var(--muted-foreground))]">Retirer</button>}
+            </div>
+            <p className="text-xs leading-relaxed text-[hsl(var(--muted-foreground))]">
+              {temporarySourceValue.trim()
+                ? "La source sera copiée et indexée pour ce projet. Le projet s’ouvrira une fois prêt, avec le matching des scènes originales et sans nettoyage du TikTok. La copie locale sera supprimée avec le projet ; tes fichiers d’origine seront conservés."
+                : "Laisse ce champ vide pour utiliser le nettoyage et le parcours Pure classique."}
+              {temporarySourceKind === "folder" && " Seules les vidéos directement dans le dossier sont incluses."}
+              {temporarySourceKind === "url" && " Liens vidéo : 1080p maximum. Les vidéos YouTube doivent être accessibles sans connexion."}
+            </p>
+            {temporarySourceValue.trim() && <details className="text-sm">
+              <summary className="cursor-pointer text-[hsl(var(--muted-foreground))]">Réglages avancés</summary>
+              <label className="mt-3 flex items-center justify-between gap-3">Densité d’indexation
+                <select value={temporarySourceFps} disabled={processing} onChange={event => setTemporarySourceFps(Number(event.target.value) as 1 | 2 | 4)} className="rounded-md bg-[hsl(var(--secondary))] px-3 py-2">
+                  {[1, 2, 4].map(fps => <option key={fps} value={fps}>{fps} image{fps > 1 ? "s" : ""}/seconde</option>)}
+                </select>
+              </label>
+            </details>}
+          </div>
         </div>
       )}
 
@@ -699,6 +748,9 @@ export function ProjectSetup() {
       />
 
       {/* Modals */}
+      <FolderBrowserModal open={showTemporaryFolderBrowser} onClose={() => setShowTemporaryFolderBrowser(false)}
+        initialPath={temporarySourceKind === "folder" ? temporarySourceValue || undefined : undefined}
+        onSelect={path => {setTemporarySourceKind("folder"); setTemporarySourceValue(path); setShowTemporaryFolderBrowser(false);}} />
       <ProjectManagerModal
         open={showProjectManager}
         onClose={() => setShowProjectManager(false)}

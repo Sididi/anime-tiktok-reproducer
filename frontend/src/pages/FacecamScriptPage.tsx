@@ -128,7 +128,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const options = stage === 'hooks' ? state.hooks : state.opinions;
   const selection = stage === 'hooks' ? hook : opinion;
   const select = stage === 'hooks' ? setHook : setOpinion;
-  const autoEditor = autoEditorDraft ?? state.auto_editor ?? DEFAULT_FACECAM_AUTO_EDITOR;
+  const autoEditor = {...DEFAULT_FACECAM_AUTO_EDITOR, ...(autoEditorDraft ?? state.auto_editor)};
   const autoEditorDirty = !sameAutoEditorSettings(autoEditor, state.auto_editor ?? DEFAULT_FACECAM_AUTO_EDITOR);
   const previewReady = approved && !!state.prepared?.preview_version && !!state.prepared?.auto_editor_signature
     && state.prepared.revision === state.revision && state.prepared.fingerprint === state.recording?.fingerprint

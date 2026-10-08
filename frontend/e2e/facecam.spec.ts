@@ -72,7 +72,7 @@ test('autoeditor tweaks regenerate preview and persist without invalidating scri
   await expect(page.getByText('Réglages modifiés :',{exact:false})).toBeVisible();
   await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
   await expect(process).toBeEnabled();
-  expect(f.previews).toEqual([{revision:1,auto_editor:{noise_threshold_db:-24,min_silence_ms:160,margin_before_ms:40,margin_after_ms:70}}]);
+  expect(f.previews).toEqual([{revision:1,auto_editor:{noise_threshold_db:-24,min_silence_ms:160,margin_before_ms:40,margin_after_ms:70,speed:1.0}}]);
   expect(f.state.revision).toBe(1);
   expect(f.state.approved_revision).toBe(1);
   expect(f.state.recording?.reviewed_revision).toBe(1);
@@ -105,6 +105,30 @@ test('legacy preview requires regeneration with protected word cuts',async({page
   await expect(page.getByRole('button',{name:'Passer au traitement'})).toBeDisabled();
   await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
   await expect(page.getByRole('button',{name:'Passer au traitement'})).toBeEnabled();
+});
+
+test('voice speed defaults to one and is applied only when preparing the preview',async({page})=>{
+  const f=await fixture(page,{recording:true});
+  const speed=page.getByRole('slider',{name:'Vitesse de la voix',exact:true});
+  const process=page.getByRole('button',{name:'Passer au traitement'});
+  await expect(speed).toHaveValue('1');
+  await expect(page.getByText('1,00× : vitesse originale, aucun traitement de vitesse.')).toBeVisible();
+  await expect(process).toBeEnabled();
+  await speed.fill('1.15');
+  expect(f.previews).toHaveLength(0);
+  expect(f.state.auto_editor?.speed).toBe(1);
+  await expect(process).toBeDisabled();
+  await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
+  await expect(process).toBeEnabled();
+  expect(f.previews[0].auto_editor.speed).toBe(1.15);
+  await page.reload();
+  await expect(speed).toHaveValue('1.15');
+  await speed.fill('1');
+  await expect(process).toBeDisabled();
+  await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
+  await expect(process).toBeEnabled();
+  expect(f.previews[1].auto_editor.speed).toBe(1);
+  await expect(page.getByText('1,00× : vitesse originale, aucun traitement de vitesse.')).toBeVisible();
 });
 
 const storyOptions: FacecamStory[] = [

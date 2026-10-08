@@ -98,10 +98,10 @@ def _build_source_dirs(project) -> list[Path]:
     if explicit_paths:
         return explicit_paths
 
-    library_root = AnimeLibraryService.get_library_path(project.library_type)
+    library_root = AnimeLibraryService.get_library_path(project.media_library)
     if library_root.exists():
-        if project.anime_name:
-            scoped_dir = _resolve_anime_source_dir(library_root, project.anime_name)
+        if project.media_series_name:
+            scoped_dir = _resolve_anime_source_dir(library_root, project.media_series_name)
             if scoped_dir is not None:
                 return [scoped_dir]
         return [library_root]
@@ -123,15 +123,15 @@ async def _resolve_source_path(project, raw_path: str) -> Path:
 
     found_path: Path | None = None
 
-    library_root = AnimeLibraryService.get_library_path(project.library_type)
+    library_root = AnimeLibraryService.get_library_path(project.media_library)
     if library_root.exists():
         manifest = await AnimeLibraryService.ensure_episode_manifest(
-            library_type=project.library_type,
+            library_type=project.media_library,
         )
         candidate = AnimeLibraryService.resolve_episode_path(
             decoded_path,
             manifest,
-            library_type=project.library_type,
+            library_type=project.media_library,
         )
         if candidate and _is_path_allowed(candidate, source_dirs):
             found_path = candidate

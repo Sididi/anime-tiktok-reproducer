@@ -1,12 +1,20 @@
 # Pure Mode
 
-Pure mode reproduces one of **our own published TikToks from its downloaded
-output**: the tiktok itself is the only source. There is no series, no index,
-no hydration — matching is an identity mapping (scene N → the same time range
-of the tiktok file), and the script/TTS/subtitles/overlays/metadata are
-regenerated as usual.
+Pure mode reproduces one of **our own published TikToks**. It has two media
+workflows, selected at creation:
 
-## Flow
+- **Without an original source:** the downloaded TikTok is the only source.
+  Cleanup removes existing overlays, then identity matching maps each scene
+  to the same time range of that file.
+- **With an optional temporary source:** the original footage is copied and
+  indexed inside the project. Media operations follow the anime workflow:
+  source matching, manual search, zoom search, source audio and gap resolution.
+  There is no subtitle-removal step or identity matching.
+
+Both workflows retain Pure prompts, titles, publishing accounts and metadata.
+Existing Pure projects keep their original behavior.
+
+## Flow without a temporary source
 
 1. **Project Setup** — select library type `Pure`; no source/series required.
    Paste the TikTok URL and start.
@@ -29,6 +37,64 @@ regenerated as usual.
    and alternatives are hidden (no library to search).
 5. Transcription → raw scenes (kept: a raw scene's audio range in the tiktok
    IS the original raw audio) → script → processing → export, unchanged.
+
+## Flow with a temporary source
+
+1. In **Project Setup → Pure**, optionally provide either a single video URL
+   (YouTube or another site supported by the downloader) or a folder accessible
+   on the backend machine. This is separate from the TikTok URL to reproduce.
+   The folder selector uses the existing server-side browser.
+2. Folder import includes compatible videos directly inside that folder,
+   excluding subfolders. The files are **copied**, and the originals are left
+   untouched. A URL must identify one video; playlists and channels are rejected.
+   Source downloads are capped at 1080p (video height), preferring H.264 video
+   and AAC audio at the best available resolution within the cap. Compatible
+   streams can be copied/remuxed instead of transcoding the entire video;
+   other codecs still use normal anime import normalization. Local folders
+   keep their existing resolution, and completed projects are not rebuilt.
+3. The startup job downloads the reference TikTok, prepares the private source,
+   and indexes it using the existing SSCD indexer and heavy-work scheduler.
+   Index density defaults to **2 fps**; advanced settings offer **1, 2 or 4 fps**.
+4. The job then performs anime scene detection (default threshold 16). The
+   project becomes openable when preparation and scene detection finish.
+5. Matching and subsequent media stages use only this project's index and
+   videos. They support the normal anime tools and playback-speed defaults.
+   Failed preparation produces an error, never identity-matching fallback.
+
+The source is fixed at creation. **Retry** reuses valid downloads, prepared
+files and index checkpoints. Incomplete imports/checkpoints are discarded;
+an index explicitly reported as corrupt by the indexer is rebuilt on retry.
+Once ready, the project no longer needs the original folder or URL.
+
+### Storage and lifetime
+
+Private data lives under `projects/{id}/temporary_source/`:
+
+- `download/` and `download.json`: URL download and its completed-file marker;
+- `library/anime/source/`: prepared media and import/subtitle sidecars;
+- `library/anime/.index/` and `.episodes.json`: index and episode manifest;
+- `previews/`, `hashes.json` and `ready.json`: private previews, source hash cache
+  and readiness signatures.
+
+There is no catalog registration, remote series ID, hydration, Storage Box
+upload or Storage Box indexation job. The ordinary Drive export/prewarming
+workflow remains available.
+
+Deleting the project through **Project Manager** or the project API stops
+preparation, settles source/preview writers, releases the loaded index and
+removes the project's local data. Original files outside the project survive.
+Duplication copies the private source and index into the new project, rebases
+local paths and preserves Pure settings. Each duplicate remains usable after
+deleting the mother project, with no shared temporary media to clean up later.
+
+### Code routing
+
+`project.library_type` remains `pure` for editorial and publishing decisions.
+Media code uses `project.media_library` (an explicit `LocalLibrary` for a
+temporary source) and `project.media_series_name`. Use
+`project.uses_identity_source` for cleanup/identity-only behavior, rather than
+testing the publishing library type. Never switch global library paths to
+select a temporary source.
 
 ## Prompts
 
@@ -74,12 +140,18 @@ the backend after editing prompt files.
 
 ## Operational notes
 
+- **YouTube sources**: `pixi install --locked` installs yt-dlp's EJS solver
+  and Deno runtime. The downloader resolves the managed runtime explicitly.
+  YouTube metadata checks and downloads are anonymous from the first request:
+  browser cookies and external yt-dlp configuration are disabled for YouTube.
+  Videos requiring a signed-in account fail without an authenticated retry.
+  TikTok keeps its configured browser cookies and existing format selection.
 - **Accounts**: add `"pure"` to `supported_types` of the publishing accounts
   in `config/accounts/config.yaml`, otherwise the project manager shows no
   compatible account for Pure projects.
-- The anime_searcher submodule enum intentionally does NOT know `pure` —
-  Pure never reaches indexing or the searcher.
+- The anime_searcher submodule enum intentionally does NOT know `pure`.
+  Temporary sources reach it as an anime library with a project-owned path.
 - `einops` was added to `pixi.toml` for ProPainter (run `pixi install`).
-- Duplication: the `cleanup/` working dir is excluded; `tiktok_clean.mp4` is
+- Classic Pure duplication: the `cleanup/` working dir is excluded; `tiktok_clean.mp4` is
   hardlinked and all absolute paths (project fields + match episodes) are
   rebased into the duplicate's directory.

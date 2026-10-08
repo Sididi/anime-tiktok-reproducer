@@ -295,3 +295,101 @@ def test_download_command_uses_configured_binary_and_browser_cookies(
     assert command[0] == "/opt/yt-dlp"
     cookie_index = command.index("--cookies-from-browser")
     assert command[cookie_index + 1] == "chrome"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [None, "The page needs to be reloaded.", "Sign in to confirm your age."])
+async def test_youtube_download_never_authenticates_and_caps_quality(monkeypatch, tmp_path, error):
+    output = tmp_path / "source.mp4"
+    commands = []
+    monkeypatch.setattr(settings, "ytdlp_cookies_from_browser", "firefox")
+    monkeypatch.setattr(DownloaderService, "EXTRACTION_RETRY_DELAYS_SECONDS", (0, 0))
+    async def stream(cls, cmd, **kwargs):
+        commands.append(cmd)
+        if error:
+            yield _DownloadCommandResult(returncode=1, stderr=f"ERROR: [youtube] video: {error}")
+        else:
+            output.write_bytes(b"video")
+            yield _DownloadCommandResult(returncode=0)
+    async def audio(_path):
+        return True
+    monkeypatch.setattr(DownloaderService, "_stream_download_command", classmethod(stream))
+    monkeypatch.setattr(DownloaderService, "_has_audio_stream", audio)
+    events = [event async for event in DownloaderService.download(
+        "https://www.youtube.com/watch?v=video", "project",
+        output_path=output, require_audio=False, format_selector="bv*+ba/b",
+    )]
+    assert len(commands) == 1
+    command = commands[0]
+    assert "--cookies-from-browser" not in command
+    assert "--no-cookies" in command and "--no-cookies-from-browser" in command
+    assert "--ignore-config" in command
+    assert command[command.index("-f") + 1] == DownloaderService.SOURCE_FORMAT_SELECTOR
+    assert events[-1].status == ("error" if error else "complete")
+    assert settings.ytdlp_cookies_from_browser == "firefox"
+
+
+@pytest.mark.parametrize("url", ["https://youtube.com/watch?v=v", "https://youtu.be/v", "https://m.youtube.com/watch?v=v"])
+def test_youtube_command_uses_managed_javascript_runtime(monkeypatch, tmp_path, url):
+    monkeypatch.setattr("app.services.downloader.get_ytdlp_js_runtime", lambda: "deno:/managed/bin/deno")
+    cmd = DownloaderService._build_primary_download_command(url, tmp_path / "source.mp4")
+    assert cmd[cmd.index("--js-runtimes") + 1] == "deno:/managed/bin/deno"
+    tiktok = DownloaderService._build_primary_download_command("https://www.tiktok.com/@test/video/1", tmp_path / "tiktok.mp4")
+    assert "--js-runtimes" not in tiktok
+
+
+def test_javascript_runtime_resolves_managed_deno_before_node(monkeypatch):
+    from app.utils import media_binaries
+    binaries = {"deno": "/managed/bin/deno", "node": "/usr/bin/node"}
+    monkeypatch.setattr(media_binaries, "_find_default_binary", binaries.get)
+    assert media_binaries.get_ytdlp_js_runtime() == "deno:/managed/bin/deno"
+    binaries.pop("deno")
+    assert media_binaries.get_ytdlp_js_runtime() == "node:/usr/bin/node"
+
+
+def test_youtube_audio_recovery_keeps_anonymous_policy_with_saved_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "ytdlp_cookies_from_browser", "firefox")
+    command = DownloaderService._build_audio_recovery_command(
+        "https://youtu.be/video", tmp_path / "audio.mp4", info_json_path=tmp_path / "video.info.json",
+    )
+    assert "--load-info-json" in command
+    assert "--no-cookies-from-browser" in command and "--ignore-config" in command
+    assert "--cookies-from-browser" not in command
+
+
+@pytest.mark.parametrize("available,expected", [
+    (["4k_av1", "1080_av1", "1080_h264", "720_h264"], "1080_h264"),
+    (["4k_av1", "1080_av1", "720_h264"], "1080_av1"),
+    (["4k_av1", "720_h264"], "720_h264"),
+    (["4k_av1"], None),
+])
+def test_actual_ytdlp_selection_caps_every_fallback_and_prefers_native_codecs(available, expected):
+    from yt_dlp import YoutubeDL
+    video_specs = {
+        "4k_av1": (2160, "av01.0.13M.08"),
+        "1080_av1": (1080, "av01.0.08M.08"),
+        "1080_h264": (1080, "avc1.64002A"),
+        "720_h264": (720, "avc1.640020"),
+    }
+    formats = [dict(format_id=key, height=video_specs[key][0], width=video_specs[key][0]*16//9,
+                    vcodec=video_specs[key][1], acodec="none", ext="mp4", url=f"https://example.test/{key}.mp4")
+               for key in available]
+    formats += [dict(format_id="aac", vcodec="none", acodec="mp4a.40.2", ext="m4a", url="https://example.test/audio.m4a"),
+                dict(format_id="opus", vcodec="none", acodec="opus", ext="webm", url="https://example.test/audio.webm")]
+    with YoutubeDL({"quiet": True, "format_sort": DownloaderService.SOURCE_FORMAT_SORT.split(",")}) as ydl:
+        info = {"formats": formats}
+        ydl.sort_formats(info)
+        selected = ydl._select_formats(info["formats"], ydl.build_format_selector(DownloaderService.SOURCE_FORMAT_SELECTOR))
+    if expected is None:
+        assert selected == []  # Never fall back to an uncapped 4K format.
+    else:
+        assert selected[0]["format_id"] == f"{expected}+aac"
+
+
+def test_non_youtube_hosts_keep_authentication(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "ytdlp_cookies_from_browser", "firefox")
+    for url in ("https://www.tiktok.com/@demo/video/1", "https://youtube.com.example.test/video"):
+        command = DownloaderService._build_primary_download_command(url, tmp_path / "video.mp4")
+        assert "--cookies-from-browser" in command
+        assert "--no-cookies-from-browser" not in command
+        assert command[command.index("-f") + 1] == DownloaderService.PRIMARY_FORMAT_SELECTOR

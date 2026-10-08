@@ -271,7 +271,7 @@ class VideoCleanupService:
         project = ProjectService.load(project_id)
         if project is None:
             raise ValueError("Project not found")
-        if project.library_type != LibraryType.PURE:
+        if not project.uses_identity_source:
             raise ValueError("Cleanup is only available for Pure projects")
         return project
 

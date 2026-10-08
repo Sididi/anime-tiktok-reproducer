@@ -1,4 +1,8 @@
-import type { Account, LibraryType, PublishingType, ProjectManagerRow } from "@/types";
+import type { Account, LibraryType, PublishingType, ProjectManagerRow, Project } from "@/types";
+
+export function usesIdentitySource(project: Pick<Project, "library_type" | "temporary_source"> | null | undefined): boolean {
+  return project?.library_type === "pure" && !project.temporary_source;
+}
 
 export const LIBRARY_TYPE_OPTIONS: Array<{
   value: LibraryType;

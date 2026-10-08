@@ -68,7 +68,7 @@ class NarratorService:
             scenes=scenes.model_copy(deep=True),
             matches=matches.model_copy(deep=True) if matches is not None else None,
             analysis=analysis,
-            pure_mode=project.library_type == "pure",
+            pure_mode=project.uses_identity_source,
         )
 
     @classmethod

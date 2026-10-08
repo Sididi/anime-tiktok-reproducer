@@ -440,7 +440,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
             resolved = AnimeLibraryService.resolve_episode_path(
                 episode_ref,
-                library_type=project.library_type,
+                library_type=project.media_library,
             )
             if resolved is not None and resolved.exists():
                 return resolved
@@ -673,7 +673,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
                 raise ValueError("Le projet Facecam doit être préparé avec son enregistrement et sa couverture.")
             for path in (cls._collect_baked_subtitle_files(output_dir) + cls._collect_subtitle_timing_files(output_dir)):
                 entries.append(ManifestEntry(relative_path=f"{folder}/subtitles/{path.name}", source_path=path))
-            _add_source_file(Path(state.recording["directory"]) / "facecam.mp4")
+            _add_source_file(Path(state.prepared.get("camera_path") or Path(state.recording["directory"]) / "facecam.mp4"))
             _add_source_file(FacecamService.directory(project.id) / "anime_reveal.png")
             original = Path(state.recording["directory"]) / state.recording["original_name"]
             entries.append(ManifestEntry(relative_path=f"{folder}/recording/{original.name}", source_path=original))

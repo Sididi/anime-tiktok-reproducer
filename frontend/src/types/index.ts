@@ -21,6 +21,17 @@ export type LibraryType =
 
 export type PublishingType = LibraryType | "facecam";
 
+export interface TemporarySourceInput {
+  kind: "url" | "folder";
+  value: string;
+  fps: 1 | 2 | 4;
+}
+
+export interface TemporarySource extends TemporarySourceInput {
+  status: "pending" | "preparing" | "indexing" | "ready" | "error";
+  error: string | null;
+}
+
 export interface Project {
   project_mode?: "standard" | "facecam";
   publishing_type?: PublishingType;
@@ -38,6 +49,8 @@ export interface Project {
   anime_name: string | null;
   series_id: string | null;
   library_type: LibraryType;
+  temporary_source?: TemporarySource | null;
+  uses_identity_source?: boolean;
   output_language: string | null;
   elevenlabs_seed: number | null;
   mother_project_id: string | null;

@@ -13,6 +13,8 @@ from ..library_types import LibraryType, coerce_library_type
 from ..models.project_startup import ProjectStartupJob
 from .atomic_files import write_text_atomic
 from .event_hub import event_hub
+from ..models.temporary_source import TemporarySourceInput
+from ..utils.file_tasks import file_io
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -73,6 +75,7 @@ class ProjectStartupService:
         # reference here a queued/running startup task can be garbage-collected
         # mid-flight and its job stays "queued" forever.
         self._tasks: set[asyncio.Task] = set()
+        self._project_tasks: dict[str, asyncio.Task] = {}
 
     async def startup_cleanup(self) -> None:
         from .project_service import ProjectService
@@ -100,9 +103,22 @@ class ProjectStartupService:
     async def remove_project_jobs(self, project_id: str) -> None:
         """Evict a deleted project's job; the registry is persisted and reloaded
         at boot, so without eviction it grows with every project ever started."""
+        await self.cancel_project(project_id)
         removed = self._jobs.pop(project_id, None)
         if removed is not None:
-            await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
+            await file_io(_write_jobs_atomic, self._jobs_path, self._jobs)
+
+    async def cancel_project(self, project_id: str) -> None:
+        task = self._project_tasks.get(project_id)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            job = self._jobs.get(project_id)
+            if job is not None:
+                await self._set_job_state(job, status="error", phase="interrupted", error="Startup cancelled.")
 
     def list_jobs(self) -> list[ProjectStartupJob]:
         return sorted(
@@ -118,8 +134,15 @@ class ProjectStartupService:
         anime_name: str | None,
         series_id: str | None,
         library_type,
+        temporary_source: TemporarySourceInput | None = None,
     ) -> ProjectStartupJob:
         from .project_service import ProjectService
+
+        if temporary_source is not None:
+            from .temporary_source_service import TemporarySourceService
+            if coerce_library_type(library_type) != LibraryType.PURE or series_id:
+                raise ValueError("Temporary sources require Pure mode without a catalog series")
+            await asyncio.to_thread(TemporarySourceService.validate_input, temporary_source)
 
         project = ProjectService.create(
             tiktok_url=tiktok_url,
@@ -127,6 +150,7 @@ class ProjectStartupService:
             anime_name=anime_name,
             series_id=series_id,
             library_type=library_type,
+            temporary_source=temporary_source,
         )
         return await self.enqueue_project(project.id)
 
@@ -136,6 +160,10 @@ class ProjectStartupService:
         project = await ProjectService.aload(project_id)
         if project is None:
             raise RuntimeError("Project not found")
+
+        from .temporary_source_service import TemporarySourceService
+        if project_id in TemporarySourceService._deleting:
+            raise RuntimeError("Project is being deleted")
 
         existing = self._jobs.get(project_id)
         if existing and existing.status in {"queued", "running"}:
@@ -162,6 +190,11 @@ class ProjectStartupService:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+        self._project_tasks[project_id] = task
+        def forget_task(done):
+            if self._project_tasks.get(project_id) is done:
+                self._project_tasks.pop(project_id, None)
+        task.add_done_callback(forget_task)
         return job
 
     async def retry_project(self, project_id: str) -> ProjectStartupJob:
@@ -175,7 +208,10 @@ class ProjectStartupService:
         if existing and existing.status in {"queued", "running"}:
             raise RuntimeError("Startup is already running for this project.")
 
-        await self._reset_project_startup_state(project_id)
+        if project.temporary_source is None:
+            await self._reset_project_startup_state(project_id)
+        elif project.phase.value not in {"setup", "downloading", "scene_detection", "scene_validation"}:
+            raise RuntimeError("This project has already completed source preparation.")
         return await self.enqueue_project(project_id)
 
     async def rename_series_references(
@@ -225,7 +261,7 @@ class ProjectStartupService:
     async def _publish_job(self, job: ProjectStartupJob) -> None:
         job.updated_at = _utc_now()
         self._jobs[job.project_id] = job
-        await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
+        await file_io(_write_jobs_atomic, self._jobs_path, self._jobs)
         self._publish_to_hub(job)
 
     async def _set_job_state(
@@ -334,6 +370,10 @@ class ProjectStartupService:
             if not project.tiktok_url:
                 raise RuntimeError("Project does not have a TikTok URL.")
 
+            if project.temporary_source is not None:
+                await self._run_temporary_project(project, job)
+                return
+
             async for progress in DownloaderService.download_project_video(
                 project.tiktok_url,
                 project_id,
@@ -352,7 +392,7 @@ class ProjectStartupService:
             if project is None:
                 raise RuntimeError("Project not found")
 
-            if project.library_type == LibraryType.PURE:
+            if project.uses_identity_source:
                 # Pure mode: stop after download. The user draws the
                 # subtitle/watermark zones on the Cleanup page; scene
                 # detection runs afterwards on the cleaned video.
@@ -450,6 +490,38 @@ class ProjectStartupService:
             logger.exception("Project startup failed for %s", project_id)
         finally:
             self._semaphore.release()
+
+    async def _run_temporary_project(self, project, job: ProjectStartupJob) -> None:
+        from .downloader import DownloaderService
+        from .project_service import ProjectService
+        from .scene_detector import SceneDetectorService
+        from .temporary_source_service import TemporarySourceService
+
+        video_info = await DownloaderService.get_video_info(Path(project.video_path)) if project.video_path else {}
+        if not video_info.get("width") or not video_info.get("duration"):
+            async for progress in DownloaderService.download_project_video(project.tiktok_url, project.id):
+                if progress.status == "error":
+                    raise RuntimeError(progress.error or "TikTok download failed")
+                await self._set_job_state(job, status="running", phase="download", progress=0.2 * progress.progress, message=progress.message)
+
+        async def source_progress(value: float, message: str) -> None:
+            await self._set_job_state(job, status="running", phase="temporary_source", progress=0.2 + 0.65 * value, message=message)
+
+        await TemporarySourceService.prepare(project.id, source_progress)
+        # Nothing is exposed as ready before both the local index and scene
+        # detection are finished. Retry preserves a previously valid download.
+        from .indexation_queue import indexation_queue
+        async with indexation_queue.matching_lock():
+            async with indexation_queue.heavy_slot("temporary_scene_detection"):
+                async for progress in SceneDetectorService.detect_project_scenes(project.id):
+                    if progress.status == "error":
+                        raise RuntimeError(progress.error or "Scene detection failed")
+                    await self._set_job_state(job, status="running", phase="scene_detection", progress=0.85 + 0.15 * progress.progress, message=progress.message)
+        await self._set_job_state(
+            job, status="complete", phase="complete", progress=1.0,
+            message="Source locale indexée — projet prêt.",
+            ready_url=self._compute_ready_url(project.id),
+        )
 
 
 project_startup_queue = ProjectStartupService()

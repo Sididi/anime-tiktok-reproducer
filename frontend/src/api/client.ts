@@ -158,6 +158,7 @@ export const api = {
     animeName: string | undefined,
     seriesId: string | undefined,
     libraryType: import("@/types").LibraryType = "anime",
+    temporarySource?: import("@/types").TemporarySourceInput,
   ) =>
     request<import("@/types").ProjectStartupJob>("/projects/start-async", {
       method: "POST",
@@ -166,6 +167,7 @@ export const api = {
         anime_name: animeName,
         series_id: seriesId,
         library_type: libraryType,
+        temporary_source: temporarySource,
       }),
     }),
 

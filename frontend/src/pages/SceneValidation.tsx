@@ -1,3 +1,4 @@
+import { usesIdentitySource } from "@/utils/libraryTypes";
 import { useEffect, useCallback, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Loader2, Wand2, ArrowRight, Info } from 'lucide-react';
@@ -80,7 +81,7 @@ function SceneValidationContent() {
   // null = per-library-type default (pure: 27, others: 16)
   const [threshold, setThreshold] = useState<number | null>(null);
   const effectiveThreshold =
-    threshold ?? (project?.library_type === "pure" ? 27.0 : 16.0);
+    threshold ?? (usesIdentitySource(project) ? 27.0 : 16.0);
   const detectionAbortRef = useRef<AbortController | null>(null);
 
   const currentScene = getSceneAtTime(currentTime);

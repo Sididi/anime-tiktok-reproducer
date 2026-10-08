@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from ...library_types import DEFAULT_LIBRARY_TYPE, LibraryType
 from ...services.project_startup_service import project_startup_queue
+from ...models.temporary_source import TemporarySourceInput
 
 
 router = APIRouter(prefix="/projects", tags=["startup"])
@@ -15,6 +16,7 @@ class StartProjectAsyncRequest(BaseModel):
     anime_name: str | None = None
     series_id: str | None = None
     library_type: LibraryType = DEFAULT_LIBRARY_TYPE
+    temporary_source: TemporarySourceInput | None = None
 
 
 @router.post("/start-async")
@@ -26,7 +28,10 @@ async def start_project_async(request: StartProjectAsyncRequest):
             anime_name=request.anime_name,
             series_id=request.series_id,
             library_type=request.library_type,
+            temporary_source=request.temporary_source,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return job.model_dump(mode="json")

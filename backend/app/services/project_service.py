@@ -8,6 +8,7 @@ from datetime import datetime
 from ..config import settings
 from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type
 from ..models import Project, ProjectPhase, SceneList
+from ..models.temporary_source import TemporarySource, TemporarySourceInput
 from .atomic_files import write_text_atomic
 from .library_state_db import LibraryStateDb
 from .project_locks import ProjectLocks
@@ -76,6 +77,7 @@ class ProjectService:
         anime_name: str | None = None,
         series_id: str | None = None,
         library_type: LibraryType = DEFAULT_LIBRARY_TYPE,
+        temporary_source: TemporarySourceInput | None = None,
     ) -> Project:
         """Create a new project."""
         source_paths = []
@@ -88,6 +90,7 @@ class ProjectService:
             anime_name=anime_name,
             series_id=series_id,
             library_type=library_type,
+            temporary_source=(TemporarySource(**temporary_source.model_dump()) if temporary_source else None),
         )
         project_dir = cls.get_project_dir(project.id)
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -98,9 +101,12 @@ class ProjectService:
     @classmethod
     def save(cls, project: Project) -> None:
         """Save a project to disk."""
+        if project.temporary_source is not None:
+            if not cls.get_project_dir(project.id).exists():
+                raise RuntimeError("Project no longer exists")
         project.updated_at = datetime.now()
         project_file = cls.get_project_file(project.id)
-        write_text_atomic(project_file, project.model_dump_json(indent=2))
+        write_text_atomic(project_file, project.model_dump_json(indent=2), create_parent=project.temporary_source is None)
         cls.sync_project_pin(project)
 
     @classmethod
@@ -268,7 +274,7 @@ class ProjectService:
     def save_scenes(cls, project_id: str, scenes: SceneList) -> None:
         """Save scenes for a project."""
         scenes_file = cls.get_scenes_file(project_id)
-        write_text_atomic(scenes_file, scenes.model_dump_json(indent=2))
+        write_text_atomic(scenes_file, scenes.model_dump_json(indent=2), create_parent=False)
 
     @classmethod
     def load_scenes(cls, project_id: str) -> SceneList | None:
@@ -297,7 +303,7 @@ class ProjectService:
     def save_matches(cls, project_id: str, matches: "MatchList") -> None:
         """Save matches for a project."""
         matches_file = cls.get_matches_file(project_id)
-        write_text_atomic(matches_file, matches.model_dump_json(indent=2))
+        write_text_atomic(matches_file, matches.model_dump_json(indent=2), create_parent=False)
 
     @classmethod
     def load_matches(cls, project_id: str) -> "MatchList | None":
@@ -317,7 +323,7 @@ class ProjectService:
     def save_transcription(cls, project_id: str, transcription: "Transcription") -> None:
         """Save transcription for a project."""
         transcription_file = cls.get_transcription_file(project_id)
-        write_text_atomic(transcription_file, transcription.model_dump_json(indent=2))
+        write_text_atomic(transcription_file, transcription.model_dump_json(indent=2), create_parent=False)
 
     @classmethod
     def load_transcription(cls, project_id: str) -> "Transcription | None":

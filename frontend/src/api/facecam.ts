@@ -12,12 +12,14 @@ export interface FacecamAutoEditorSettings {
   min_silence_ms: number;
   margin_before_ms: number;
   margin_after_ms: number;
+  speed: number;
 }
 export const DEFAULT_FACECAM_AUTO_EDITOR: FacecamAutoEditorSettings = {
-  noise_threshold_db: -26, min_silence_ms: 120, margin_before_ms: 30, margin_after_ms: 50,
+  noise_threshold_db: -26, min_silence_ms: 120, margin_before_ms: 30, margin_after_ms: 50, speed: 1.0,
 };
 export function sameAutoEditorSettings(a?: FacecamAutoEditorSettings, b?: FacecamAutoEditorSettings): boolean {
-  return !!a && !!b && (Object.keys(DEFAULT_FACECAM_AUTO_EDITOR) as (keyof FacecamAutoEditorSettings)[]).every(key => a[key] === b[key]);
+  return !!a && !!b && (Object.keys(DEFAULT_FACECAM_AUTO_EDITOR) as (keyof FacecamAutoEditorSettings)[])
+    .every(key => (a[key] ?? DEFAULT_FACECAM_AUTO_EDITOR[key]) === (b[key] ?? DEFAULT_FACECAM_AUTO_EDITOR[key]));
 }
 export interface FacecamState {
   stories?: FacecamStory[]; selected_story_id?: string | null; estimated_duration_seconds?: number | null;

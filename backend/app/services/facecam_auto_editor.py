@@ -14,7 +14,11 @@ WORD_TAIL_SECONDS = 0.05
 
 
 def settings_signature(settings: FacecamAutoEditorSettings) -> str:
-    payload = {"version": ALGORITHM_VERSION, **settings.model_dump()}
+    # Keep existing 1x previews valid: adding the optional speed control must not
+    # reprocess a recording that the user has not asked to retime.
+    payload = {"version": ALGORITHM_VERSION, **settings.model_dump(exclude={"speed"})}
+    if settings.speed != 1.0:
+        payload["speed"] = settings.speed
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 

@@ -60,7 +60,8 @@ einops = ">=0.7"
 
 # Video/Audio processing
 av = ">=15.0,<16"
-yt-dlp = { url = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.07.23.234303/yt-dlp.tar.gz" }
+# YouTube needs both the EJS challenge solver (default extra) and a JS runtime.
+yt-dlp = { url = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.07.23.234303/yt-dlp.tar.gz", extras = ["default", "deno"] }
 # Enables yt-dlp's browser impersonation path, which TikTok's extractor uses
 # when the regular webpage is protected by its JavaScript challenge.
 curl-cffi = ">=0.11,<0.16"

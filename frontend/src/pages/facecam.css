@@ -9,6 +9,11 @@
 .facecam-auto-editor-controls output { color: #a5b4fc; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .facecam-auto-editor-controls input { width: 100%; accent-color: #818cf8; }
 .facecam-auto-editor-controls small { opacity: .65; line-height: 1.5; }
+.facecam-auto-editor-speed { display: grid; gap: 10px; margin-bottom: 20px; font-size: 13px; }
+.facecam-auto-editor-speed > span { display: flex; justify-content: space-between; gap: 12px; }
+.facecam-auto-editor-speed output { color: #a5b4fc; font-variant-numeric: tabular-nums; }
+.facecam-auto-editor-speed input { width: 100%; accent-color: #818cf8; }
+.facecam-auto-editor-speed small { opacity: .65; line-height: 1.5; }
 @media (max-width: 600px) { .facecam-auto-editor-controls { grid-template-columns: 1fr; } .facecam-auto-editor { padding: 16px; } }
 .facecam-prompter { margin: 24px 0; padding: 22px; border: 1px solid #818cf860; border-radius: 12px; background: #6366f108; }
 .facecam-prompter-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }

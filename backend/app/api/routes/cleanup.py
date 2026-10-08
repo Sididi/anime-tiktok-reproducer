@@ -22,7 +22,7 @@ def _require_pure(project_id: str):
     project = ProjectService.load(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if project.library_type != LibraryType.PURE:
+    if not project.uses_identity_source:
         raise HTTPException(
             status_code=400, detail="Cleanup is only available for Pure projects"
         )

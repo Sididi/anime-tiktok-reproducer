@@ -13,6 +13,7 @@ import re
 logger = logging.getLogger("uvicorn.error")
 
 from ...services.executors import heavy_executor
+from ...utils.file_tasks import wait_for_worker
 from ...config import settings
 from ...library_types import LibraryType
 from ...models import ProjectPhase, MatchList, SceneMatch, SceneList
@@ -27,6 +28,7 @@ from ...services import (
 from ...services.match_playback_service import MatchPlaybackService
 from ...services.fast_matching import bounded_matcher_enabled
 from ...services.project_locks import project_edit_locked
+from ...services.temporary_source_service import TemporarySourceService
 from ...services.zoom_search_service import zoom_search_service
 from ...services.episode_names import (
     KNOWN_MEDIA_EXTENSIONS,
@@ -35,6 +37,13 @@ from ...services.episode_names import (
 )
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
+
+
+def _require_source_ready(project) -> None:
+    try:
+        TemporarySourceService.require_ready(project)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def _etag_for_path(path: Path) -> str:
@@ -198,14 +207,14 @@ def _build_episode_source_dirs(project) -> list[Path]:
     if explicit_paths:
         return explicit_paths
 
-    library_root = AnimeLibraryService.get_library_path(project.library_type)
+    library_root = AnimeLibraryService.get_library_path(project.media_library)
     if not library_root.exists():
         return []
 
-    if project.anime_name:
+    if project.media_series_name:
         scoped_dir = _resolve_anime_source_dir(
             library_root,
-            project.anime_name,
+            project.media_series_name,
         )
         if scoped_dir is not None:
             source_dirs.append(scoped_dir)
@@ -223,6 +232,9 @@ async def set_sources(project_id: str, request: SetSourcesRequest):
     project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    if project.temporary_source is not None:
+        raise HTTPException(status_code=400, detail="La source temporaire est fixée à la création du projet.")
 
     # Validate paths exist
     for path in request.paths:
@@ -262,7 +274,7 @@ async def list_episodes(project_id: str):
     VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".webm", ".mov", ".m4v"}
     episodes: list[str] = []
 
-    library_root = AnimeLibraryService.get_library_path(project.library_type)
+    library_root = AnimeLibraryService.get_library_path(project.media_library)
     source_dirs = _build_episode_source_dirs(project)
 
     def _is_under(path: Path, root: Path) -> bool:
@@ -285,13 +297,13 @@ async def list_episodes(project_id: str):
     manifest: dict | None = None
     if library_root and any(_is_under(src, library_root) or src.resolve() == library_root.resolve() for src in source_dirs if src.exists()):
         manifest = await AnimeLibraryService.ensure_episode_manifest(
-            library_type=project.library_type,
+            library_type=project.media_library,
         )
 
     manifest_episodes: list[str] = (
         AnimeLibraryService.list_episode_paths(
             manifest,
-            library_type=project.library_type,
+            library_type=project.media_library,
         )
         if manifest
         else []
@@ -325,7 +337,7 @@ async def list_episodes(project_id: str):
     if project.series_id:
         try:
             episode_sources = await LibraryHydrationService.get_episode_sources(
-                library_type=project.library_type,
+                library_type=project.media_library,
                 series_id=project.series_id,
             )
             storage_episodes = (
@@ -355,25 +367,28 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    _require_source_ready(project)
+    if project.temporary_source is not None and request.source_path:
+        raise HTTPException(status_code=400, detail="Ce projet utilise uniquement sa source temporaire.")
 
     if project.series_id:
         try:
             await LibraryHydrationService.ensure_matcher_ready_for_project(
                 project_id=project.id,
-                library_type=project.library_type,
+                library_type=project.media_library,
                 series_id=project.series_id,
             )
         except Exception as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    is_pure = project.library_type == LibraryType.PURE
+    is_pure = project.uses_identity_source
 
     # Use provided source_path or default to anime_library_path.
     # Pure projects have no library: the tiktok itself is the source.
     source_path = (
         Path(request.source_path)
         if request.source_path
-        else AnimeLibraryService.get_library_path(project.library_type)
+        else AnimeLibraryService.get_library_path(project.media_library)
     )
     if not is_pure and not source_path.exists():
         raise HTTPException(status_code=400, detail="Source path not found")
@@ -418,7 +433,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
     await ProjectService.asave(project)
 
     # Get anime name for filtering (if set on project)
-    anime_name = project.anime_name
+    anime_name = project.media_series_name
 
     # Optional episode subset (pure projects match against their own video,
     # so a subset is meaningless there and silently ignored).
@@ -502,7 +517,7 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
                     video_path,
                     scenes,
                     source_path,
-                    project.library_type,
+                    project.media_library,
                     anime_name=anime_name,
                     episode_whitelist=episode_whitelist,
                 ):
@@ -582,8 +597,17 @@ async def deferred_download(project_id: str):
     if not matches:
         raise HTTPException(status_code=400, detail="No matches found")
 
-    library_root = AnimeLibraryService.get_library_path(project.library_type)
-    anime_name = project.anime_name
+    if project.temporary_source is not None:
+        _require_source_ready(project)
+        for match in matches.matches:
+            if match.episode and AnimeLibraryService.resolve_episode_path(match.episode, library_type=project.media_library) is None:
+                raise HTTPException(status_code=409, detail=f"Source locale introuvable : {match.episode}")
+        async def local_ready():
+            yield 'data: {"status":"complete","phase":"check","message":"Source locale prête","progress":1.0}\n\n'
+        return StreamingResponse(local_ready(), media_type="text/event-stream")
+
+    library_root = AnimeLibraryService.get_library_path(project.media_library)
+    anime_name = project.media_series_name
     series_id = project.series_id
 
     if not anime_name and not series_id:
@@ -641,7 +665,7 @@ async def deferred_download(project_id: str):
                     })
                     await LibraryHydrationService.ensure_matcher_ready_for_project(
                         project_id=project.id,
-                        library_type=project.library_type,
+                        library_type=project.media_library,
                         series_id=series_id,
                     )
                     phase = "hydrate_episode"
@@ -652,7 +676,7 @@ async def deferred_download(project_id: str):
                         "progress": 0.15,
                     })
                     await LibraryHydrationService.hydrate_series(
-                        library_type=project.library_type,
+                        library_type=project.media_library,
                         series_id=series_id,
                         episode_keys=episode_paths,
                         full_series=False,
@@ -728,6 +752,7 @@ async def prepare_matches_playback(project_id: str, request: PreparePlaybackRequ
     project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    _require_source_ready(project)
 
     async def stream_progress():
         async for progress in MatchPlaybackService.prepare_playback(
@@ -756,6 +781,7 @@ async def prepare_matches_playback_scene(
     project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    _require_source_ready(project)
 
     async def stream_progress():
         async for progress in MatchPlaybackService.prepare_scene_playback(
@@ -882,15 +908,16 @@ async def merge_with_previous(project_id: str, scene_index: int):
         try:
             await LibraryHydrationService.ensure_matcher_ready_for_project(
                 project_id=project.id,
-                library_type=project.library_type,
+                library_type=project.media_library,
                 series_id=project.series_id,
             )
         except Exception as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    is_pure = project.library_type == LibraryType.PURE
+    is_pure = project.uses_identity_source
 
-    source_path = AnimeLibraryService.get_library_path(project.library_type)
+    source_path = AnimeLibraryService.get_library_path(project.media_library)
+    _require_source_ready(project)
     if not is_pure and not source_path.exists():
         raise HTTPException(status_code=400, detail="Source path not found")
 
@@ -990,32 +1017,32 @@ async def merge_with_previous(project_id: str, scene_index: int):
 
                 # match_scenes initializes the searcher itself; the bounded
                 # partial path requires it to be live already.
-                init_success = await loop.run_in_executor(
+                init_success = await wait_for_worker(loop.run_in_executor(
                     heavy_executor(),
                     AnimeMatcherService._init_searcher,
                     source_path,
-                    project.library_type,
-                    project.anime_name,
-                )
+                    project.media_library,
+                    project.media_series_name,
+                ))
                 if not init_success:
                     raise HTTPException(
                         status_code=500,
                         detail="Failed to initialize anime_searcher for re-match",
                     )
                 try:
-                    rematched_matches = await loop.run_in_executor(
+                    rematched_matches = await wait_for_worker(loop.run_in_executor(
                         heavy_executor(),
                         partial(
                             HierarchicalMatcherService.rematch_scene_sync,
                             video_path,
                             merged_scenes,
-                            project.library_type,
-                            project.anime_name,
+                            project.media_library,
+                            project.media_series_name,
                             scene_index=merged_scene_index,
                             existing_matches=merged_matches,
                             prior=prior,
                         ),
-                    )
+                    ))
                 except Exception as exc:
                     logger.exception("Bounded partial re-match failed")
                     raise HTTPException(
@@ -1027,8 +1054,8 @@ async def merge_with_previous(project_id: str, scene_index: int):
                     video_path,
                     merged_scenes,
                     source_path,
-                    project.library_type,
-                    anime_name=project.anime_name,
+                    project.media_library,
+                    anime_name=project.media_series_name,
                     scene_indices_to_match=[merged_scene_index],
                     existing_matches=merged_matches,
                 ):
@@ -1111,7 +1138,7 @@ async def update_match(project_id: str, scene_index: int, request: UpdateMatchRe
     # Update match
     match.episode = _canonical_episode_ref(
         request.episode,
-        library_type=project.library_type,
+        library_type=project.media_library,
     )
     match.start_time = request.start_time
     match.end_time = request.end_time
@@ -1178,7 +1205,7 @@ async def update_matches_batch(project_id: str, request: BatchUpdateMatchesReque
 
         match.episode = _canonical_episode_ref(
             update.episode,
-            library_type=project.library_type,
+            library_type=project.media_library,
         )
         match.start_time = update.start_time
         match.end_time = update.end_time
@@ -1229,7 +1256,8 @@ async def start_zoom_search(project_id: str, scene_index: int):
     project = await ProjectService.aload(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if project.library_type == LibraryType.PURE:
+    _require_source_ready(project)
+    if project.uses_identity_source:
         raise HTTPException(
             status_code=400,
             detail="Zoom search is not available for pure projects",

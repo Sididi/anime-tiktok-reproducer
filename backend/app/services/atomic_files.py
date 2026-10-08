@@ -11,7 +11,7 @@ from pathlib import Path
 _REPLACE_ATTEMPTS = 3
 
 
-def write_text_atomic(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+def write_text_atomic(path: Path, text: str, *, encoding: str = "utf-8", create_parent: bool = True) -> None:
     """Write ``text`` to ``path`` so readers only ever see the old or the new file.
 
     The temp file gets a unique name (two concurrent writers of the same path
@@ -21,7 +21,8 @@ def write_text_atomic(path: Path, text: str, *, encoding: str = "utf-8") -> None
     times before giving up.  The temp file is removed on any failure.
     """
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if create_parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         tmp_path.write_text(text, encoding=encoding)

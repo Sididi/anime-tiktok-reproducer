@@ -1,11 +1,12 @@
 from enum import Enum
 from datetime import datetime
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Any, ClassVar, Literal
 import uuid
 
 from ..config import settings
-from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType
+from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, LocalLibrary
+from .temporary_source import TemporarySource
 from .cleanup import CleanupState
 
 
@@ -77,6 +78,7 @@ class Project(BaseModel):
     anime_name: str | None = None  # Selected anime from indexed library
     series_id: str | None = None
     library_type: LibraryType = DEFAULT_LIBRARY_TYPE
+    temporary_source: TemporarySource | None = None
     source_paths: list[str] = Field(default_factory=list)  # Kept for backwards compatibility
     phase: ProjectPhase = ProjectPhase.SETUP
     created_at: datetime = Field(default_factory=datetime.now)
@@ -146,16 +148,38 @@ class Project(BaseModel):
             )
         return value
 
-    # Pure mode: the only extra footage available for gap resolution is the
+    # Classic Pure: the only extra footage available for gap resolution is the
     # neighboring scene, so a deeper slow-mo floor absorbs most gaps before
     # boundary borrowing has to move cuts. An explicit project value still
-    # wins; template/global floors are anime-tuned and are skipped for Pure.
+    # wins; template/global floors are skipped only for the identity workflow.
     PURE_DEFAULT_MIN_PLAYBACK_SPEED: ClassVar[float] = 0.4
+
+    @model_validator(mode="after")
+    def validate_temporary_source(self):
+        if self.temporary_source is not None:
+            if self.library_type != LibraryType.PURE or self.series_id:
+                raise ValueError("Temporary sources require a Pure project without a catalog series")
+        return self
+
+    @property
+    def uses_identity_source(self) -> bool:
+        return self.library_type == LibraryType.PURE and self.temporary_source is None
+
+    @property
+    def media_library(self) -> LibraryType | LocalLibrary:
+        if self.temporary_source is not None:
+            from ..services.project_service import ProjectService
+            return LocalLibrary(ProjectService.get_project_dir(self.id) / "temporary_source" / "library" / "anime")
+        return self.library_type
+
+    @property
+    def media_series_name(self) -> str | None:
+        return "source" if self.temporary_source is not None else self.anime_name
 
     def resolved_min_playback_speed(self) -> float:
         if self.min_playback_speed is not None:
             return self.min_playback_speed
-        if self.library_type == LibraryType.PURE:
+        if self.uses_identity_source:
             return self.PURE_DEFAULT_MIN_PLAYBACK_SPEED
         template_value = self._resolved_template().min_playback_speed
         if template_value is not None:

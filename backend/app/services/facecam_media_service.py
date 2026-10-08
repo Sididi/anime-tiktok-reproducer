@@ -44,12 +44,12 @@ def compare_words(expected: str, actual: str) -> list[dict]:
             for tag, i, j, k, l in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes() if tag != "equal"]
 
 
-def camera_segments(keep: list[tuple[int, int]], playback: list) -> list[dict]:
+def camera_segments(keep: list[tuple[int, int]], playback: list, time_scale: float = 1.0) -> list[dict]:
     """Compose original→clean voice intervals with clean voice→final playback."""
     mapping, clean_cursor = [], 0.0
     for start, end in keep:
-        length = (end - start) / FPS
-        mapping.append((clean_cursor, clean_cursor + length, start / FPS))
+        length = (end - start) / FPS * time_scale
+        mapping.append((clean_cursor, clean_cursor + length, start / FPS * time_scale))
         clean_cursor += length
     result, timeline = [], 0.0
     for segment in playback:
@@ -67,6 +67,28 @@ def camera_segments(keep: list[tuple[int, int]], playback: list) -> list[dict]:
 
 
 class FacecamMediaService:
+    @staticmethod
+    def apply_speed(clean: Path, camera: Path, work: Path, speed: float) -> tuple[Path, Path, float]:
+        """Retiming is opt-in. At 1x return the original paths without any I/O."""
+        if speed == 1.0:
+            return clean, camera, 1.0
+        from .audio_speed_service import AudioSpeedService
+        from .processing import ProcessingService
+        voice = work / "voice_speed.wav"
+        asyncio.run(AudioSpeedService.apply_speed(clean, voice, speed))
+        # atempo can differ by a few samples from duration / requested_speed.
+        # Use the measured ratio for both the picture and its edit map so that
+        # rounding does not accumulate drift or clip the final word.
+        original_duration = ProcessingService._probe_wav_duration(clean)
+        retimed_duration = ProcessingService._probe_wav_duration(voice)
+        if original_duration <= 0 or retimed_duration <= 0:
+            raise ValueError("La modification de vitesse n'a produit aucun audio.")
+        time_scale = retimed_duration / original_duration
+        retimed_camera = work / "facecam.mp4"
+        ffmpeg(["-i", str(camera), "-an", "-vf", f"setpts=(PTS-STARTPTS)*{time_scale:.12f},fps=60",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-movflags", "+faststart", str(retimed_camera)])
+        return voice, retimed_camera, time_scale
+
     @classmethod
     def ingest(cls, project_id: str, upload: Path):
         state = FacecamService.load(project_id)
@@ -148,7 +170,8 @@ class FacecamMediaService:
         if state.recording.get("reviewed_revision") != state.revision:
             raise ValueError("Vérifiez les différences entre votre script et votre enregistrement.")
         if prepared_is_current(state) and all((Path(state.prepared["directory"]) / name).is_file()
-                                             for name in ("narration.wav", "transcription.json", "voice_clean.wav")):
+                                             for name in ("narration.wav", "transcription.json", "voice_clean.wav")) and (
+                state.auto_editor.speed == 1.0 or Path(state.prepared.get("camera_path", "")).is_file()):
             return state
         root = Path(state.recording["directory"])
         # Never overwrite the last playable preview if analysis or alignment fails.
@@ -187,6 +210,7 @@ class FacecamMediaService:
                 sample_count = (end - start) * (RATE // FPS)
                 frames = src.readframes(sample_count)
                 dst.writeframes(frames + b"\x00" * (sample_count * frame_size - len(frames)))
+        voice, camera, time_scale = cls.apply_speed(clean, root / "facecam.mp4", work, tuning.speed)
         payload = {"language": "fr", "scenes": state.assignment}
         # One contiguous known-text segment per narration block, without any TTS normalization.
         manifest = cls.manifest(payload)
@@ -194,7 +218,7 @@ class FacecamMediaService:
         with TranscriberService.model_session():
             alignment = ForcedAlignmentService._align_single_audio(
                 project_id=project_id, script_payload=payload, reference_transcription=reference,
-                manifest=manifest, edited_audio_path=clean, align_language="fr", coarse_model_size="large-v3", output_dir=work)
+                manifest=manifest, edited_audio_path=voice, align_language="fr", coarse_model_size="large-v3", output_dir=work)
         ForcedAlignmentService.write_alignment_report(work, alignment.report)
         project = FacecamService.project(project_id)
         matches = ProjectService.load_matches(project_id).matches
@@ -210,14 +234,14 @@ class FacecamMediaService:
                 ProjectService.save_matches(project_id, MatchList(matches=matches))
         source_fps = asyncio.run(ProcessingService.detect_first_source_fps(matches, library_type=project.library_type))
         resolved = ProcessingService.resolve_scene_sources(matches, ProcessingService._build_source_rate(source_fps), library_type=project.library_type)
-        # Do not shift only word timings: source_start must stay in the clean WAV's coordinate system.
+        # Word timings and source_start share the optionally retimed voice clock.
         transcription, playback = ProcessingService.build_authoritative_playback_timeline(
-            alignment.transcription, resolved, contiguous_audio_duration=ProcessingService._probe_wav_duration(clean),
+            alignment.transcription, resolved, contiguous_audio_duration=ProcessingService._probe_wav_duration(voice),
             preserve_audio_start=True)
         output_voice = work / "narration.wav"
-        ProcessingService.rebuild_tts_audio_with_playback_segments(clean, output_voice, playback,
+        ProcessingService.rebuild_tts_audio_with_playback_segments(voice, output_voice, playback,
             apply_tail_fade=False, exact_sample_boundaries=True)
-        clips = camera_segments(keep, playback)
+        clips = camera_segments(keep, playback, time_scale)
         end = math.ceil(ProcessingService._probe_wav_duration(output_voice) * FPS - 1e-7) / FPS
         write_text_atomic(work / "transcription.json", transcription.model_dump_json())
         cut_report = {"source_duration_seconds": duration,
@@ -229,6 +253,7 @@ class FacecamMediaService:
         write_text_atomic(work / "cut_report.json", json.dumps(cut_report, indent=2))
         prepared = {"revision": state.revision, "fingerprint": state.recording["fingerprint"], "directory": str(work),
             "auto_editor": tuning.model_dump(), "auto_editor_signature": signature, "cut_report": cut_report,
+            "camera_path": str(camera), "camera_time_scale": time_scale,
             "keep_frames": [list(interval) for interval in keep], "camera_segments": clips, "cover_start": end,
             "duration_seconds": end + 1,
             "alignment_path": str(ForcedAlignmentService.report_path(work)),

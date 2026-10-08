@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import uuid
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -72,6 +73,10 @@ class ProjectDuplicationService:
             raise ValueError("Project not found")
         if source.project_mode == "facecam":
             raise ValueError("Créez un nouveau Facecam depuis le projet anime original.")
+        if source.temporary_source is not None:
+            from .temporary_source_service import TemporarySourceService
+            if not TemporarySourceService.is_ready(source):
+                raise ValueError("La source temporaire doit être prête avant de dupliquer le projet.")
         if not variants:
             raise ValueError("At least one duplication variant is required")
 
@@ -99,6 +104,7 @@ class ProjectDuplicationService:
         try:
             cls._copy_project_dir(source_dir, target_dir)
             duplicate = source.model_copy(
+                deep=True,
                 update={
                     "id": new_id,
                     "mother_project_id": family_root,
@@ -160,12 +166,33 @@ class ProjectDuplicationService:
         target_prefix = str(target_dir)
 
         def rebase(value: str | None) -> str | None:
-            if value and value.startswith(source_prefix):
+            if value and (value == source_prefix or value.startswith(source_prefix + os.sep)):
                 return target_prefix + value[len(source_prefix):]
             return value
 
         duplicate.video_path = rebase(duplicate.video_path)
         duplicate.original_video_path = rebase(duplicate.original_video_path)
+        duplicate.source_paths = [rebase(path) or path for path in duplicate.source_paths]
+        if duplicate.temporary_source is not None:
+            # Sidecars and the episode manifest contain absolute paths. Index
+            # shards themselves use paths relative to the library and can be
+            # copied unchanged, preserving resumability and their signatures.
+            def rebase_payload(value):
+                if isinstance(value, str):
+                    return rebase(value)
+                if isinstance(value, list):
+                    return [rebase_payload(item) for item in value]
+                if isinstance(value, dict):
+                    return {rebase(key): rebase_payload(item) for key, item in value.items()}
+                return value
+
+            for path in (target_dir / "temporary_source").rglob("*.json"):
+                if ".index" in path.relative_to(target_dir).parts:
+                    continue
+                payload = json.loads(path.read_text())
+                rebased = rebase_payload(payload)
+                if rebased != payload:
+                    path.write_text(json.dumps(rebased, ensure_ascii=False, indent=2))
         if duplicate.cleanup is not None:
             duplicate.cleanup.cleaned_video_path = rebase(
                 duplicate.cleanup.cleaned_video_path

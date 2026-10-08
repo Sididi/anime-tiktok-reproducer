@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from .executors import heavy_executor
+from ..utils.file_tasks import wait_for_worker
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from ..models import AlternativeMatch, MatchCandidate, MatchList, Scene, SceneMatch, SceneList
@@ -3401,9 +3402,9 @@ class AnimeMatcherService:
 
         # Initialize searcher in thread pool
         loop = asyncio.get_event_loop()
-        init_success = await loop.run_in_executor(
+        init_success = await wait_for_worker(loop.run_in_executor(
             heavy_executor(), cls._init_searcher, library_path, library_type, anime_name
-        )
+        ))
 
         if not init_success:
             yield MatchProgress(
@@ -3432,13 +3433,13 @@ class AnimeMatcherService:
             0,
             total_scenes,
         )
-        probe_frames, probe_frame_indices = await loop.run_in_executor(
+        probe_frames, probe_frame_indices = await wait_for_worker(loop.run_in_executor(
             heavy_executor(),
             cls._extract_scene_probe_frames_with_indices,
             video_path,
             target_scene_items,
-        )
-        direct_candidates = await loop.run_in_executor(
+        ))
+        direct_candidates = await wait_for_worker(loop.run_in_executor(
             heavy_executor(),
             partial(
                 cls._search_scene_probe_candidates_batch,
@@ -3450,7 +3451,7 @@ class AnimeMatcherService:
                 video_path=video_path,
                 probe_frame_indices=probe_frame_indices,
             ),
-        )
+        ))
 
         matches = MatchList()
         processed_count = 0
@@ -3572,7 +3573,7 @@ class AnimeMatcherService:
                 )
                 if selected_before_refine is not None:
                     if selected_before_refine.source != "merged_seed":
-                        refined = await loop.run_in_executor(
+                        refined = await wait_for_worker(loop.run_in_executor(
                             heavy_executor(),
                             cls._refine_boundaries,
                             video_path,
@@ -3581,7 +3582,7 @@ class AnimeMatcherService:
                             selected_before_refine.start_time,
                             selected_before_refine.end_time,
                             library_type,
-                        )
+                        ))
                         if refined is not None:
                             refined_start, refined_end = refined
                             if cls._source_duration_within_speed_bounds(

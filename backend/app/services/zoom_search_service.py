@@ -22,6 +22,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .executors import heavy_executor
+from ..utils.file_tasks import wait_for_worker
 from ..library_types import LibraryType
 from .event_hub import event_hub
 
@@ -207,8 +208,10 @@ class ZoomSearchService:
         project = await ProjectService.aload(job.project_id)
         if not project:
             return self._fail(job, "Project not found")
-        if project.library_type == LibraryType.PURE:
+        if project.uses_identity_source:
             return self._fail(job, "Zoom search is not available for pure projects")
+        from .temporary_source_service import TemporarySourceService
+        TemporarySourceService.require_ready(project)
 
         scenes = await ProjectService.aload_scenes(job.project_id)
         if not scenes or not scenes.scenes:
@@ -250,13 +253,13 @@ class ZoomSearchService:
             try:
                 await LibraryHydrationService.ensure_matcher_ready_for_project(
                     project_id=project.id,
-                    library_type=project.library_type,
+                    library_type=project.media_library,
                     series_id=project.series_id,
                 )
             except Exception as exc:
                 return self._fail(job, f"Library not ready: {exc}")
 
-        source_path = AnimeLibraryService.get_library_path(project.library_type)
+        source_path = AnimeLibraryService.get_library_path(project.media_library)
         if not source_path.exists():
             return self._fail(job, "Source path not found")
 
@@ -278,30 +281,30 @@ class ZoomSearchService:
                 job.message = "Searching…"
                 self._broadcast(job)
 
-                init_success = await loop.run_in_executor(
+                init_success = await wait_for_worker(loop.run_in_executor(
                     heavy_executor(),
                     AnimeMatcherService._init_searcher,
                     source_path,
-                    project.library_type,
-                    project.anime_name,
-                )
+                    project.media_library,
+                    project.media_series_name,
+                ))
                 if not init_success:
                     return self._fail(job, "Failed to initialize anime_searcher")
 
-                outcome = await loop.run_in_executor(
+                outcome = await wait_for_worker(loop.run_in_executor(
                     heavy_executor(),
                     partial(
                         ZoomRematchService.search_scene_sync,
                         video_path,
                         scenes,
-                        project.library_type,
-                        project.anime_name,
+                        project.media_library,
+                        project.media_series_name,
                         scene_index=job.scene_index,
                         existing_match=existing_match,
                         cancel_event=cancel_event,
                         context_matches=matches,
                     ),
-                )
+                ))
 
         if cancel_event.is_set():
             raise asyncio.CancelledError

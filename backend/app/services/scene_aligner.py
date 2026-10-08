@@ -18,6 +18,7 @@ from PIL import Image, ImageFilter, ImageOps
 
 from .executors import heavy_executor
 from ..library_types import LibraryType
+from ..utils.file_tasks import wait_for_worker
 from ..models import AlternativeMatch, MatchCandidate, MatchList, Scene, SceneMatch, SceneList
 from .anime_matcher import AnimeMatcherService, MatchProgress
 
@@ -717,13 +718,13 @@ class SceneAlignerService:
         total = len(scenes.scenes)
         yield MatchProgress("starting", 0.0, "Initializing global aligner...", 0, total)
         loop = asyncio.get_running_loop()
-        init_success = await loop.run_in_executor(
+        init_success = await wait_for_worker(loop.run_in_executor(
             heavy_executor(),
             AnimeMatcherService._init_searcher,
             library_path,
             library_type,
             anime_name,
-        )
+        ))
         if not init_success:
             yield MatchProgress(
                 "error",
@@ -747,7 +748,7 @@ class SceneAlignerService:
             0,
             total,
         )
-        result = await loop.run_in_executor(
+        result = await wait_for_worker(loop.run_in_executor(
             heavy_executor(),
             partial(
                 cls.align_scenes_sync,
@@ -757,7 +758,7 @@ class SceneAlignerService:
                 anime_name,
                 episode_whitelist=episode_whitelist,
             ),
-        )
+        ))
         yield MatchProgress(
             "complete",
             1.0,

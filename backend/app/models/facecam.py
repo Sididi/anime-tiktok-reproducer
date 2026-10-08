@@ -53,10 +53,11 @@ class FacecamFinding(BaseModel):
 class FacecamAutoEditorSettings(BaseModel):
     """Real-voice silence detection; word protection is always enabled."""
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    noise_threshold_db: float = Field(default=-26, ge=-60, le=-15)
+    noise_threshold_db: float = Field(default=-26.0, ge=-60, le=-15)
     min_silence_ms: int = Field(default=120, ge=80, le=1000)
     margin_before_ms: int = Field(default=30, ge=0, le=300)
     margin_after_ms: int = Field(default=50, ge=0, le=500)
+    speed: float = Field(default=1.0, ge=0.9, le=1.5)
 
 
 class FacecamState(BaseModel):

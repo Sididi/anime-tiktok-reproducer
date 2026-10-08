@@ -197,6 +197,7 @@ function startupStatusLabel(job: ProjectStartupJob): string {
     if (job.phase === "download") return "Téléchargement";
     if (job.phase === "scene_detection") return "Découpage";
     if (job.phase === "activation") return "Activation";
+    if (job.phase === "temporary_source") return "Source locale";
     return "Démarrage";
   }
   if (job.status === "complete") {

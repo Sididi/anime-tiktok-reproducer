@@ -1,3 +1,4 @@
+import { usesIdentitySource } from "@/utils/libraryTypes";
 import {
   useEffect,
   useState,
@@ -2718,7 +2719,7 @@ export function MatchValidation() {
                   />
                   Recompute
                 </Button>
-                {project?.library_type !== "pure" && (
+                {!usesIdentitySource(project) && (
                   <RecomputeEpisodesSplitButton
                     proposedCount={proposedEpisodes.length}
                     matching={matching}
@@ -3038,7 +3039,7 @@ export function MatchValidation() {
                       zoomJobsBySceneIndex[scene.index]?.status ?? null
                     }
                     zoomSearchGlow={zoomAlertSceneIndices.has(scene.index)}
-                    hideManualMatch={project?.library_type === "pure"}
+                    hideManualMatch={usesIdentitySource(project)}
                   />
                 </div>
               );
@@ -3159,7 +3160,7 @@ export function MatchValidation() {
       )}
 
       {/* Extensive zoom search: job stream subscription + completion alerts */}
-      {projectId && project?.library_type !== "pure" && (
+      {projectId && !usesIdentitySource(project) && (
         <>
           <ZoomSearchJobsBridge
             projectId={projectId}

@@ -77,6 +77,7 @@ def test_facecam_audio_preserves_every_sample_through_raw_insert_and_scene_joins
     ('noise_threshold_db', -61), ('noise_threshold_db', -14), ('noise_threshold_db', float('nan')),
     ('noise_threshold_db', float('inf')), ('min_silence_ms', 79), ('min_silence_ms', 1001),
     ('margin_before_ms', -1), ('margin_after_ms', 501), ('protect_words', False),
+    ('speed', .89), ('speed', 1.51), ('speed', float('nan')), ('speed', float('inf')),
 ])
 def test_invalid_tuning_is_rejected(field, value):
     with pytest.raises(ValidationError):
@@ -89,7 +90,7 @@ def current_state():
         prepared={'revision': 3, 'fingerprint': 'original', 'auto_editor_signature': settings_signature(settings)})
 
 
-@pytest.mark.parametrize('field,value', [('noise_threshold_db', -32), ('min_silence_ms', 200), ('margin_before_ms', 80), ('margin_after_ms', 140)])
+@pytest.mark.parametrize('field,value', [('noise_threshold_db', -32), ('min_silence_ms', 200), ('margin_before_ms', 80), ('margin_after_ms', 140), ('speed', 1.15)])
 def test_every_setting_invalidates_prepared_audio(field, value):
     state = current_state()
     assert prepared_is_current(state)
@@ -107,6 +108,60 @@ def test_legacy_preview_recording_changes_and_revision_changes_are_stale():
     state = current_state()
     state.revision += 1
     assert not prepared_is_current(state)
+
+
+def test_adding_speed_at_one_keeps_existing_preview_signature():
+    import hashlib
+    import json
+    settings = FacecamAutoEditorSettings()
+    assert settings.speed == 1.0
+    legacy_payload = {'version': 2, 'noise_threshold_db': -26.0, 'min_silence_ms': 120,
+                      'margin_before_ms': 30, 'margin_after_ms': 50}
+    legacy_signature = hashlib.sha256(json.dumps(legacy_payload, sort_keys=True).encode()).hexdigest()[:16]
+    assert settings_signature(settings) == legacy_signature
+    assert settings_signature(FacecamAutoEditorSettings.model_validate_json(settings.model_dump_json())) == legacy_signature
+
+
+def test_speed_one_bypasses_audio_video_and_file_operations(monkeypatch, tmp_path):
+    from app.services import facecam_media_service as media
+    from app.services.audio_speed_service import AudioSpeedService
+    from app.services.processing import ProcessingService
+    def forbidden(*args, **kwargs):
+        pytest.fail('1.0x must never call a media transform or probe')
+    monkeypatch.setattr(AudioSpeedService, 'apply_speed', forbidden)
+    monkeypatch.setattr(media, 'ffmpeg', forbidden)
+    monkeypatch.setattr(ProcessingService, '_probe_wav_duration', forbidden)
+    # Nonexistent paths are intentional: even copying/probing is forbidden here.
+    clean, camera = tmp_path / 'voice.wav', tmp_path / 'facecam.mp4'
+    assert media.FacecamMediaService.apply_speed(clean, camera, tmp_path, 1.0) == (clean, camera, 1.0)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize('speed', [.9, 1.2, 1.5])
+def test_retimed_audio_camera_and_word_clock_share_actual_duration(tmp_path, speed):
+    from types import SimpleNamespace
+    from app.services.facecam_media_service import FacecamMediaService, ffmpeg, probe, camera_segments
+    from app.services.processing import ProcessingService
+    clean, camera = tmp_path / 'voice_clean.wav', tmp_path / 'original.mp4'
+    ffmpeg(['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2', str(clean)])
+    ffmpeg(['-f', 'lavfi', '-i', 'color=c=blue:s=64x96:r=60:d=3', '-an', '-c:v', 'libx264', str(camera)])
+    voice, retimed_camera, scale = FacecamMediaService.apply_speed(clean, camera, tmp_path, speed)
+    voice_duration = ProcessingService._probe_wav_duration(voice)
+    assert abs(voice_duration - 2 / speed) < .05
+    assert scale == voice_duration / 2
+    streams = probe(retimed_camera)['streams']
+    assert len(streams) == 1 and streams[0]['codec_type'] == 'video'
+    assert streams[0]['r_frame_rate'] == '60/1'
+    assert abs(float(streams[0]['duration']) - 3 * scale) <= 1 / 60
+    # A one-second gap from the anime remains one second at every voice speed.
+    playback = [SimpleNamespace(kind='audio', source_start=0, source_end=scale, duration=scale),
+                SimpleNamespace(kind='silence', duration=1),
+                SimpleNamespace(kind='audio', source_start=scale, source_end=2 * scale, duration=scale)]
+    clips = camera_segments([(0, 60), (120, 180)], playback, scale)
+    assert clips == [
+        {'start_frame': 0, 'end_frame': round(scale * 60), 'source_frame': 0},
+        {'start_frame': round((scale + 1) * 60), 'end_frame': round((2 * scale + 1) * 60), 'source_frame': round(2 * scale * 60)},
+    ]
 
 
 def test_facecam_timeline_keeps_first_consonant_margin_and_entire_clean_audio():

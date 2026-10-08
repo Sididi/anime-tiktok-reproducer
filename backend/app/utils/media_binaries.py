@@ -185,6 +185,15 @@ def get_ytdlp_binary() -> str:
     return value
 
 
+def get_ytdlp_js_runtime() -> str | None:
+    """Resolve the managed JS runtime even when pixi's bin isn't on PATH."""
+    for runtime in ("deno", "node"):
+        binary = _find_default_binary(runtime)
+        if binary is not None:
+            return f"{runtime}:{binary}"
+    return None
+
+
 def rewrite_media_command(cmd: Sequence[str]) -> list[str]:
     if not cmd:
         return []

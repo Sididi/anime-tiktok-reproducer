@@ -20,7 +20,7 @@ import spacy
 
 from .executors import heavy_executor, run_heavy
 from ..config import settings
-from ..library_types import LibraryType
+from ..library_types import LibraryType, LocalLibrary
 from ..models import MatchList, Project, Transcription, SceneMatch
 from ..models.cleanup import CleanFeedRect
 from ..models.transcription import Word, SceneTranscription
@@ -457,7 +457,7 @@ class ProcessingService:
         )
 
         # Reupload to storage box so the fix persists remotely.
-        if StorageBoxRepository.is_enabled() and library_type is not None:
+        if not isinstance(library_type, LocalLibrary) and StorageBoxRepository.is_enabled() and library_type is not None:
             try:
                 series_dir = source_path.parent
                 metadata = StorageBoxRepository.read_local_series_metadata(series_dir)
@@ -1147,7 +1147,7 @@ class ProcessingService:
         resolved_scene_sources = resolved_scene_sources or cls.resolve_scene_sources(
             matches,
             source_rate,
-            library_type=project.library_type,
+            library_type=project.media_library,
         )
 
         calculator = OTIOTimingCalculator(
@@ -1286,7 +1286,7 @@ class ProcessingService:
             template.overlay.category.enabled
             and str(template.overlay.category.text or overlay.get("category", "")).strip()
         )
-        is_pure = project.library_type == LibraryType.PURE
+        is_pure = project.uses_identity_source
         clean_feed_rect: CleanFeedRect | None = (
             project.cleanup.clean_feed_rect if project.cleanup else None
         )
@@ -1525,7 +1525,7 @@ class ProcessingService:
         Recomputes the same entry the JSX generation produced, so the border
         slab and overlay anchors always match the timeline geometry.
         """
-        if project.library_type != LibraryType.PURE or not source_dimensions:
+        if not project.uses_identity_source or not source_dimensions:
             return None
         clean_feed_rect = project.cleanup.clean_feed_rect if project.cleanup else None
         if clean_feed_rect is None:
@@ -2901,13 +2901,13 @@ class ProcessingService:
                 resuming_after_duration_warning = True
         source_fps = await cls.detect_first_source_fps(
             matches,
-            library_type=project.library_type,
+            library_type=project.media_library,
         )
         source_rate = cls._build_source_rate(source_fps)
         playback_scene_sources = cls.resolve_scene_sources(
             matches,
             source_rate,
-            library_type=project.library_type,
+            library_type=project.media_library,
         )
 
         if resuming_after_gaps:
@@ -3139,7 +3139,7 @@ class ProcessingService:
                 # Skip this check if gaps were already resolved in a previous run
                 gaps_already_resolved = cls.check_gaps_resolved(project.id)
 
-                is_pure = project.library_type == LibraryType.PURE
+                is_pure = project.uses_identity_source
 
                 if gaps_already_resolved or (project.project_mode == "facecam" and facecam_state.selected_story_id):
                     # User already resolved/skipped gaps in a previous run
@@ -3217,13 +3217,13 @@ class ProcessingService:
                         candidates_by_scene = await GapResolutionService.generate_candidates_batch_dedup(
                             gaps,
                             matches=matches,
-                            library_type=project.library_type,
+                            library_type=project.media_library,
                         )
                         selection_result = await GapResolutionService.select_autofill_candidates_overlap_aware(
                             matches=matches,
                             gaps=gaps,
                             candidates_by_scene=candidates_by_scene,
-                            library_type=project.library_type,
+                            library_type=project.media_library,
                         )
 
                         for gap in gaps:
@@ -3259,7 +3259,7 @@ class ProcessingService:
                             project.id,
                             gaps,
                             matches,
-                            project.library_type,
+                            project.media_library,
                         )
 
                         # Backup current matches before gap resolution modifies them
@@ -3293,7 +3293,7 @@ class ProcessingService:
             playback_scene_sources = cls.resolve_scene_sources(
                 matches,
                 source_rate,
-                library_type=project.library_type,
+                library_type=project.media_library,
             )
             try:
                 required_source_paths = cls._collect_required_source_paths(
@@ -3304,12 +3304,12 @@ class ProcessingService:
                 # Storage Box). Refresh once and re-resolve before giving up.
                 await AnimeLibraryService.ensure_episode_manifest(
                     force_refresh=True,
-                    library_type=project.library_type,
+                    library_type=project.media_library,
                 )
                 playback_scene_sources = cls.resolve_scene_sources(
                     matches,
                     source_rate,
-                    library_type=project.library_type,
+                    library_type=project.media_library,
                 )
                 required_source_paths = cls._collect_required_source_paths(
                     playback_scene_sources,
@@ -3363,7 +3363,7 @@ class ProcessingService:
                         await cls._fix_premiere_incompatible_audio_in_place(
                             resolved_source_path,
                             probe=pre_probe,
-                            library_type=project.library_type,
+                            library_type=project.media_library,
                         )
 
                     audio_policy = await asyncio.to_thread(
@@ -3485,7 +3485,7 @@ class ProcessingService:
             resolved_scene_sources = cls.resolve_scene_sources(
                 matches,
                 source_rate,
-                library_type=project.library_type,
+                library_type=project.media_library,
             )
 
             # Step 4: Generate JSX script from canonical v7.8 template

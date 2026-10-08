@@ -11,6 +11,8 @@ Resolution ladder, cheapest first:
 3. Hashing the file now, then recording it in the central cache.
 
 All methods are synchronous; callers wrap them in ``run_heavy``.
+Project-owned temporary sources bypass this ladder and keep a relative-path
+cache under their own temporary_source directory, removed with the project.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import settings
+from .atomic_files import write_text_atomic
 from .storage_box_repository import (
     HASH_CACHE_FILENAME,
     LOCAL_STORAGE_BOX_METADATA,
@@ -115,6 +118,35 @@ class SourceHashService:
     def sha256_for(cls, path: Path) -> str:
         path = Path(path)
         size, mtime_ns, inode_key = cls._stat_signature(path)
+
+        # A temporary source owns its hash cache too. Relative keys also let
+        # independent duplicates reuse hashes without retaining parent paths.
+        try:
+            parts = path.resolve().relative_to(settings.projects_dir.resolve()).parts
+        except ValueError:
+            parts = ()
+        if len(parts) > 2 and parts[1] == "temporary_source":
+            cache_path = settings.projects_dir / parts[0] / "temporary_source" / "hashes.json"
+            key = str(Path(*parts[2:]))
+            def load_cache():
+                try:
+                    value = json.loads(cache_path.read_text())
+                    return value if isinstance(value, dict) else {}
+                except (OSError, ValueError):
+                    return {}
+            with _lock:
+                cached = cls._entry_matches(load_cache().get(key), size, mtime_ns)
+            if cached:
+                return cached
+            digest = _sha256_file(path)
+            with _lock:
+                payload = load_cache()
+                payload[key] = {"sha256": digest, "size": size, "mtime_ns": mtime_ns}
+                try:
+                    write_text_atomic(cache_path, json.dumps(payload), create_parent=False)
+                except FileNotFoundError:
+                    pass  # Deletion won the race; never recreate the project.
+            return digest
 
         cached = cls._series_cache_lookup(path, size, mtime_ns)
         if cached:
