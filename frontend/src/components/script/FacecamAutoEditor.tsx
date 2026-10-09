@@ -9,9 +9,9 @@ const controls: {key: keyof FacecamAutoEditorSettings; label: string; help: stri
   {key: 'margin_after_ms', label: 'Marge après la parole', help: 'Temps conservé après la fin de la voix.', min: 0, max: 500, step: 10, unit: 'ms'},
 ];
 
-export function FacecamAutoEditor({value, defaults, disabled, pending, onChange}: {
+export function FacecamAutoEditor({value, defaults, disabled, pending, automatic = false, onChange}: {
   value: FacecamAutoEditorSettings; defaults: FacecamAutoEditorSettings;
-  disabled: boolean; pending: boolean; onChange: (value: FacecamAutoEditorSettings) => void;
+  disabled: boolean; pending: boolean; automatic?: boolean; onChange: (value: FacecamAutoEditorSettings) => void;
 }) {
   return <div className="facecam-auto-editor">
     <div className="facecam-auto-editor-heading">
@@ -35,6 +35,8 @@ export function FacecamAutoEditor({value, defaults, disabled, pending, onChange}
         ? '1,00× : vitesse originale, aucun traitement de vitesse.'
         : 'La voix et la caméra changent de vitesse ensemble. La hauteur de la voix est conservée.'}</small>
     </label>
-    <p role="status">{pending ? 'Réglages modifiés : préparez l’aperçu audio pour les enregistrer et recalculer les coupes.' : 'Ces réglages sont enregistrés avec le projet lors de la préparation de l’aperçu audio.'}</p>
+    <p role="status">{automatic
+      ? pending ? 'Réglages modifiés : mise à jour automatique de l’aperçu audio…' : 'L’aperçu audio se met à jour automatiquement quand vous modifiez les coupes, la vitesse ou la musique.'
+      : pending ? 'Réglages modifiés : préparez l’aperçu audio pour les enregistrer et recalculer les coupes.' : 'Préparez un premier aperçu audio pour activer sa mise à jour automatique.'}</p>
   </div>;
 }

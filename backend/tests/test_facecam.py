@@ -378,7 +378,7 @@ def test_phone_stream_offsets_are_preserved_in_silent_camera_and_voice(source,mo
         '-filter_complex',"[0:v]drawbox=color=white:t=fill:enable='gte(t,0.2)'[v];[1:a]asetpts=PTS+0.2/TB[a]",
         '-map','[v]','-map','[a]','-c:v','libx264','-c:a','pcm_s16le',str(upload)])
     monkeypatch.setattr(TranscriberService,'model_session',lambda:contextlib.nullcontext())
-    monkeypatch.setattr(TranscriberService,'_transcribe_sync',lambda *a:([{'text':state.spoken_text()}],'fr'))
+    monkeypatch.setattr(TranscriberService,'_transcribe_sync',lambda *a:([{'text':state.spoken_text(),'start':.2,'end':1.2}],'fr'))
     result=FacecamMediaService.ingest(project.id,upload)
     root=Path(result.recording['directory'])
     assert len(probe(root/'facecam.mp4')['streams'])==1
@@ -389,6 +389,31 @@ def test_phone_stream_offsets_are_preserved_in_silent_camera_and_voice(source,mo
     assert abs(onset-0.2)<=1/60
     assert result.recording['reviewed_revision']==state.revision
     assert (root/'original.mov').exists()
+    # An identical take reuses both extracted streams and the speech analysis.
+    import shutil
+    from app.services import facecam_media_service as media
+    source_mtime=(root/'voice.wav').stat().st_mtime_ns
+    shutil.copy2(root/'original.mov',upload)
+    def forbidden(*args,**kwargs):
+        pytest.fail('Reimporting identical bytes must reuse the extracted audio and speech timing')
+    monkeypatch.setattr(media,'ffmpeg',forbidden)
+    monkeypatch.setattr(TranscriberService,'_transcribe_sync',forbidden)
+    again=FacecamMediaService.ingest(project.id,upload)
+    assert again.recording['fingerprint']==result.recording['fingerprint']
+    assert (root/'voice.wav').stat().st_mtime_ns==source_mtime
+    # A changed take gets a new cache and must extract its own audio.
+    shutil.copy2(root/'original.mov',upload)
+    with upload.open('ab') as stream: stream.write(b'new take')
+    calls=[]
+    def track(args):
+        calls.append(args)
+        return ffmpeg(args)
+    monkeypatch.setattr(media,'ffmpeg',track)
+    monkeypatch.setattr(TranscriberService,'_transcribe_sync',lambda *a:([{'text':state.spoken_text(),'start':.2,'end':1.2}],'fr'))
+    changed=FacecamMediaService.ingest(project.id,upload)
+    assert changed.recording['fingerprint']!=result.recording['fingerprint']
+    assert len(calls)==2
+    assert Path(calls[0][-1]).name=='voice.tmp.wav'
 
 
 @pytest.mark.parametrize('retimed', [False, True])
@@ -520,12 +545,12 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     FacecamService.update(project.id,{'recording':{'fingerprint':'test','directory':str(root),'reviewed_revision':state.revision},
         'auto_editor':FacecamAutoEditorSettings(speed=speed)})
     # Source timing/cuts are always at native speed. Only the subsequent audio
-    # and camera clocks change, before alignment and native raw-dialogue inserts.
+    # and camera clocks change, after source alignment and before raw-dialogue inserts.
     clean_duration=2/speed
     if speed!=1.0:
         def retime(clean,camera,work,requested):
             assert requested==speed
-            voice=work/'voice_speed.wav';video=work/'facecam.mp4';video.write_bytes(b'retimed')
+            voice=work/'voice_speed.wav';video=work/'facecam.mp4'
             with wave.open(str(clean)) as src,wave.open(str(voice),'wb') as dst:
                 dst.setparams(src.getparams());dst.writeframes(src.readframes(round(clean_duration*48000)))
             return voice,video,1/speed
@@ -535,7 +560,7 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     narrated=[s for s in aligned.scenes if not s.is_raw]
     assigned={a['scene_index']:a['text'] for a in state.assignment}
     for index,scene in enumerate(narrated):
-        text=assigned[scene.scene_index];words=text.split();start=index*clean_duration/len(narrated);end=(index+1)*clean_duration/len(narrated)
+        text=assigned[scene.scene_index];words=text.split();start=index*2/len(narrated);end=(index+1)*2/len(narrated)
         scene.text=text;scene.start_time=start;scene.end_time=end
         scene.words=[Word(text=w,start=start+(end-start)*i/len(words),end=start+(end-start)*(i+1)/len(words)) for i,w in enumerate(words)]
     align_calls=[]
@@ -543,7 +568,8 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
         align_calls.append(kwargs['edited_audio_path'])
         assert kwargs['manifest']['mode']=='single_audio'
         assert all(part['text'] for part in kwargs['manifest']['segments'])
-        assert kwargs['edited_audio_path'].name==('voice_speed.wav' if speed!=1.0 else 'voice_clean.wav')
+        assert kwargs['edited_audio_path'] == root/'voice.wav'
+        assert kwargs['coarse_words'] == [{'start':0,'end':2,'text':'Voix'}]
         return SimpleNamespace(transcription=aligned,report={"status":"complete"})
     monkeypatch.setattr(ForcedAlignmentService,'_align_single_audio',align)
     monkeypatch.setattr(TranscriberService,'model_session',lambda:contextlib.nullcontext())
@@ -564,14 +590,14 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     assert result.prepared['scenes'][-1]['duration_frames']==60
     assert FacecamMediaService.prepare(project.id).prepared==result.prepared
     assert len(align_calls)==1
-    # Changing only the tuning must rebuild audio/alignment/camera without a new
+    # Changing only the tuning must rebuild audio using cached alignment without a new
     # recording, script revision, approval, or discrepancy review.
     stale_processing=ProcessingService.get_output_dir(project.id)/'processing_state.json'
     stale_processing.parent.mkdir(exist_ok=True)
     stale_processing.write_text('{}')
     FacecamService.update(project.id,{'auto_editor':FacecamAutoEditorSettings(min_silence_ms=200,speed=speed)})
     updated=FacecamMediaService.prepare(project.id)
-    assert len(align_calls)==2
+    assert len(align_calls)==1
     assert not stale_processing.exists()
     assert updated.revision==result.revision
     assert updated.approved_revision==result.approved_revision
@@ -580,6 +606,9 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     assert updated.prepared['auto_editor_signature']!=result.prepared['auto_editor_signature']
     assert updated.prepared['cut_report']['clipped_word_count']==0
     assert (work/'narration.wav').is_file()
+    changed_state=updated.model_copy(deep=True)
+    changed_state.assignment[0]['text']='Un autre texte.'
+    assert FacecamMediaService.alignment_cache(project.id,changed_state)!=FacecamMediaService.alignment_cache(project.id,updated)
 
 
 def test_facecam_schedule_requires_explicit_account_optin(source,monkeypatch):

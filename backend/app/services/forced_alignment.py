@@ -506,12 +506,15 @@ class ForcedAlignmentService:
         align_language: str,
         coarse_model_size: str,
         output_dir: Path,
+        coarse_words: list[dict[str, Any]] | None = None,
     ) -> ForcedAlignmentResult:
-        coarse_words, coarse_language = TranscriberService._transcribe_sync(
-            edited_audio_path,
-            align_language,
-            coarse_model_size,
-        )
+        coarse_language = align_language
+        if coarse_words is None:
+            coarse_words, coarse_language = TranscriberService._transcribe_sync(
+                edited_audio_path,
+                align_language,
+                coarse_model_size,
+            )
         align_language = cls._resolve_alignment_language(coarse_language or align_language)
         alignment_model, alignment_metadata, align_device = cls._load_alignment_backend(
             align_language

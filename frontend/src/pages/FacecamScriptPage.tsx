@@ -9,7 +9,8 @@ import { FacecamStories } from '@/components/script/FacecamStories';
 import { FacecamPrompter } from '@/components/script/FacecamPrompter';
 import { FacecamAutoEditor } from '@/components/script/FacecamAutoEditor';
 import { MetadataEditorModal } from '@/components/script/MetadataEditorModal';
-import { DEFAULT_FACECAM_AUTO_EDITOR, facecamRequest, sameAutoEditorSettings, uploadFacecam, type FacecamAutoEditorSettings, type FacecamBlock, type FacecamState, type Finding } from '@/api/facecam';
+import { DEFAULT_FACECAM_AUTO_EDITOR, facecamRequest, uploadFacecam, type FacecamAutoEditorSettings, type FacecamBlock, type FacecamState, type Finding } from '@/api/facecam';
+import { useFacecamPreview } from '@/hooks/useFacecamPreview';
 import type { PlatformMetadata, Project } from '@/types';
 import './facecam.css';
 
@@ -23,7 +24,6 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const [hook, setHook] = useState(''), [opinion, setOpinion] = useState(''), [stage, setStage] = useState<'hooks' | 'opinions'>('hooks');
   const [finding, setFinding] = useState<Finding | null>(null), [covers, setCovers] = useState<Cover[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null), [upload, setUpload] = useState<number | null>(null);
-  const [autoEditorDraft, setAutoEditorDraft] = useState<FacecamAutoEditorSettings | null>(null);
   const [metadata, setMetadata] = useState<PlatformMetadata | null>(null), [metadataOpen, setMetadataOpen] = useState(false);
   const [delivery, setDelivery] = useState<{status: string} | null>(project.facecam_delivery ?? null);
   const [sourceOpen, setSourceOpen] = useState(false), [sourceLoaded, setSourceLoaded] = useState(false);
@@ -42,7 +42,6 @@ export function FacecamScriptPage({project}: {project: Project}) {
   }
   const dialog = useRef<HTMLDialogElement>(null), draft = useRef<FacecamBlock[]>([]), editVersion = useRef(0), savedVersion = useRef(0);
   const savePromise = useRef<Promise<void> | null>(null), saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const busy = working || state?.job?.status === 'processing';
   const currentRevision = state?.revision ?? 0;
   const approved = state?.approved_revision === currentRevision && !!state?.blocks.length && saved;
   const apply = useCallback((next: FacecamState) => {
@@ -51,6 +50,10 @@ export function FacecamScriptPage({project}: {project: Project}) {
     const merged = dirty ? {...next, blocks: draft.current} : next;
     stateRef.current = merged; draft.current = merged.blocks; setState(merged);
   }, []);
+  const saveMusic = useCallback((music_key: string | null) => setSettings(previous => previous ? {...previous, music_key} : previous), []);
+  const preview = useFacecamPreview({id, state, musicKey: settings?.music_key ?? null, settingsLoaded: !!settings,
+    approved, working, apply, saveMusic, onError: setError});
+  const busy = working || preview.requestBusy || state?.job?.status === 'processing';
   const loadMetadata = useCallback(async () => {
     const response = await fetch(`/api/projects/${id}/metadata`);
     if (response.ok) {const result = await response.json(); setMetadata(result.metadata);}
@@ -112,27 +115,12 @@ export function FacecamScriptPage({project}: {project: Project}) {
     try {setSettings(await facecamRequest<Settings>(id, '/settings', 'PUT', {[key]: value}));}
     catch(e) {setError((e as Error).message);} finally {setWorking(false);}
   }
-  async function preparePreview() {
-    setWorking(true); setError('');
-    try {
-      await flush();
-      const current = stateRef.current;
-      const next = await facecamRequest(id, '/preview', 'POST', {
-        revision: current?.revision, auto_editor: autoEditorDraft ?? current?.auto_editor ?? DEFAULT_FACECAM_AUTO_EDITOR,
-      });
-      apply(next); setAutoEditorDraft(null);
-    } catch (e) {setError((e as Error).message);} finally {setWorking(false);}
-  }
   if (!state) return <div className="p-8">{error || 'Chargement de Facecam…'}</div>;
   const visibleFindings = state.fact_revision === state.revision && saved ? state.findings : [];
   const options = stage === 'hooks' ? state.hooks : state.opinions;
   const selection = stage === 'hooks' ? hook : opinion;
   const select = stage === 'hooks' ? setHook : setOpinion;
-  const autoEditor = {...DEFAULT_FACECAM_AUTO_EDITOR, ...(autoEditorDraft ?? state.auto_editor)};
-  const autoEditorDirty = !sameAutoEditorSettings(autoEditor, state.auto_editor ?? DEFAULT_FACECAM_AUTO_EDITOR);
-  const previewReady = approved && !!state.prepared?.preview_version && !!state.prepared?.auto_editor_signature
-    && state.prepared.revision === state.revision && state.prepared.fingerprint === state.recording?.fingerprint
-    && state.prepared.preview_music_key === settings?.music_key && sameAutoEditorSettings(autoEditor, state.prepared.auto_editor);
+  const previewReady = preview.previewReady;
   const storyReady = !!state.selected_story_id || (!state.stories?.length && state.blocks.length > 0);
   const wordCount = state.blocks.filter(b => b.kind !== 'raw').reduce((n, b) => n + (b.text.trim() ? b.text.trim().split(/\s+/).length : 0), 0);
   return <main className="facecam-page">
@@ -188,16 +176,16 @@ export function FacecamScriptPage({project}: {project: Project}) {
           <p className="text-sm">Modifiez le script si votre lecture a changé, ou acceptez les écarts de transcription après écoute.</p>
         </div></div>}
       {state.recording && <>
-        <FacecamAutoEditor value={autoEditor} defaults={settings?.auto_editor_defaults ?? DEFAULT_FACECAM_AUTO_EDITOR} disabled={!!busy}
-          pending={autoEditorDirty} onChange={setAutoEditorDraft}/>
-        <div className="mt-5 flex flex-wrap items-center gap-4"><Button disabled={busy || !approved || state.recording.reviewed_revision !== state.revision} onClick={() => void preparePreview()}>Préparer l’aperçu audio</Button>{previewReady && <audio key={state.prepared?.preview_version} controls aria-label="Aperçu audio Facecam" src={`/api/projects/${id}/facecam/preview?r=${state.revision}&v=${state.prepared?.preview_version}`} preload="metadata"/>}</div>
+        <FacecamAutoEditor value={preview.tuning} defaults={settings?.auto_editor_defaults ?? DEFAULT_FACECAM_AUTO_EDITOR} disabled={preview.controlsDisabled}
+          pending={preview.pending} automatic={preview.enabled} onChange={preview.changeTuning}/>
+        <div className="mt-5 flex flex-wrap items-center gap-4"><Button disabled={busy || !settings || !approved || state.recording.reviewed_revision !== state.revision} onClick={preview.prepare}>Préparer l’aperçu audio</Button>{previewReady && <audio key={state.prepared?.preview_version} controls aria-label="Aperçu audio Facecam" src={`/api/projects/${id}/facecam/preview?r=${state.revision}&v=${state.prepared?.preview_version}`} preload="metadata"/>}</div>
       </>}
       {previewReady && state.prepared?.cut_report && <p>{state.prepared.cut_report.removed_seconds.toFixed(1)} s de pauses retirées · {state.prepared.cut_report.cut_count} coupes · {state.prepared.cut_report.protected_word_count} mots protégés.</p>}
       {previewReady && state.prepared?.duration_seconds != null && <p>Durée montée, carte finale comprise : {state.prepared.duration_seconds.toFixed(1)} s.
         {state.prepared.duration_seconds <= 60 ? ' Le montage ne dépasse pas encore une minute : ajustez le récit et enregistrez une nouvelle prise.' : state.prepared.duration_seconds > 70 ? ' Le montage dépasse la cible de 65–70 s.' : ''}</p>}
     </section>
     <section className="facecam-card"><h2>Finition et publication</h2><div className="facecam-settings">
-      {settings && <><label>Musique<select disabled={busy} value={settings.music_key || ''} onChange={e => void updateSetting('music_key', e.target.value)}>{settings.music.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label></>}
+      {settings && <><label>Musique<select aria-label="Musique" disabled={preview.controlsDisabled} value={preview.selectedMusic || ''} onChange={e => preview.changeMusic(e.target.value)}>{settings.music.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label><p>La musique est incluse dans l’aperçu audio.</p></>}
       <div><h3>Couverture finale</h3><p>Récupérée automatiquement au traitement. Vous pouvez aussi la choisir ici.</p><div className="flex gap-3 flex-wrap"><Button variant="outline" disabled={busy} onClick={() => {setError(''); facecamRequest<Cover[]>(id, '/covers').then(setCovers).catch(e => setError(e.message));}}>Choisir la couverture</Button><label className="facecam-file-button">Importer une image<input type="file" accept="image/jpeg,image/png,image/webp" disabled={busy} onChange={e => {const file=e.target.files?.[0]; if(file) void importFile(file,'cover');}}/></label></div>
       {state.cover && <img className="facecam-cover-preview" src={`/api/projects/${id}/facecam/cover?v=${JSON.stringify(state.cover)}`} alt="Couverture et titre de l’anime"/>}</div>
     </div>

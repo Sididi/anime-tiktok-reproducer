@@ -29,6 +29,7 @@ export interface FacecamState {
   fact_context?: {padding_seconds: number; episodes: {episode: string; status: 'available' | 'partial' | 'unavailable'; language: string | null; note: string | null; windows: {start: string; end: string}[]; cues: {id: string; start: string; end: string; text: string; source_url: string}[]}[]} | null;
   recording: {fingerprint: string; duration: number; transcript: string; differences: {kind: string; expected: string; spoken: string}[]; reviewed_revision: number | null} | null;
   auto_editor?: FacecamAutoEditorSettings;
+  preview_enabled?: boolean;
   prepared: {revision: number; fingerprint: string; preview_music_key?: string | null; preview_version?: string; duration_seconds?: number;
     auto_editor?: FacecamAutoEditorSettings; auto_editor_signature?: string;
     cut_report?: {removed_seconds: number; cut_count: number; protected_word_count: number; clipped_word_count: number};

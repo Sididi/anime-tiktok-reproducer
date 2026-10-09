@@ -1,10 +1,13 @@
 import {test,expect,type Page} from '@playwright/test';
 import {DEFAULT_FACECAM_AUTO_EDITOR, type FacecamState, type FacecamStory} from '../src/api/facecam';
 
-async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean}) {
+async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean}) {
   const id='facecam-browser';
   let checks=0,saves=0,analyses=0;
-  let preset='gpt';
+  let preset='gpt',music='music';
+  let finishPreview: (() => void) | undefined, releaseJob: (() => void) | undefined;
+  let jobDone = Promise.resolve();
+  let conflictingRequests=0;
   const analysisPresets:string[]=[];
   const previews: {revision: number; auto_editor: typeof DEFAULT_FACECAM_AUTO_EDITOR}[]=[];
   let state:FacecamState={revision:1,approved_revision:null,selected_hook:'Imagine ce ninja.',selected_opinion:'Ce choix est intéressant.',
@@ -18,23 +21,46 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
     recording:{fingerprint:'take-1',duration:77,transcript:'Imagine ce ninja.',differences:[],reviewed_revision:state.revision},
     prepared:{revision:state.revision,fingerprint:'take-1',preview_music_key:'music',preview_version:'original',
       ...(options.legacyPreview?{}:{auto_editor:{...DEFAULT_FACECAM_AUTO_EDITOR},auto_editor_signature:'signature-0'})}};
+  if(options?.noPreview) state={...state,prepared:null};
+  if(options?.unreviewed && state.recording) state={...state,preview_enabled:true,prepared:null,recording:{...state.recording,reviewed_revision:null}};
   await page.route(url=>url.pathname.startsWith('/api/'),async route=>{
     const path=new URL(route.request().url()).pathname.replace(`/api/projects/${id}`,'');
     const json=(body:unknown)=>route.fulfill({json:body});
     if(path==='')return json({id,anime_name:'Naruto',project_mode:'facecam',library_type:'anime',phase:'script_restructure',source_paths:[]});
     if(path==='/facecam')return json(state);
+    if(path==='/facecam/recording/review' && state.recording) {
+      state={...state,recording:{...state.recording,reviewed_revision:state.revision}};
+      return json(state);
+    }
     if(path==='/facecam/settings'){
-      if(route.request().method()==='PUT') preset=route.request().postDataJSON().llm_preset??preset;
-      return json({llm_preset:preset,music_key:'music',models:[{key:'gpt',label:'GPT'},{key:'gemini',label:'Gemini'}],music:[{key:'music',label:'Musique'}],auto_editor_defaults:DEFAULT_FACECAM_AUTO_EDITOR});
+      if(route.request().method()==='PUT') {
+        if(state.job?.status==='processing') {conflictingRequests++;return route.fulfill({status:409,json:{detail:'Busy'}});}
+        const data=route.request().postDataJSON();preset=data.llm_preset??preset;music=data.music_key??music;
+      }
+      return json({llm_preset:preset,music_key:music,models:[{key:'gpt',label:'GPT'},{key:'gemini',label:'Gemini'}],music:[{key:'music',label:'Musique'},{key:'other',label:'Autre musique'}],auto_editor_defaults:DEFAULT_FACECAM_AUTO_EDITOR});
     }
     if(path==='/facecam/preview'&&route.request().method()==='POST'){
+      if(state.job?.status==='processing') {conflictingRequests++;return route.fulfill({status:409,json:{detail:'Busy'}});}
       const data=route.request().postDataJSON();previews.push(data);
       if(options?.failPreview) return route.fulfill({status:503,json:{detail:'Analyse audio indisponible. Réessayez.'}});
       expect(data.revision).toBe(state.revision);
-      state={...state,auto_editor:data.auto_editor,prepared:{revision:state.revision,fingerprint:'take-1',
-        auto_editor:data.auto_editor,auto_editor_signature:`signature-${previews.length}`,preview_music_key:'music',preview_version:`preview-${previews.length}`,
-        cut_report:{removed_seconds:13.4,cut_count:26,protected_word_count:221,clipped_word_count:0}}};
+      const snapshotMusic=music,version=previews.length;
+      state={...state,auto_editor:data.auto_editor,preview_enabled:true};
+      finishPreview=()=>{
+        state={...state,job:{status:'complete'},prepared:{revision:state.revision,fingerprint:'take-1',
+          auto_editor:data.auto_editor,auto_editor_signature:`signature-${version}`,preview_music_key:snapshotMusic,preview_version:`preview-${version}`,
+          cut_report:{removed_seconds:13.4,cut_count:26,protected_word_count:221,clipped_word_count:0}}};
+        releaseJob?.();
+      };
+      if(options?.delayedPreview) {
+        jobDone=new Promise<void>(resolve=>{releaseJob=resolve;});
+        state={...state,job:{status:'processing',step:"Préparation de la voix et de l'aperçu"}};
+      } else finishPreview();
       return json(state);
+    }
+    if(path==='/facecam/events'){
+      await jobDone;
+      return route.fulfill({contentType:'text/event-stream',body:`data: ${JSON.stringify(state)}\n\n`});
     }
     if(path==='/metadata')return json({metadata:null});
     if(path==='/facecam/stories/analyze'){
@@ -58,7 +84,7 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
   });
   await page.goto(`/project/${id}/script`);
   await expect(page.getByRole('heading',{name:'Naruto',exact:true})).toBeVisible();
-  return {analysisPresets,previews,get state(){return state;},get saves(){return saves;},get checks(){return checks;},get analyses(){return analyses;}};
+  return {analysisPresets,previews,completePreview:()=>finishPreview?.(),get conflictingRequests(){return conflictingRequests;},get state(){return state;},get saves(){return saves;},get checks(){return checks;},get analyses(){return analyses;}};
 }
 
 test('autoeditor tweaks regenerate preview and persist without invalidating script or recording',async({page})=>{
@@ -70,7 +96,6 @@ test('autoeditor tweaks regenerate preview and persist without invalidating scri
   for(const [label,value] of controls) await page.getByRole('slider',{name:label,exact:true}).fill(value);
   await expect(process).toBeDisabled();
   await expect(page.getByText('Réglages modifiés :',{exact:false})).toBeVisible();
-  await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
   await expect(process).toBeEnabled();
   expect(f.previews).toEqual([{revision:1,auto_editor:{noise_threshold_db:-24,min_silence_ms:160,margin_before_ms:40,margin_after_ms:70,speed:1.0}}]);
   expect(f.state.revision).toBe(1);
@@ -83,7 +108,6 @@ test('autoeditor tweaks regenerate preview and persist without invalidating scri
   await expect(process).toBeEnabled();
   await page.getByRole('button',{name:'Rétablir le rythme rapide'}).click();
   await expect(process).toBeDisabled();
-  await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
   await expect(process).toBeEnabled();
   expect(f.previews[1].auto_editor).toEqual(DEFAULT_FACECAM_AUTO_EDITOR);
   await expect(page.getByLabel('Aperçu audio Facecam')).toHaveAttribute('src',/preview-2$/);
@@ -92,12 +116,15 @@ test('autoeditor tweaks regenerate preview and persist without invalidating scri
 test('failed preview keeps pending tuning available for retry',async({page})=>{
   const f=await fixture(page,{recording:true,failPreview:true});
   await page.getByRole('slider',{name:'Seuil de silence',exact:true}).fill('-30');
-  await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
   await expect(page.getByRole('alert').filter({visible:true})).toContainText('Analyse audio indisponible. Réessayez.');
   await expect(page.getByRole('slider',{name:'Seuil de silence',exact:true})).toHaveValue('-30');
   await expect(page.getByRole('button',{name:'Passer au traitement'})).toBeDisabled();
   await expect(page.getByRole('button',{name:'Préparer l’aperçu audio'})).toBeEnabled();
   expect(f.previews).toHaveLength(1);
+  await page.waitForTimeout(650);
+  expect(f.previews).toHaveLength(1); // No automatic retry loop on failure.
+  await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
+  await expect.poll(()=>f.previews.length).toBe(2);
 });
 
 test('legacy preview requires regeneration with protected word cuts',async({page})=>{
@@ -107,7 +134,7 @@ test('legacy preview requires regeneration with protected word cuts',async({page
   await expect(page.getByRole('button',{name:'Passer au traitement'})).toBeEnabled();
 });
 
-test('voice speed defaults to one and is applied only when preparing the preview',async({page})=>{
+test('voice speed changes and returning to one automatically regenerate an existing preview',async({page})=>{
   const f=await fixture(page,{recording:true});
   const speed=page.getByRole('slider',{name:'Vitesse de la voix',exact:true});
   const process=page.getByRole('button',{name:'Passer au traitement'});
@@ -115,20 +142,78 @@ test('voice speed defaults to one and is applied only when preparing the preview
   await expect(page.getByText('1,00× : vitesse originale, aucun traitement de vitesse.')).toBeVisible();
   await expect(process).toBeEnabled();
   await speed.fill('1.15');
-  expect(f.previews).toHaveLength(0);
-  expect(f.state.auto_editor?.speed).toBe(1);
   await expect(process).toBeDisabled();
-  await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
   await expect(process).toBeEnabled();
   expect(f.previews[0].auto_editor.speed).toBe(1.15);
   await page.reload();
   await expect(speed).toHaveValue('1.15');
   await speed.fill('1');
   await expect(process).toBeDisabled();
-  await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
   await expect(process).toBeEnabled();
   expect(f.previews[1].auto_editor.speed).toBe(1);
   await expect(page.getByText('1,00× : vitesse originale, aucun traitement de vitesse.')).toBeVisible();
+});
+
+test('first preview requires a click, then speed, cuts and music regenerate automatically',async({page})=>{
+  const f=await fixture(page,{recording:true,noPreview:true});
+  await page.getByRole('slider',{name:'Vitesse de la voix',exact:true}).fill('1.15');
+  await page.getByLabel('Musique',{exact:true}).selectOption('other');
+  await page.waitForTimeout(650);
+  expect(f.previews).toHaveLength(0);
+  await page.getByRole('button',{name:'Préparer l’aperçu audio'}).click();
+  await expect(page.getByLabel('Aperçu audio Facecam')).toBeVisible();
+  expect(f.previews[0].auto_editor.speed).toBe(1.15);
+  expect(f.state.prepared?.preview_music_key).toBe('other');
+  await page.getByLabel('Musique',{exact:true}).selectOption('music');
+  await expect.poll(()=>f.previews.length).toBe(2);
+  await expect(page.getByLabel('Aperçu audio Facecam')).toHaveAttribute('src',/preview-2$/);
+  expect(f.state.prepared?.preview_music_key).toBe('music');
+  await page.getByRole('slider',{name:'Seuil de silence',exact:true}).fill('-29');
+  await expect.poll(()=>f.previews.length).toBe(3);
+});
+
+test('edits during preview generation coalesce and never overwrite the latest controls',async({page})=>{
+  const f=await fixture(page,{recording:true,delayedPreview:true});
+  const speed=page.getByRole('slider',{name:'Vitesse de la voix',exact:true});
+  await speed.fill('1.15');
+  await expect.poll(()=>f.previews.length).toBe(1);
+  await expect(speed).toBeEnabled();
+  await speed.fill('1.3');
+  await speed.fill('1'); // Return to the previous value while 1.15 is still running.
+  await page.getByRole('slider',{name:'Seuil de silence',exact:true}).fill('-30');
+  await page.getByLabel('Musique',{exact:true}).selectOption('other');
+  await page.waitForTimeout(650);
+  expect(f.previews).toHaveLength(1);
+  f.completePreview();
+  await expect.poll(()=>f.previews.length).toBe(2);
+  await expect(speed).toHaveValue('1');
+  expect(f.previews[1].auto_editor).toEqual({...DEFAULT_FACECAM_AUTO_EDITOR,noise_threshold_db:-30});
+  f.completePreview();
+  await expect(page.getByRole('button',{name:'Passer au traitement'})).toBeEnabled();
+  await expect(page.getByLabel('Aperçu audio Facecam')).toHaveAttribute('src',/preview-2$/);
+  expect(f.state.prepared?.preview_music_key).toBe('other');
+  expect(f.conflictingRequests).toBe(0);
+  await page.waitForTimeout(650);
+  expect(f.previews).toHaveLength(2);
+});
+
+test('leaving the page cancels an unsent automatic preview',async({page})=>{
+  const f=await fixture(page,{recording:true});
+  await page.getByRole('slider',{name:'Vitesse de la voix',exact:true}).fill('1.15');
+  await page.goto('about:blank');
+  await page.waitForTimeout(650);
+  expect(f.previews).toHaveLength(0);
+});
+
+test('automatic preview resumes after reviewing a new take with changed music',async({page})=>{
+  const f=await fixture(page,{recording:true,unreviewed:true});
+  await page.getByLabel('Musique',{exact:true}).selectOption('other');
+  await page.waitForTimeout(650);
+  expect(f.previews).toHaveLength(0);
+  await page.getByRole('button',{name:'J’ai vérifié les différences'}).click();
+  await expect.poll(()=>f.previews.length).toBe(1);
+  await expect(page.getByRole('button',{name:'Passer au traitement'})).toBeEnabled();
+  expect(f.state.prepared?.preview_music_key).toBe('other');
 });
 
 const storyOptions: FacecamStory[] = [

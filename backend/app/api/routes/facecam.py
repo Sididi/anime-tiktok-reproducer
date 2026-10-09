@@ -226,7 +226,10 @@ async def preview(project_id: str, request: PreviewRequest | None = None):
             if request.auto_editor != state.auto_editor:
                 FacecamService.update(project_id, {"auto_editor": request.auto_editor, "processed_signature": None}, request.revision)
                 FacecamService.invalidate_output(project_id)
-    return await _job(project_id, "Préparation de la voix et de l'aperçu", FacecamMediaService.preview, heavy=True)
+        FacecamService.update(project_id, {"preview_enabled": True})
+    # Cached audio edits need no GPU and should not wait behind an indexation.
+    return await _job(project_id, "Préparation de la voix et de l'aperçu", FacecamMediaService.preview,
+                      heavy=FacecamMediaService.needs_speech_analysis(project_id))
 
 
 @router.get("/{project_id}/facecam/preview")

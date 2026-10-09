@@ -82,6 +82,7 @@ class FacecamState(BaseModel):
     recording: dict[str, Any] | None = None
     auto_editor: FacecamAutoEditorSettings = Field(default_factory=FacecamAutoEditorSettings)
     prepared: dict[str, Any] | None = None
+    preview_enabled: bool = False
     processed_signature: str | None = None
     delivery: dict[str, Any] | None = None
     cover: dict[str, Any] | None = None

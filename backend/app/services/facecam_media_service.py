@@ -84,10 +84,30 @@ class FacecamMediaService:
         if original_duration <= 0 or retimed_duration <= 0:
             raise ValueError("La modification de vitesse n'a produit aucun audio.")
         time_scale = retimed_duration / original_duration
-        retimed_camera = work / "facecam.mp4"
-        ffmpeg(["-i", str(camera), "-an", "-vf", f"setpts=(PTS-STARTPTS)*{time_scale:.12f},fps=60",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-movflags", "+faststart", str(retimed_camera)])
-        return voice, retimed_camera, time_scale
+        # Reserve the camera path; video encoding belongs to final processing,
+        # never to an audio preview (including a speed-only adjustment).
+        return voice, work / "facecam.mp4", time_scale
+
+    @staticmethod
+    def retime_camera(camera: Path, destination: Path, time_scale: float):
+        if destination.is_file():
+            return
+        temporary = destination.with_name("facecam.tmp.mp4")
+        try:
+            ffmpeg(["-i", str(camera), "-an", "-vf", f"setpts=(PTS-STARTPTS)*{time_scale:.12f},fps=60",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-movflags", "+faststart", str(temporary)])
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def ensure_camera(cls, project_id: str):
+        state = FacecamService.load(project_id)
+        if not prepared_is_current(state):
+            raise ValueError("Préparez l'aperçu Facecam avant le traitement.")
+        if state.auto_editor.speed != 1.0:
+            cls.retime_camera(Path(state.recording["directory"]) / "facecam.mp4",
+                              Path(state.prepared["camera_path"]), state.prepared["camera_time_scale"])
 
     @classmethod
     def ingest(cls, project_id: str, upload: Path):
@@ -110,15 +130,20 @@ class FacecamMediaService:
         # Silent CFR master is the only camera asset imported by JSX; audio lives exclusively on A2.
         # Both streams use the input's common zero. Pad delayed streams instead of
         # resetting picture/audio independently (phone recordings may have offsets).
-        ffmpeg(["-i", str(original), "-map", "0:v:0", "-an", "-vf", "fps=60:start_time=0,format=yuv420p",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-movflags", "+faststart", str(root / "facecam.mp4")])
-        ffmpeg(["-i", str(original), "-map", "0:a:0", "-vn", "-af", "aresample=48000:async=1:first_pts=0", "-ar", str(RATE), "-ac", "1", str(root / "voice.wav")])
-        master_info = probe(root / "facecam.mp4")["streams"][0]
+        # The content hash identifies the take. Reimporting the same video must
+        # not decode its audio or analyze its speech again. Publish complete files only.
+        if not (root / "voice.wav").is_file():
+            ffmpeg(["-i", str(original), "-map", "0:a:0", "-vn", "-af", "aresample=48000:async=1:first_pts=0", "-ar", str(RATE), "-ac", "1", str(root / "voice.tmp.wav")])
+            (root / "voice.tmp.wav").replace(root / "voice.wav")
+        if not (root / "facecam.mp4").is_file():
+            ffmpeg(["-i", str(original), "-map", "0:v:0", "-an", "-vf", "fps=60:start_time=0,format=yuv420p",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-movflags", "+faststart", str(root / "facecam.tmp.mp4")])
+            (root / "facecam.tmp.mp4").replace(root / "facecam.mp4")
+        master = probe(root / "facecam.mp4")
+        write_text_atomic(root / "source_media.json", json.dumps({"camera_duration": float(master["format"]["duration"])}))
+        master_info = master["streams"][0]
         scale = max(1080 / master_info["width"], 1920 / master_info["height"]) * 100
-        from .transcriber import TranscriberService
-        with TranscriberService.model_session():
-            words, _ = TranscriberService._transcribe_sync(root / "voice.wav", "fr", "large-v3")
-            cls.save_speech_timing(root, words, TranscriberService._last_unrecovered_gaps)
+        words = cls.speech_timing(root)["words"]
         spoken = " ".join(str(w.get("word", w.get("text", ""))) for w in words)
         differences = compare_words(state.spoken_text(), spoken)
         result = FacecamService.update(project_id, {"prepared": None, "processed_signature": None, "recording": {
@@ -159,19 +184,78 @@ class FacecamMediaService:
         return timing
 
     @classmethod
-    def prepare(cls, project_id: str):
+    def alignment_cache(cls, project_id: str, state) -> Path:
+        from .project_service import ProjectService
+        payload = {"language": "fr", "scenes": state.assignment}
+        reference = ProjectService.load_transcription(project_id)
+        key = hashlib.sha256(json.dumps({"version": 1, "script": payload,
+            "reference": reference.model_dump()}, sort_keys=True).encode()).hexdigest()[:20]
+        return Path(state.recording["directory"]) / f"alignment-{key}" / "source_transcription.json"
+
+    @classmethod
+    def needs_speech_analysis(cls, project_id: str) -> bool:
+        state = FacecamService.load(project_id)
+        if cls.prepared_audio_exists(state):
+            return False
+        if not state.recording:
+            return True
+        return not ((Path(state.recording["directory"]) / "speech_timing.json").is_file()
+                    and cls.alignment_cache(project_id, state).is_file())
+
+    @staticmethod
+    def prepared_audio_exists(state) -> bool:
+        return prepared_is_current(state) and all((Path(state.prepared["directory"]) / name).is_file()
+            for name in ("narration.wav", "transcription.json", "voice_clean.wav"))
+
+    @classmethod
+    def source_alignment(cls, project_id: str, state, root: Path, timing: dict):
+        """Align the approved script once on the immutable, uncut source audio."""
         from .forced_alignment import ForcedAlignmentService
-        from .processing import ProcessingService
         from .project_service import ProjectService
         from .transcriber import TranscriberService
+        cache = cls.alignment_cache(project_id, state)
+        directory = cache.parent
+        if not cache.is_file():
+            directory.mkdir(exist_ok=True)
+            payload = {"language": "fr", "scenes": state.assignment}
+            reference = ProjectService.load_transcription(project_id)
+            with TranscriberService.model_session():
+                alignment = ForcedAlignmentService._align_single_audio(
+                    project_id=project_id, script_payload=payload, reference_transcription=reference,
+                    manifest=cls.manifest(payload), edited_audio_path=root / "voice.wav", align_language="fr",
+                    coarse_model_size="large-v3", output_dir=directory, coarse_words=timing["words"])
+            ForcedAlignmentService.write_alignment_report(directory, alignment.report)
+            write_text_atomic(cache, alignment.transcription.model_dump_json())
+        return Transcription.model_validate_json(cache.read_text()), ForcedAlignmentService.report_path(directory)
+
+    @staticmethod
+    def map_source_alignment(source: Transcription, keep: list[tuple[int, int]], time_scale: float) -> Transcription:
+        """Map native word timestamps through silence cuts and measured audio speed.
+
+        Raw anime dialogue has its own clock and must retain its original duration.
+        """
+        def mapped(timestamp):
+            return sum(max(0.0, min(timestamp, b / FPS) - a / FPS) for a, b in keep) * time_scale
+        result = source.model_copy(deep=True)
+        for scene in result.scenes:
+            if scene.is_raw:
+                continue
+            scene.start_time, scene.end_time = mapped(scene.start_time), mapped(scene.end_time)
+            for word in scene.words:
+                word.start, word.end = mapped(word.start), mapped(word.end)
+        result.unrecovered_gaps = [(mapped(a), mapped(b)) for a, b in result.unrecovered_gaps]
+        return result
+
+    @classmethod
+    def prepare(cls, project_id: str):
+        from .processing import ProcessingService
+        from .project_service import ProjectService
         state = FacecamService.load(project_id)
         if state.approved_revision != state.revision or not state.recording:
             raise ValueError("Validez le script et importez un enregistrement.")
         if state.recording.get("reviewed_revision") != state.revision:
             raise ValueError("Vérifiez les différences entre votre script et votre enregistrement.")
-        if prepared_is_current(state) and all((Path(state.prepared["directory"]) / name).is_file()
-                                             for name in ("narration.wav", "transcription.json", "voice_clean.wav")) and (
-                state.auto_editor.speed == 1.0 or Path(state.prepared.get("camera_path", "")).is_file()):
+        if cls.prepared_audio_exists(state):
             return state
         root = Path(state.recording["directory"])
         # Never overwrite the last playable preview if analysis or alignment fails.
@@ -194,7 +278,10 @@ class FacecamMediaService:
                 silences.append((silence_start, float(match[1])))
                 silence_start = None
         duration = ProcessingService._probe_wav_duration(wav)
-        duration = min(duration, float(probe(root / "facecam.mp4")["format"]["duration"]))
+        media_cache = root / "source_media.json"
+        if not media_cache.is_file():  # One metadata probe for recordings imported before caching.
+            write_text_atomic(media_cache, json.dumps({"camera_duration": float(probe(root / "facecam.mp4")["format"]["duration"])}))
+        duration = min(duration, json.loads(media_cache.read_text())["camera_duration"])
         if silence_start is not None:
             silences.append((silence_start, duration))
         keep = keep_intervals(duration, silences, tuning, speech)
@@ -211,15 +298,8 @@ class FacecamMediaService:
                 frames = src.readframes(sample_count)
                 dst.writeframes(frames + b"\x00" * (sample_count * frame_size - len(frames)))
         voice, camera, time_scale = cls.apply_speed(clean, root / "facecam.mp4", work, tuning.speed)
-        payload = {"language": "fr", "scenes": state.assignment}
-        # One contiguous known-text segment per narration block, without any TTS normalization.
-        manifest = cls.manifest(payload)
-        reference = ProjectService.load_transcription(project_id)
-        with TranscriberService.model_session():
-            alignment = ForcedAlignmentService._align_single_audio(
-                project_id=project_id, script_payload=payload, reference_transcription=reference,
-                manifest=manifest, edited_audio_path=voice, align_language="fr", coarse_model_size="large-v3", output_dir=work)
-        ForcedAlignmentService.write_alignment_report(work, alignment.report)
+        source_alignment, report_path = cls.source_alignment(project_id, state, root, timing)
+        aligned = cls.map_source_alignment(source_alignment, keep, time_scale)
         project = FacecamService.project(project_id)
         matches = ProjectService.load_matches(project_id).matches
         # Bound the additional outro to actual source media; existing gap resolution handles short coverage.
@@ -236,7 +316,7 @@ class FacecamMediaService:
         resolved = ProcessingService.resolve_scene_sources(matches, ProcessingService._build_source_rate(source_fps), library_type=project.library_type)
         # Word timings and source_start share the optionally retimed voice clock.
         transcription, playback = ProcessingService.build_authoritative_playback_timeline(
-            alignment.transcription, resolved, contiguous_audio_duration=ProcessingService._probe_wav_duration(voice),
+            aligned, resolved, contiguous_audio_duration=ProcessingService._probe_wav_duration(voice),
             preserve_audio_start=True)
         output_voice = work / "narration.wav"
         ProcessingService.rebuild_tts_audio_with_playback_segments(voice, output_voice, playback,
@@ -256,7 +336,7 @@ class FacecamMediaService:
             "camera_path": str(camera), "camera_time_scale": time_scale,
             "keep_frames": [list(interval) for interval in keep], "camera_segments": clips, "cover_start": end,
             "duration_seconds": end + 1,
-            "alignment_path": str(ForcedAlignmentService.report_path(work)),
+            "alignment_path": str(report_path),
             "scenes": [{"kind": "cover", "start_frame": round(end * FPS), "duration_frames": FPS}]}
         with FacecamService.lock(project_id):
             current = FacecamService.load(project_id)
@@ -300,11 +380,21 @@ class FacecamMediaService:
             if scene.is_raw:
                 match = matches[scene.scene_index]
                 source, _ = ProcessingService._resolve_source_reference(match.episode, library_type=project.library_type)
-                from .anime_library import AnimeLibraryService
-                policy = AnimeLibraryService.build_source_audio_selection_policy(source, target_language=project.output_language)
-                clip = work / f"raw-{scene.scene_index}.wav"
-                ffmpeg(["-ss", str(match.start_time), "-i", str(source), "-t", str(scene.end_time - scene.start_time),
-                    "-map", f"0:{policy.selected_stream_index}", "-vn", "-ar", str(RATE), "-ac", "1", str(clip)])
+                # Raw dialogue is independent of narration speed, silence cuts
+                # and background music. Decode it once per source/range/language.
+                stat = source.stat()
+                key = hashlib.sha256(json.dumps([str(source.resolve()), stat.st_size, stat.st_mtime_ns,
+                    match.start_time, round(scene.end_time - scene.start_time, 6), project.output_language]).encode()).hexdigest()[:20]
+                cache = FacecamService.directory(project_id) / "preview-audio"
+                cache.mkdir(exist_ok=True)
+                clip = cache / f"raw-{key}.wav"
+                if not clip.is_file():
+                    from .anime_library import AnimeLibraryService
+                    policy = AnimeLibraryService.build_source_audio_selection_policy(source, target_language=project.output_language)
+                    temporary = clip.with_suffix(".tmp.wav")
+                    ffmpeg(["-ss", str(match.start_time), "-i", str(source), "-t", str(scene.end_time - scene.start_time),
+                        "-map", f"0:{policy.selected_stream_index}", "-vn", "-ar", str(RATE), "-ac", "1", str(temporary)])
+                    temporary.replace(clip)
                 mix = mix.overlay(AudioSegment.from_wav(clip), position=round(scene.start_time * 1000))
         if project.resolved_music_key():
             music = MusicConfigService.get_music(project.resolved_music_key())
@@ -312,6 +402,7 @@ class FacecamMediaService:
             if len(bed):
                 bed = (bed * (len(mix) // len(bed) + 1))[:len(mix)]
                 mix = mix.overlay(bed)
-        mix.export(work / "preview.wav", format="wav")
+        mix.export(work / "preview.tmp.wav", format="wav")
+        (work / "preview.tmp.wav").replace(work / "preview.wav")
         return FacecamService.update(project_id, {"prepared": {**state.prepared,
             "preview_music_key": project.resolved_music_key(), "preview_version": uuid.uuid4().hex}}, state.revision)

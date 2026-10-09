@@ -149,6 +149,11 @@ def test_retimed_audio_camera_and_word_clock_share_actual_duration(tmp_path, spe
     voice_duration = ProcessingService._probe_wav_duration(voice)
     assert abs(voice_duration - 2 / speed) < .05
     assert scale == voice_duration / 2
+    assert not retimed_camera.exists(), 'Audio preview must never encode video'
+    FacecamMediaService.retime_camera(camera, retimed_camera, scale)
+    original_mtime = retimed_camera.stat().st_mtime_ns
+    FacecamMediaService.retime_camera(camera, retimed_camera, scale)
+    assert retimed_camera.stat().st_mtime_ns == original_mtime
     streams = probe(retimed_camera)['streams']
     assert len(streams) == 1 and streams[0]['codec_type'] == 'video'
     assert streams[0]['r_frame_rate'] == '60/1'
@@ -201,6 +206,7 @@ def test_preview_saves_tuning_and_rejects_stale_or_busy_requests(monkeypatch):
     from fastapi import HTTPException
     from app.api.routes import facecam
     from app.services.facecam_service import FacecamService
+    from app.services.facecam_media_service import FacecamMediaService
     state = current_state()
     invalidations = []
     jobs = []
@@ -211,16 +217,20 @@ def test_preview_saves_tuning_and_rejects_stale_or_busy_requests(monkeypatch):
         return state
     monkeypatch.setattr(FacecamService, 'update', update)
     monkeypatch.setattr(FacecamService, 'invalidate_output', lambda pid: invalidations.append(pid))
+    monkeypatch.setattr(FacecamMediaService, 'needs_speech_analysis', lambda pid: False)
     async def job(*args, **kwargs):
+        assert kwargs['heavy'] is False
         jobs.append(args)
         return state
     monkeypatch.setattr(facecam, '_job', job)
     request = facecam.PreviewRequest(revision=3, auto_editor=FacecamAutoEditorSettings(min_silence_ms=220))
     asyncio.run(facecam.preview('test-preview', request))
     assert state.auto_editor.min_silence_ms == 220
+    assert state.preview_enabled is True
     assert state.revision == state.approved_revision == 3
     assert invalidations == ['test-preview']
     assert len(jobs) == 1
+
     request.revision = 2
     with pytest.raises(HTTPException) as stale:
         asyncio.run(facecam.preview('test-preview', request))
@@ -230,3 +240,85 @@ def test_preview_saves_tuning_and_rejects_stale_or_busy_requests(monkeypatch):
         asyncio.run(facecam.preview('test-preview', request))
     assert busy.value.status_code == 409
     assert len(jobs) == 1
+
+def test_source_alignment_mapping_preserves_words_and_raw_clock_without_mutating_cache():
+    from app.services.facecam_media_service import FacecamMediaService
+    source = Transcription(language='fr', scenes=[
+        SceneTranscription(scene_index=0, text='Bonjour', words=[Word(text='Bonjour', start=.6, end=.9)], start_time=.6, end_time=.9),
+        SceneTranscription(scene_index=1, text='Extrait', is_raw=True, start_time=8, end_time=10),
+        SceneTranscription(scene_index=2, text='Salut', words=[Word(text='Salut', start=2.1, end=2.8)], start_time=2.1, end_time=2.8),
+    ])
+    mapped = FacecamMediaService.map_source_alignment(source, [(30, 60), (120, 180)], .8)
+    assert mapped.scenes[0].words[0].start == pytest.approx(.08)
+    assert mapped.scenes[0].words[0].end == pytest.approx(.32)
+    assert mapped.scenes[2].words[0].start == pytest.approx(.48)
+    assert mapped.scenes[2].words[0].end == pytest.approx(1.04)
+    assert mapped.scenes[1] == source.scenes[1]
+    assert source.scenes[0].words[0].start == .6
+    assert source.scenes[2].words[0].end == 2.8
+
+
+def test_music_remix_and_new_cuts_reuse_extracted_raw_dialogue(monkeypatch, tmp_path):
+    import array
+    import wave
+    from types import SimpleNamespace
+    from app.services import facecam_media_service as media
+    from app.services.facecam_service import FacecamService
+    from app.services.project_service import ProjectService
+    from app.services.processing import ProcessingService
+    from app.services.anime_library import AnimeLibraryService
+    from app.services.music_config_service import MusicConfigService
+
+    def wav(path, value):
+        with wave.open(str(path), 'wb') as stream:
+            stream.setparams((1, 2, 48000, 0, 'NONE', 'not compressed'))
+            stream.writeframes(array.array('h', [value] * 96000).tobytes())
+    source, bed = tmp_path / 'source.wav', tmp_path / 'music.wav'
+    wav(source, 1000); wav(bed, 2000)
+    work = tmp_path / 'prepared'; work.mkdir()
+    wav(work / 'narration.wav', 0)
+    transcription = Transcription(language='fr', scenes=[
+        SceneTranscription(scene_index=1, text='Extrait', start_time=.5, end_time=1.5, is_raw=True),
+    ])
+    (work / 'transcription.json').write_text(transcription.model_dump_json())
+    state = SimpleNamespace(revision=1, prepared={'directory': str(work)})
+    music = {'key': None}
+    project = SimpleNamespace(library_type='anime', output_language='fr', resolved_music_key=lambda: music['key'])
+    monkeypatch.setattr(media.FacecamMediaService, 'prepare', lambda pid: state)
+    monkeypatch.setattr(FacecamService, 'project', lambda pid: project)
+    monkeypatch.setattr(FacecamService, 'directory', lambda pid: tmp_path)
+    def update(pid, values, revision):
+        state.prepared = values['prepared']
+        return state
+    monkeypatch.setattr(FacecamService, 'update', update)
+    monkeypatch.setattr(ProjectService, 'load_matches', lambda pid: SimpleNamespace(matches=[SimpleNamespace(scene_index=1, start_time=0, episode='episode')]))
+    monkeypatch.setattr(ProcessingService, '_resolve_source_reference', lambda *a, **kw: (source, None))
+    monkeypatch.setattr(AnimeLibraryService, 'build_source_audio_selection_policy', lambda *a, **kw: SimpleNamespace(selected_stream_index=0))
+    monkeypatch.setattr(MusicConfigService, 'get_music', lambda key: SimpleNamespace(file_path=bed, volume_db=0))
+    calls = []
+    original_ffmpeg = media.ffmpeg
+    def ffmpeg(args):
+        calls.append(args)
+        return original_ffmpeg(args)
+    monkeypatch.setattr(media, 'ffmpeg', ffmpeg)
+    media.FacecamMediaService.preview('test')
+    with wave.open(str(work / 'preview.wav')) as stream:
+        samples = array.array('h', stream.readframes(stream.getnframes()))
+    assert samples[0] == 0 and samples[30000] == 1000
+    music['key'] = 'music'
+    media.FacecamMediaService.preview('test')
+    with wave.open(str(work / 'preview.wav')) as stream:
+        samples = array.array('h', stream.readframes(stream.getnframes()))
+    assert samples[0] == 2000 and samples[30000] == 3000
+    # A new silence-cut work directory still shares the source dialogue cache.
+    other = tmp_path / 'other'; other.mkdir()
+    wav(other / 'narration.wav', 0)
+    (other / 'transcription.json').write_text(transcription.model_dump_json())
+    state.prepared = {'directory': str(other)}
+    media.FacecamMediaService.preview('test')
+    assert len(calls) == 1
+    assert state.prepared['preview_music_key'] == 'music'
+    # Changing the anime source invalidates the extracted dialogue cache.
+    source.touch()
+    media.FacecamMediaService.preview('test')
+    assert len(calls) == 2

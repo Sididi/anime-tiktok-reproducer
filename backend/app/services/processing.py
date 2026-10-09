@@ -2973,6 +2973,8 @@ class ProcessingService:
                     prepared = facecam_state.prepared
                     if not prepared_is_current(facecam_state):
                         raise ValueError("Préparez l'aperçu Facecam avant le traitement.")
+                    from .facecam_media_service import FacecamMediaService
+                    await asyncio.to_thread(FacecamMediaService.ensure_camera, project.id)
                     prepared_dir = Path(prepared["directory"])
                     edited_audio_path = output_dir / "tts_edited.wav"
                     shutil.copy2(prepared_dir / "narration.wav", edited_audio_path)
