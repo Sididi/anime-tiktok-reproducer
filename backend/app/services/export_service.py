@@ -649,7 +649,12 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             source_items.append(name)
             entries.append(ManifestEntry(relative_path=f"{folder}/sources/{name}", source_path=path))
 
-        for source_path in cls._collect_episode_sources(project, matches):
+        bundle_matches = matches
+        if project.project_mode == "facecam":
+            from .facecam_editor_track import FacecamEditorTrackService
+            bundle_matches = [*matches, *FacecamEditorTrackService.export_matches(
+                project.id, jsx_path.read_text(encoding="utf-8"))]
+        for source_path in cls._collect_episode_sources(project, bundle_matches):
             _add_source_file(source_path)
 
         for overlay_name in (
@@ -703,12 +708,20 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             )
         )
         if project.project_mode == "facecam":
+            editor_instructions = ""
+            if FacecamEditorTrackService.payload_from_jsx(jsx_path.read_text(encoding="utf-8")):
+                editor_instructions = (
+                    "V3 : montage automatique masqué (réactivable avec l'oeil). V4 : illustrations à 100 %, mêmes effets, sélection élargie.\n"
+                    "V4 conserve les coupes source de V3 ; les ajouts sont préplacés entre ses repères. Les trous sont volontaires.\n"
+                    "V5 : facecam et carte finale. V6 : sous-titres. Le fond flou V1 suit le montage automatique.\n"
+                )
             entries[-1].inline_content = (
                 "PROJET FACECAM\n\n1. Installez l'extension Facecam Import (une seule fois).\n"
                 "2. Extrayez entièrement ce ZIP dans un dossier local.\n"
                 "3. Ouvrez Premiere Pro > Fenêtre > Extensions > Facecam Import.\n"
                 "4. Lancez run_in_premiere.bat, ou choisissez import_project.jsx dans le panneau.\n"
                 "La facecam est au-dessus des images anime, les sous-titres au-dessus. La voix est sur A2.\n"
+                + editor_instructions +
                 "5. Montez puis exportez un seul MP4 dans le dossier Drive du projet.\n"
                 "6. Cliquez sur « Confirmer montage envoyé » dans Discord.\n"
             ).encode("utf-8")
@@ -733,6 +746,8 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             raise ValueError("Le JSX Facecam ne contient aucune scène.")
         scenes, _ = json.JSONDecoder().raw_decode(jsx[scene_start.end():])
         references.extend(s["clipName"] for s in scenes)
+        from .facecam_editor_track import FacecamEditorTrackService
+        references.extend(c["clipName"] for c in FacecamEditorTrackService.payload_from_jsx(jsx).get("clips", []))
         for key in ("MUSIC_FILENAME", "BORDER_IMAGE_FILENAME", "TITLE_OVERLAY_FILENAME", "CATEGORY_OVERLAY_FILENAME"):
             if key == "BORDER_IMAGE_FILENAME" and "var WHITE_BORDER_ENABLED = false;" in jsx:
                 continue

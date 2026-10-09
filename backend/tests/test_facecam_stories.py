@@ -240,7 +240,8 @@ def test_changed_source_cannot_keep_an_approved_selection_after_reanalysis(proje
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('selected', [True, False])
-async def test_processing_keeps_editorial_cuts_instead_of_extending_them(project, monkeypatch, tmp_path, selected):
+@pytest.mark.parametrize('extra_episode', [True, False])
+async def test_processing_keeps_editorial_cuts_instead_of_extending_them(project, monkeypatch, tmp_path, selected, extra_episode):
     from app.services.processing import ProcessingService
     from app.services.gap_resolution import GapResolutionService
     detect(project, monkeypatch, option(indices=(42,)))
@@ -263,11 +264,17 @@ async def test_processing_keeps_editorial_cuts_instead_of_extending_them(project
     async def fps(*a, **k):
         return 24.0
     monkeypatch.setattr(ProcessingService, 'detect_first_source_fps', fps)
-    monkeypatch.setattr(ProcessingService, '_resolve_source_reference', lambda *a, **k: (tmp_path / 'episode.mp4', 'episode.mp4'))
+    monkeypatch.setattr(ProcessingService, '_resolve_source_reference', lambda episode, **k: (tmp_path / (episode + '.mp4'), episode + '.mp4'))
+    if extra_episode:
+        from app.services.facecam_editor_track import FacecamEditorTrackService
+        # The original source ID can collide with a reindexed V3 scene; neither source may disappear.
+        monkeypatch.setattr(FacecamEditorTrackService, 'selected_matches', lambda _: [
+            SceneMatch(scene_index=0, episode='extra', start_time=30, end_time=32, confidence=1, speed_ratio=1)])
     detected = []
     monkeypatch.setattr(GapResolutionService, 'calculate_gaps', lambda *a, **k: detected.append(a) or [])
     reached_export = []
-    def checkpoint(*a):
+    def checkpoint(sources):
+        assert {s.source_path.name for s in sources.values()} == ({'episode.mp4', 'extra.mp4'} if extra_episode else {'episode.mp4'})
         reached_export.append(True)
         raise ValueError('Test checkpoint before episode normalization')
     monkeypatch.setattr(ProcessingService, '_collect_required_source_paths', checkpoint)

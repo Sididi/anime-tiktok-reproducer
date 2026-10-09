@@ -423,7 +423,8 @@ def test_phone_stream_offsets_are_preserved_in_silent_camera_and_voice(source,mo
 
 @pytest.mark.parametrize('retimed', [False, True])
 @pytest.mark.parametrize('edited', [False, True])
-def test_package_expands_subtitles_and_contains_original_media(source,monkeypatch,tmp_path,retimed,edited):
+@pytest.mark.parametrize('extra_illustrations', [False, True])
+def test_package_expands_subtitles_and_contains_original_media(source,monkeypatch,tmp_path,retimed,edited,extra_illustrations):
     from app.services.export_service import ExportService
     from app.services.facecam_cover_service import FacecamCoverService
     from PIL import Image
@@ -445,14 +446,24 @@ def test_package_expands_subtitles_and_contains_original_media(source,monkeypatc
     picture=io.BytesIO();Image.new('RGB',(200,300),'red').save(picture,'PNG')
     FacecamCoverService.store(project.id,picture.getvalue(),{'manual':True})
     output=ExportService.get_output_dir(project.id);output.mkdir(parents=True,exist_ok=True)
-    (output/'import_project.jsx').write_text('var FACECAM = {}; var scenes = [{"clipName":"episode"}];')
+    editor_payload = {}
+    if extra_illustrations:
+        references = FacecamService.source_matches(project.id)
+        references.matches[2].episode = 'extra.mp4'
+        (FacecamService.directory(project.id) / 'reference_matches.json').write_text(references.model_dump_json())
+        editor_payload = {'editor_track': {'clips': [{'kind': 'extra', 'source_scene_index': 2, 'clipName': 'extra.mp4'}]}}
+    (output/'import_project.jsx').write_text('var FACECAM = ' + json.dumps(editor_payload) + '; var scenes = [{"clipName":"episode"}];')
     (output/'tts_edited.wav').write_bytes(b'voice')
     subtitle=output/'subtitles.srt';subtitle.write_text('timing')
     (output/'subtitles').mkdir();mogrt=output/'subtitles'/'word.mogrt';mogrt.write_bytes(b'mogrt')
     timing=output/'subtitles'/'subtitle_timings.srt';timing.write_text('timing')
     episode=tmp_path/'episode.mp4';episode.write_bytes(b'episode')
+    extra=tmp_path/'extra.mp4';extra.write_bytes(b'extra illustration episode')
     monkeypatch.setattr(ExportService,'subtitle_path',lambda p:subtitle)
-    monkeypatch.setattr(ExportService,'_collect_episode_sources',lambda *a:[episode])
+    def collect_sources(project, matches):
+        assert [m.episode for m in matches] == (['extra.mp4'] if extra_illustrations else [])
+        return [episode, extra] if extra_illustrations else [episode]
+    monkeypatch.setattr(ExportService,'_collect_episode_sources',collect_sources)
     monkeypatch.setattr(ExportService,'get_required_import_assets',lambda *a:['TikTok60fps.sqpreset'])
     monkeypatch.setattr(ExportService,'_resolve_selected_music_path',lambda *a:None)
     monkeypatch.setattr(ExportService,'_collect_baked_subtitle_files',lambda *a:[mogrt])
@@ -469,6 +480,8 @@ def test_package_expands_subtitles_and_contains_original_media(source,monkeypatc
         assert archive.read(folder+'script.txt').decode()==state.spoken_text()
         assert archive.read(folder+'sources/facecam.mp4')==(b'retimed camera' if retimed else b'edited camera' if edited else b'media')
         assert archive.read(folder+'recording/original.mov') == b'media'
+        if extra_illustrations:
+            assert archive.read(folder+'sources/extra.mp4') == b'extra illustration episode'
     FacecamService.save_draft(project.id,state.revision,state.blocks,'','')
     with pytest.raises(ValueError,match='Relancez'): ExportService.build_bundle(project,[])
 

@@ -1323,9 +1323,11 @@ class ProcessingService:
         facecam = None
         if project.project_mode == "facecam":
             from .facecam_service import FacecamService
+            from .facecam_editor_track import FacecamEditorTrackService
             state = FacecamService.load(project.id)
             facecam = {"camera_segments": state.prepared["camera_segments"], "cover_start": state.prepared["cover_start"], "filename": "facecam.mp4", "cover": "anime_reveal.png",
-                "scale": (state.recording or {}).get("scale", 100)}
+                "scale": (state.recording or {}).get("scale", 100),
+                "editor_track": FacecamEditorTrackService.build(project, scenes, source_rate)}
         voice_key = project.resolved_voice_key()
         voice_gain_db = VoiceConfigService.get_voice(voice_key).volume_db if voice_key else 0.0
         return cls._render_jsx_from_template(
@@ -1902,6 +1904,9 @@ class ProcessingService:
             ),
             label="RAW_SCENE_TEXT_SUBTITLE_SRT_PATH",
         )
+        if facecam is not None:
+            from .facecam_premiere import specialize_facecam_jsx
+            content = specialize_facecam_jsx(content)
         return content
 
     @classmethod
@@ -3291,9 +3296,19 @@ class ProcessingService:
                         )
                         return  # Stop processing here - frontend will redirect to gap resolution
 
-            # Step 3: Normalize only the source episodes used by final matches.
+            # Step 3: Include Facecam's independent editor illustrations in source inspection.
+            normalization_matches = matches
+            if project.project_mode == "facecam":
+                from .facecam_editor_track import FacecamEditorTrackService
+                yield ProcessingProgress("processing", "editor_illustrations", 0.4,
+                                         "Sélection des illustrations supplémentaires pour V4...")
+                extra_matches = await asyncio.to_thread(FacecamEditorTrackService.selected_matches, project.id)
+                next_index = max((m.scene_index for m in matches), default=-1) + 1
+                normalization_matches = [*matches, *[
+                    m.model_copy(update={"scene_index": next_index + i}) for i, m in enumerate(extra_matches)
+                ]]
             playback_scene_sources = cls.resolve_scene_sources(
-                matches,
+                normalization_matches,
                 source_rate,
                 library_type=project.media_library,
             )
@@ -3309,7 +3324,7 @@ class ProcessingService:
                     library_type=project.media_library,
                 )
                 playback_scene_sources = cls.resolve_scene_sources(
-                    matches,
+                    normalization_matches,
                     source_rate,
                     library_type=project.media_library,
                 )
