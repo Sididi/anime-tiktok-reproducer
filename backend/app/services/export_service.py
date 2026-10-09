@@ -675,7 +675,7 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
                 entries.append(ManifestEntry(relative_path=f"{folder}/subtitles/{path.name}", source_path=path))
             _add_source_file(Path(state.prepared.get("camera_path") or Path(state.recording["directory"]) / "facecam.mp4"))
             _add_source_file(FacecamService.directory(project.id) / "anime_reveal.png")
-            original = Path(state.recording["directory"]) / state.recording["original_name"]
+            original = Path(state.recording.get("source_directory", state.recording["directory"])) / state.recording["original_name"]
             entries.append(ManifestEntry(relative_path=f"{folder}/recording/{original.name}", source_path=original))
             entries.append(ManifestEntry(relative_path=f"{folder}/script.txt", inline_content=state.spoken_text().encode("utf-8")))
         elif subtitles_archive_entry is not None:

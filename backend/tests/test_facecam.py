@@ -379,6 +379,7 @@ def test_phone_stream_offsets_are_preserved_in_silent_camera_and_voice(source,mo
         '-map','[v]','-map','[a]','-c:v','libx264','-c:a','pcm_s16le',str(upload)])
     monkeypatch.setattr(TranscriberService,'model_session',lambda:contextlib.nullcontext())
     monkeypatch.setattr(TranscriberService,'_transcribe_sync',lambda *a:([{'text':state.spoken_text(),'start':.2,'end':1.2}],'fr'))
+    monkeypatch.setattr(FacecamService,'llm',lambda *a: {'suggestions': []})
     result=FacecamMediaService.ingest(project.id,upload)
     root=Path(result.recording['directory'])
     assert len(probe(root/'facecam.mp4')['streams'])==1
@@ -387,7 +388,10 @@ def test_phone_stream_offsets_are_preserved_in_silent_camera_and_voice(source,mo
         samples=array.array('h',wav.readframes(wav.getnframes()))
     onset=next(i for i,value in enumerate(samples) if abs(value)>500)/48000
     assert abs(onset-0.2)<=1/60
-    assert result.recording['reviewed_revision']==state.revision
+    assert result.recording['reviewed_revision'] is None
+    assert result.recording['transcript'] == ''  # Comparison waits for cut approval.
+    assert result.recording_edit.applied is False
+    assert result.recording_edit.analysis_status == 'ready'
     assert (root/'original.mov').exists()
     # An identical take reuses both extracted streams and the speech analysis.
     import shutil
@@ -400,6 +404,7 @@ def test_phone_stream_offsets_are_preserved_in_silent_camera_and_voice(source,mo
     monkeypatch.setattr(TranscriberService,'_transcribe_sync',forbidden)
     again=FacecamMediaService.ingest(project.id,upload)
     assert again.recording['fingerprint']==result.recording['fingerprint']
+    assert again.recording_edit.id != result.recording_edit.id  # Even identical reuploads reopen cleanup.
     assert (root/'voice.wav').stat().st_mtime_ns==source_mtime
     # A changed take gets a new cache and must extract its own audio.
     shutil.copy2(root/'original.mov',upload)
@@ -412,12 +417,13 @@ def test_phone_stream_offsets_are_preserved_in_silent_camera_and_voice(source,mo
     monkeypatch.setattr(TranscriberService,'_transcribe_sync',lambda *a:([{'text':state.spoken_text(),'start':.2,'end':1.2}],'fr'))
     changed=FacecamMediaService.ingest(project.id,upload)
     assert changed.recording['fingerprint']!=result.recording['fingerprint']
-    assert len(calls)==2
+    assert len(calls)==3  # Audio, silent camera and browser-compatible preview (video stream copy).
     assert Path(calls[0][-1]).name=='voice.tmp.wav'
 
 
 @pytest.mark.parametrize('retimed', [False, True])
-def test_package_expands_subtitles_and_contains_original_media(source,monkeypatch,tmp_path,retimed):
+@pytest.mark.parametrize('edited', [False, True])
+def test_package_expands_subtitles_and_contains_original_media(source,monkeypatch,tmp_path,retimed,edited):
     from app.services.export_service import ExportService
     from app.services.facecam_cover_service import FacecamCoverService
     from PIL import Image
@@ -425,13 +431,17 @@ def test_package_expands_subtitles_and_contains_original_media(source,monkeypatc
     project,state=draft(source)
     root=FacecamService.directory(project.id)/'recordings'/'test';root.mkdir(parents=True)
     for name in ['facecam.mp4','original.mov']:(root/name).write_bytes(b'media')
+    source_directory = root
+    if edited:
+        root = root / 'edits' / 'cut'; root.mkdir(parents=True)
+        (root / 'facecam.mp4').write_bytes(b'edited camera')
     prepared={'revision':state.revision,'fingerprint':'test'}
     if retimed:
         work=root/'retimed';work.mkdir()
         (work/'facecam.mp4').write_bytes(b'retimed camera')
         prepared['camera_path']=str(work/'facecam.mp4')
     FacecamService.update(project.id,{'approved_revision':state.revision,'prepared':prepared,
-        'recording':{'directory':str(root),'original_name':'original.mov','fingerprint':'test'}})
+        'recording':{'directory':str(root),'source_directory':str(source_directory),'original_name':'original.mov','fingerprint':'test'}})
     picture=io.BytesIO();Image.new('RGB',(200,300),'red').save(picture,'PNG')
     FacecamCoverService.store(project.id,picture.getvalue(),{'manual':True})
     output=ExportService.get_output_dir(project.id);output.mkdir(parents=True,exist_ok=True)
@@ -457,7 +467,8 @@ def test_package_expands_subtitles_and_contains_original_media(source,monkeypatc
             assert folder+name in names
         assert not any(name.endswith('.zip') for name in names)
         assert archive.read(folder+'script.txt').decode()==state.spoken_text()
-        assert archive.read(folder+'sources/facecam.mp4')==(b'retimed camera' if retimed else b'media')
+        assert archive.read(folder+'sources/facecam.mp4')==(b'retimed camera' if retimed else b'edited camera' if edited else b'media')
+        assert archive.read(folder+'recording/original.mov') == b'media'
     FacecamService.save_draft(project.id,state.revision,state.blocks,'','')
     with pytest.raises(ValueError,match='Relancez'): ExportService.build_bundle(project,[])
 

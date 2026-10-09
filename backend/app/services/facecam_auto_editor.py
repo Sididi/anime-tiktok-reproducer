@@ -25,6 +25,7 @@ def settings_signature(settings: FacecamAutoEditorSettings) -> str:
 def prepared_is_current(state: FacecamState) -> bool:
     prepared = state.prepared or {}
     return bool(state.recording and prepared
+                and (not state.recording_edit or state.recording_edit.applied)
                 and state.approved_revision == state.revision
                 and prepared.get("revision") == state.revision
                 and prepared.get("fingerprint") == state.recording["fingerprint"]

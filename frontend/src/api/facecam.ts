@@ -14,6 +14,14 @@ export interface FacecamAutoEditorSettings {
   margin_after_ms: number;
   speed: number;
 }
+export interface RecordingCut {id: string; start: number; end: number; enabled: boolean; origin: 'manual' | 'ai'}
+export interface RecordingSuggestion extends RecordingCut {confidence: 'high' | 'review'; reason: string; removed_text: string; retained_text: string}
+export interface RecordingEdit {
+  id: string; version: number; duration: number; applied: boolean;
+  analysis_status: 'analyzing' | 'ready' | 'error'; analysis_error: string | null;
+  suggestions: RecordingSuggestion[]; cuts: RecordingCut[];
+}
+export interface RecordingCutData {id: string; duration: number; peaks: number[]; words: {text: string; start: number; end: number}[]}
 export const DEFAULT_FACECAM_AUTO_EDITOR: FacecamAutoEditorSettings = {
   noise_threshold_db: -26, min_silence_ms: 120, margin_before_ms: 30, margin_after_ms: 50, speed: 1.0,
 };
@@ -28,6 +36,7 @@ export interface FacecamState {
   fact_revision: number | null; fact_status: 'unchecked' | 'complete' | 'unavailable'; fact_error: string | null; findings: Finding[];
   fact_context?: {padding_seconds: number; episodes: {episode: string; status: 'available' | 'partial' | 'unavailable'; language: string | null; note: string | null; windows: {start: string; end: string}[]; cues: {id: string; start: string; end: string; text: string; source_url: string}[]}[]} | null;
   recording: {fingerprint: string; duration: number; transcript: string; differences: {kind: string; expected: string; spoken: string}[]; reviewed_revision: number | null} | null;
+  recording_edit?: RecordingEdit | null;
   auto_editor?: FacecamAutoEditorSettings;
   preview_enabled?: boolean;
   prepared: {revision: number; fingerprint: string; preview_music_key?: string | null; preview_version?: string; duration_seconds?: number;

@@ -50,6 +50,37 @@ class FacecamFinding(BaseModel):
     sources: list[dict[str, str]] = Field(default_factory=list)
 
 
+class RecordingCut(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    id: str = Field(min_length=1, max_length=100)
+    start: float = Field(ge=0)
+    end: float = Field(gt=0)
+    enabled: bool = True
+    origin: Literal["manual", "ai"] = "manual"
+
+
+class RecordingSuggestion(RecordingCut):
+    confidence: Literal["high", "review"]
+    reason: str
+    removed_text: str
+    retained_text: str
+
+
+class RecordingEdit(BaseModel):
+    id: str
+    version: int = 0
+    source_directory: str
+    source_fingerprint: str
+    original_name: str
+    duration: float
+    scale: float
+    analysis_status: Literal["analyzing", "ready", "error"] = "analyzing"
+    analysis_error: str | None = None
+    suggestions: list[RecordingSuggestion] = Field(default_factory=list)
+    cuts: list[RecordingCut] = Field(default_factory=list)
+    applied: bool = False
+
+
 class FacecamAutoEditorSettings(BaseModel):
     """Real-voice silence detection; word protection is always enabled."""
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -80,6 +111,7 @@ class FacecamState(BaseModel):
     fact_context: dict[str, Any] | None = None
     findings: list[FacecamFinding] = Field(default_factory=list)
     recording: dict[str, Any] | None = None
+    recording_edit: RecordingEdit | None = None
     auto_editor: FacecamAutoEditorSettings = Field(default_factory=FacecamAutoEditorSettings)
     prepared: dict[str, Any] | None = None
     preview_enabled: bool = False

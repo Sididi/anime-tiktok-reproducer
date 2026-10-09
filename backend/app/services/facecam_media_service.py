@@ -143,22 +143,28 @@ class FacecamMediaService:
         write_text_atomic(root / "source_media.json", json.dumps({"camera_duration": float(master["format"]["duration"])}))
         master_info = master["streams"][0]
         scale = max(1080 / master_info["width"], 1920 / master_info["height"]) * 100
-        words = cls.speech_timing(root)["words"]
-        spoken = " ".join(str(w.get("word", w.get("text", ""))) for w in words)
-        differences = compare_words(state.spoken_text(), spoken)
-        result = FacecamService.update(project_id, {"prepared": None, "processed_signature": None, "recording": {
+        from .facecam_cut_service import FacecamCutService, waveform
+        with wave.open(str(root / "voice.wav"), "rb") as audio:
+            duration = min(audio.getnframes() / audio.getframerate(), float(master["format"]["duration"]))
+        FacecamCutService.source_preview(root)
+        waveform(root, duration)
+        recording = {
             "fingerprint": digest, "directory": str(root), "original_name": original.name,
-            "duration": duration, "scale": scale, "transcript": spoken, "differences": differences,
-            "reviewed_revision": state.revision if not differences else None,
-        }}, state.revision)
+            "duration": duration, "scale": scale, "transcript": "", "differences": [], "reviewed_revision": None,
+        }
+        # Publish the editor before ASR/LLM work so manual cuts are available immediately.
+        FacecamService.update(project_id, {"prepared": None, "processed_signature": None,
+            "recording": recording, "recording_edit": FacecamCutService.new_edit(recording)}, state.revision)
         FacecamService.invalidate_output(project_id)
-        return result
+        return FacecamCutService.analyze(project_id)
 
     @classmethod
     def review(cls, project_id, revision):
         state = FacecamService.load(project_id)
         if not state.recording:
             raise ValueError("Importez votre enregistrement.")
+        if state.recording_edit and not state.recording_edit.applied:
+            raise ValueError("Validez d'abord les coupes de l'enregistrement.")
         return FacecamService.update(project_id, {"recording": {**state.recording, "reviewed_revision": revision}, "prepared": None}, revision)
 
     @staticmethod
@@ -253,6 +259,8 @@ class FacecamMediaService:
         state = FacecamService.load(project_id)
         if state.approved_revision != state.revision or not state.recording:
             raise ValueError("Validez le script et importez un enregistrement.")
+        if state.recording_edit and not state.recording_edit.applied:
+            raise ValueError("Validez d'abord les coupes de l'enregistrement.")
         if state.recording.get("reviewed_revision") != state.revision:
             raise ValueError("Vérifiez les différences entre votre script et votre enregistrement.")
         if cls.prepared_audio_exists(state):

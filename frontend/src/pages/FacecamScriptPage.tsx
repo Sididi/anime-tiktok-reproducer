@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Check, ChevronRight, Loader2, Video, RefreshCw, ShieldCheck, Upload, ExternalLink, X, Play } from 'lucide-react';
+import { Check, ChevronRight, Loader2, Video, RefreshCw, ShieldCheck, Upload, ExternalLink, X, Play, Scissors } from 'lucide-react';
 import { Button } from '@/components/ui';
 import { ProjectManagedVideoPlayer } from '@/components/video/ProjectManagedVideoPlayer';
 import type { ManagedVideoPlayerHandle } from '@/components/video/ManagedVideoPlayer';
@@ -9,10 +9,12 @@ import { FacecamStories } from '@/components/script/FacecamStories';
 import { FacecamPrompter } from '@/components/script/FacecamPrompter';
 import { FacecamAutoEditor } from '@/components/script/FacecamAutoEditor';
 import { MetadataEditorModal } from '@/components/script/MetadataEditorModal';
-import { DEFAULT_FACECAM_AUTO_EDITOR, facecamRequest, uploadFacecam, type FacecamAutoEditorSettings, type FacecamBlock, type FacecamState, type Finding } from '@/api/facecam';
+import { DEFAULT_FACECAM_AUTO_EDITOR, facecamRequest, uploadFacecam, type FacecamAutoEditorSettings, type FacecamBlock, type FacecamState, type Finding, type RecordingCut } from '@/api/facecam';
 import { useFacecamPreview } from '@/hooks/useFacecamPreview';
 import type { PlatformMetadata, Project } from '@/types';
 import './facecam.css';
+
+const FacecamCuts = lazy(() => import('@/components/script/FacecamCuts').then(module => ({default: module.FacecamCuts})));
 
 interface Settings {llm_preset: string; music_key: string | null; models: {key: string; label: string}[]; music: {key: string; label: string}[]; auto_editor_defaults?: FacecamAutoEditorSettings}
 interface Cover {id: number; title: {romaji: string; english: string | null}; coverImage: {extraLarge: string}}
@@ -27,6 +29,9 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const [metadata, setMetadata] = useState<PlatformMetadata | null>(null), [metadataOpen, setMetadataOpen] = useState(false);
   const [delivery, setDelivery] = useState<{status: string} | null>(project.facecam_delivery ?? null);
   const [sourceOpen, setSourceOpen] = useState(false), [sourceLoaded, setSourceLoaded] = useState(false);
+  const [cutsOpen, setCutsOpen] = useState(false);
+  const closeCuts = useCallback(() => setCutsOpen(false), []);
+  const recordingPlayer = useRef<HTMLVideoElement>(null);
   const sourcePlayer = useRef<ManagedVideoPlayerHandle>(null);
   const sourceToggle = useRef<HTMLButtonElement | null>(null);
   function toggleSource(trigger?: HTMLButtonElement) {
@@ -47,17 +52,17 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const apply = useCallback((next: FacecamState) => {
     const dirty = editVersion.current !== savedVersion.current;
     if (stateRef.current && next.revision < stateRef.current.revision) return;
+    if (next.recording_edit && !next.recording_edit.applied && next.recording_edit.id !== stateRef.current?.recording_edit?.id) setCutsOpen(true);
     const merged = dirty ? {...next, blocks: draft.current} : next;
     stateRef.current = merged; draft.current = merged.blocks; setState(merged);
   }, []);
   const saveMusic = useCallback((music_key: string | null) => setSettings(previous => previous ? {...previous, music_key} : previous), []);
   const preview = useFacecamPreview({id, state, musicKey: settings?.music_key ?? null, settingsLoaded: !!settings,
-    approved, working, apply, saveMusic, onError: setError});
+    approved, working: working || cutsOpen, apply, saveMusic, onError: setError});
   const busy = working || preview.requestBusy || state?.job?.status === 'processing';
-  const loadMetadata = useCallback(async () => {
-    const response = await fetch(`/api/projects/${id}/metadata`);
+  const loadMetadata = useCallback(() => fetch(`/api/projects/${id}/metadata`).then(async response => {
     if (response.ok) {const result = await response.json(); setMetadata(result.metadata);}
-  }, [id]);
+  }), [id]);
   useEffect(() => {let cancelled = false;
     facecamRequest(id).then(next => {if (!cancelled) {apply(next); setHook(next.selected_hook); setOpinion(next.selected_opinion);}}).catch(e => setError(e.message));
     facecamRequest<Settings>(id, '/settings').then(setSettings).catch(e => setError(e.message));
@@ -66,12 +71,46 @@ export function FacecamScriptPage({project}: {project: Project}) {
   }, [id, apply, loadMetadata]);
   useEffect(() => {
     if (state?.job?.status !== 'processing') return;
-    const source = new EventSource(`/api/projects/${id}/facecam/events`);
-    source.onmessage = event => {const next = JSON.parse(event.data) as FacecamState; apply(next); if (next.job?.status !== 'processing') {source.close(); void loadMetadata();}};
-    source.onerror = () => {source.close(); facecamRequest(id).then(apply).catch(e => setError(e.message));};
-    return () => source.close();
+    let source: EventSource | undefined, retry: ReturnType<typeof setTimeout> | undefined, stopped = false;
+    function connect() {
+      if (stopped) return;
+      source = new EventSource(`/api/projects/${id}/facecam/events`);
+      source.onmessage = event => {if (stopped) return; const next = JSON.parse(event.data) as FacecamState; apply(next); if (next.job?.status !== 'processing') {source?.close(); void loadMetadata();}};
+      source.onerror = () => {
+        source?.close();
+        facecamRequest(id).then(next => {
+          if (stopped) return;
+          apply(next);
+          if (next.job?.status === 'processing') retry = setTimeout(connect, 1000);
+        }).catch(() => {if (!stopped) retry = setTimeout(connect, 1000);});
+      };
+    }
+    connect();
+    return () => {stopped = true; source?.close(); clearTimeout(retry);};
   }, [id, state?.job?.status, apply, loadMetadata]);
   useEffect(() => {const warn = (e: BeforeUnloadEvent) => {if (editVersion.current !== savedVersion.current) {e.preventDefault(); e.returnValue = '';}}; window.addEventListener('beforeunload', warn); return () => window.removeEventListener('beforeunload', warn);}, []);
+  useEffect(() => {if (cutsOpen) {recordingPlayer.current?.pause(); sourcePlayer.current?.pause();}}, [cutsOpen]);
+
+  async function analyzeCuts() {
+    setWorking(true);
+    try {apply(await facecamRequest(id, '/recording/cuts/analyze', 'POST'));} finally {setWorking(false);}
+  }
+  async function openCuts() {
+    setWorking(true);
+    try {
+      const latest = await facecamRequest(id); apply(latest); setCutsOpen(true);
+      if (!latest.recording_edit) await analyzeCuts();
+    } catch (e) {setError((e as Error).message); setCutsOpen(false);}
+    finally {setWorking(false);}
+  }
+  async function applyCuts(cuts: RecordingCut[]) {
+    const snapshot = stateRef.current;
+    if (!snapshot?.recording_edit) return;
+    setWorking(true);
+    try {apply(await facecamRequest(id, '/recording/cuts/apply', 'POST', {revision: snapshot.revision,
+      edit_id: snapshot.recording_edit.id, version: snapshot.recording_edit.version, cuts}));}
+    finally {setWorking(false);}
+  }
 
   async function flush(): Promise<void> {
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -121,6 +160,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const selection = stage === 'hooks' ? hook : opinion;
   const select = stage === 'hooks' ? setHook : setOpinion;
   const previewReady = preview.previewReady;
+  const cutsPending = !!state.recording_edit && !state.recording_edit.applied;
   const storyReady = !!state.selected_story_id || (!state.stories?.length && state.blocks.length > 0);
   const wordCount = state.blocks.filter(b => b.kind !== 'raw').reduce((n, b) => n + (b.text.trim() ? b.text.trim().split(/\s+/).length : 0), 0);
   return <main className="facecam-page">
@@ -165,17 +205,18 @@ export function FacecamScriptPage({project}: {project: Project}) {
           {finding && <div className="facecam-fact-detail"><strong>{finding.quote}</strong><p>{finding.explanation}</p>{finding.correction && <p><b>Suggestion :</b> {finding.correction}</p>}{finding.sources.map(s => <div key={s.url}><a href={s.url} target="_blank" rel="noreferrer">{s.title}<ExternalLink size={12}/></a>{s.kind === 'subtitle' && s.text && <blockquote>{s.text}</blockquote>}</div>)}<button onClick={() => setFinding(null)} className="underline mt-3">Fermer</button></div>}
         </aside></div>
     </section>}
-    <section className="facecam-card" hidden={!state.blocks.length}><h2>4. Votre enregistrement</h2><p>Lisez uniquement votre narration, sans les extraits audio originaux ni le titre final. Une prise correcte suffit : les silences seront coupés et les extraits réinsérés automatiquement.</p>
+    <section className="facecam-card" hidden={!state.blocks.length}><h2>4. Votre enregistrement</h2><p>Lisez uniquement votre narration, sans les extraits audio originaux ni le titre final. Vous pourrez retirer les ratés après l’import. Les silences seront coupés et les extraits réinsérés automatiquement.</p>
       <FacecamPrompter projectId={id} title={project.anime_name || 'Facecam'} revision={state.revision} blocks={state.blocks} saved={saved} busy={!!busy} prepare={flush}/>
       <label className={`facecam-upload ${!approved || busy ? 'disabled' : ''}`}><Upload size={24}/><span>{state.recording ? 'Remplacer l’enregistrement' : 'Importer votre vidéo'}<small>MP4 ou MOV avec son</small></span><input type="file" accept="video/mp4,video/quicktime,.mp4,.mov" disabled={!approved || busy} onChange={e => {const file = e.target.files?.[0]; if(file) void importFile(file, 'recording'); e.target.value = '';}}/></label>
       {!approved && <p>Validez votre script avant d’importer une vidéo.</p>}{upload !== null && <progress max={100} value={upload} aria-label="Envoi du fichier"/>}
-      {state.recording && <div className="facecam-recording"><video controls src={`/api/projects/${id}/facecam/recording?v=${state.recording.fingerprint}`} preload="metadata"/>
-        <div><h3>Texte enregistré</h3><p className="max-h-48 overflow-auto">{state.recording.transcript}</p>
+      {state.recording && <div className="facecam-recording"><video ref={recordingPlayer} controls src={`/api/projects/${id}/facecam/recording?v=${state.recording.fingerprint}`} preload="metadata"/>
+        <div><Button variant="outline" disabled={working || preview.requestBusy || (!!busy && !state.recording_edit)} onClick={() => void openCuts()}><Scissors size={16} className="mr-2"/>{cutsPending ? 'Vérifier les coupes' : 'Modifier les coupes'}</Button>
+          {cutsPending ? <p>Vérifiez les reprises et validez votre prise avant la transcription définitive.</p> : <><h3 className="mt-4">Texte enregistré</h3><p className="max-h-48 overflow-auto">{state.recording.transcript}</p>
           {state.recording.differences.length > 0 && <details open={state.recording.reviewed_revision !== state.revision}><summary>{state.recording.differences.length} différence(s) à vérifier</summary><ul>{state.recording.differences.map((d,i) => <li key={i}><del>{d.expected || '(ajout)'}</del><ins>{d.spoken || '(omis)'}</ins></li>)}</ul></details>}
           {state.recording.reviewed_revision !== state.revision && <Button variant="outline" disabled={busy || !approved} onClick={() => void action('/recording/review', {})}>J’ai vérifié les différences</Button>}
-          <p className="text-sm">Modifiez le script si votre lecture a changé, ou acceptez les écarts de transcription après écoute.</p>
+          <p className="text-sm">Modifiez le script si votre lecture a changé, ou acceptez les écarts de transcription après écoute.</p></>}
         </div></div>}
-      {state.recording && <>
+      {state.recording && !cutsPending && <>
         <FacecamAutoEditor value={preview.tuning} defaults={settings?.auto_editor_defaults ?? DEFAULT_FACECAM_AUTO_EDITOR} disabled={preview.controlsDisabled}
           pending={preview.pending} automatic={preview.enabled} onChange={preview.changeTuning}/>
         <div className="mt-5 flex flex-wrap items-center gap-4"><Button disabled={busy || !settings || !approved || state.recording.reviewed_revision !== state.revision} onClick={preview.prepare}>Préparer l’aperçu audio</Button>{previewReady && <audio key={state.prepared?.preview_version} controls aria-label="Aperçu audio Facecam" src={`/api/projects/${id}/facecam/preview?r=${state.revision}&v=${state.prepared?.preview_version}`} preload="metadata"/>}</div>
@@ -204,6 +245,8 @@ export function FacecamScriptPage({project}: {project: Project}) {
       {error && <p role="alert" className="text-red-400">{error}</p>}{state.job?.status === 'error' && <p role="alert" className="text-red-400">{state.job.message}</p>}
       <footer className="flex flex-wrap gap-3 justify-between mt-5">{stage === 'opinions' ? <Button variant="outline" disabled={busy} onClick={() => setStage('hooks')}>Retour aux accroches</Button> : <span/>}<Button disabled={busy || !hook.trim()} onClick={() => void (stage === 'hooks' ? chooseNext() : generate())}>{stage === 'hooks' ? 'Choisir le point de vue' : 'Générer mon script'}</Button></footer>
     </dialog>
+    {cutsOpen && state.recording_edit && <Suspense fallback={<p role="status">Ouverture du montage…</p>}><FacecamCuts key={state.recording_edit.id} projectId={id} edit={state.recording_edit} busy={!!busy}
+      job={state.job} onClose={closeCuts} onApply={applyCuts} onAnalyze={analyzeCuts}/></Suspense>}
     {metadata && <MetadataEditorModal isOpen={metadataOpen} onClose={() => setMetadataOpen(false)} metadata={metadata} onSave={value => {facecamRequest(id, '/metadata', 'PUT', value).then(() => {setMetadata(value); setMetadataOpen(false);}).catch(e => setError(e.message));}}/>}
   </main>;
 }

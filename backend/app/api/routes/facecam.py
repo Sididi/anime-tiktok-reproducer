@@ -9,9 +9,9 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from ...models.facecam import FacecamAutoEditorSettings, ScriptBlock
+from ...models.facecam import FacecamAutoEditorSettings, RecordingCut, ScriptBlock
 from ...services.facecam_service import FacecamService, StaleFacecamRevision
 from ...services.project_service import ProjectService
 
@@ -40,6 +40,18 @@ class StoryRequest(BaseModel):
 class PreviewRequest(BaseModel):
     revision: int
     auto_editor: FacecamAutoEditorSettings
+
+
+class RecordingCutsRequest(BaseModel):
+    revision: int
+    edit_id: str
+    version: int
+    cuts: list[RecordingCut] = Field(max_length=200)
+
+
+def _require_idle(project_id):
+    if project_id in FacecamService._processing or (project_id in _jobs and not _jobs[project_id].done()):
+        raise HTTPException(409, "Attendez la fin de l'opération Facecam.")
 
 
 def _state(project_id):
@@ -85,7 +97,11 @@ async def create_facecam(project_id: str):
 async def get_facecam(project_id: str):
     state = _state(project_id)
     if state.job and state.job.get("status") == "processing" and (project_id not in _jobs or _jobs[project_id].done()):
-        state = FacecamService.update(project_id, {"job": {"status": "error", "message": "Opération interrompue. Vous pouvez réessayer."}})
+        values = {"job": {"status": "error", "message": "Opération interrompue. Vous pouvez réessayer."}}
+        if state.recording_edit and state.recording_edit.analysis_status == "analyzing":
+            values["recording_edit"] = state.recording_edit.model_copy(update={"analysis_status": "error",
+                "analysis_error": "Analyse interrompue. Vous pouvez couper manuellement ou réessayer."})
+        state = FacecamService.update(project_id, values)
     return state
 
 
@@ -195,6 +211,7 @@ async def upload_recording(project_id: str, file: UploadFile = File(...)):
 @router.post("/{project_id}/facecam/recording/review")
 async def review_recording(project_id: str, request: ActionRequest):
     from ...services.facecam_media_service import FacecamMediaService
+    _require_idle(project_id)
     try:
         return FacecamMediaService.review(project_id, request.revision)
     except ValueError as exc:
@@ -207,8 +224,51 @@ async def recording(project_id: str):
     if not state.recording:
         raise HTTPException(404, "Enregistrement manquant.")
     root = Path(state.recording["directory"])
-    # Original recording includes its voice for the user's recording player.
-    return FileResponse(root / state.recording["original_name"])
+    for name in ("review.mp4", "source_preview.mp4", state.recording["original_name"]):
+        if (root / name).is_file():
+            return FileResponse(root / name)
+    raise HTTPException(404, "Enregistrement indisponible.")
+
+
+@router.get("/{project_id}/facecam/recording/source")
+async def recording_source(project_id: str, edit_id: str):
+    edit = _state(project_id).recording_edit
+    if not edit or edit.id != edit_id:
+        raise HTTPException(409, "L'enregistrement a changé. Rouvrez le montage.")
+    root = Path(edit.source_directory)
+    path = root / "source_preview.mp4"
+    return FileResponse(path if path.is_file() else root / edit.original_name)
+
+
+@router.get("/{project_id}/facecam/recording/cuts")
+async def recording_cuts(project_id: str, edit_id: str):
+    from ...services.facecam_cut_service import FacecamCutService
+    _state(project_id)
+    try:
+        return await asyncio.to_thread(FacecamCutService.data, project_id, edit_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/{project_id}/facecam/recording/cuts/analyze")
+async def analyze_recording_cuts(project_id: str):
+    from ...services.facecam_cut_service import FacecamCutService
+    state = _state(project_id)
+    if not state.recording:
+        raise HTTPException(400, "Importez votre enregistrement.")
+    return await _job(project_id, "Analyse des reprises", FacecamCutService.analyze, heavy=True)
+
+
+@router.post("/{project_id}/facecam/recording/cuts/apply")
+async def apply_recording_cuts(project_id: str, request: RecordingCutsRequest):
+    from ...services.facecam_cut_service import FacecamCutService
+    _require_idle(project_id)
+    try:
+        FacecamCutService.validate_request(project_id, request.revision, request.edit_id, request.version, request.cuts)
+    except ValueError as exc:
+        raise HTTPException(409 if isinstance(exc, StaleFacecamRevision) else 400, str(exc)) from exc
+    return await _job(project_id, "Application des coupes", FacecamCutService.apply,
+        request.revision, request.edit_id, request.version, request.cuts, heavy=True)
 
 
 @router.post("/{project_id}/facecam/preview")
@@ -220,6 +280,8 @@ async def preview(project_id: str, request: PreviewRequest | None = None):
         state = _state(project_id)
         if project_id in FacecamService._processing or (project_id in _jobs and not _jobs[project_id].done()):
             raise HTTPException(409, "Attendez la fin de l'opération Facecam.")
+        if state.recording_edit and not state.recording_edit.applied:
+            raise HTTPException(409, "Validez d'abord les coupes de l'enregistrement.")
         if request:
             if request.revision != state.revision:
                 raise HTTPException(409, "Le script a changé. Rechargez la version actuelle.")

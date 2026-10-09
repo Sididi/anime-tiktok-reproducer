@@ -327,7 +327,7 @@ class FacecamService:
                 text = "\n\n".join(b.text for b in blocks if b.kind != "raw")
                 differences = compare_words(text, recording.get("transcript", ""))
                 recording = {**recording, "differences": differences,
-                    "reviewed_revision": revision + 1 if not differences else None}
+                    "reviewed_revision": revision + 1 if not differences and (not old.recording_edit or old.recording_edit.applied) else None}
             state = cls.update(project_id, {
                 "blocks": blocks, "selected_hook": hook, "selected_opinion": opinion,
                 "revision": revision + 1, "approved_revision": None, "assignment": [],
