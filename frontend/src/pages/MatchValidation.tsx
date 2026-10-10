@@ -1862,9 +1862,9 @@ export function MatchValidation() {
     setSceneWarnings({});
     setToast(null);
     matchesAutoFillTriggeredRef.current = false;
-    matchesAutoFillAllowedRef.current = true;
+    matchesAutoFillAllowedRef.current = false;
     setMatching(true);
-    setPlaybackManifest(null);
+    setError(null);
     setPlaybackProgress(null);
     setPlaybackError(null);
     setMatchProgress({
@@ -1893,12 +1893,9 @@ export function MatchValidation() {
         },
       );
 
-      if (
-        signal.aborted ||
-        finalEvent?.status !== "complete" ||
-        !finalEvent.matches
-      ) {
-        return;
+      if (signal.aborted) return;
+      if (finalEvent?.status !== "complete" || !finalEvent.matches) {
+        throw new Error(finalEvent?.error || "Matching ended without results. Please retry.");
       }
 
       const matchesData = finalEvent.matches as unknown as {
@@ -1910,6 +1907,8 @@ export function MatchValidation() {
           match.was_no_match ?? (match.confidence === 0 && !match.episode),
       }));
 
+      setPlaybackManifest(null);
+      matchesAutoFillAllowedRef.current = true;
       setMatches(completedMatches);
       await loadScenes(projectId);
       if (signal.aborted) return;
@@ -1935,7 +1934,7 @@ export function MatchValidation() {
       // Keep /matches visible so the user can manually continue.
     } catch (err) {
       if (!signal.aborted) {
-        setError((err as Error).message);
+        showToast("error", (err as Error).message);
         setMatchProgress(null);
       }
     } finally {
@@ -1957,6 +1956,7 @@ export function MatchValidation() {
     releaseStreamController,
     clearZoomProject,
     refreshEpisodes,
+    showToast,
   ]);
 
   // Auto-start matching when skipUiEnabled and no matches exist
@@ -2237,12 +2237,10 @@ export function MatchValidation() {
   };
 
   const handleRecomputeMatches = async (episodeSubset?: string[]) => {
-    // Clear existing matches and recompute
+    // Keep the last successful result visible if recomputing fails.
     stopFastWatch();
     setPendingSceneUpdates({});
     setSceneWarnings({});
-    setMatches([]);
-    setPlaybackManifest(null);
     setPlaybackProgress(null);
     setPlaybackError(null);
     await handleFindMatches(episodeSubset);

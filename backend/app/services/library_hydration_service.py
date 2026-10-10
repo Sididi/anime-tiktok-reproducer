@@ -19,6 +19,7 @@ from .executors import run_heavy
 from ..config import settings
 from ..library_types import LibraryType, coerce_library_type
 from .anime_library import AnimeLibraryService
+from .episode_names import canonical_episode_stem
 from .library_state_db import LibraryStateDb, OperationRow, SeriesStateRow
 from .pending_publish_store import PendingPublishRecord, PendingPublishStore
 from .project_service import ProjectService
@@ -1643,6 +1644,11 @@ class LibraryHydrationService:
                         raise RuntimeError(
                             str(operation.get("error") or state.get("last_error") or "Library activation failed.")
                         )
+                    if status == OPERATION_COMPLETE:
+                        raise RuntimeError(
+                            "Library activation completed but the matcher index is incomplete. "
+                            "Re-index the series before matching."
+                        )
                 await asyncio.sleep(0.25)
                 state = await cls.get_activation_state(
                     library_type=library_type,
@@ -2458,7 +2464,34 @@ class LibraryHydrationService:
             shard_dir.is_dir()
             and (shard_dir / "faiss.index").is_file()
             and (shard_dir / "metadata.json").is_file()
+            and cls._index_covers_manifest_episodes(shard_dir / "metadata.json", manifest)
         )
+
+    @staticmethod
+    def _index_covers_manifest_episodes(metadata_path: Path, manifest: dict[str, Any]) -> bool:
+        """An existing shard may have been rebuilt from only hydrated videos.
+
+        Check retrieval metadata, not local media files: matching must work for
+        remote episodes before their videos are downloaded.
+        """
+        try:
+            metadata = _json_load(metadata_path)
+            frames = metadata.get("frames")
+            if not isinstance(frames, list) or not frames:
+                return False
+            indexed = {
+                canonical_episode_stem(frame.get("episode", ""))
+                for frame in frames
+                if isinstance(frame, dict)
+            } - {""}
+            expected = {
+                canonical_episode_stem(episode.get("episode_key", ""))
+                for episode in manifest.get("episodes", [])
+                if isinstance(episode, dict)
+            } - {""}
+            return bool(indexed) and expected.issubset(indexed)
+        except (OSError, ValueError, AttributeError, TypeError):
+            return False
 
     @classmethod
     async def _hydrate_index_artifacts(
@@ -2548,6 +2581,25 @@ class LibraryHydrationService:
         manifest_fragment = _json_load(manifest_fragment_path)
         state_fragment = _json_load(state_fragment_path)
 
+        # Validate the downloaded shard before replacing a working local index.
+        # Old releases may contain an incompatible index or incomplete coverage;
+        # re-downloading those must fail explicitly instead of looping forever.
+        if (
+            manifest_fragment.get("version") != AnimeLibraryService.SEARCHER_INDEX_FORMAT_VERSION
+            or manifest_fragment.get("engine_profile") != AnimeLibraryService.SEARCHER_ENGINE_PROFILE
+        ):
+            raise RuntimeError("Storage Box matcher index is incompatible. Re-index the series before matching.")
+        series_entry = manifest_fragment.get("series", {}).get(display_name, {})
+        shard_key = str(series_entry.get("key") or "").strip()
+        if not shard_key:
+            raise RuntimeError(f"Missing shard key for {display_name}")
+        shard_src_dir = fragment_root / "series" / shard_key
+        if (
+            not (shard_src_dir / "faiss.index").is_file()
+            or not cls._index_covers_manifest_episodes(shard_src_dir / "metadata.json", manifest)
+        ):
+            raise RuntimeError("Storage Box matcher index is incomplete. Re-index the series before matching.")
+
         local_manifest_path = index_dir / AnimeLibraryService.MANIFEST_FILE
         local_state_path = index_dir / AnimeLibraryService.STATE_FILE
 
@@ -2582,11 +2634,6 @@ class LibraryHydrationService:
         }
         local_state["files"].update(state_fragment.get("files", {}))
 
-        series_entry = manifest_fragment.get("series", {}).get(display_name, {})
-        shard_key = str(series_entry.get("key") or "").strip()
-        if not shard_key:
-            raise RuntimeError(f"Missing shard key for {display_name}")
-        shard_src_dir = fragment_root / "series" / shard_key
         shard_dst_dir = series_dir / shard_key
         if shard_dst_dir.exists():
             shutil.rmtree(shard_dst_dir, ignore_errors=True)

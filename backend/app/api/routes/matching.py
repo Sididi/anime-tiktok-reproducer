@@ -426,9 +426,9 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
             TINY_SCENE_THRESHOLD,
         )
         scenes = merged_scenes
-        await ProjectService.asave_scenes(project_id, scenes)
 
     # Update phase
+    previous_phase = project.phase
     project.phase = ProjectPhase.MATCHING
     await ProjectService.asave(project)
 
@@ -459,6 +459,8 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
             final_matches = PureMatcherService.build_identity_matches(
                 video_path, scenes
             )
+            if tiny_merge_log:
+                await ProjectService.asave_scenes(project_id, scenes)
             await ProjectService.asave_matches(project_id, final_matches)
             project.phase = ProjectPhase.MATCH_VALIDATION
             await ProjectService.asave(project)
@@ -552,6 +554,19 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
 
         final_scenes = align_result.scenes
         final_matches = align_result.matches
+        if not any(match.episode for match in final_matches.matches):
+            project.phase = previous_phase
+            await ProjectService.asave(project)
+            yield "data: " + json.dumps({
+                "status": "error",
+                "progress": 0.0,
+                "message": "",
+                "error": (
+                    "No source matches found in the searched episodes. "
+                    "Existing scenes and matches were kept. Check the episode selection and series index."
+                ),
+            }) + "\n\n"
+            return
         await ProjectService.asave_scenes(project_id, final_scenes)
         await ProjectService.asave_matches(project_id, final_matches)
         project.phase = ProjectPhase.MATCH_VALIDATION

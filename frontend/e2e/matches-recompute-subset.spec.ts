@@ -7,7 +7,7 @@ import { expect, test } from "@playwright/test";
 // Episode-04 appears nowhere in the previous run — it was indexed after it —
 // and must always be proposed.
 function installSubsetMocks(
-  { projectId, libraryType }: { projectId: string; libraryType: string },
+  { projectId, libraryType, failure }: { projectId: string; libraryType: string; failure?: "stream" | "http" },
 ) {
   const testWindow = window as typeof window & {
     __findBodies?: unknown[];
@@ -133,6 +133,14 @@ function installSubsetMocks(
     }
     if (url.pathname === `${prefix}/matches/find` && init?.method === "POST") {
       testWindow.__findBodies?.push(JSON.parse(String(init?.body ?? "{}")));
+      if (failure) {
+        const error = "No source matches found. Existing scenes and matches were kept.";
+        return failure === "stream"
+          ? sse([{ status: "error", error }])
+          : new Response(JSON.stringify({ detail: error }), {
+              status: 409, headers: { "Content-Type": "application/json" },
+            });
+      }
       return sse([
         {
           status: "complete",
@@ -158,6 +166,20 @@ function installSubsetMocks(
 
     return originalFetch(input, init);
   };
+}
+
+for (const failure of ["stream", "http"] as const) {
+  test(`failed recompute preserves previous results (${failure})`, async ({ page }) => {
+    const projectId = `recompute-failed-${failure}`;
+    await page.addInitScript(installSubsetMocks, { projectId, libraryType: "anime", failure });
+    await page.goto(`/project/${projectId}/matches`);
+    const recompute = page.getByRole("button", { name: "Recompute (3 ep.)" });
+    await expect(recompute).toBeVisible();
+    await recompute.click();
+    await expect(page.getByText("No source matches found. Existing scenes and matches were kept.", { exact: true })).toBeVisible();
+    await expect(recompute).toBeVisible();
+    await expect(page.getByRole("button", { name: "Find Matches", exact: true })).toHaveCount(0);
+  });
 }
 
 test("primary click recomputes with the AI-proposed episode subset", async ({
