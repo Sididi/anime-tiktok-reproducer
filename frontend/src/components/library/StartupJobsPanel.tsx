@@ -48,6 +48,8 @@ export function StartupJobsPanel({
   const activeJobs = sortedJobs.filter(
     (job) => job.status === "queued" || job.status === "running",
   );
+  const runningCount = activeJobs.filter((job) => job.status === "running").length;
+  const queuedCount = activeJobs.length - runningCount;
 
   if (sortedJobs.length === 0) {
     return null;
@@ -78,7 +80,7 @@ export function StartupJobsPanel({
           }`}
         />
         <span className="text-[hsl(var(--muted-foreground))]">
-          {activeJobs.length} startup{activeJobs.length !== 1 ? "s" : ""} en cours
+          {runningCount} startups en préparation · {queuedCount} en attente
         </span>
         <ChevronDown
           className={`ml-auto h-3.5 w-3.5 text-[hsl(var(--muted-foreground))] transition-transform ${

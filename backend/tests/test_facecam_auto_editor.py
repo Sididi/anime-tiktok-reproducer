@@ -188,14 +188,13 @@ def test_facecam_timeline_keeps_first_consonant_margin_and_entire_clean_audio():
 def test_source_word_timings_are_cached_across_tuning(monkeypatch, tmp_path):
     from contextlib import nullcontext
     from app.services.facecam_media_service import FacecamMediaService
-    from app.services.transcriber import TranscriberService
+    from app.services.transcriber import ASRResult, TranscriberService
     calls = []
     def transcribe(*args):
         calls.append(args)
-        return ([{'text': 'Bonjour', 'start': .1, 'end': .7}], 'fr')
+        return ASRResult([{'text': 'Bonjour', 'start': .1, 'end': .7}], 'fr', [(.8, 1)])
     monkeypatch.setattr(TranscriberService, '_transcribe_sync', transcribe)
     monkeypatch.setattr(TranscriberService, 'model_session', lambda: nullcontext())
-    monkeypatch.setattr(TranscriberService, '_last_unrecovered_gaps', [(.8, 1)])
     first = FacecamMediaService.speech_timing(tmp_path)
     assert FacecamMediaService.speech_timing(tmp_path) == first
     assert len(calls) == 1

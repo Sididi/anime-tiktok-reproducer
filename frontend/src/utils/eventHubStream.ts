@@ -28,6 +28,7 @@ export interface HubCoreOptions {
   fetchImpl?: () => typeof fetch;
   reconnectMs?: number;
   streamStaleMs?: number;
+  polling?: boolean;
 }
 
 export class HubCore {
@@ -112,6 +113,7 @@ export class HubCore {
   }
 
   private async connect(): Promise<void> {
+    if (this.options.polling) return this.poll();
     const controller = new AbortController();
     this.controller = controller;
     this.connects += 1;
@@ -162,5 +164,29 @@ export class HubCore {
       this.reconnectTimer = null;
       if (this.running) void this.connect();
     }, this.options.reconnectMs ?? RECONNECT_MS);
+  }
+
+  private async poll(): Promise<void> {
+    const controller = new AbortController();
+    this.controller = controller;
+    this.connects += 1;
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    try {
+      const response = await fetch("/api/events/snapshot", { signal: controller.signal });
+      if (!response.ok) throw new Error(`Snapshot HTTP ${response.status}`);
+      for (const frame of await response.json() as ServerFrame[]) {
+        this.applyFrame(frame);
+        this.options.onFrame(frame);
+      }
+      this.setStatus("connected");
+    } catch {
+      if (this.running) this.setStatus("reconnecting");
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (this.running) this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.running) void this.poll();
+    }, 5000 + Math.random() * 1000);
   }
 }

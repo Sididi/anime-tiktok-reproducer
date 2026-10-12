@@ -67,7 +67,7 @@ async def test_v4_run_context_seed_manifest_and_pcm(tmp_path, monkeypatch, missi
     for i, call in enumerate(calls):
         assert call["seed"] == 321
         assert call["language_code"] == "fr"
-        assert call["inputs"] == [{"voice_id": "voice", "text": f"{Automation.NARRATION_CONTROL_PREFIX} {chunks[i]}"}]
+        assert call["inputs"] == [{"voice_id": "voice", "text": f"[TikTok narrator, rapid] {chunks[i]}"}]
         assert "next_text" not in call
         if i < len(chunks) - 1:
             assert call["future_text"] == chunks[i + 1][:100]

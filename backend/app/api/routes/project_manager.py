@@ -149,6 +149,8 @@ async def delete_managed_project(project_id: str, confirmed: bool = False):
                 confirmed=confirmed,
             )
         if result.get("local_deleted"):
+            from ...services.progress_jobs import progress_jobs
+            await progress_jobs.remove_project(project_id)
             await project_startup_queue.remove_project_jobs(project_id)
             await project_upload_queue.remove_project_jobs(project_id)
         return result

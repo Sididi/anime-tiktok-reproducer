@@ -1,3 +1,4 @@
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import AsyncIterator
 import asyncio
@@ -6,6 +7,7 @@ from scenedetect import open_video, SceneManager, ContentDetector
 
 from .executors import heavy_executor
 from ..models import Scene
+from ..config import settings
 
 
 class SceneDetectionProgress:
@@ -48,6 +50,8 @@ class SceneDetectionProgress:
 class SceneDetectorService:
     """Service for detecting scenes using PySceneDetect."""
 
+    _cpu_slots = asyncio.Semaphore(settings.scene_detection_max_concurrent)
+
     HEARTBEAT_INTERVAL_SECONDS = 3.0
     EXTREME_SHORT_SECONDS_FLOOR = 0.08
     EXTREME_SHORT_MIN_FRAMES = 3
@@ -86,6 +90,32 @@ class SceneDetectorService:
 
     @classmethod
     async def detect_scenes(
+        cls, video_path: Path, threshold: float = 16.0, min_scene_len: int = 10,
+        library_path: Path | None = None, library_type: object = None,
+        anime_name: str | None = None,
+    ) -> AsyncIterator[SceneDetectionProgress]:
+        # Library-assisted short-cut correction touches the process-global
+        # SSCD matcher. It must obey the SAME lock and GPU budget as matching,
+        # including startup and cleanup callers. Pure CPU detection can overlap.
+        from .indexation_queue import indexation_queue
+        yield SceneDetectionProgress("starting", 0, "En attente du découpage…")
+        async with AsyncExitStack() as stack:
+            if library_path is not None:
+                await stack.enter_async_context(indexation_queue.matching_lock())
+                await stack.enter_async_context(indexation_queue.heavy_slot(
+                    "scene_detection", slots=indexation_queue.MAX_CONCURRENT,
+                ))
+            await stack.enter_async_context(cls._cpu_slots)
+            stream = cls._detect_scenes_impl(video_path, threshold, min_scene_len,
+                                           library_path, library_type, anime_name)
+            try:
+                async for progress in stream:
+                    yield progress
+            finally:
+                await stream.aclose()
+
+    @classmethod
+    async def _detect_scenes_impl(
         cls,
         video_path: Path,
         threshold: float = 16.0,

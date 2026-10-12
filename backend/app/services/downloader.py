@@ -50,6 +50,8 @@ class _DownloadCommandResult:
 class DownloaderService:
     """Service for downloading TikTok videos using yt-dlp."""
 
+    _project_download_slots = asyncio.Semaphore(settings.download_max_concurrent)
+
     DOWNLOAD_TIMEOUT_SECONDS = 1800.0
     DOWNLOAD_HEARTBEAT_INTERVAL_SECONDS = 5.0
     DOWNLOAD_STALL_SECONDS = 60.0
@@ -743,6 +745,20 @@ class DownloaderService:
         cls,
         url: str,
         project_id: str,
+    ) -> AsyncIterator[DownloadProgress]:
+        if cls._project_download_slots.locked():
+            yield DownloadProgress("starting", 0, "En attente d’un créneau de téléchargement…")
+        async with cls._project_download_slots:
+            stream = cls._download_project_video(url, project_id)
+            try:
+                async for progress in stream:
+                    yield progress
+            finally:
+                await stream.aclose()
+
+    @classmethod
+    async def _download_project_video(
+        cls, url: str, project_id: str,
     ) -> AsyncIterator[DownloadProgress]:
         from ..models import ProjectPhase
         from .project_service import ProjectService

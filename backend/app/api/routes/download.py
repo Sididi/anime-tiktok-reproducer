@@ -1,9 +1,11 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import Header, APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
 
 from ...services import ProjectService, DownloaderService
+
+from ...services.progress_jobs import progress_response
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["download"])
 
@@ -13,7 +15,12 @@ class DownloadRequest(BaseModel):
 
 
 @router.post("/download")
-async def download_video(project_id: str, request: DownloadRequest):
+async def download_video(project_id: str, request: DownloadRequest, prefer: str | None = Header(default=None)):
+    return await progress_response(project_id, "download", request.model_dump(),
+                                   lambda: _download_video_stream(project_id, request), prefer)
+
+
+async def _download_video_stream(project_id: str, request: DownloadRequest):
     """Download a TikTok video and stream progress updates."""
     project = await ProjectService.aload(project_id)
     if not project:

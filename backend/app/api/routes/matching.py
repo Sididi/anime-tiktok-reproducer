@@ -3,7 +3,7 @@ import logging
 import math
 from contextlib import suppress
 from functools import partial
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import Header, APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import json
@@ -35,6 +35,8 @@ from ...services.episode_names import (
     normalize_episode_whitelist,
     strip_known_media_extension,
 )
+
+from ...services.progress_jobs import progress_response
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["matching"])
 
@@ -362,7 +364,12 @@ async def list_episodes(project_id: str):
 
 
 @router.post("/matches/find")
-async def find_matches(project_id: str, request: FindMatchesRequest):
+async def find_matches(project_id: str, request: FindMatchesRequest, prefer: str | None = Header(default=None)):
+    return await progress_response(project_id, "matching", request.model_dump(),
+                                   lambda: _find_matches_stream(project_id, request), prefer)
+
+
+async def _find_matches_stream(project_id: str, request: FindMatchesRequest):
     """Find anime source matches for all scenes with optional continuous scene merging."""
     project = await ProjectService.aload(project_id)
     if not project:
@@ -599,7 +606,12 @@ async def find_matches(project_id: str, request: FindMatchesRequest):
 
 
 @router.post("/matches/deferred-download")
-async def deferred_download(project_id: str):
+async def deferred_download(project_id: str, prefer: str | None = Header(default=None)):
+    return await progress_response(project_id, "deferred_download", {},
+                                   lambda: _deferred_download_stream(project_id), prefer)
+
+
+async def _deferred_download_stream(project_id: str):
     """Hydrate matched episodes from Storage Box or recover local imports.
 
     Always returns an SSE stream so the frontend can track progress phases.
@@ -762,7 +774,12 @@ async def deferred_download(project_id: str):
 
 
 @router.post("/matches/playback/prepare")
-async def prepare_matches_playback(project_id: str, request: PreparePlaybackRequest):
+async def prepare_matches_playback(project_id: str, request: PreparePlaybackRequest, prefer: str | None = Header(default=None)):
+    return await progress_response(project_id, "playback", request.model_dump(),
+                                   lambda: _prepare_matches_playback_stream(project_id, request), prefer)
+
+
+async def _prepare_matches_playback_stream(project_id: str, request: PreparePlaybackRequest):
     """Prepare browser-safe clips for /matches playback and Fast Watch."""
     project = await ProjectService.aload(project_id)
     if not project:
@@ -787,7 +804,12 @@ async def prepare_matches_playback(project_id: str, request: PreparePlaybackRequ
 
 
 @router.post("/matches/playback/prepare-scene/{scene_index}")
-async def prepare_matches_playback_scene(
+async def prepare_matches_playback_scene(project_id: str, scene_index: int, request: PrepareScenePlaybackRequest, prefer: str | None = Header(default=None)):
+    return await progress_response(project_id, f"playback_scene:{scene_index}", request.model_dump(),
+                                   lambda: _prepare_matches_playback_scene_stream(project_id, scene_index, request), prefer)
+
+
+async def _prepare_matches_playback_scene_stream(
     project_id: str,
     scene_index: int,
     request: PrepareScenePlaybackRequest,

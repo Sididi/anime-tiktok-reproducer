@@ -88,6 +88,18 @@ class EventHub:
     def topics(self) -> list[str]:
         return list(self._topics)
 
+    def refresh_topic(self, topic: str) -> None:
+        """Replace client caches after registry eviction, including live workers."""
+        if topic not in self._topics:
+            return
+        frame = self.snapshot_frame(topic)
+        for sub in tuple(self._subscribers):
+            for slot in list(sub.pending):
+                if slot[0] == topic:
+                    sub.pending.pop(slot, None)
+            sub.pending[(topic, "__snapshot__")] = frame
+            sub.wake.set()
+
     # ------------------------------------------------------------------
     # publishing
 

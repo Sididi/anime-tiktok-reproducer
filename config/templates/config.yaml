@@ -50,8 +50,8 @@ templates:
         enabled: false
         style: "minimal"
         prfpset: null
-    voice_key: paul_k
-    music_key: montagem_batchi_cut_start_15s
+    voice_key: maxime_v4
+    music_key: credits_song_death
     llm_preset: mistral
     min_playback_speed: 0.5
 
@@ -80,7 +80,7 @@ templates:
         enabled: true
         style: "minimal"
         prfpset: null
-    voice_key: noe
-    music_key: credits_song_death
-    llm_preset: gemini
+    voice_key: bass_v4
+    music_key: carol_of_the_bells
+    llm_preset: claude
     min_playback_speed: 0.8

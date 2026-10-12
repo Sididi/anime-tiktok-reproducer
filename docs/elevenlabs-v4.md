@@ -54,7 +54,7 @@ side rather than submitting both. Missing response IDs clear the audio context
 chain so the next block falls back to its immediate predecessor's text.
 
 Neighbor text comes from the normalized spoken script. The delivery tag
-`[TikTok narrator, energetic, rapid]` is added only to the block being generated,
+`[TikTok narrator, rapid]` is added only to the block being generated,
 not its neighbors or stored transcripts. Existing post-generation speed,
 silence processing, PCM-to-WAV wrapping, and merging remain in place.
 

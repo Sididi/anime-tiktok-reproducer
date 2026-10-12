@@ -14,12 +14,14 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from .executors import heavy_executor, run_heavy
+from ..config import settings
 from ..models import Word, SceneTranscription, Transcription, Scene, SceneList, SceneMatch, MatchList
 from ..models.raw_scene import RawSceneDetectionResult
 from ..services import ProjectService
 from . import asr_engine
 from ..utils.media_binaries import get_media_subprocess_env, rewrite_media_command
 from ..utils.process_cleanup import shutdown_torch_compile_workers
+from ..utils.file_tasks import wait_for_worker
 
 
 class TranscriptionProgress:
@@ -75,6 +77,14 @@ logger = logging.getLogger(__name__)
 TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS = 5.0
 
 
+class ASRResult(tuple):
+    """Two-value unpacking with coverage diagnostics owned by this result."""
+    def __new__(cls, words, language, unrecovered_gaps=()):
+        result = super().__new__(cls, (words, language))
+        result.unrecovered_gaps = list(unrecovered_gaps)
+        return result
+
+
 class TranscriberService:
     """Service for transcribing audio using WhisperX."""
 
@@ -84,10 +94,6 @@ class TranscriberService:
     _model_lock = threading.RLock()
     _active_transcriptions: int = 0
     _unload_requested: bool = False
-    # Speech spans the last _transcribe_sync run could not recover words for
-    # (post-alignment, post-repair). Safe as a class attribute: transcription
-    # runs are serialized behind the indexation queue's heavy slot.
-    _last_unrecovered_gaps: list[tuple[float, float]] = []
 
     @classmethod
     def _ensure_unsafe_torch_load_env(cls) -> None:
@@ -157,6 +163,7 @@ class TranscriberService:
 
             had_asr = len(cls._asr_models)
             had_align = len(cls._align_models)
+            cleanup_requested = cls._unload_requested
             asr_models = [cls._asr_models.pop(key) for key in list(cls._asr_models)]
             align_models = [cls._align_models.pop(key) for key in list(cls._align_models)]
             # A forced unload (the CUDA-OOM retry) can run while ANOTHER
@@ -172,6 +179,9 @@ class TranscriberService:
             cls._unload_requested = not destroy
 
         if not destroy:
+            return
+
+        if not had_asr and not had_align and not cleanup_requested:
             return
 
         # --- ASR models (faster_whisper.WhisperModel) ---
@@ -376,8 +386,8 @@ class TranscriberService:
         if cls._get_device() == "cuda":
             # Keep a fast default first, then progressively reduce VRAM pressure.
             profiles.extend([
-                ("cuda", "float16", 8, sizes[0]),
-                ("cuda", "float16", 4, sizes[0]),
+                ("cuda", "float16", settings.transcription_batch_size, sizes[0]),
+                ("cuda", "float16", min(4, settings.transcription_batch_size), sizes[0]),
                 ("cuda", "int8_float16", 4, sizes[0]),
             ])
             for fallback_size in sizes[1:]:
@@ -572,6 +582,7 @@ class TranscriberService:
             return aligned.get("segments") or segments, model_a, metadata, device
         except Exception as exc:
             if device == "cuda" and cls._is_cuda_oom(exc):
+                logger.warning("ASR alignment fallback: CUDA memory exhausted; retrying on CPU")
                 try:
                     model_a, metadata = cls._load_align_model(detected_language, "cpu")
                     aligned = whisperx.align(segments, model_a, metadata, audio, "cpu")
@@ -592,7 +603,6 @@ class TranscriberService:
     ) -> tuple[list[dict], str]:
         cls._ensure_unsafe_torch_load_env()
         cls._start_transcription_session()
-        cls._last_unrecovered_gaps = []
 
         temp_audio_path: Path | None = None
         try:
@@ -628,6 +638,8 @@ class TranscriberService:
             last_exc: Exception | None = None
 
             for device, compute_type, batch_size, profile_model_size in attempts:
+                logger.info("ASR profile: device=%s compute=%s batch=%s model=%s",
+                            device, compute_type, batch_size, profile_model_size)
                 if device == "cuda":
                     cls._clear_cuda_cache()
 
@@ -694,10 +706,10 @@ class TranscriberService:
                         residual = asr_engine.log_residual_coverage(
                             words, speech_regions
                         )
-                cls._last_unrecovered_gaps = [
+                unrecovered_gaps = [
                     (float(start), float(end)) for start, end in residual
                 ]
-                return words, detected_language
+                return ASRResult(words, detected_language, unrecovered_gaps)
 
             if last_exc is not None:
                 raise last_exc
@@ -1219,7 +1231,7 @@ class TranscriberService:
             # the shielded native worker is still running. _end_transcription_session
             # performs the actual unload as soon as the last worker exits.
             with suppress(Exception):
-                cls.unload_models()
+                await wait_for_worker(run_heavy(cls.unload_models))
 
     @classmethod
     async def _transcribe_impl(
@@ -1296,10 +1308,11 @@ class TranscriberService:
             native_futures.append(transcription_future)
             while True:
                 try:
-                    words, detected_lang = await asyncio.wait_for(
+                    asr_result = await asyncio.wait_for(
                         asyncio.shield(transcription_future),
                         timeout=TRANSCRIPTION_HEARTBEAT_INTERVAL_SECONDS,
                     )
+                    words, detected_lang = asr_result
                     break
                 except asyncio.TimeoutError:
                     yield TranscriptionProgress(
@@ -1316,12 +1329,12 @@ class TranscriberService:
             transcription = Transcription(
                 language=detected_lang,
                 scenes=scene_transcriptions,
-                unrecovered_gaps=list(cls._last_unrecovered_gaps),
+                unrecovered_gaps=list(getattr(asr_result, "unrecovered_gaps", [])),
             )
 
             # Keep existing working files intact until the complete new
             # source and derived outputs are ready to publish together.
-            cls.unload_models()
+            await wait_for_worker(run_heavy(cls.unload_models))
             from .raw_scene_detector import RawSceneDetectorService
             from .narrator_service import NarratorService
             from .project_locks import ProjectLocks
@@ -1397,11 +1410,11 @@ class TranscriberService:
                 with suppress(Exception):
                     await asyncio.shield(future)
             with suppress(Exception):
-                cls.unload_models()
+                await wait_for_worker(run_heavy(cls.unload_models))
             raise
         except Exception as e:
             with suppress(Exception):
-                cls.unload_models()
+                await wait_for_worker(run_heavy(cls.unload_models))
             yield TranscriptionProgress("error", 0, "", error=str(e))
 
     @classmethod

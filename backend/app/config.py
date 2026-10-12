@@ -1,7 +1,7 @@
 import logging
 import os
 from fractions import Fraction
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
     integration_startup_health_check_enabled: bool = True
+
+    # Pipeline capacity is independent of the shared GPU admission budget.
+    # Up to four projects can download/prepare/wait; only two heavy GPU
+    # slots exist, and large matching/cleanup stages reserve both.
+    startup_max_concurrent: int = Field(default=4, ge=1, le=8)
+    download_max_concurrent: int = Field(default=3, ge=1, le=6)
+    scene_detection_max_concurrent: int = Field(default=2, ge=1, le=4)
+    gpu_max_concurrent: int = Field(default=2, ge=1, le=2)
+    transcription_batch_size: int = Field(default=4, ge=1, le=8)
 
     # Video settings
     default_fps: float = 30.0

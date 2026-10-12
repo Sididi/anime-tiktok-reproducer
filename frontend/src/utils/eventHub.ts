@@ -173,7 +173,9 @@ class EventHubClientImpl implements EventHubClient {
   private ensureStarted(): void {
     if (this.started || this.disposed) return;
     this.started = true;
-    if (wantsDirectTransport()) {
+    if (typeof SharedWorker === "undefined") {
+      this.startDirect(true);
+    } else if (wantsDirectTransport()) {
       this.startDirect();
     } else {
       this.startShared();
@@ -204,9 +206,10 @@ class EventHubClientImpl implements EventHubClient {
     }
   }
 
-  private startDirect(): void {
+  private startDirect(polling = false): void {
     this.transportKind = "direct";
     this.direct = new HubCore({
+      polling,
       onFrame: (frame) => this.applyFrame(frame),
       onStatus: (status) => this.setStatus(status),
     });
@@ -216,12 +219,12 @@ class EventHubClientImpl implements EventHubClient {
   private fallbackToDirect(reason: string): void {
     if (this.disposed || this.transportKind === "direct") return;
     console.warn(
-      `[eventHub] using a per-tab connection: ${reason}. ` +
+      `[eventHub] using short snapshot requests: ${reason}. ` +
         "If this is a stale dev worker, close every tab of the app once.",
     );
     this.stopHeartbeat();
     this.detachWorker(false);
-    this.startDirect();
+    this.startDirect(true);
   }
 
   private detachWorker(sayBye: boolean): void {

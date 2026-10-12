@@ -7,6 +7,7 @@ from collections import Counter
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from pathlib import Path
 
+from ..config import settings
 from ..library_types import LibraryType
 from ..models.torrent import IndexationJob
 from .anime_library import AnimeLibraryService
@@ -40,6 +41,7 @@ class IndexationQueueService:
     UPLOAD_RETRY_DELAYS = (30.0, 120.0, 600.0)
 
     def __init__(self) -> None:
+        self.MAX_CONCURRENT = settings.gpu_max_concurrent
         self._jobs: dict[str, IndexationJob] = {}
         self._job_tasks: set[asyncio.Task] = set()
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)

@@ -180,8 +180,9 @@ class FacecamMediaService:
         path = root / "speech_timing.json"
         if not path.exists():
             with TranscriberService.model_session():
-                words, _ = TranscriberService._transcribe_sync(root / "voice.wav", "fr", "large-v3")
-                cls.save_speech_timing(root, words, TranscriberService._last_unrecovered_gaps)
+                result = TranscriberService._transcribe_sync(root / "voice.wav", "fr", "large-v3")
+                words, _ = result
+                cls.save_speech_timing(root, words, getattr(result, "unrecovered_gaps", []))
         timing = json.loads(path.read_text())
         if not timing.get("words"):
             raise ValueError("Aucune parole détectée dans l'enregistrement.")

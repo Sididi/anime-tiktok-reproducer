@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import Header, APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import asyncio
@@ -11,6 +11,8 @@ from ...services.drive_prewarm_service import DrivePrewarmService
 from ...services.match_playback_service import MatchPlaybackService
 from ...services.project_locks import project_edit_locked
 from ...services.narrator_service import NarratorService
+
+from ...services.progress_jobs import progress_response
 
 router = APIRouter(prefix="/projects/{project_id}/transcription", tags=["transcription"])
 
@@ -34,7 +36,12 @@ async def get_transcription_config(project_id: str):
 
 
 @router.post("/start")
-async def start_transcription(project_id: str, request: StartTranscriptionRequest):
+async def start_transcription(project_id: str, request: StartTranscriptionRequest, prefer: str | None = Header(default=None)):
+    return await progress_response(project_id, "transcription", request.model_dump(),
+                                   lambda: _start_transcription_stream(project_id, request), prefer)
+
+
+async def _start_transcription_stream(project_id: str, request: StartTranscriptionRequest):
     """Start transcription with WhisperX."""
     NarratorService.ensure_idle(project_id)
     project = await ProjectService.aload(project_id)

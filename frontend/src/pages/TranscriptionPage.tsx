@@ -11,6 +11,7 @@ import { api } from "@/api/client";
 import { formatTime, readSSEStream } from "@/utils";
 import { getProjectVideoSourceCandidates } from "@/utils/mediaSources";
 import { MEDIA_PRIORITY, getViewportPriority } from "@/utils/mediaPriorities";
+import { observeProgressJob, type ProgressJob } from "@/utils/progressJobs";
 import type { Transcription } from "@/types";
 
 interface TranscriptionProgress {
@@ -43,6 +44,7 @@ export function TranscriptionPage() {
   const [fullAutoEnabled, setFullAutoEnabled] = useState(false);
   const [loading, setLoading] = useState(true);
   const [transcribing, setTranscribing] = useState(false);
+  const [resumeJob, setResumeJob] = useState<ProgressJob | null>(null);
   const [narratorBusy, setNarratorBusy] = useState(false);
   const [progress, setProgress] = useState<TranscriptionProgress | null>(null);
   const [language, setLanguage] = useState("auto");
@@ -115,6 +117,9 @@ export function TranscriptionPage() {
         await loadProject(projectId);
         await loadScenes(projectId);
         const { transcription: loaded } = await api.getTranscription(projectId);
+        const operations = await api.getProgressJobs(projectId).catch(() => ({ jobs: [] }));
+        setResumeJob(operations.jobs.find((job) => job.kind === "transcription"
+          && (job.status === "queued" || job.status === "running")) ?? null);
         setTranscription(loaded);
         if (loaded?.language) {
           // Default the re-run selector to the language of the existing
@@ -145,7 +150,7 @@ export function TranscriptionPage() {
     loadData();
   }, [projectId, loadProject, loadScenes]);
 
-  const handleStartTranscription = useCallback(async (forcedLanguage?: string) => {
+  const handleStartTranscription = useCallback(async (forcedLanguage?: string, existingJob?: ProgressJob) => {
     if (!projectId) return;
     const selectedLanguage = forcedLanguage ?? language;
     transcriptionAbortRef.current?.abort();
@@ -162,7 +167,7 @@ export function TranscriptionPage() {
     setError(null);
 
     try {
-      const response = await api.startTranscription(
+      const response = existingJob ? observeProgressJob(existingJob, controller.signal) : await api.startTranscription(
         projectId,
         selectedLanguage,
         controller.signal,
@@ -215,6 +220,13 @@ export function TranscriptionPage() {
   }, [projectId, language, fullAutoEnabled, navigate]);
 
   useEffect(() => {
+    if (loading || !resumeJob || resumeJob.project_id !== projectId) return;
+    autoStartedTranscriptionProjects.add(resumeJob.project_id);
+    setResumeJob(null);
+    void handleStartTranscription(undefined, resumeJob);
+  }, [loading, resumeJob, projectId, handleStartTranscription]);
+
+  useEffect(() => {
     return () => {
       transcriptionAbortRef.current?.abort();
     };
@@ -224,6 +236,7 @@ export function TranscriptionPage() {
     if (
       !projectId ||
       loading ||
+      resumeJob ||
       transcribing ||
       transcription ||
       !fullAutoEnabled ||
@@ -238,6 +251,7 @@ export function TranscriptionPage() {
   }, [
     projectId,
     loading,
+    resumeJob,
     transcribing,
     transcription,
     fullAutoEnabled,

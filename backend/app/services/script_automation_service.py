@@ -50,6 +50,7 @@ class ScriptAutomationService:
     # Delivery instruction for expressive models; kept out of transcripts and
     # neighboring text context. V4 has no generation speed setting.
     NARRATION_CONTROL_PREFIX = "[TikTok narrator, energetic, rapid]"
+    V4_NARRATION_CONTROL_PREFIX = "[TikTok narrator, rapid]"
 
     @classmethod
     def _generate_and_store_elevenlabs_seed(cls, project_id: str) -> int:
@@ -1159,9 +1160,12 @@ class ScriptAutomationService:
                         char_count=segment_char_count,
                     )
 
-                    outgoing_text = (
-                        f"{cls.NARRATION_CONTROL_PREFIX} {chunk}" if uses_audio_tags else chunk
+                    narration_prefix = (
+                        cls.V4_NARRATION_CONTROL_PREFIX
+                        if normalized_model == "eleven_v4"
+                        else cls.NARRATION_CONTROL_PREFIX
                     )
+                    outgoing_text = f"{narration_prefix} {chunk}" if uses_audio_tags else chunk
                     synthesize_kwargs: dict[str, Any] = {
                         "voice_id": voice.elevenlabs_voice_id,
                         "text": outgoing_text,

@@ -19,11 +19,13 @@ from .integrations import router as integrations_router
 from .tiktok_url_db import router as tiktok_url_db_router
 from .scheduling import router as scheduling_router
 from .events import router as events_router
+from .progress import router as progress_router
 # TEMPORARILY DISABLED - Subtitle video generation feature
 
 api_router = APIRouter(prefix="/api")
 api_router.include_router(facecam_router)
 api_router.include_router(events_router)
+api_router.include_router(progress_router)
 api_router.include_router(accounts_router)
 api_router.include_router(projects_router)
 api_router.include_router(startup_router)

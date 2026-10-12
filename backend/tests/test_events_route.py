@@ -15,7 +15,7 @@ from app.api.routes import events as events_route
 from app.main import app
 from app.services.event_hub import event_hub
 
-EXPECTED_TOPICS = {"startup_jobs", "upload_jobs", "index_jobs", "zoom_jobs"}
+EXPECTED_TOPICS = {"startup_jobs", "upload_jobs", "index_jobs", "zoom_jobs", "cleanup_jobs", "progress_jobs"}
 
 
 @pytest.fixture

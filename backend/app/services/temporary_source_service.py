@@ -236,15 +236,25 @@ class TemporarySourceService:
         from .indexation_queue import indexation_queue
         from .zoom_search_service import zoom_search_service
         from .match_playback_service import MatchPlaybackService
+        from .progress_jobs import progress_jobs
 
         project = await ProjectService.aload(project_id)
         if project is None or project.temporary_source is None:
-            yield
+            if project_id in cls._deleting:
+                raise RuntimeError("Project deletion is already running")
+            cls._deleting.add(project_id)
+            try:
+                await progress_jobs.cancel_project(project_id)
+                await project_startup_queue.cancel_project(project_id)
+                yield
+            finally:
+                cls._deleting.discard(project_id)
             return
         if project_id in cls._deleting:
             raise RuntimeError("Project deletion is already running")
         cls._deleting.add(project_id)
         try:
+            await progress_jobs.cancel_project(project_id)
             await project_startup_queue.cancel_project(project_id)
             zoom_search_service.invalidate_project(project_id, reason="project deleted")
             root = cls.root(project_id).resolve()

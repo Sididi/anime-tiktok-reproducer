@@ -35,15 +35,6 @@ def _jobs_payload(jobs: dict[str, ProjectStartupJob]) -> dict[str, Any]:
     }
 
 
-def _write_jobs_atomic(path: Path, jobs: dict[str, ProjectStartupJob]) -> None:
-    # Unique temp name: two publishes running on worker threads at once used
-    # to share one ".tmp" path and could rename each other's half-written file.
-    write_text_atomic(
-        path,
-        json.dumps(_jobs_payload(jobs), ensure_ascii=True, indent=2, sort_keys=True),
-    )
-
-
 def _load_jobs(path: Path) -> dict[str, ProjectStartupJob]:
     if not path.exists():
         return {}
@@ -64,18 +55,30 @@ def _load_jobs(path: Path) -> dict[str, ProjectStartupJob]:
 
 
 class ProjectStartupService:
-    MAX_CONCURRENT = 1
     RESTART_INTERRUPTED_ERROR = "Startup interrupted by server restart."
 
     def __init__(self, jobs_path: Path | None = None) -> None:
+        self.MAX_CONCURRENT = settings.startup_max_concurrent
         self._jobs_path = jobs_path or (settings.data_dir / "project_startup_jobs.json")
         self._jobs = _load_jobs(self._jobs_path)
+        self._persist_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT)
         # The event loop only keeps weak references to tasks; without a strong
         # reference here a queued/running startup task can be garbage-collected
         # mid-flight and its job stays "queued" forever.
         self._tasks: set[asyncio.Task] = set()
         self._project_tasks: dict[str, asyncio.Task] = {}
+
+    async def _persist(self) -> None:
+        # Freeze on the loop and serialize writes: concurrent startup workers
+        # must not persist an older mutable registry after a newer update.
+        async with self._persist_lock:
+            payload = json.dumps(_jobs_payload(self._jobs), ensure_ascii=True)
+            await file_io(write_text_atomic, self._jobs_path, payload)
+
+    async def shutdown(self) -> None:
+        for project_id in list(self._project_tasks):
+            await self.cancel_project(project_id)
 
     async def startup_cleanup(self) -> None:
         from .project_service import ProjectService
@@ -98,7 +101,7 @@ class ProjectStartupService:
         for project_id in stale_ids:
             del self._jobs[project_id]
         if updated or stale_ids:
-            await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
+            await self._persist()
 
     async def remove_project_jobs(self, project_id: str) -> None:
         """Evict a deleted project's job; the registry is persisted and reloaded
@@ -106,12 +109,13 @@ class ProjectStartupService:
         await self.cancel_project(project_id)
         removed = self._jobs.pop(project_id, None)
         if removed is not None:
-            await file_io(_write_jobs_atomic, self._jobs_path, self._jobs)
+            await self._persist()
 
     async def cancel_project(self, project_id: str) -> None:
         task = self._project_tasks.get(project_id)
         if task is not None and not task.done():
-            task.cancel()
+            if not task.cancelling():
+                task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
@@ -236,7 +240,7 @@ class ProjectStartupService:
         if not renamed_jobs:
             return []
 
-        await asyncio.to_thread(_write_jobs_atomic, self._jobs_path, self._jobs)
+        await self._persist()
         for job in renamed_jobs:
             self._publish_to_hub(job)
         return renamed_jobs
@@ -261,7 +265,7 @@ class ProjectStartupService:
     async def _publish_job(self, job: ProjectStartupJob) -> None:
         job.updated_at = _utc_now()
         self._jobs[job.project_id] = job
-        await file_io(_write_jobs_atomic, self._jobs_path, self._jobs)
+        await self._persist()
         self._publish_to_hub(job)
 
     async def _set_job_state(
@@ -427,7 +431,7 @@ class ProjectStartupService:
                         message=progress.message or "Scene detection complete.",
                         ready_url=ready_url,
                     )
-                    break
+                    continue
                 await self._set_job_state(
                     job,
                     status="running",
@@ -510,13 +514,10 @@ class ProjectStartupService:
         await TemporarySourceService.prepare(project.id, source_progress)
         # Nothing is exposed as ready before both the local index and scene
         # detection are finished. Retry preserves a previously valid download.
-        from .indexation_queue import indexation_queue
-        async with indexation_queue.matching_lock():
-            async with indexation_queue.heavy_slot("temporary_scene_detection"):
-                async for progress in SceneDetectorService.detect_project_scenes(project.id):
-                    if progress.status == "error":
-                        raise RuntimeError(progress.error or "Scene detection failed")
-                    await self._set_job_state(job, status="running", phase="scene_detection", progress=0.85 + 0.15 * progress.progress, message=progress.message)
+        async for progress in SceneDetectorService.detect_project_scenes(project.id):
+            if progress.status == "error":
+                raise RuntimeError(progress.error or "Scene detection failed")
+            await self._set_job_state(job, status="running", phase="scene_detection", progress=0.85 + 0.15 * progress.progress, message=progress.message)
         await self._set_job_state(
             job, status="complete", phase="complete", progress=1.0,
             message="Source locale indexée — projet prêt.",

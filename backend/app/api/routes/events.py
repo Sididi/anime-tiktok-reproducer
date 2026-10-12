@@ -20,6 +20,7 @@ TOPIC_UPLOAD_JOBS = "upload_jobs"
 TOPIC_INDEX_JOBS = "index_jobs"
 TOPIC_ZOOM_JOBS = "zoom_jobs"
 TOPIC_CLEANUP_JOBS = "cleanup_jobs"
+TOPIC_PROGRESS_JOBS = "progress_jobs"
 
 _topics_registered = False
 
@@ -100,7 +101,19 @@ def ensure_topics_registered() -> None:
     event_hub.register_topic(TOPIC_INDEX_JOBS, _index_jobs_snapshot)
     event_hub.register_topic(TOPIC_ZOOM_JOBS, _zoom_jobs_snapshot)
     event_hub.register_topic(TOPIC_CLEANUP_JOBS, _cleanup_jobs_snapshot)
+    from ...services.progress_jobs import progress_jobs
+    event_hub.register_topic(TOPIC_PROGRESS_JOBS, lambda: [
+        {"key": job.id, "project_id": job.project_id, "data": job.model_dump(mode="json")}
+        for job in progress_jobs.list_jobs()
+    ])
     _topics_registered = True
+
+
+@router.get("/snapshot")
+async def event_snapshot():
+    """Short polling fallback when the browser cannot share a live connection."""
+    ensure_topics_registered()
+    return [event_hub.hello_frame(), *[event_hub.snapshot_frame(topic) for topic in event_hub.topics()]]
 
 
 @router.get("/stream")

@@ -1307,6 +1307,28 @@ class MatchPlaybackService:
     ) -> AsyncIterator[_ClipJobResult]:
         if not clip_plans:
             return
+        from .indexation_queue import indexation_queue
+        # A batch can launch up to eight NVDEC/NVENC processes. Its local
+        # semaphore used to multiply by the number of projects and bypass
+        # the ASR/matching memory budget. Reserve the full budget for this
+        # short batch; retain the proven intra-batch encoding parallelism.
+        async with indexation_queue.matching_lock():
+            async with indexation_queue.heavy_slot(
+                "playback_encoding", slots=indexation_queue.MAX_CONCURRENT,
+            ):
+                stream = cls._run_clip_jobs_impl(project_id, clip_plans, max_workers=max_workers)
+                try:
+                    async for result in stream:
+                        yield result
+                finally:
+                    await stream.aclose()
+
+    @classmethod
+    async def _run_clip_jobs_impl(
+        cls, project_id: str, clip_plans: list[_ClipPlan], *, max_workers: int,
+    ) -> AsyncIterator[_ClipJobResult]:
+        if not clip_plans:
+            return
 
         unique_plans: dict[str, _ClipPlan] = {}
         for plan in clip_plans:

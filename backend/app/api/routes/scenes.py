@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import Header, APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
@@ -7,6 +7,8 @@ from ...config import settings
 from ...models import Scene, SceneList
 from ...services import ProjectService, SceneDetectorService
 from ...services.project_locks import project_edit_locked
+
+from ...services.progress_jobs import progress_response
 
 router = APIRouter(prefix="/projects/{project_id}/scenes", tags=["scenes"])
 
@@ -166,7 +168,12 @@ class DetectScenesRequest(BaseModel):
 
 
 @router.post("/detect")
-async def detect_scenes(project_id: str, request: DetectScenesRequest | None = None):
+async def detect_scenes(project_id: str, request: DetectScenesRequest | None = None, prefer: str | None = Header(default=None)):
+    return await progress_response(project_id, "scene_detection", request.model_dump() if request else {},
+                                   lambda: _detect_scenes_stream(project_id, request), prefer)
+
+
+async def _detect_scenes_stream(project_id: str, request: DetectScenesRequest | None = None):
     """Auto-detect scenes using PySceneDetect and stream progress."""
     project = await ProjectService.aload(project_id)
     if not project:

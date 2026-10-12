@@ -245,13 +245,12 @@ def test_legacy_leading_rejected_scene_and_raw_neighbor_are_preserved():
 @pytest.mark.parametrize("merged", [False, True])
 async def test_full_retranscription_publishes_new_source_and_resets_selection(case, monkeypatch, merged):
     client, _, source = case
-    from app.services.transcriber import TranscriberService as T
+    from app.services.transcriber import ASRResult, TranscriberService as T
     select_group(client, [STORY, DIALOGUE]) if merged else select(client)
     words = [w.model_dump() for s in source.transcription.scenes for w in s.words]
-    monkeypatch.setattr(T, "_transcribe_sync", lambda *args: (words, "hi"))
+    monkeypatch.setattr(T, "_transcribe_sync", lambda *args: ASRResult(words, "hi", [(14, 17)]))
     monkeypatch.setattr(T, "_extract_audio_for_whisper", lambda *args: None)
     monkeypatch.setattr(T, "unload_models", lambda: None)
-    monkeypatch.setattr(T, "_last_unrecovered_gaps", [(14, 17)])
     monkeypatch.setattr(R, "analyze", lambda *args: source.analysis)
     progress = [item async for item in T._transcribe_impl("test", "hi")]
     assert progress[-1].status == "complete", progress[-1].error

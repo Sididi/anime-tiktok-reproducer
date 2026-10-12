@@ -38,6 +38,7 @@ from .services.integration_health_service import IntegrationHealthService
 from .services.library_hydration_service import LibraryHydrationService
 from .services.project_service import ProjectService
 from .services.project_startup_service import project_startup_queue
+from .services.progress_jobs import progress_jobs
 from .services.project_upload_service import project_upload_queue
 from .services.cep_link_service import CepLinkService
 from .services.reschedule_retry_service import RescheduleRetryService
@@ -150,6 +151,7 @@ async def lifespan(app: FastAPI):
     ProjectService.sync_all_project_pins()
     await LibraryHydrationService.startup_cleanup()
     await project_startup_queue.startup_cleanup()
+    await progress_jobs.startup_cleanup()
     await project_upload_queue.startup_cleanup()
     # Resume Storage Box uploads for releases finalized locally before a
     # crash/stop: the series stays usable; only the upload restarts.
@@ -233,6 +235,8 @@ async def lifespan(app: FastAPI):
     log_memory("backend_startup", **executor_stats())
     yield
     reschedule_retry_stop.set()
+    await progress_jobs.shutdown()
+    await project_startup_queue.shutdown()
     await _cancel_app_tasks(app)
     await StorageBoxSftpClient.close_pool()
     with suppress(Exception):

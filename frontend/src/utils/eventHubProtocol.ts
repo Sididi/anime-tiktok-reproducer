@@ -44,7 +44,8 @@ export type HubTopic =
   | "upload_jobs"
   | "index_jobs"
   | "zoom_jobs"
-  | "cleanup_jobs";
+  | "cleanup_jobs"
+  | "progress_jobs";
 
 export interface HubItem<T = unknown> {
   key: string;

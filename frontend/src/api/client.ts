@@ -1,3 +1,5 @@
+import { startProgressJob, type ProgressJob } from "@/utils/progressJobs";
+
 const API_BASE = "/api";
 const VITE_MEDIA_ORIGIN =
   typeof import.meta !== "undefined" &&
@@ -435,7 +437,7 @@ export const api = {
 
   // Download
   downloadVideo: (projectId: string, url: string, signal?: AbortSignal) => {
-    return fetch(`${API_BASE}/projects/${projectId}/download`, {
+    return startProgressJob(`${API_BASE}/projects/${projectId}/download`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
@@ -451,7 +453,7 @@ export const api = {
     minSceneLen = 10,
     signal?: AbortSignal,
   ) => {
-    return fetch(`${API_BASE}/projects/${projectId}/scenes/detect`, {
+    return startProgressJob(`${API_BASE}/projects/${projectId}/scenes/detect`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ threshold, min_scene_len: minSceneLen }),
@@ -537,7 +539,7 @@ export const api = {
     signal?: AbortSignal,
     episodes?: string[],
   ) => {
-    return fetch(`${API_BASE}/projects/${projectId}/matches/find`, {
+    return startProgressJob(`${API_BASE}/projects/${projectId}/matches/find`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -561,7 +563,7 @@ export const api = {
 
   // Deferred download — check and download missing source episodes
   deferredDownload: (projectId: string, signal?: AbortSignal) =>
-    fetch(`${API_BASE}/projects/${projectId}/matches/deferred-download`, {
+    startProgressJob(`${API_BASE}/projects/${projectId}/matches/deferred-download`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal,
@@ -572,7 +574,7 @@ export const api = {
     force = false,
     signal?: AbortSignal,
   ) =>
-    fetch(`${API_BASE}/projects/${projectId}/matches/playback/prepare`, {
+    startProgressJob(`${API_BASE}/projects/${projectId}/matches/playback/prepare`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ force }),
@@ -585,7 +587,7 @@ export const api = {
     force = false,
     signal?: AbortSignal,
   ) =>
-    fetch(
+    startProgressJob(
       `${API_BASE}/projects/${projectId}/matches/playback/prepare-scene/${sceneIndex}`,
       {
         method: "POST",
@@ -691,13 +693,16 @@ export const api = {
       `/projects/${projectId}/video/source/descriptor?path=${encodeURIComponent(episodePath)}`,
     ),
 
+  getProgressJobs: (projectId: string) =>
+    request<{ jobs: ProgressJob[] }>(`/projects/${projectId}/operations`),
+
   // Transcription
   startTranscription: (
     projectId: string,
     language = "auto",
     signal?: AbortSignal,
   ) => {
-    return fetch(`${API_BASE}/projects/${projectId}/transcription/start`, {
+    return startProgressJob(`${API_BASE}/projects/${projectId}/transcription/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ language }),

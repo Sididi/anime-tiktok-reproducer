@@ -48,6 +48,7 @@ import type { ManualMatchSaveMeta } from "@/components/video/ManualMatchModal";
 import { useProjectStore, useSceneStore } from "@/stores";
 import { api } from "@/api/client";
 import { readSSEStream } from "@/utils/sse";
+import { observeProgressJob, type ProgressJob } from "@/utils/progressJobs";
 import { cn, formatTime } from "@/utils";
 import { formatNetworkProgressLine } from "@/utils/networkProgress";
 import {
@@ -916,6 +917,7 @@ export function MatchValidation() {
     }
   }, [projectId]);
   const [loading, setLoading] = useState(true);
+  const [resumeMatchJob, setResumeMatchJob] = useState<ProgressJob | null>(null);
   const [matching, setMatching] = useState(false);
   const [matchProgress, setMatchProgress] = useState<MatchProgress | null>(
     null,
@@ -1635,6 +1637,10 @@ export function MatchValidation() {
         await loadProject(projectId);
         await loadScenes(projectId);
         const { matches: loadedMatches } = await api.getMatches(projectId);
+        const operations = await api.getProgressJobs(projectId).catch(() => ({ jobs: [] }));
+        const activeMatch = operations.jobs.find((job) => job.kind === "matching"
+          && (job.status === "queued" || job.status === "running")) ?? null;
+        setResumeMatchJob(activeMatch);
         // Track which scenes were initially "no match found"
         const matchesWithTracking = loadedMatches.map((m) => ({
           ...m,
@@ -1643,7 +1649,7 @@ export function MatchValidation() {
         matchesAutoFillTriggeredRef.current = true;
         matchesAutoFillAllowedRef.current = false;
         setMatches(matchesWithTracking);
-        if (matchesWithTracking.length > 0) {
+        if (matchesWithTracking.length > 0 && !activeMatch) {
           try {
             const manifest = await api.getMatchesPlaybackManifest(projectId);
             if (manifest.ready) {
@@ -1841,7 +1847,7 @@ export function MatchValidation() {
     };
   }, [clearFastWatchBuffers]);
 
-  const handleFindMatches = useCallback(async (episodeSubset?: string[]) => {
+  const handleFindMatches = useCallback(async (episodeSubset?: string[], existingJob?: ProgressJob) => {
     if (!projectId) return;
     const restrictedEpisodes =
       Array.isArray(episodeSubset) && episodeSubset.length > 0
@@ -1874,7 +1880,7 @@ export function MatchValidation() {
     });
 
     try {
-      const response = await api.findMatches(
+      const response = existingJob ? observeProgressJob(existingJob, signal) : await api.findMatches(
         projectId,
         undefined,
         mergeContinuous,
@@ -1961,10 +1967,18 @@ export function MatchValidation() {
 
   // Auto-start matching when skipUiEnabled and no matches exist
   useEffect(() => {
+    if (loading || !resumeMatchJob || resumeMatchJob.project_id !== projectId) return;
+    autoStartedMatchProjects.add(resumeMatchJob.project_id);
+    setResumeMatchJob(null);
+    void handleFindMatches(undefined, resumeMatchJob);
+  }, [loading, resumeMatchJob, projectId, handleFindMatches]);
+
+  useEffect(() => {
     if (
       !projectId ||
       loading ||
       matching ||
+      resumeMatchJob ||
       !skipUiEnabled ||
       matches.length > 0 ||
       autoStartedMatchProjects.has(projectId)
@@ -1977,6 +1991,7 @@ export function MatchValidation() {
     projectId,
     loading,
     matching,
+    resumeMatchJob,
     skipUiEnabled,
     matches.length,
     handleFindMatches,

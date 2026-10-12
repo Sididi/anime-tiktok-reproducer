@@ -47,7 +47,9 @@ export default defineConfig({
   ],
 
   /* Run your local dev server before starting the tests */
-  webServer: [
+  // Isolated integration backends must never fall back to starting production
+  // services (whose lifespan can resume uploads and scheduled work).
+  webServer: process.env.PLAYWRIGHT_EXTERNAL_SERVERS === "1" ? [] : [
     {
       command: "npm run dev",
       url: baseURL,

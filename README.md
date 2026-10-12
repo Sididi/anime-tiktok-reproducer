@@ -184,6 +184,56 @@ Access the app at `http://localhost:5173`
 
 ### Workflow Guide
 
+#### Processing several projects
+
+Keep one tab per project. Downloads, scene detection, matching, deferred source
+downloads, playback preparation and transcription use short job submissions;
+their progress is delivered through the shared browser connection. Matching and
+transcription reattach to active jobs after a page reload. Closing a tab detaches
+its observer and does not cancel accepted background work. A backend restart
+marks interrupted operations as errors so they can be retried.
+Run one backend worker: the GPU budget and shared event hub are process-local.
+The hub broadcasts small progress states; completed transcripts and matches are
+fetched only by the relevant tab, with a bounded result history on disk.
+
+Startups can overlap downloads, preparation and library activation. Resource
+limits are separate from the number of open tabs:
+
+| Environment variable | Default | Scope |
+| --- | --- | --- |
+| `ATR_STARTUP_MAX_CONCURRENT` | `4` | Projects advancing through startup |
+| `ATR_DOWNLOAD_MAX_CONCURRENT` | `3` | Project-video downloads |
+| `ATR_SCENE_DETECTION_MAX_CONCURRENT` | `2` | Scene detection workers |
+| `ATR_GPU_MAX_CONCURRENT` | `2` | Shared heavy-processing slots; accepts 1 or 2 |
+| `ATR_TRANSCRIPTION_BATCH_SIZE` | `4` | ASR segments per inference batch |
+
+Each transcription reserves one heavy slot, including speaker analysis. Fast
+matching, library-assisted scene detection, inpainting and batches of preview
+encodes reserve the full GPU budget. Preview encoding retains its parallel
+workers within that reservation. CPU-only detection and network work can overlap
+GPU work. The model remains large-v3 in FP16; existing memory-error fallbacks are
+retained. Restart the backend after changing these limits.
+
+On the local RTX 4070 Laptop (8 GiB), a four-audio ASR + diarization benchmark on
+2026-10-12 took 54.5 s serially with the old batch size of 8. Two concurrent jobs
+with that batch size took 54.8 s and triggered memory retries. Batch size 4 with
+two jobs took 38.6 s, then 46.2 s on a warmer repeat; one job at batch size 4 took
+61.2 s. Both parallel batch-4 runs stayed on large-v3/FP16 without observed
+memory retries, with device memory peaks of 6.6 and 7.4 GiB including other
+applications. These are sample measurements, not a guaranteed speedup: desktop
+memory use and GPU temperature changed between runs.
+
+Reproduce without modifying project files using
+`scripts/benchmark_project_concurrency.py --workers 1 --batch-size 4 --output /tmp/serial.json <audio.wav>...`
+and the same inputs with `--workers 2`, in the pixi environment. Raw local runs
+are in `backend/data/measurements/project-concurrency-2026-10-12/`.
+
+The browser integration test uses `backend/tests/progress_browser_server.py`
+and a separate Vite instance. Set `PLAYWRIGHT_EXTERNAL_SERVERS=1`,
+`ATR_PROGRESS_BROWSER_TEST=1`, `PLAYWRIGHT_BASE_URL` and
+`PLAYWRIGHT_BACKEND_HEALTH_URL` to that isolated stack before running
+`frontend/e2e/progress-jobs-multitab.spec.ts`.
+
 #### 1. Project Setup
 
 1. Enter the TikTok URL you want to remaster
