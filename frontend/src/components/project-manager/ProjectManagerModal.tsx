@@ -165,6 +165,7 @@ export function ProjectManagerModal({
   const [error, setError] = useState<string | null>(null);
   const [sortColumn, setSortColumn] = useState<SortColumn>("created_at");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
+  const [showArchived, setShowArchived] = useState(false);
 
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(
     null,
@@ -795,14 +796,15 @@ export function ProjectManagerModal({
   };
 
   const filteredRows = useMemo(() => {
-    if (!selectedAccount) return rows;
     return rows.filter((r) => {
+      if (r.archived_at && !showArchived) return false;
+      if (!selectedAccount) return true;
       if (r.uploaded || r.scheduled_at) {
         return r.scheduled_account_id === selectedAccount.id;
       }
       return isAccountCompatibleWithProjectRow(selectedAccount, r);
     });
-  }, [rows, selectedAccount]);
+  }, [rows, selectedAccount, showArchived]);
 
   const sortedRows = useMemo(() => {
     const statusWeight = (value: "green" | "orange" | "red" | "publish_error") =>
@@ -1042,6 +1044,15 @@ export function ProjectManagerModal({
                 </div>
               </div>
               <div className="flex items-center gap-2">
+                <label className="flex items-center gap-1.5 mr-2 text-xs text-[hsl(var(--muted-foreground))] cursor-pointer whitespace-nowrap">
+                  <input
+                    type="checkbox"
+                    checked={showArchived}
+                    onChange={(event) => setShowArchived(event.target.checked)}
+                    className="h-3.5 w-3.5 accent-[hsl(var(--primary))]"
+                  />
+                  Show archived
+                </label>
                 <AnimatePresence mode="wait">
                   {multiDeleteMode ? (
                     <motion.div

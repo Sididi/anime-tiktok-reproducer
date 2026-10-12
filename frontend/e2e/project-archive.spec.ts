@@ -48,8 +48,11 @@ test("deletion keeps the archive row, replaces its Drive link, and disables acti
   await page.getByRole("button", { name: "Projects", exact: true }).click();
   const row = page.getByRole("row").filter({ hasText: "Archive Test" });
   await expect(row).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "Show archived" })).not.toBeChecked();
   await row.getByRole("button", { name: "Delete project", exact: true }).click();
   await page.getByRole("button", { name: "Confirm delete", exact: true }).click();
+  await expect(row).toHaveCount(0);
+  await page.getByRole("checkbox", { name: "Show archived" }).check();
   await expect(row.getByText("Archive-only · Read-only")).toBeVisible();
   await expect(row.getByRole("link", { name: "Drive archive" })).toHaveAttribute("href", "https://drive.example/archive");
   await expect(row.getByRole("button", { name: "Archive-only project — already deleted" })).toBeDisabled();
@@ -62,6 +65,8 @@ test("deletion keeps the archive row, replaces its Drive link, and disables acti
   await expect(row.getByRole("checkbox")).toBeDisabled();
   expect(deleteRequests).toBe(1);
   expect(managerReads).toBe(1);
+  await page.getByRole("checkbox", { name: "Show archived" }).uncheck();
+  await expect(row).toHaveCount(0);
 });
 
 for (const path of ["/project/archive-test/matches", "/projects/archive-test/matches", "/project/archive-test/prompter"]) {
@@ -135,6 +140,8 @@ test("bulk deletion runs six at a time and restores failed selections after relo
   fail = false;
   await page.getByRole("button", { name: "Delete (1)", exact: true }).click();
   await page.getByRole("button", { name: "Delete All", exact: true }).click();
+  await expect(page.getByRole("row").filter({ hasText: "Bulk 7" })).toHaveCount(0);
+  await page.getByRole("checkbox", { name: "Show archived" }).check();
   await expect(page.getByRole("row").filter({ hasText: "Bulk 7" }).getByText("Archive-only · Read-only")).toBeVisible();
   expect(requests).toHaveLength(9);
   expect(await page.evaluate(() => localStorage.getItem("project-manager-pending-deletions"))).toBeNull();
