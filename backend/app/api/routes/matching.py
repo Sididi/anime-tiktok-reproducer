@@ -290,8 +290,10 @@ async def list_episodes(project_id: str):
         found: list[str] = []
         if src_path.is_dir():
             for ext in VIDEO_EXTENSIONS:
-                found.extend(str(f.resolve()) for f in src_path.glob(f"*{ext}"))
-                found.extend(str(f.resolve()) for f in src_path.glob(f"**/*{ext}"))
+                found.extend(
+                    str(f.resolve()) for f in src_path.glob(f"**/*{ext}")
+                    if not AnimeLibraryService.is_transient_library_video_path(f)
+                )
         elif src_path.is_file() and src_path.suffix.lower() in VIDEO_EXTENSIONS:
             found.append(str(src_path.resolve()))
         return found
@@ -327,11 +329,10 @@ async def list_episodes(project_id: str):
                 elif src_resolved.is_file() and episode_path.resolve() == src_resolved:
                     episodes.append(episode)
 
-        # The cached manifest can lag behind the actual library contents for a
-        # scoped series folder. When it yields nothing for that source, fall
-        # back to a direct filesystem scan so manual match selection still has
-        # episodes to offer.
-        if len(episodes) == manifest_hits_before:
+        # An interrupted import can leave new files alongside old manifest
+        # hits. Always merge a scoped source's current contents; avoid a full
+        # library scan when we only have the unscoped fallback root.
+        if src_path.resolve() != library_root.resolve() or len(episodes) == manifest_hits_before:
             episodes.extend(await asyncio.to_thread(_scan_source_dir_sync, src_path))
 
     episodes = _dedupe_episode_options(episodes)

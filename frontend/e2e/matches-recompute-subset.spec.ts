@@ -12,6 +12,7 @@ function installSubsetMocks(
   const testWindow = window as typeof window & {
     __findBodies?: unknown[];
     __episodeFetches?: number;
+    __newEpisode?: string;
   };
   testWindow.__findBodies = [];
   testWindow.__episodeFetches = 0;
@@ -113,7 +114,8 @@ function installSubsetMocks(
     if (url.pathname === `${prefix}/sources/episodes`) {
       testWindow.__episodeFetches = (testWindow.__episodeFetches ?? 0) + 1;
       return json({
-        episodes: ["Episode-01", "Episode-02", "Episode-03", "Episode-04"],
+        episodes: ["Episode-01", "Episode-02", "Episode-03", "Episode-04",
+          ...(testWindow.__newEpisode ? [testWindow.__newEpisode] : [])],
       });
     }
     if (url.pathname === `${prefix}/scenes/config`) {
@@ -255,6 +257,29 @@ test("modal allows manual episode selection before recompute", async ({
   );
   expect(body.episodes).toEqual(["Episode-01", "Episode-04"]);
 });
+
+for (const launch of ["proposed", "modal"] as const) {
+  test(`episodes added while the page is open are selected on first ${launch} recompute`, async ({ page }) => {
+    const projectId = `new-episodes-${launch}`;
+    await page.addInitScript(installSubsetMocks, { projectId, libraryType: "anime" });
+    await page.goto(`/project/${projectId}/matches`);
+    await expect(page.getByRole("button", { name: "Recompute (3 ep.)" })).toBeVisible();
+    await page.evaluate(() => {
+      (window as typeof window & { __newEpisode?: string }).__newEpisode = "Season-02-Episode-01";
+    });
+    if (launch === "proposed") {
+      await page.getByRole("button", { name: "Recompute (3 ep.)" }).click();
+    } else {
+      await page.getByRole("button", { name: "Choose episodes" }).click();
+      const dialog = page.getByRole("dialog");
+      await expect(dialog.locator('input[type="checkbox"]').last()).toBeChecked();
+      await dialog.getByRole("button", { name: "Recompute" }).click();
+    }
+    await expect.poll(() => page.evaluate(() => (window.__findBodies ?? []).length)).toBe(1);
+    const body = await page.evaluate(() => (window.__findBodies ?? [])[0] as { episodes: string[] });
+    expect(body.episodes).toEqual(["Episode-01", "Episode-02", "Episode-04", "Season-02-Episode-01"]);
+  });
+}
 
 test("selecting no episodes disables the modal launch button", async ({
   page,

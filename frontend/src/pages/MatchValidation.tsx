@@ -912,6 +912,7 @@ export function MatchValidation() {
     try {
       const { episodes: loadedEpisodes } = await api.getEpisodes(projectId);
       setEpisodes(loadedEpisodes);
+      return loadedEpisodes;
     } catch {
       // Keep the previous list; the modal self-fetches when it is empty.
     }
@@ -1847,9 +1848,9 @@ export function MatchValidation() {
     };
   }, [clearFastWatchBuffers]);
 
-  const handleFindMatches = useCallback(async (episodeSubset?: string[], existingJob?: ProgressJob) => {
+  const handleFindMatches = useCallback(async (episodeSubset?: string[] | "proposed", existingJob?: ProgressJob) => {
     if (!projectId) return;
-    const restrictedEpisodes =
+    let restrictedEpisodes =
       Array.isArray(episodeSubset) && episodeSubset.length > 0
         ? episodeSubset
         : undefined;
@@ -1880,6 +1881,16 @@ export function MatchValidation() {
     });
 
     try {
+      if (episodeSubset === "proposed" && !existingJob) {
+        const currentEpisodes = await refreshEpisodes();
+        if (signal.aborted) return;
+        const proposed = currentEpisodes
+          ? proposeEpisodes(matches, scenes, currentEpisodes)
+          : [];
+        // If refresh fails, search all episodes rather than send a stale
+        // whitelist that silently excludes newly indexed episodes.
+        restrictedEpisodes = proposed.length ? proposed : undefined;
+      }
       const response = existingJob ? observeProgressJob(existingJob, signal) : await api.findMatches(
         projectId,
         undefined,
@@ -1963,6 +1974,8 @@ export function MatchValidation() {
     clearZoomProject,
     refreshEpisodes,
     showToast,
+    matches,
+    scenes,
   ]);
 
   // Auto-start matching when skipUiEnabled and no matches exist
@@ -2251,7 +2264,7 @@ export function MatchValidation() {
     }
   };
 
-  const handleRecomputeMatches = async (episodeSubset?: string[]) => {
+  const handleRecomputeMatches = async (episodeSubset?: string[] | "proposed") => {
     // Keep the last successful result visible if recomputing fails.
     stopFastWatch();
     setPendingSceneUpdates({});
@@ -2737,10 +2750,10 @@ export function MatchValidation() {
                     proposedCount={proposedEpisodes.length}
                     matching={matching}
                     onRecomputeProposed={() =>
-                      handleRecomputeMatches(proposedEpisodes)
+                      handleRecomputeMatches("proposed")
                     }
-                    onOpenModal={() => {
-                      void refreshEpisodes();
+                    onOpenModal={async () => {
+                      await refreshEpisodes();
                       setEpisodeModalOpen(true);
                     }}
                   />

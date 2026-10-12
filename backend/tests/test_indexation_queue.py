@@ -13,6 +13,7 @@ from app.library_types import LibraryType
 from app.models.torrent import IndexationJob
 from app.services.anime_library import IndexProgress
 from app.services.indexation_queue import IndexationQueueService
+from app.services.indexation_job_store import IndexationJobStore
 from app.services.pending_publish_store import (
     PendingPublishRecord,
     PendingPublishStore,
@@ -59,11 +60,84 @@ async def _drain_job_tasks(
     await asyncio.wait_for(_wait(), timeout=timeout)
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def isolated_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
     monkeypatch.setattr(settings, "cache_dir", tmp_path / "cache")
     return tmp_path
+
+
+@pytest.mark.asyncio
+async def test_interrupted_update_survives_restart_and_resumes_once(monkeypatch, tmp_path):
+    import asyncio
+
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def interrupted(self, job):
+        # The request must be durable before any import/index work starts.
+        assert IndexationJobStore.load_all()[0].id == job.id
+        job.status = "indexing"
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(IndexationQueueService, "_run_job", interrupted)
+    old = IndexationQueueService()
+    ids = await asyncio.gather(*[
+        old.enqueue(str(tmp_path), LibraryType.ANIME, "Series", 2.0, "update", "series-1")
+        for _ in range(2)
+    ])
+    assert ids[0] == ids[1]
+    await started.wait()
+    await old.shutdown()
+    assert stopped.is_set()
+
+    resumed = []
+
+    async def finish(self, job):
+        resumed.append(job.model_copy())
+
+    monkeypatch.setattr(IndexationQueueService, "_run_job", finish)
+    new = IndexationQueueService()
+    await new.resume_pending_indexations()
+    await new.resume_pending_indexations()
+    await _drain_job_tasks(new)
+    assert len(resumed) == 1
+    assert resumed[0].id == ids[0]
+    assert resumed[0].job_type == "update"
+    assert resumed[0].series_id == "series-1"
+    assert resumed[0].source_path == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_failed_indexation_keeps_error_after_restart_without_retry(monkeypatch, tmp_path):
+    async def fail(**kwargs):
+        yield IndexProgress(status="error", error="Decoder failed")
+
+    monkeypatch.setattr("app.services.indexation_queue.AnimeLibraryService.index_anime", fail)
+    old = IndexationQueueService()
+    job_id = await old.enqueue(str(tmp_path), LibraryType.ANIME, "Series", 2.0)
+    await _drain_job_tasks(old)
+    assert IndexationJobStore.load_all()[0].error == "Decoder failed"
+
+    new = IndexationQueueService()
+    await new.resume_pending_indexations()
+    assert not new._job_tasks
+    assert new._jobs[job_id].status == "error"
+    assert new._jobs[job_id].error == "Decoder failed"
+
+
+@pytest.mark.asyncio
+async def test_completed_indexation_is_restored_without_running_again(monkeypatch, tmp_path):
+    job = IndexationJob(source_name="Series", library_type="anime", source_path=str(tmp_path), status="complete")
+    IndexationJobStore.save(job)
+    service = IndexationQueueService()
+    await service.resume_pending_indexations()
+    assert not service._job_tasks
+    assert service._jobs[job.id].status == "complete"
 
 
 @pytest.mark.asyncio

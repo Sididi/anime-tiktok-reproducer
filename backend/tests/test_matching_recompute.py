@@ -12,6 +12,30 @@ from app.services.indexation_queue import indexation_queue
 
 
 @pytest.mark.asyncio
+async def test_unfinished_episode_import_preserves_saved_project_before_matching(monkeypatch):
+    project = Project(
+        id="recompute", anime_name="Series", series_id="series-1",
+        phase=ProjectPhase.MATCH_VALIDATION,
+    )
+    monkeypatch.setattr(matching.ProjectService, "aload", AsyncMock(return_value=project))
+    monkeypatch.setattr(matching.LibraryHydrationService, "ensure_matcher_ready_for_project", AsyncMock(
+        side_effect=RuntimeError("12 local episode(s) have not finished indexing"),
+    ))
+    save_project, save_scenes, save_matches = AsyncMock(), AsyncMock(), AsyncMock()
+    monkeypatch.setattr(matching.ProjectService, "asave", save_project)
+    monkeypatch.setattr(matching.ProjectService, "asave_scenes", save_scenes)
+    monkeypatch.setattr(matching.ProjectService, "asave_matches", save_matches)
+    with pytest.raises(matching.HTTPException) as error:
+        await matching._find_matches_stream(project.id, matching.FindMatchesRequest())
+    assert error.value.status_code == 409
+    assert "have not finished indexing" in error.value.detail
+    assert project.phase == ProjectPhase.MATCH_VALIDATION
+    save_project.assert_not_awaited()
+    save_scenes.assert_not_awaited()
+    save_matches.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bounded", [True, False])
 @pytest.mark.parametrize("matched", [True, False])
 async def test_recompute_only_replaces_saved_results_when_matches_exist(monkeypatch, tmp_path, bounded, matched):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -143,6 +144,55 @@ async def test_partial_index_triggers_hydration_before_matching(monkeypatch, par
     # Complete index coverage reuses the cache, even without local videos.
     await LibraryHydrationService.ensure_series_index_hydrated(library_type="anime", series_id="series-1")
     hydrate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_matching_rejects_imported_episodes_missing_from_old_release_index(partial_index):
+    manifest, shard = partial_index
+    _write_json(shard / "metadata.json", {"frames": [
+        {"episode": episode["episode_key"]} for episode in manifest["episodes"]
+    ]})
+    await LibraryHydrationService._cache_manifest("anime", manifest)
+    series_dir = AnimeLibraryService.get_library_path("anime") / "Series"
+    (series_dir / "Season 2 Episode 01.mp4").touch()
+    (series_dir / "Season 2 Episode 02.import.tmp.mp4").touch()
+    (series_dir / "Season 2 Episode 03.normalize.tmp.mp4").touch()
+
+    # The older published release is complete and remains a valid baseline
+    # for an incremental update, but cannot satisfy a new matching request.
+    assert await LibraryHydrationService.ensure_index_ready(library_type="anime", series_id="series-1")
+    with pytest.raises(RuntimeError, match="1 local episode.*have not finished indexing"):
+        await LibraryHydrationService.ensure_matcher_ready_for_project(
+            project_id="project-1", library_type="anime", series_id="series-1",
+        )
+
+    # A completed incremental index makes the new episode searchable without
+    # requiring remote episode videos to be present locally.
+    _write_json(shard / "metadata.json", {"frames": [
+        {"episode": episode["episode_key"]} for episode in manifest["episodes"]
+    ] + [{"episode": "Series/Season 2 Episode 01.mp4"}]})
+    await LibraryHydrationService.ensure_matcher_ready_for_project(
+        project_id="project-1", library_type="anime", series_id="series-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_matching_waits_for_active_series_update(monkeypatch, partial_index):
+    manifest, shard = partial_index
+    monkeypatch.setattr(LibraryHydrationService, "_series_locks", {})
+    await LibraryHydrationService._cache_manifest("anime", manifest)
+    series_dir = AnimeLibraryService.get_library_path("anime") / "Series"
+    (series_dir / "New Episode.mp4").touch()
+    async with LibraryHydrationService._series_lock("anime", "series-1"):
+        task = asyncio.create_task(LibraryHydrationService.ensure_matcher_ready_for_project(
+            project_id="project-1", library_type="anime", series_id="series-1",
+        ))
+        await asyncio.sleep(0)
+        assert not task.done()
+        _write_json(shard / "metadata.json", {"frames": [
+            {"episode": episode["episode_key"]} for episode in manifest["episodes"]
+        ] + [{"episode": "New Episode"}]})
+    await asyncio.wait_for(task, timeout=2)
 
 
 @pytest.mark.parametrize("payload", [{}, {"frames": []}, {"frames": [{"episode": "Episode 04"}]}])

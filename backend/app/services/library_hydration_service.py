@@ -1627,7 +1627,13 @@ class LibraryHydrationService:
     ) -> None:
         if not series_id:
             raise RuntimeError("Project is missing series_id for matcher activation.")
-        ready = await cls.ensure_index_ready(library_type=library_type, series_id=series_id)
+        # An update holds this lock until its new release is finalized. Wait
+        # for it instead of accepting the still-valid previous release while
+        # new videos are being imported/indexed.
+        async with cls._series_lock(library_type, series_id):
+            ready = await cls.ensure_index_ready(library_type=library_type, series_id=series_id)
+            if ready:
+                await cls._require_local_episode_coverage(library_type, series_id)
         if not ready:
             state = await cls.enqueue_project_activation(
                 project_id=project_id,
@@ -1637,6 +1643,8 @@ class LibraryHydrationService:
             while True:
                 operation = state.get("operation")
                 if await cls.ensure_index_ready(library_type=library_type, series_id=series_id):
+                    async with cls._series_lock(library_type, series_id):
+                        await cls._require_local_episode_coverage(library_type, series_id)
                     return
                 if isinstance(operation, dict):
                     status = str(operation.get("status") or "")
@@ -1654,6 +1662,59 @@ class LibraryHydrationService:
                     library_type=library_type,
                     series_id=series_id,
                 )
+
+    @classmethod
+    async def _require_local_episode_coverage(
+        cls, library_type: LibraryType | str, series_id: str,
+    ) -> None:
+        manifest = await cls._load_or_fetch_manifest(library_type, series_id)
+        missing = await asyncio.to_thread(
+            cls._unindexed_local_episodes, library_type, manifest,
+        )
+        if missing:
+            examples = ", ".join(missing[:3])
+            raise RuntimeError(
+                f"{len(missing)} local episode(s) have not finished indexing "
+                f"for '{manifest['display_name']}': {examples}. "
+                "Finish or retry Add episodes in the library before recomputing. "
+                "Existing scenes and matches were kept."
+            )
+
+    @classmethod
+    def _unindexed_local_episodes(
+        cls, library_type: LibraryType | str, manifest: dict[str, Any],
+    ) -> list[str]:
+        """Detect imports interrupted before the release manifest was updated.
+
+        Release coverage alone cannot detect these: the previous release and
+        shard agree, but neither contains the newly imported local episodes.
+        Do not change ensure_index_ready's baseline check: update jobs need
+        that older shard to incrementally append the missing episodes.
+        """
+        library = AnimeLibraryService.get_library_path(library_type)
+        name = str(manifest["display_name"])
+        series_dir = library / name
+        if not series_dir.is_dir():
+            return []
+        local = {
+            canonical_episode_stem(path.name)
+            for path in series_dir.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in AnimeLibraryService.VIDEO_EXTENSIONS
+            and not AnimeLibraryService.is_transient_library_video_path(path)
+        }
+        index = library / AnimeLibraryService.INDEX_DIR_NAME
+        index_manifest = _json_load(index / AnimeLibraryService.MANIFEST_FILE)
+        shard_key = index_manifest.get("series", {}).get(name, {}).get("key")
+        indexed: set[str] = set()
+        if shard_key:
+            metadata = _json_load(index / "series" / shard_key / "metadata.json")
+            indexed = {
+                canonical_episode_stem(frame.get("episode", ""))
+                for frame in metadata.get("frames", [])
+                if isinstance(frame, dict)
+            }
+        return sorted(local - indexed)
 
     @classmethod
     async def _run_background_activation(

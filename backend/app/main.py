@@ -153,6 +153,7 @@ async def lifespan(app: FastAPI):
     await project_startup_queue.startup_cleanup()
     await progress_jobs.startup_cleanup()
     await project_upload_queue.startup_cleanup()
+    await indexation_queue.resume_pending_indexations()
     # Resume Storage Box uploads for releases finalized locally before a
     # crash/stop: the series stays usable; only the upload restarts.
     await indexation_queue.resume_pending_uploads()
@@ -237,6 +238,7 @@ async def lifespan(app: FastAPI):
     reschedule_retry_stop.set()
     await progress_jobs.shutdown()
     await project_startup_queue.shutdown()
+    await indexation_queue.shutdown()
     await _cancel_app_tasks(app)
     await StorageBoxSftpClient.close_pool()
     with suppress(Exception):

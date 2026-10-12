@@ -14,6 +14,7 @@ from .anime_library import AnimeLibraryService
 from .anime_matcher import AnimeMatcherService
 from .event_hub import event_hub
 from .indexation_preflight import IndexationPreflightService
+from .indexation_job_store import IndexationJobStore
 from .library_hydration_service import LibraryHydrationService
 from .pending_publish_store import PendingPublishRecord, PendingPublishStore
 from .storage_box_progress import ProgressSnapshot
@@ -50,6 +51,50 @@ class IndexationQueueService:
         self._active_heavy_kinds: Counter[str] = Counter()
         self._upload_semaphore = asyncio.Semaphore(1)
         self._upload_tasks: dict[str, asyncio.Task] = {}
+        self._enqueue_lock = asyncio.Lock()
+
+    async def resume_pending_indexations(self) -> None:
+        """Restore history and resume requests interrupted before publication.
+
+        Import preparation and the incremental indexer reuse completed files.
+        Persisting the request before starting also covers a crash before the
+        first index checkpoint (when only the imported videos exist).
+        """
+        for job in await asyncio.to_thread(IndexationJobStore.load_all):
+            if job.id in self._jobs:
+                continue
+            self._jobs[job.id] = job
+            if job.status not in {"complete", "error"}:
+                job.status = "queued"
+                job.message = "Resuming interrupted indexation..."
+                self._start_job(job)
+            self._broadcast(job)
+        await self._prune_persisted_jobs()
+
+    async def _prune_persisted_jobs(self) -> None:
+        previous_ids = set(self._jobs)
+        self._prune_terminal_jobs()
+        for job_id in previous_ids - self._jobs.keys():
+            await asyncio.to_thread(IndexationJobStore.delete, job_id)
+        # Upload enqueue can also prune the shared in-memory history. Bound
+        # disk history independently so those removed rows cannot accumulate.
+        persisted = await asyncio.to_thread(IndexationJobStore.load_all)
+        terminal = [job for job in persisted if job.status in {"complete", "error"}]
+        for job in terminal[:max(0, len(terminal) - self.MAX_TERMINAL_JOBS)]:
+            await asyncio.to_thread(IndexationJobStore.delete, job.id)
+
+    def _start_job(self, job: IndexationJob) -> None:
+        task = asyncio.create_task(self._run_job(job))
+        self._job_tasks.add(task)
+        task.add_done_callback(self._job_tasks.discard)
+
+    async def shutdown(self) -> None:
+        # Stop index subprocesses before closing shared clients/executors.
+        # Their durable requests stay queued and can be resumed next startup.
+        tasks = list(self._job_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _prune_terminal_jobs(self) -> None:
         terminal_ids = [
@@ -142,6 +187,22 @@ class IndexationQueueService:
         job_type: str = "index",
         series_id: str | None = None,
     ) -> str:
+        # Persistence yields to the event loop; keep concurrent requests from
+        # passing the target deduplication check before either is registered.
+        async with self._enqueue_lock:
+            return await self._enqueue(
+                source_path, library_type, anime_name, fps, job_type, series_id,
+            )
+
+    async def _enqueue(
+        self,
+        source_path: str,
+        library_type: LibraryType,
+        anime_name: str | None,
+        fps: float,
+        job_type: str,
+        series_id: str | None,
+    ) -> str:
         source_name = anime_name or Path(source_path).name
         normalized_target = IndexationPreflightService.normalize_target_name(source_name)
         for existing_job in self._jobs.values():
@@ -164,12 +225,11 @@ class IndexationQueueService:
             fps=fps,
             series_id=series_id,
         )
-        self._prune_terminal_jobs()
+        await self._prune_persisted_jobs()
+        await asyncio.to_thread(IndexationJobStore.save, job)
         self._jobs[job.id] = job
         self._broadcast(job)
-        task = asyncio.create_task(self._run_job(job))
-        self._job_tasks.add(task)
-        task.add_done_callback(self._job_tasks.discard)
+        self._start_job(job)
         return job.id
 
     @classmethod
@@ -497,6 +557,10 @@ class IndexationQueueService:
         finally:
             if slot_held:
                 self.release_heavy_slot("indexation")
+            # High-frequency progress stays in memory; the durable queued
+            # request is enough for recovery until a terminal outcome exists.
+            if job.status in {"complete", "error"}:
+                await asyncio.to_thread(IndexationJobStore.save, job.model_copy(deep=True))
 
     def enqueue_upload(self, record: PendingPublishRecord) -> str:
         """Register a background upload job for a pending publish.

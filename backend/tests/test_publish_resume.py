@@ -59,7 +59,9 @@ def _make_finalized_series(
     shard_dir = index_dir / "series" / shard_key
     shard_dir.mkdir(parents=True, exist_ok=True)
     (shard_dir / "faiss.index").write_bytes(b"index")
-    _write_json(shard_dir / "metadata.json", {})
+    _write_json(shard_dir / "metadata.json", {
+        "frames": [{"episode": f"{display_name} - 01"}],
+    })
     _write_json(
         index_dir / AnimeLibraryService.MANIFEST_FILE,
         {

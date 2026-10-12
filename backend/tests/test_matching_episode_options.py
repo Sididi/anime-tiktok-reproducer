@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,6 +14,23 @@ from app.api.routes.matching import _dedupe_episode_options
 from app.api.routes.matching import _has_persisted_match_choice
 from app.models import MatchList, Project, Scene, SceneList, SceneMatch
 from app.services.match_playback_service import MatchPlaybackService
+
+
+@pytest.mark.asyncio
+async def test_episode_list_includes_new_files_when_cached_manifest_has_old_hits(monkeypatch, tmp_path):
+    series = tmp_path / "Series"
+    series.mkdir()
+    old = series / "Season 1 Episode 01.mp4"
+    old.touch()
+    (series / "Season 2 Episode 01.mp4").touch()
+    (series / "Season 2 Episode 02.import.tmp.mp4").touch()
+    project = Project(id="project-1", anime_name="Series")
+    monkeypatch.setattr(matching.ProjectService, "aload", AsyncMock(return_value=project))
+    monkeypatch.setattr(matching.AnimeLibraryService, "get_library_path", lambda *a: tmp_path)
+    monkeypatch.setattr(matching.AnimeLibraryService, "ensure_episode_manifest", AsyncMock(return_value={"old": True}))
+    monkeypatch.setattr(matching.AnimeLibraryService, "list_episode_paths", lambda *a, **kw: [str(old)])
+    result = await matching.list_episodes(project.id)
+    assert result["episodes"] == ["Season 1 Episode 01", "Season 2 Episode 01"]
 
 
 def test_episode_options_collapse_extension_variants_to_extensionless_value():
