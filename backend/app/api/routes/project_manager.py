@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/project-manager", tags=["project-manager"])
 
+# Bound expensive Drive work across all callers, not just one browser batch.
+_delete_slots = asyncio.Semaphore(6)
+
 
 class UploadProjectRequest(BaseModel):
     account_id: str | None = None
@@ -137,6 +140,11 @@ async def list_project_upload_jobs():
 
 @router.delete("/projects/{project_id}")
 async def delete_managed_project(project_id: str, confirmed: bool = False):
+    async with _delete_slots:
+        return await _delete_managed_project(project_id, confirmed=confirmed)
+
+
+async def _delete_managed_project(project_id: str, confirmed: bool = False):
     """Archive and delete a project, requiring confirmation while scheduled."""
     if any(job.project_id == project_id and job.status in {"queued", "running"}
            for job in project_upload_queue.list_jobs()):

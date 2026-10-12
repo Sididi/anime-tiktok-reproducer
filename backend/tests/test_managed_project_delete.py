@@ -21,6 +21,7 @@ from app.services.upload_phase import (
 @pytest.fixture(autouse=True)
 def isolate_local_caches(monkeypatch):
     monkeypatch.setattr(UploadPhaseService, "cleanup_project_caches", lambda _id: None)
+    monkeypatch.setattr(GoogleDriveService, "_archive_root_cache", None)
 
 
 def _scheduled_project() -> Project:
@@ -311,6 +312,19 @@ def test_drive_archive_copies_only_reconstructable_files(monkeypatch):
 
     drive = MagicMock()
     drive.files.return_value = Files()
+    class Batch:
+        def __init__(self, callback):
+            self.callback = callback
+            self.requests = []
+
+        def add(self, request, request_id):
+            self.requests.append((request_id, request))
+
+        def execute(self):
+            for request_id, request in self.requests:
+                self.callback(request_id, request.execute(), None)
+
+    drive.new_batch_http_request.side_effect = lambda callback: Batch(callback)
     monkeypatch.setattr(GoogleDriveService, "_client", classmethod(lambda cls: drive))
     monkeypatch.setattr(
         GoogleDriveService,

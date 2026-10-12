@@ -83,3 +83,59 @@ for (const path of ["/project/archive-test/matches", "/projects/archive-test/mat
     expect([...new Set(projectRequests)]).toEqual(["/api/projects/archive-test"]);
   });
 }
+
+test("bulk deletion runs six at a time and restores failed selections after reload", async ({ page }) => {
+  await page.addInitScript(installEventHubMock, {});
+  const rows = Array.from({ length: 8 }, (_, index) => ({
+    ...activeRow, project_id: `bulk-${index}`, anime_title: `Bulk ${index}`,
+  }));
+  const completed = new Set<string>();
+  const requests: string[] = [];
+  let running = 0;
+  let peak = 0;
+  let fail = true;
+  await page.route((url) => url.pathname.startsWith("/api/"), async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const match = path.match(/^\/api\/project-manager\/projects\/(bulk-\d+)$/);
+    if (match && route.request().method() === "DELETE") {
+      const id = match[1];
+      requests.push(id);
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      running--;
+      if (id === "bulk-7" && fail) return route.fulfill({ status: 503, json: { detail: "Temporary Drive failure" } });
+      completed.add(id);
+      return route.fulfill({ json: { status: "deleted", local_deleted: true, project: {
+        ...archivedRow, project_id: id, anime_title: `Bulk ${id.slice(-1)}`,
+      } } });
+    }
+    if (path === "/api/project-manager/projects") return route.fulfill({ json: { projects: rows.map((row) => completed.has(row.project_id) ? {
+      ...archivedRow, project_id: row.project_id, anime_title: row.anime_title,
+    } : row) } });
+    if (path === "/api/accounts") return route.fulfill({ json: { accounts: [] } });
+    if (path.endsWith("/jobs") || path.endsWith("/upload-jobs")) return route.fulfill({ json: { jobs: [] } });
+    if (path === "/api/projects" || path === "/api/anime/source-details") return route.fulfill({ json: [] });
+    return route.fulfill({ json: {} });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Projects", exact: true }).click();
+  await page.getByRole("button", { name: "Multi-select delete" }).click();
+  for (const row of rows) await page.getByRole("row").filter({ hasText: row.anime_title }).getByRole("checkbox").check();
+  await page.getByRole("button", { name: "Delete (8)", exact: true }).click();
+  await page.getByRole("button", { name: "Delete All", exact: true }).click();
+  await expect(page.getByRole("button", { name: /Deleting \d\/8/ })).toBeVisible();
+  await expect(page.getByText("Deleted 7/8 selected projects. 1 failed.")).toBeVisible();
+  expect(peak).toBe(6);
+  expect(requests).toHaveLength(8);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("project-manager-pending-deletions") ?? "[]"))).toEqual(["bulk-7"]);
+  await page.reload();
+  await page.getByRole("button", { name: "Projects", exact: true }).click();
+  await expect(page.getByRole("row").filter({ hasText: "Bulk 7" }).getByRole("checkbox")).toBeChecked();
+  fail = false;
+  await page.getByRole("button", { name: "Delete (1)", exact: true }).click();
+  await page.getByRole("button", { name: "Delete All", exact: true }).click();
+  await expect(page.getByRole("row").filter({ hasText: "Bulk 7" }).getByText("Archive-only · Read-only")).toBeVisible();
+  expect(requests).toHaveLength(9);
+  expect(await page.evaluate(() => localStorage.getItem("project-manager-pending-deletions"))).toBeNull();
+});

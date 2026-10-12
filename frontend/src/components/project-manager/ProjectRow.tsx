@@ -296,7 +296,7 @@ export function ProjectRow({
           <input
             type="checkbox"
             checked={isSelected}
-            disabled={!!row.archived_at}
+            disabled={!!row.archived_at || activeDeleteId !== null}
             onChange={() => onToggleSelect(row.project_id)}
             className="h-4 w-4 rounded cursor-pointer accent-[hsl(var(--destructive))]"
           />

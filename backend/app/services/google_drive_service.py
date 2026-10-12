@@ -99,6 +99,20 @@ class GoogleDriveService:
     _client_local = local()
     _video_duration_cache_lock = Lock()
     _video_duration_cache: dict[str, tuple[float, float]] = {}
+    _archive_root_lock = Lock()
+    _archive_root_cache: tuple[str, float, dict[str, Any]] | None = None
+
+    @classmethod
+    def _archive_root(cls, parent_id: str, *, drive) -> dict[str, Any]:
+        # Avoid six parallel find-or-create calls creating duplicate roots.
+        # Cache only folder metadata; Drive clients remain thread-local.
+        with cls._archive_root_lock:
+            cached = cls._archive_root_cache
+            if cached and cached[0] == parent_id and time.monotonic() - cached[1] < 60:
+                return cached[2]
+            folder = cls._ensure_child_folder(cls.ARCHIVE_FOLDER_NAME, parent_id, drive=drive)
+            cls._archive_root_cache = (parent_id, time.monotonic(), folder)
+            return folder
 
     # googleapiclient's default socket timeout is 60s (DEFAULT_HTTP_TIMEOUT_SEC).
     # That is too short for the transfer client: the last chunk of a resumable
@@ -568,6 +582,7 @@ class GoogleDriveService:
         destination_folder_id: str,
         *,
         drive,
+        copies: list[tuple[str, str, str]],
         allowed_names: set[str] | None = None,
     ) -> int:
         copied = 0
@@ -583,23 +598,52 @@ class GoogleDriveService:
                     name, destination_folder_id, drive=drive
                 )
                 copied += cls._copy_archive_tree(
-                    item_id, destination["id"], drive=drive
+                    item_id, destination["id"], drive=drive, copies=copies
                 )
                 continue
-
-            def _copy() -> dict[str, Any]:
-                return drive.files().copy(
-                    fileId=item_id,
-                    body={"name": name, "parents": [destination_folder_id]},
-                    fields="id",
-                    supportsAllDrives=True,
-                ).execute()
-
-            cls._execute_with_retries(
-                _copy, operation=f"drive_archive_copy:{item_id}"
-            )
+            copies.append((item_id, name, destination_folder_id))
             copied += 1
         return copied
+
+    @classmethod
+    def _execute_archive_copies(cls, copies: list[tuple[str, str, str]], *, drive) -> None:
+        """Batch independent copies, after every destination folder exists.
+
+        Inspect every subresponse. Only explicitly failed parts are retried;
+        an ambiguous batch transport failure aborts the archive, preserving
+        the original folder for a clean retry of the project.
+        """
+        for start in range(0, len(copies), 100):
+            chunk = copies[start:start + 100]
+            outcomes: dict[str, Exception | None] = {}
+
+            def completed(request_id, response, exception):
+                outcomes[request_id] = exception or (
+                    None if isinstance(response, dict) and response.get("id")
+                    else RuntimeError("Drive archive copy returned no file ID")
+                )
+
+            batch = drive.new_batch_http_request(callback=completed)
+            requests = {}
+            for index, (file_id, name, destination_id) in enumerate(chunk):
+                request_id = str(index)
+                request = drive.files().copy(
+                    fileId=file_id, body={"name": name, "parents": [destination_id]},
+                    fields="id", supportsAllDrives=True,
+                )
+                requests[request_id] = request
+                batch.add(request, request_id=request_id)
+            batch.execute()
+            for request_id, request in requests.items():
+                if request_id not in outcomes:
+                    raise RuntimeError("Drive archive batch omitted a copy result")
+                error = outcomes[request_id]
+                if error is not None:
+                    if not cls._is_retryable_http_error(error):
+                        raise error
+                    cls._execute_with_retries(
+                        request.execute, operation=f"drive_archive_copy:{chunk[int(request_id)][0]}"
+                    )
 
     @classmethod
     def archive_project_folder(cls, source_folder_id: str) -> dict[str, Any]:
@@ -617,9 +661,7 @@ class GoogleDriveService:
         if not parent_id:
             raise RuntimeError("Google Drive parent folder not configured")
 
-        archive_root = cls._ensure_child_folder(
-            cls.ARCHIVE_FOLDER_NAME, parent_id, drive=drive
-        )
+        archive_root = cls._archive_root(parent_id, drive=drive)
         archive_project = cls._ensure_child_folder(
             project_name, archive_root["id"], drive=drive
         )
@@ -638,7 +680,7 @@ class GoogleDriveService:
         # A previous interrupted attempt may have left a partial archive.
         cls.clear_folder(archive_project["id"], drive=drive)
 
-        copied = 0
+        copies: list[tuple[str, str, str]] = []
         for item in children:
             name = str(item.get("name") or "")
             item_id = str(item.get("id") or "")
@@ -647,29 +689,27 @@ class GoogleDriveService:
             if item.get("mimeType") != FOLDER_MIME:
                 if name not in cls.ARCHIVE_ROOT_FILES:
                     continue
-                copied += cls._copy_archive_tree(
-                    source_folder_id,
-                    archive_project["id"],
-                    drive=drive,
-                    allowed_names={name},
-                )
+                copies.append((item_id, name, archive_project["id"]))
                 continue
             if name not in cls.ARCHIVE_FULL_FOLDERS and name != "sources":
                 continue
             destination = cls._ensure_child_folder(
                 name, archive_project["id"], drive=drive
             )
-            copied += cls._copy_archive_tree(
+            cls._copy_archive_tree(
                 item_id,
                 destination["id"],
                 drive=drive,
+                copies=copies,
                 allowed_names=cls.ARCHIVE_SOURCE_FILES if name == "sources" else None,
             )
+
+        cls._execute_archive_copies(copies, drive=drive)
 
         return {
             "folder_id": archive_project["id"],
             "folder_url": archive_project.get("webViewLink", ""),
-            "files_copied": copied,
+            "files_copied": len(copies),
         }
 
     @classmethod

@@ -2832,6 +2832,8 @@ class UploadPhaseService:
             max_speed=SocialUploadService._YOUTUBE_MAX_SPEED_FACTOR,
         )
 
+    _delete_cleanup_lock = threading.Lock()
+
     @classmethod
     def managed_delete(
         cls, project_id: str, *, confirmed: bool = False
@@ -3000,21 +3002,24 @@ class UploadPhaseService:
         # writing references after we release them: stop it first (its own
         # cancel path re-runs GC once the project dir is gone).
         DrivePrewarmService.request_cancel(project.id)
-        released_manifest = DriveSharedSources.load_local_manifest(project.id)
-        if released_manifest and GoogleDriveService.is_configured():
-            try:
-                shared_gc = DriveSharedSources.collect_garbage(
-                    released_manifest, exclude_project_id=project.id
-                )
-            except Exception as exc:
-                cleanup_warnings.append(f"shared-source GC failed: {exc}")
+        # Serialize GC with manifest removal: the next deletion must see
+        # references released by this one, rather than both keeping orphans.
+        with cls._delete_cleanup_lock:
+            released_manifest = DriveSharedSources.load_local_manifest(project.id)
+            if released_manifest and GoogleDriveService.is_configured():
+                try:
+                    shared_gc = DriveSharedSources.collect_garbage(
+                        released_manifest, exclude_project_id=project.id
+                    )
+                except Exception as exc:
+                    cleanup_warnings.append(f"shared-source GC failed: {exc}")
 
-        local_deleted = ProjectService.archive(
-            archive_project,
-            drive_archive=archive_result,
-            uploaded=archived_upload,
-            cancellations=cancellation_status,
-        )
+            local_deleted = ProjectService.archive(
+                archive_project,
+                drive_archive=archive_result,
+                uploaded=archived_upload,
+                cancellations=cancellation_status,
+            )
         if local_deleted:
             cls.cleanup_project_caches(project.id)
         result = {

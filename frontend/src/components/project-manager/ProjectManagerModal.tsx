@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Loader2, RefreshCw, X, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { api } from "@/api/client";
+import { api, ProjectArchivedError } from "@/api/client";
+import { deleteProjectsConcurrently, pendingProjectDeletions, savePendingProjectDeletions } from "@/utils/projectDeletion";
 import { getEventHub } from "@/utils/eventHub";
 import { confirmTikTokPrecedence } from "@/utils/tiktokPrecedence";
 import { scheduledPlatformsForAccount } from "@/utils/scheduling";
@@ -198,12 +199,13 @@ export function ProjectManagerModal({
   } | null>(null);
   const loadRequestIdRef = useRef(0);
 
-  const [multiDeleteMode, setMultiDeleteMode] = useState(false);
+  const [multiDeleteMode, setMultiDeleteMode] = useState(() => pendingProjectDeletions().length > 0);
   const [selectedProjectIds, setSelectedProjectIds] = useState<Set<string>>(
-    new Set(),
+    () => new Set(pendingProjectDeletions()),
   );
   const [showMultiDeleteConfirm, setShowMultiDeleteConfirm] = useState(false);
   const [multiDeleting, setMultiDeleting] = useState(false);
+  const [deleteProgress, setDeleteProgress] = useState({ done: 0, total: 0 });
 
   const selectedAccount = useMemo(
     () => accounts.find((a) => a.id === selectedAccountId) ?? null,
@@ -369,6 +371,7 @@ export function ProjectManagerModal({
     if (!open) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
+      if (multiDeleting) return;
       if (previewTarget) return;
       if (Object.values(uploadSessionsRef.current).some((session) => isPromptSessionStatus(session.status))) {
         return;
@@ -382,7 +385,7 @@ export function ProjectManagerModal({
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [open, onClose, previewTarget, multiDeleteMode]);
+  }, [open, onClose, previewTarget, multiDeleteMode, multiDeleting]);
 
   useEffect(
     () => () => {
@@ -735,7 +738,7 @@ export function ProjectManagerModal({
   };
 
   const toggleSelectProject = (id: string) => {
-    if (rowsByProjectId[id]?.archived_at) return;
+    if (multiDeleting || rowsByProjectId[id]?.archived_at) return;
     setSelectedProjectIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -751,20 +754,34 @@ export function ProjectManagerModal({
     const ids = Array.from(selectedProjectIds).filter((id) => !rowsByProjectId[id]?.archived_at);
     const failedIds: string[] = [];
     const deletedIds: string[] = [];
+    const pendingIds = new Set(ids);
+    savePendingProjectDeletions(pendingIds);
+    setDeleteProgress({ done: 0, total: ids.length });
 
     try {
-      for (const id of ids) {
+      await deleteProjectsConcurrently(ids, async (id) => {
         try {
           const result = await api.deleteManagedProject(id, true);
           patchRow(result.project);
-          deletedIds.push(id);
-        } catch {
-          failedIds.push(id);
+        } catch (error) {
+          // A tab reload can lose the response after the server completed.
+          if (!(error instanceof ProjectArchivedError)) throw error;
+          const { project } = await api.getProjectManagerRow(id);
+          patchRow(project);
         }
-      }
+      }, (id, error) => {
+        if (error) {
+          failedIds.push(id);
+        } else {
+          deletedIds.push(id);
+          pendingIds.delete(id);
+          savePendingProjectDeletions(pendingIds);
+        }
+        setDeleteProgress((progress) => ({ ...progress, done: progress.done + 1 }));
+      });
     } finally {
-      setSelectedProjectIds(new Set());
-      setMultiDeleteMode(false);
+      setSelectedProjectIds(new Set(pendingIds));
+      setMultiDeleteMode(pendingIds.size > 0);
       setMultiDeleting(false);
     }
 
@@ -1049,15 +1066,15 @@ export function ProjectManagerModal({
                         ) : (
                           <Trash2 className="h-4 w-4 mr-1.5" />
                         )}
-                        Delete
-                        {selectedProjectIds.size > 0
-                          ? ` (${selectedProjectIds.size})`
-                          : ""}
+                        {multiDeleting
+                          ? `Deleting ${deleteProgress.done}/${deleteProgress.total}`
+                          : `Delete${selectedProjectIds.size > 0 ? ` (${selectedProjectIds.size})` : ""}`}
                       </Button>
                       <Button
                         variant="ghost"
                         size="sm"
                         onClick={exitMultiDeleteMode}
+                        disabled={multiDeleting}
                         className="active:scale-95 transition-transform"
                       >
                         Cancel
@@ -1130,7 +1147,7 @@ export function ProjectManagerModal({
                 sortDirection={sortDirection}
                 onToggleSort={toggleSort}
                 uploadStateByProjectId={uploadStateByProjectId}
-                activeDeleteId={activeDeleteId}
+                activeDeleteId={multiDeleting ? "__batch__" : activeDeleteId}
                 onUpload={handleUploadClick}
                 onUploadSchedule={handleUploadSchedule}
                 onUploadUrgent={handleUploadUrgent}
