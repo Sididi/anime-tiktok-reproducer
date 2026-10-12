@@ -18,6 +18,11 @@ from app.services.upload_phase import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_local_caches(monkeypatch):
+    monkeypatch.setattr(UploadPhaseService, "cleanup_project_caches", lambda _id: None)
+
+
 def _scheduled_project() -> Project:
     future = datetime.now(timezone.utc) + timedelta(days=1)
     return Project(
@@ -107,8 +112,8 @@ def test_confirmed_managed_delete_archives_unschedules_then_deletes(monkeypatch)
         lambda _id: calls.append("drive-delete"),
     )
     monkeypatch.setattr(
-        "app.services.upload_phase.ProjectService.delete",
-        lambda _id: calls.append("local-delete") or True,
+        "app.services.upload_phase.ProjectService.archive",
+        lambda _project, **_kwargs: calls.append("local-delete") or True,
     )
 
     result = UploadPhaseService.managed_delete(project.id, confirmed=True)
@@ -144,7 +149,7 @@ def test_archive_failure_preserves_original_and_local_project(monkeypatch):
     monkeypatch.setattr(
         "app.services.upload_phase.GoogleDriveService.delete_folder", drive_delete
     )
-    monkeypatch.setattr("app.services.upload_phase.ProjectService.delete", local_delete)
+    monkeypatch.setattr("app.services.upload_phase.ProjectService.archive", local_delete)
 
     with pytest.raises(RuntimeError, match="copy failed"):
         UploadPhaseService.managed_delete(project.id, confirmed=True)
@@ -171,8 +176,8 @@ def _mock_delete_collaborators(monkeypatch, calls: list[str]) -> None:
         lambda _id: calls.append("drive-delete"),
     )
     monkeypatch.setattr(
-        "app.services.upload_phase.ProjectService.delete",
-        lambda _id: calls.append("local-delete") or True,
+        "app.services.upload_phase.ProjectService.archive",
+        lambda _project, **_kwargs: calls.append("local-delete") or True,
     )
 
 

@@ -3,7 +3,7 @@ import json
 import re
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..config import settings
 from ..library_types import DEFAULT_LIBRARY_TYPE, LibraryType, coerce_library_type
@@ -14,6 +14,11 @@ from .library_state_db import LibraryStateDb
 from .project_locks import ProjectLocks
 
 _PROJECT_ID_RE = re.compile(r"[a-zA-Z0-9_-]+$")
+
+
+class ArchivedProjectError(ValueError):
+    def __init__(self):
+        super().__init__("This project is archive-only and is disabled. Its read-only information is available in Project Manager.")
 
 
 def _validate_project_id(project_id: str) -> None:
@@ -43,7 +48,7 @@ class ProjectService:
     @staticmethod
     def should_keep_project_pin(project: Project) -> bool:
         """Keep local residency only while a project is still actively generating."""
-        if not project.series_id:
+        if project.archived_at or not project.series_id:
             return False
         if project.upload_completed_at is not None:
             return False
@@ -101,6 +106,9 @@ class ProjectService:
     @classmethod
     def save(cls, project: Project) -> None:
         """Save a project to disk."""
+        cls.require_active(project.id)
+        if project.archived_at:
+            raise ArchivedProjectError()
         if project.temporary_source is not None:
             if not cls.get_project_dir(project.id).exists():
                 raise RuntimeError("Project no longer exists")
@@ -116,6 +124,13 @@ class ProjectService:
         if not project_file.exists():
             return None
         return Project.model_validate_json(project_file.read_text())
+
+    @classmethod
+    def require_active(cls, project_id: str) -> None:
+        """Reject stale writers as well as direct access to archived projects."""
+        project = cls.load(project_id)
+        if project is not None and project.archived_at:
+            raise ArchivedProjectError()
 
     # ------------------------------------------------------------------
     # event-loop friendly twins (light thread pool) + per-project edit lock
@@ -134,7 +149,9 @@ class ProjectService:
         await asyncio.to_thread(cls.save, project)
 
     @classmethod
-    async def alist_all(cls) -> list[Project]:
+    async def alist_all(cls, *, include_archived: bool = False) -> list[Project]:
+        if include_archived:
+            return await asyncio.to_thread(cls.list_all, include_archived=True)
         return await asyncio.to_thread(cls.list_all)
 
     @classmethod
@@ -166,6 +183,7 @@ class ProjectService:
     @classmethod
     def delete(cls, project_id: str) -> bool:
         """Delete a project and all its data."""
+        cls.require_active(project_id)
         project_dir = cls.get_project_dir(project_id)
         if not project_dir.exists():
             return False
@@ -174,6 +192,65 @@ class ProjectService:
 
         LibraryStateDb.remove_project_pins(project_id)
         shutil.rmtree(project_dir)
+        return True
+
+    @classmethod
+    def archive(
+        cls,
+        project: Project,
+        *,
+        drive_archive: dict | None,
+        uploaded: dict,
+        cancellations: dict[str, str],
+    ) -> bool:
+        """Keep one small project.json; discard all generation data and assets.
+
+        Persist the record before removing any files, so a failed metadata
+        write cannot destroy the only local copy of the publishing history.
+        This allowlist deliberately does not grow with the Project model.
+        """
+        import shutil
+
+        cls.require_active(project.id)
+        project_dir = cls.get_project_dir(project.id)
+        if not project_dir.exists():
+            return False
+        retained = project.model_dump(mode="json", include={
+            "id", "anime_name", "library_type", "project_mode", "output_language",
+            "created_at", "updated_at", "tiktok_url", "mother_project_id", "source_project_id",
+            "scheduled_at", "scheduled_account_id", "scheduled_slot", "platform_schedules",
+            "upload_completed_at",
+        }, exclude_none=True)
+        upload_result = project.upload_last_result or {}
+        # Remote video/cache references are obsolete after Drive deletion.
+        # Platform outcomes and public post links remain useful history.
+        retained["upload_last_result"] = {
+            key: upload_result[key]
+            for key in ("platforms", "requested_platforms")
+            if key in upload_result
+        }
+        if project.temporary_source is not None and project.temporary_source.kind == "url":
+            retained["source_url"] = project.temporary_source.value
+        retained.update(
+            archived_at=datetime.now(timezone.utc).isoformat(),
+            archived_upload=uploaded,
+            archive_cancellations=cancellations,
+            drive_folder_id=drive_archive.get("folder_id") if drive_archive else None,
+            drive_folder_url=(
+                drive_archive.get("folder_url")
+                or f"https://drive.google.com/drive/folders/{drive_archive['folder_id']}"
+            ) if drive_archive else None,
+        )
+        project_file = cls.get_project_file(project.id)
+        write_text_atomic(project_file, json.dumps(retained, ensure_ascii=False, indent=2), create_parent=False)
+        LibraryStateDb.remove_project_pins(project.id)
+        for child in project_dir.iterdir():
+            if child == project_file:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
         return True
 
     @classmethod
@@ -226,13 +303,13 @@ class ProjectService:
         return renamed_projects
 
     @classmethod
-    def list_all(cls) -> list[Project]:
-        """List all projects."""
+    def list_all(cls, *, include_archived: bool = False) -> list[Project]:
+        """List active projects; history consumers can explicitly include archives."""
         projects = []
         for project_dir in settings.projects_dir.iterdir():
             if project_dir.is_dir():
                 project = cls.load(project_dir.name)
-                if project:
+                if project and (include_archived or not project.archived_at):
                     projects.append(project)
         return sorted(projects, key=lambda p: p.created_at, reverse=True)
 
@@ -255,7 +332,7 @@ class ProjectService:
                 raw = json.loads(project_file.read_text())
             except (OSError, ValueError):
                 continue
-            if not isinstance(raw, dict) or not raw.get("reschedule_pending"):
+            if not isinstance(raw, dict) or raw.get("archived_at") or not raw.get("reschedule_pending"):
                 continue
             projects.append(Project.model_validate(raw))
         return sorted(projects, key=lambda p: p.created_at, reverse=True)
@@ -273,6 +350,7 @@ class ProjectService:
     @classmethod
     def save_scenes(cls, project_id: str, scenes: SceneList) -> None:
         """Save scenes for a project."""
+        cls.require_active(project_id)
         scenes_file = cls.get_scenes_file(project_id)
         write_text_atomic(scenes_file, scenes.model_dump_json(indent=2), create_parent=False)
 
@@ -302,6 +380,7 @@ class ProjectService:
     @classmethod
     def save_matches(cls, project_id: str, matches: "MatchList") -> None:
         """Save matches for a project."""
+        cls.require_active(project_id)
         matches_file = cls.get_matches_file(project_id)
         write_text_atomic(matches_file, matches.model_dump_json(indent=2), create_parent=False)
 
@@ -322,6 +401,7 @@ class ProjectService:
     @classmethod
     def save_transcription(cls, project_id: str, transcription: "Transcription") -> None:
         """Save transcription for a project."""
+        cls.require_active(project_id)
         transcription_file = cls.get_transcription_file(project_id)
         write_text_atomic(transcription_file, transcription.model_dump_json(indent=2), create_parent=False)
 

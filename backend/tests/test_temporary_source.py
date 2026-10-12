@@ -381,7 +381,8 @@ async def test_delete_waits_for_cancelled_playback_encoder(isolated, monkeypatch
     with pytest.raises(asyncio.CancelledError):
         await playback
     await deletion
-    assert not Projects.get_project_dir(project.id).exists()
+    assert [p.name for p in Projects.get_project_dir(project.id).iterdir()] == ["project.json"]
+    assert Projects.load(project.id).archived_at is not None
     assert not MatchPlaybackService._clip_tasks.get(project.id)
 
 

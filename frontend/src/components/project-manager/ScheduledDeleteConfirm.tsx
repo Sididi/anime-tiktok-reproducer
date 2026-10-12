@@ -47,7 +47,8 @@ export function ScheduledDeleteConfirm({ open, projectTitle, scheduledAt, onConf
               )}
               {" "}Already-posted projects first have their reconstructable
               Drive files copied to Archive Projets; scheduled-only or unposted
-              projects are deleted entirely.
+              projects have their Drive files deleted. Locally, only a read-only
+              Project Manager record is retained; all assets and work files are removed.
             </p>
             <div className="flex justify-end gap-2">
               <Button variant="ghost" size="sm" onClick={onCancel}>

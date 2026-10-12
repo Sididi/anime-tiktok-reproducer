@@ -52,7 +52,7 @@ export function ProjectRow({
   const hasCompatibleAccount = compatibleAccounts.length > 0;
   const requiresCompatibleAccount = accounts.length > 0;
   const readinessReasons = row.can_upload_reasons.join("; ");
-  const canUpload = row.can_upload_status === "green"
+  const canUpload = !row.archived_at && row.can_upload_status === "green"
     && row.uploaded_status === "red"
     && (!requiresCompatibleAccount || hasCompatibleAccount);
 
@@ -63,7 +63,9 @@ export function ProjectRow({
     : null;
 
   const uploadDisabledReason = !canUpload
-    ? row.uploaded_status !== "red"
+    ? row.archived_at
+      ? "Archive-only project — disabled"
+      : row.uploaded_status !== "red"
       ? "Already uploaded or scheduled"
       : [compatibilityReason, readinessReasons || null]
           .filter(Boolean)
@@ -101,7 +103,9 @@ export function ProjectRow({
         <span
           className={statusCircleClasses(row.uploaded_status)}
           title={
-            row.uploaded_status === "publish_error"
+            row.archived_at
+              ? `Status retained at archive time: ${formatDateTime(row.archived_at)}`
+              : row.uploaded_status === "publish_error"
               ? `Échec de publication — ${row.publish_error_detail ?? "voir Discord"}`
               : row.uploaded
                 ? row.scheduled_at
@@ -117,6 +121,11 @@ export function ProjectRow({
       {/* Title — truncate to prevent overflow */}
       <td className="py-3 pr-3 overflow-hidden">
         <div className="font-medium truncate">{row.anime_title || "Unknown"}</div>
+        {row.archived_at && (
+          <div className="text-xs text-[hsl(var(--muted-foreground))]" title={formatDateTime(row.archived_at)}>
+            Archive-only · Read-only
+          </div>
+        )}
         <div className="font-mono text-[11px] tracking-wide text-[hsl(var(--muted-foreground))] truncate">
           {row.project_id}
         </div>
@@ -128,8 +137,31 @@ export function ProjectRow({
             className="text-xs text-[hsl(var(--primary))] hover:underline"
             onClick={(e) => e.stopPropagation()}
           >
-            Drive folder
+            {row.archived_at ? "Drive archive" : "Drive folder"}
           </a>
+        )}
+        {row.archived_at && (
+          <details className="mt-1 text-xs text-[hsl(var(--muted-foreground))]">
+            <summary className="cursor-pointer">Archive information</summary>
+            <div className="space-y-1 mt-1 break-words">
+              <div>Archived {formatDateTime(row.archived_at)}</div>
+              {row.source_url && <a href={row.source_url} target="_blank" rel="noreferrer" className="block text-[hsl(var(--primary))] hover:underline">Original source</a>}
+              {row.mother_project_id && <div>Parent: {row.mother_project_id}</div>}
+              {row.source_project_id && <div>Source project: {row.source_project_id}</div>}
+              {Object.entries(row.platform_schedules ?? {}).map(([platform, schedule]) => (
+                <div key={platform}>
+                  {platform}: {formatDateTime(schedule.scheduled_at)}
+                  {row.archive_cancellations?.[platform] ? ` · cancellation: ${row.archive_cancellations[platform]}` : ""}
+                </div>
+              ))}
+              {Array.isArray(row.upload_last_result?.platforms) && row.upload_last_result.platforms.map((upload, index) => (
+                <div key={`${upload.platform}-${index}`} title={upload.detail}>
+                  {upload.platform}: {upload.status ?? "Recorded"}
+                  {upload.url && <> · <a href={upload.url} target="_blank" rel="noreferrer" className="text-[hsl(var(--primary))] hover:underline">Post</a></>}
+                </div>
+              ))}
+            </div>
+          </details>
         )}
       </td>
 
@@ -161,40 +193,42 @@ export function ProjectRow({
 
       {/* Config: LLM • Speed • Template */}
       <td className="py-3 pr-3 overflow-hidden">
-        <div className="text-xs whitespace-nowrap truncate">
-          <span
-            className={
-              row.llm_preset_is_default
-                ? "italic text-[hsl(var(--muted-foreground))]"
-                : "text-[hsl(var(--foreground))]"
-            }
-            title={`LLM — ${row.llm_preset_is_default ? "Default" : "Project override"}`}
-          >
-            {row.llm_preset_resolved}
-          </span>
-          <span className="text-[hsl(var(--muted-foreground))]"> • </span>
-          <span
-            className={`font-mono ${
-              row.min_playback_speed_is_default
-                ? "italic text-[hsl(var(--muted-foreground))]"
-                : "text-[hsl(var(--foreground))]"
-            }`}
-            title={`Speed — ${row.min_playback_speed_is_default ? "Default" : "Project override"}`}
-          >
-            {row.min_playback_speed_resolved.toFixed(2)}
-          </span>
-          <span className="text-[hsl(var(--muted-foreground))]"> • </span>
-          <span
-            className={
-              row.template_is_default
-                ? "italic text-[hsl(var(--muted-foreground))]"
-                : "text-[hsl(var(--foreground))]"
-            }
-            title={`Template — ${row.template_is_default ? "Default" : "Project override"}`}
-          >
-            {row.template_resolved}
-          </span>
-        </div>
+        {row.archived_at ? <span className="text-[hsl(var(--muted-foreground))]">—</span> : (
+          <div className="text-xs whitespace-nowrap truncate">
+            <span
+              className={
+                row.llm_preset_is_default
+                  ? "italic text-[hsl(var(--muted-foreground))]"
+                  : "text-[hsl(var(--foreground))]"
+              }
+              title={`LLM — ${row.llm_preset_is_default ? "Default" : "Project override"}`}
+            >
+              {row.llm_preset_resolved}
+            </span>
+            <span className="text-[hsl(var(--muted-foreground))]"> • </span>
+            <span
+              className={`font-mono ${
+                row.min_playback_speed_is_default
+                  ? "italic text-[hsl(var(--muted-foreground))]"
+                  : "text-[hsl(var(--foreground))]"
+              }`}
+              title={`Speed — ${row.min_playback_speed_is_default ? "Default" : "Project override"}`}
+            >
+              {row.min_playback_speed_resolved?.toFixed(2)}
+            </span>
+            <span className="text-[hsl(var(--muted-foreground))]"> • </span>
+            <span
+              className={
+                row.template_is_default
+                  ? "italic text-[hsl(var(--muted-foreground))]"
+                  : "text-[hsl(var(--foreground))]"
+              }
+              title={`Template — ${row.template_is_default ? "Default" : "Project override"}`}
+            >
+              {row.template_resolved}
+            </span>
+          </div>
+        )}
       </td>
 
       {/* Scheduled At */}
@@ -202,6 +236,11 @@ export function ProjectRow({
         <span className="text-xs text-[hsl(var(--muted-foreground))]">
           {formatScheduledAt(row.scheduled_at) || (row.uploaded ? "Uploaded" : "")}
         </span>
+        {row.archived_at && Object.keys(row.archive_cancellations ?? {}).length > 0 && (
+          <div className="text-xs text-[hsl(var(--muted-foreground))]" title={Object.keys(row.archive_cancellations ?? {}).join(", ")}>
+            Pending schedules cancelled
+          </div>
+        )}
       </td>
 
       {/* Size */}
@@ -211,7 +250,7 @@ export function ProjectRow({
       <td className="py-3 pr-3">
         <div className="flex items-center gap-1.5">
           {/* Video preview (always reserve space for alignment) */}
-          {row.drive_video_id ? (
+          {!row.archived_at && row.drive_video_id ? (
             <Button
               size="icon"
               variant="ghost"
@@ -238,9 +277,9 @@ export function ProjectRow({
             size="icon"
             variant="destructive"
             className="relative overflow-hidden h-9 w-9 active:scale-95 transition-transform shrink-0"
-            disabled={activeDeleteId !== null}
+            disabled={!!row.archived_at || !!uploadState?.active || activeDeleteId !== null}
             onClick={() => onDelete(row)}
-            title="Delete project"
+            title={row.archived_at ? "Archive-only project — already deleted" : "Delete project"}
           >
             {activeDeleteId === row.project_id ? (
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -257,6 +296,7 @@ export function ProjectRow({
           <input
             type="checkbox"
             checked={isSelected}
+            disabled={!!row.archived_at}
             onChange={() => onToggleSelect(row.project_id)}
             className="h-4 w-4 rounded cursor-pointer accent-[hsl(var(--destructive))]"
           />

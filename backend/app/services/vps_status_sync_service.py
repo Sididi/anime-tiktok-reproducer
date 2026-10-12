@@ -115,7 +115,7 @@ class VpsStatusSyncService:
             if not terminal:
                 continue
             project = ProjectService.load(project_id)
-            if project is None:
+            if project is None or project.archived_at:
                 continue
             result = project.upload_last_result
             if not isinstance(result, dict):

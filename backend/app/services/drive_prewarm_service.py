@@ -155,7 +155,7 @@ class DrivePrewarmService:
         if not cls.is_enabled():
             return None
         project = ProjectService.load(project_id)
-        if project is None or project.project_mode == "facecam":
+        if project is None or project.archived_at or project.project_mode == "facecam":
             return None
         live = cls._tasks.get(project_id)
         if live is not None and not live.done():
@@ -280,6 +280,9 @@ class DrivePrewarmService:
         """
         if not ProjectService.get_project_dir(project_id).is_dir():
             return False
+        project = ProjectService.load(project_id)
+        if project is not None and project.archived_at:
+            return False
         existing = DriveSharedSources.load_local_manifest(project_id) or {}
         merged = DriveSharedSources.merge_records(existing, records)
         final_status = (
@@ -348,8 +351,8 @@ class DrivePrewarmService:
         state.started_at = _utc_now_iso()
 
         project = await ProjectService.aload(project_id)
-        if project is None:
-            return cls._finish(state, "skipped", "project not found")
+        if project is None or project.archived_at:
+            return cls._finish(state, "skipped", "project is unavailable")
         if not GoogleDriveService.is_configured():
             return cls._finish(state, "skipped", "Google Drive is not configured")
         matches = await ProjectService.aload_matches(project_id)
@@ -466,13 +469,15 @@ class DrivePrewarmService:
     async def _release_if_project_gone(cls, project_id: str, state: PrewarmState) -> None:
         """After a cancel/delete: drop the references this run held.
 
-        Only acts when the project dir no longer exists (so a mere cancel of
+        Only acts when the project is gone or archived (so a mere cancel of
         a live project keeps its manifest — the export will reconcile it).
         """
         if not state.records:
             return
         if await asyncio.to_thread(ProjectService.get_project_dir(project_id).is_dir):
-            return
+            project = await ProjectService.aload(project_id)
+            if project is None or not project.archived_at:
+                return
         released = {"shared_files": [record.to_dict() for record in state.records]}
         try:
             result = await run_heavy(

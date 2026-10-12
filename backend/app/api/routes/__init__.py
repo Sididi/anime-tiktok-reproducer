@@ -1,4 +1,6 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from ..archive_access import require_active_project
 
 from .facecam import router as facecam_router
 from .accounts import router as accounts_router
@@ -22,7 +24,7 @@ from .events import router as events_router
 from .progress import router as progress_router
 # TEMPORARILY DISABLED - Subtitle video generation feature
 
-api_router = APIRouter(prefix="/api")
+api_router = APIRouter(prefix="/api", dependencies=[Depends(require_active_project)])
 api_router.include_router(facecam_router)
 api_router.include_router(events_router)
 api_router.include_router(progress_router)

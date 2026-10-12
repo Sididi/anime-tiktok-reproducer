@@ -271,6 +271,13 @@ export interface ScriptAutomationEvent {
 }
 
 export interface ProjectManagerRow {
+  archived_at?: string | null;
+  archive_cancellations?: Record<string, string>;
+  source_url?: string | null;
+  source_project_id?: string | null;
+  platform_schedules?: Record<string, { slot: string; scheduled_at: string }>;
+  upload_completed_at?: string | null;
+  upload_last_result?: { platforms?: Array<{ platform: string; status?: string; url?: string; detail?: string }> } | null;
   project_mode?: "standard" | "facecam";
   publishing_type?: PublishingType;
   project_id: string;
@@ -294,11 +301,11 @@ export interface ProjectManagerRow {
   scheduled_at: string | null;
   scheduled_account_id: string | null;
   mother_project_id: string | null;
-  llm_preset_resolved: string;
+  llm_preset_resolved: string | null;
   llm_preset_is_default: boolean;
-  min_playback_speed_resolved: number;
+  min_playback_speed_resolved: number | null;
   min_playback_speed_is_default: boolean;
-  template_resolved: string;
+  template_resolved: string | null;
   template_is_default: boolean;
 }
 

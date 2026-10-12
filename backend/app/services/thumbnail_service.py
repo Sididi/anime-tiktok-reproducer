@@ -255,6 +255,7 @@ class ThumbnailService:
         """Synchronous builder body; callers get progress via candidates_status.
         Safe to call directly from tests (bypasses the background thread)."""
         with cls._build_lock(project_id):
+            ProjectService.require_active(project_id)
             version = cls._candidates_version(project_id)
             if version is None:
                 return  # candidates_status reports the "error" state

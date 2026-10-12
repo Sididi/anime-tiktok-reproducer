@@ -38,7 +38,7 @@ from .post_for_me_client import (
     PostForMeError,
     build_post_body,
 )
-from .project_service import ProjectService
+from .project_service import ArchivedProjectError, ProjectService
 from .scheduling_service import SchedulingService
 from .social_upload_service import PlatformUploadResult, SocialUploadService
 from .thumbnail_service import ThumbnailService
@@ -97,6 +97,8 @@ def _uploaded_fields(project: "Project") -> dict[str, Any]:
 
     A VPS-reported publish failure (IG/TT gave up after all retries)
     overrides the clock-based status with "publish_error"."""
+    if project.archived_at and project.archived_upload is not None:
+        return project.archived_upload
     publish_errors = _vps_publish_errors(project)
     has_discord = bool(project.final_upload_discord_message_id)
     scheduled_at = project.scheduled_at
@@ -362,6 +364,8 @@ class UploadPhaseService:
 
     @classmethod
     def compute_readiness(cls, project: Project) -> UploadReadiness:
+        if project.archived_at:
+            return cls._archived_manager_readiness(project)
         metadata_exists = ProjectService.get_metadata_file(project.id).exists()
 
         folder_id, folder_url = cls._resolve_drive_folder(project)
@@ -423,6 +427,8 @@ class UploadPhaseService:
     @classmethod
     def _compute_preflight_readiness(cls, project: Project) -> UploadReadiness:
         """Reuse the manager's recent Drive result before issuing another query."""
+        if project.archived_at:
+            raise ArchivedProjectError()
         metadata_exists = ProjectService.get_metadata_file(project.id).exists()
 
         folder_id, folder_url = cls._resolve_drive_folder_offline(project, None)
@@ -445,7 +451,7 @@ class UploadPhaseService:
 
     @classmethod
     def list_manager_rows(cls) -> list[dict[str, Any]]:
-        projects = ProjectService.list_all()
+        projects = ProjectService.list_all(include_archived=True)
         # Upload-locked rows (already posted, or scheduled with a dispatched
         # upload) render with the Upload button disabled, so their Drive
         # readiness is never shown: keep them out of the batch video lookup
@@ -457,14 +463,14 @@ class UploadPhaseService:
         folder_listing_ok = False
         drive_root_videos: dict[str, list[dict[str, Any]]] = {}
         drive_batch_lookup_failed = False
-        if GoogleDriveService.is_configured():
+        if any(not project.archived_at for project in projects) and GoogleDriveService.is_configured():
             for attempt in range(1, cls._DRIVE_BATCH_LOOKUP_MAX_ATTEMPTS + 1):
                 try:
                     drive = GoogleDriveService.client()
                     folder_candidates_by_name = GoogleDriveService.list_project_folders_under_parent(drive=drive)
                     folder_ids: list[str] = []
                     for project in projects:
-                        if upload_locked[project.id]:
+                        if project.archived_at or upload_locked[project.id]:
                             continue
                         folder_id, _ = cls._resolve_drive_folder(
                             project,
@@ -501,6 +507,8 @@ class UploadPhaseService:
                     time.sleep(min(0.25 * attempt, 0.75))
 
         def _build_row(project: Project) -> dict[str, Any]:
+            if project.archived_at:
+                return cls._manager_row_payload(project, cls._archived_manager_readiness(project))
             if upload_locked[project.id]:
                 readiness = cls._locked_manager_readiness(
                     project, folder_candidates_by_name
@@ -553,6 +561,17 @@ class UploadPhaseService:
         return [row for row in rows if row is not None]
 
     @classmethod
+    def _archived_manager_readiness(cls, project: Project) -> UploadReadiness:
+        """Archive links are final; never discover folders or inspect videos."""
+        return UploadReadiness(
+            status="red", metadata_exists=False, drive_video_count=0,
+            drive_video_id=None, drive_video_name=None, drive_video_web_url=None,
+            reasons=[str(ArchivedProjectError())],
+            drive_folder_id=project.drive_folder_id,
+            drive_folder_url=project.drive_folder_url,
+        )
+
+    @classmethod
     def _locked_manager_readiness(
         cls,
         project: Project,
@@ -592,6 +611,8 @@ class UploadPhaseService:
         project = ProjectService.load(project_id)
         if project is None:
             return None
+        if project.archived_at:
+            return cls._manager_row_payload(project, cls._archived_manager_readiness(project))
         readiness = (
             cls._locked_manager_readiness(project, None)
             if _upload_locked(project)
@@ -606,13 +627,19 @@ class UploadPhaseService:
         project_dir = ProjectService.get_project_dir(project.id)
         return {
             "project_id": project.id,
+            "archived_at": project.archived_at.isoformat() if project.archived_at else None,
+            "archive_cancellations": project.archive_cancellations,
             "anime_title": project.anime_name,
             "library_type": project.library_type.value,
             "project_mode": project.project_mode,
             "publishing_type": project.publishing_type,
             "facecam_delivery": project.facecam_delivery,
             "language": project.output_language,
-            "local_size_bytes": _dir_size(project_dir) if project_dir.exists() else 0,
+            "local_size_bytes": (
+                ProjectService.get_project_file(project.id).stat().st_size
+                if project.archived_at and ProjectService.get_project_file(project.id).exists()
+                else _dir_size(project_dir) if project_dir.exists() else 0
+            ),
             **_uploaded_fields(project),
             "can_upload_status": readiness.status,
             "can_upload_reasons": readiness.reasons,
@@ -627,6 +654,10 @@ class UploadPhaseService:
             "scheduled_at": project.scheduled_at.isoformat() if project.scheduled_at else None,
             "scheduled_account_id": project.scheduled_account_id,
             "mother_project_id": project.mother_project_id,
+            "source_project_id": project.source_project_id,
+            "source_url": project.source_url or project.tiktok_url,
+            "upload_completed_at": project.upload_completed_at.isoformat() if project.upload_completed_at else None,
+            "upload_last_result": project.upload_last_result,
             "platform_schedules": {
                 platform: {
                     "slot": ps.slot.isoformat(),
@@ -634,11 +665,11 @@ class UploadPhaseService:
                 }
                 for platform, ps in (project.platform_schedules or {}).items()
             },
-            "llm_preset_resolved": project.resolved_llm_preset_key(),
+            "llm_preset_resolved": None if project.archived_at else project.resolved_llm_preset_key(),
             "llm_preset_is_default": project.llm_preset is None,
-            "template_resolved": project.resolved_template_key(),
+            "template_resolved": None if project.archived_at else project.resolved_template_key(),
             "template_is_default": project.template is None,
-            "min_playback_speed_resolved": project.resolved_min_playback_speed(),
+            "min_playback_speed_resolved": None if project.archived_at else project.resolved_min_playback_speed(),
             "min_playback_speed_is_default": project.min_playback_speed is None,
         }
 
@@ -1271,6 +1302,8 @@ class UploadPhaseService:
         project = ProjectService.load(project_id)
         if not project:
             raise ValueError("Project not found")
+        if project.archived_at:
+            raise ArchivedProjectError()
         requested_platforms = cls._normalize_platforms(platforms)
         # Urgent-immediate mode: these platforms publish right now (no
         # scheduled_at). "tiktok" is a valid member here even though it is
@@ -2398,6 +2431,7 @@ class UploadPhaseService:
     ) -> Path:
         """Blocking: return the cached final video, materializing it if needed."""
         with cls._source_lock(project_id):
+            ProjectService.require_active(project_id)
             cached = cls.cached_source_video(project_id)
             if cached is not None:
                 return cached
@@ -2805,6 +2839,12 @@ class UploadPhaseService:
         project = ProjectService.load(project_id)
         if not project:
             raise ValueError("Project not found")
+        if project.archived_at:
+            raise ArchivedProjectError()
+        # Cancellation may mutate publishing state; retain the history as it
+        # looked when deletion was requested, plus cancellation outcomes.
+        archive_project = project.model_copy(deep=True)
+        archived_upload = _uploaded_fields(project)
 
         now = datetime.now(timezone.utc)
         pending_platform_set = {
@@ -2969,7 +3009,14 @@ class UploadPhaseService:
             except Exception as exc:
                 cleanup_warnings.append(f"shared-source GC failed: {exc}")
 
-        local_deleted = ProjectService.delete(project.id)
+        local_deleted = ProjectService.archive(
+            archive_project,
+            drive_archive=archive_result,
+            uploaded=archived_upload,
+            cancellations=cancellation_status,
+        )
+        if local_deleted:
+            cls.cleanup_project_caches(project.id)
         result = {
             "status": "deleted" if local_deleted else "not_found",
             "local_deleted": local_deleted,
@@ -2982,6 +3029,26 @@ class UploadPhaseService:
         if cleanup_warnings:
             result["cleanup_warnings"] = cleanup_warnings
         return result
+
+    @classmethod
+    def cleanup_project_caches(cls, project_id: str) -> None:
+        """Delete upload/preview assets stored outside the project directory."""
+        # Wait for an already-running preview download or thumbnail build;
+        # subsequent source downloads reject the archive marker.
+        with cls._source_lock(project_id), ThumbnailService._build_lock(project_id):
+            for root in (
+                cls._SOURCE_CACHE_DIR, cls._COPYRIGHT_AUDIO_CACHE_DIR,
+                cls._FACEBOOK_PREP_CACHE_DIR, cls._YOUTUBE_PREP_CACHE_DIR,
+                cls._LEGACY_FACEBOOK_PREP_CACHE_DIR, cls._LEGACY_YOUTUBE_PREP_CACHE_DIR,
+                ThumbnailService._THUMBS_CACHE_DIR,
+            ):
+                path = root / project_id
+                if path.exists():
+                    shutil.rmtree(path)
+        cls._drive_video_cache.pop(project_id, None)
+        with cls._source_download_guard:
+            cls._source_download_errors.pop(project_id, None)
+            cls._source_download_totals.pop(project_id, None)
 
     # ── Copyright music replacement ──────────────────────────────────────
 

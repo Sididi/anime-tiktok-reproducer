@@ -80,7 +80,7 @@ def drive_calls(tmp_path, monkeypatch):
     monkeypatch.setattr(UploadPhaseService, "_drive_video_cache", {})
 
     def _set_projects(projects):
-        monkeypatch.setattr(up.ProjectService, "list_all", classmethod(lambda cls: projects))
+        monkeypatch.setattr(up.ProjectService, "list_all", classmethod(lambda cls, **_kwargs: projects))
 
     calls["set_projects"] = _set_projects
     return calls
@@ -88,6 +88,19 @@ def drive_calls(tmp_path, monkeypatch):
 
 def _rows_by_id(rows):
     return {row["project_id"]: row for row in rows}
+
+
+def test_mixed_list_excludes_archive_folders_from_drive_batch(drive_calls):
+    archived = Project(
+        id="archive", archived_at=PAST, drive_folder_id="archive-folder",
+        archived_upload={"uploaded": False, "uploaded_status": "red", "publish_error_detail": None},
+    )
+    active = Project(id="active", drive_folder_id="active-folder")
+    drive_calls["set_projects"]([archived, active])
+    rows = _rows_by_id(UploadPhaseService.list_manager_rows())
+    assert drive_calls["batch_parent_ids"] == ["active-folder"]
+    assert rows["archive"]["archived_at"]
+    assert rows["archive"]["drive_video_id"] is None
 
 
 def test_posted_project_skips_drive_batch_and_uses_persisted_video(drive_calls):

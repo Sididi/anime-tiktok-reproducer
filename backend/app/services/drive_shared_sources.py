@@ -544,6 +544,7 @@ class DriveSharedSources:
         records: list[SharedFileRecord],
         drive_folder_id: str | None = None,
     ) -> None:
+        ProjectService.require_active(project_id)
         payload = {
             "schema_version": SCHEMA_VERSION,
             "project_id": project_id,

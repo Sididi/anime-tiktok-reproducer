@@ -75,6 +75,7 @@ class Project(BaseModel):
     source_project_id: str | None = None
     facecam_delivery: dict[str, Any] | None = None
     tiktok_url: str | None = None
+    source_url: str | None = None  # Archive provenance for a temporary URL source.
     anime_name: str | None = None  # Selected anime from indexed library
     series_id: str | None = None
     library_type: LibraryType = DEFAULT_LIBRARY_TYPE
@@ -83,6 +84,12 @@ class Project(BaseModel):
     phase: ProjectPhase = ProjectPhase.SETUP
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
+
+    # A local archive is only a publishing-history record. All project work
+    # and background processing must ignore it.
+    archived_at: datetime | None = None
+    archived_upload: dict[str, Any] | None = None
+    archive_cancellations: dict[str, str] = Field(default_factory=dict)
 
     # Video metadata (populated after download)
     video_path: str | None = None

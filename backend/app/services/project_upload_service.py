@@ -216,6 +216,9 @@ class ProjectUploadService:
         project = await ProjectService.aload(project_id)
         if project is None:
             raise ValueError("Project not found")
+        if project.archived_at:
+            from .project_service import ArchivedProjectError
+            raise ArchivedProjectError()
 
         existing = self._jobs.get(project_id)
         if existing and existing.status in {"queued", "running"}:

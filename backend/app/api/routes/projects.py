@@ -9,7 +9,6 @@ from ...models import Project, ProjectPhase
 from ...models.temporary_source import TemporarySource, TemporarySourceInput
 from ...services import LibraryHydrationService, ProjectService
 from ...services.project_locks import project_edit_locked
-from ...utils.file_tasks import file_io
 from ...services.drive_prewarm_service import DrivePrewarmService
 from ...services.project_duplication_service import (
     DuplicationVariant,
@@ -177,20 +176,11 @@ async def duplicate_project(
 
 
 @router.delete("/{project_id}")
-async def delete_project(project_id: str) -> dict:
-    """Delete a project."""
-    from ...services.temporary_source_service import TemporarySourceService
-    async with TemporarySourceService.deleting_project(project_id):
-        if not await file_io(ProjectService.delete, project_id):
-            raise HTTPException(status_code=404, detail="Project not found")
-    from ...services.project_startup_service import project_startup_queue
-    from ...services.project_upload_service import project_upload_queue
+async def delete_project(project_id: str, confirmed: bool = False) -> dict:
+    """Use the same archive and schedule-cancellation flow as Project Manager."""
+    from .project_manager import delete_managed_project
 
-    from ...services.progress_jobs import progress_jobs
-    await progress_jobs.remove_project(project_id)
-    await project_startup_queue.remove_project_jobs(project_id)
-    await project_upload_queue.remove_project_jobs(project_id)
-    return {"status": "deleted"}
+    return await delete_managed_project(project_id, confirmed=confirmed)
 
 
 @router.patch("/{project_id}", response_model=ProjectResponse)

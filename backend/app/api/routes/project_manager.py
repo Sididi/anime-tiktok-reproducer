@@ -11,7 +11,7 @@ from ...services import UploadPhaseService
 from ...services.google_drive_service import GoogleDriveService
 from ...services.project_duplication_service import UploadRestrictionService
 from ...services.project_upload_service import project_upload_queue
-from ...services.project_service import ProjectService
+from ...services.project_service import ArchivedProjectError, ProjectService
 from ...services.thumbnail_service import ThumbnailService
 from ...services.upload_phase import (
     PendingProjectDeletionRequiresConfirmation,
@@ -138,6 +138,9 @@ async def list_project_upload_jobs():
 @router.delete("/projects/{project_id}")
 async def delete_managed_project(project_id: str, confirmed: bool = False):
     """Archive and delete a project, requiring confirmation while scheduled."""
+    if any(job.project_id == project_id and job.status in {"queued", "running"}
+           for job in project_upload_queue.list_jobs()):
+        raise HTTPException(status_code=409, detail="Wait for this project's upload to finish before deleting it.")
     try:
         from ...services.temporary_source_service import TemporarySourceService
         from ...services.project_startup_service import project_startup_queue
@@ -153,7 +156,10 @@ async def delete_managed_project(project_id: str, confirmed: bool = False):
             await progress_jobs.remove_project(project_id)
             await project_startup_queue.remove_project_jobs(project_id)
             await project_upload_queue.remove_project_jobs(project_id)
+            result["project"] = await asyncio.to_thread(UploadPhaseService.get_manager_row, project_id)
         return result
+    except ArchivedProjectError as exc:
+        raise HTTPException(status_code=410, detail={"code": "project_archived", "message": str(exc)}) from exc
     except PendingProjectDeletionRequiresConfirmation as exc:
         raise HTTPException(
             status_code=409,

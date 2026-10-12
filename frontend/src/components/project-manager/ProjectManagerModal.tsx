@@ -282,12 +282,6 @@ export function ProjectManagerModal({
     });
   }, []);
 
-  const dropRows = useCallback((projectIds: Iterable<string>) => {
-    const removed = new Set(projectIds);
-    if (removed.size === 0) return;
-    setRows((prev) => prev.filter((r) => !removed.has(r.project_id)));
-  }, []);
-
   /**
    * Re-read a single row instead of the whole table.
    *
@@ -741,6 +735,7 @@ export function ProjectManagerModal({
   };
 
   const toggleSelectProject = (id: string) => {
+    if (rowsByProjectId[id]?.archived_at) return;
     setSelectedProjectIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -753,14 +748,15 @@ export function ProjectManagerModal({
     setShowMultiDeleteConfirm(false);
     setMultiDeleting(true);
     setError(null);
-    const ids = Array.from(selectedProjectIds);
+    const ids = Array.from(selectedProjectIds).filter((id) => !rowsByProjectId[id]?.archived_at);
     const failedIds: string[] = [];
     const deletedIds: string[] = [];
 
     try {
       for (const id of ids) {
         try {
-          await api.deleteManagedProject(id, true);
+          const result = await api.deleteManagedProject(id, true);
+          patchRow(result.project);
           deletedIds.push(id);
         } catch {
           failedIds.push(id);
@@ -771,8 +767,6 @@ export function ProjectManagerModal({
       setMultiDeleteMode(false);
       setMultiDeleting(false);
     }
-
-    dropRows(deletedIds);
 
     if (failedIds.length > 0) {
       setError(
@@ -940,18 +934,20 @@ export function ProjectManagerModal({
       setActiveDeleteId(projectId);
       setError(null);
       try {
-        await api.deleteManagedProject(projectId, true);
-        dropRows([projectId]);
+        const result = await api.deleteManagedProject(projectId, true);
+        patchRow(result.project);
       } catch (err) {
         setError((err as Error).message);
       } finally {
         setActiveDeleteId(null);
       }
     },
-    [dropRows],
+    [patchRow],
   );
 
-  const requestDelete = (row: ProjectManagerRow) => setDeleteConfirmRow(row);
+  const requestDelete = (row: ProjectManagerRow) => {
+    if (!row.archived_at) setDeleteConfirmRow(row);
+  };
 
   const promptSessions = useMemo(
     () =>
@@ -1372,7 +1368,8 @@ export function ProjectManagerModal({
                   <p className="text-sm text-[hsl(var(--muted-foreground))] mb-4">
                     Already-posted projects have their reconstructable Drive
                     files copied to Archive Projets first; scheduled-only or
-                    unposted projects are deleted entirely.
+                    unposted projects have their Drive files deleted. Only read-only
+                    Project Manager records are retained locally; all assets and work files are removed.
                   </p>
                   {selectedPendingRows.length > 0 && (
                     <div className="mb-4 rounded-md border border-[hsl(var(--destructive))]/50 bg-[hsl(var(--destructive))]/10 p-3">

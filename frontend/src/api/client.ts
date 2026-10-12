@@ -65,6 +65,8 @@ export class SeriesDeleteConflictError extends Error {
   }
 }
 
+export class ProjectArchivedError extends Error {}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -81,6 +83,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       throw new Error(detail || "Request failed");
     }
     if (detail && typeof detail === "object") {
+      if (detail.code === "project_archived") {
+        throw new ProjectArchivedError(detail.message || "This project is archive-only and is disabled.");
+      }
       const message =
         ("message" in detail && typeof detail.message === "string"
           ? detail.message
@@ -376,10 +381,14 @@ export const api = {
       drive_deleted: boolean;
       archive: { folder_id: string; folder_url: string; files_copied: number } | null;
       unscheduled: Record<string, string>;
+      project: import("@/types").ProjectManagerRow;
     }>(
       `/project-manager/projects/${projectId}?confirmed=${confirmed}`,
       { method: "DELETE" },
-    ),
+    ).then((result) => {
+      window.dispatchEvent(new CustomEvent("project-archived", { detail: { projectId } }));
+      return result;
+    }),
 
   // Video
   getVideoInfo: (projectId: string) =>
