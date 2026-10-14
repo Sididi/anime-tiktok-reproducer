@@ -13,11 +13,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 
 from app.models import Project, VideoMetadataPayload
-from app.services.account_service import ADDITIONAL_PLATFORMS, AccountService
+from app.services.account_service import (
+    ADDITIONAL_PLATFORMS,
+    AccountService,
+    AccountTikTokConfig,
+)
 from app.services.discord_service import DiscordService
 from app.services.export_service import ExportService
 from app.services.google_drive_service import GoogleDriveService
 from app.services.metadata import MetadataService
+from app.services.post_for_me_client import PfmPublishOutcome, PostForMeClient
 from app.services.project_duplication_service import UploadRestrictionService
 from app.services.project_service import ProjectService
 from app.services.scheduling_service import SchedulingService
@@ -186,6 +191,62 @@ def _execute(flow, **kwargs):
         platform_result_callback=flow.callbacks.append,
         **kwargs,
     )
+
+
+@pytest.mark.parametrize("immediate", [False, True])
+@pytest.mark.parametrize("suffix", ["#WhatToWatch", "#NewCampaign", ""])
+def test_tiktok_campaign_suffix_reaches_publish_and_reminder(
+    flow, monkeypatch, immediate, suffix
+):
+    monkeypatch.setattr(
+        "app.services.upload_phase.settings.tiktok_description_suffix", suffix
+    )
+    flow.account.tiktok = AccountTikTokConfig(
+        post_for_me_account_id="spc_1", slots=["14:00"]
+    )
+    original_metadata = flow.metadata.model_dump()
+    create_post = MagicMock(return_value="post-1")
+    monkeypatch.setattr(
+        PostForMeClient, "stage_media", MagicMock(return_value="https://pfm/media/1")
+    )
+    monkeypatch.setattr(PostForMeClient, "create_post", create_post)
+    monkeypatch.setattr(
+        PostForMeClient,
+        "poll_outcome",
+        MagicMock(return_value=PfmPublishOutcome(
+            success=True, url="https://www.tiktok.com/@anime/video/123"
+        )),
+    )
+
+    _execute(flow, immediate_platforms=["tiktok"] if immediate else [])
+
+    expected = "TikTok caption" + (f" {suffix}" if suffix else "")
+    create_post.assert_called_once()
+    body = create_post.call_args.args[0]
+    assert body["caption"] == expected
+    if immediate:
+        assert "scheduled_at" not in body
+    else:
+        assert body["scheduled_at"] == (FUTURE + timedelta(minutes=2)).isoformat()
+    assert flow.project.tiktok_pfm.caption == expected
+    sent = flow.create_job.call_args.kwargs
+    assert sent["description"] == expected
+    assert sent["publishers"]["dailymotion"]["description"] == "Full description"
+    assert sent["publishers"]["bilibili"]["description"] == "Full description"
+    assert sent["publishers"]["snapchat"]["description"] == flow.metadata.youtube.title[:160]
+    assert flow.metadata.model_dump() == original_metadata
+
+
+def test_manual_tiktok_reminder_uses_campaign_suffix(flow, monkeypatch):
+    monkeypatch.setattr(
+        "app.services.upload_phase.settings.tiktok_description_suffix", "#WhatToWatch"
+    )
+    flow.account.tiktok = AccountTikTokConfig(slots=["14:00"])
+    _execute(flow)
+    sent = flow.create_job.call_args.kwargs
+    assert sent["tiktok_manual"] is True
+    assert sent["description"] == "TikTok caption #WhatToWatch"
+    assert flow.metadata.tiktok.description == "TikTok caption"
 
 
 @pytest.mark.parametrize("mode", ["manual", "api"])

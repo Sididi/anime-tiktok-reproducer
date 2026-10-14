@@ -134,6 +134,7 @@ Environment variables or defaults in `backend/app/config.py`:
 
 Additional integration variables (see `.env.example`):
 
+- `ATR_TIKTOK_DESCRIPTION_SUFFIX`: text appended to TikTok descriptions for both immediate and scheduled uploads (disabled when empty or unset). Set `ATR_TIKTOK_DESCRIPTION_SUFFIX="#WhatToWatch"` in `.env` to enable it, replace the value for another campaign, or set `ATR_TIKTOK_DESCRIPTION_SUFFIX=""` to disable it, then restart the backend. The suffix also appears in manual TikTok reminders; saved video metadata and other platforms are unchanged. Posts already submitted to Post for Me retain their existing caption, including when rescheduled.
 - `ATR_DISCORD_WEBHOOK_URL`: Discord webhook for generation/upload notifications
 - `ATR_CEP_TRIGGER_URL_TEMPLATE`: Local CEP trigger URL template used in generation-complete message (must include `{project_id}`), default:
   - `http://localhost:48653/p/{project_id}`

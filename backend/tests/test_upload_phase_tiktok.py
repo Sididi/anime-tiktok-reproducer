@@ -4,13 +4,46 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.config import Settings, settings
 from app.services.account_service import (
     AccountConfig,
     AccountTikTokConfig,
 )
 from app.services.upload_phase import UploadPhaseService
+
+
+@pytest.mark.parametrize("suffix", ["#WhatToWatch", "#AnotherCampaign", "", "   "])
+def test_tiktok_suffix_environment_configuration(monkeypatch, tmp_path, suffix):
+    env_file = tmp_path / ".env"
+    env_file.write_text(f'ATR_TIKTOK_DESCRIPTION_SUFFIX="{suffix}"\n')
+    monkeypatch.delenv("ATR_TIKTOK_DESCRIPTION_SUFFIX", raising=False)
+    assert Settings(_env_file=env_file).tiktok_description_suffix == suffix
+    monkeypatch.setenv("ATR_TIKTOK_DESCRIPTION_SUFFIX", suffix)
+    assert Settings(_env_file=None).tiktok_description_suffix == suffix
+
+
+def test_tiktok_suffix_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("ATR_TIKTOK_DESCRIPTION_SUFFIX", raising=False)
+    assert Settings(_env_file=None).tiktok_description_suffix == ""
+
+
+@pytest.mark.parametrize(
+    ("description", "suffix", "expected"),
+    [
+        ("Caption #Anime", "#WhatToWatch", "Caption #Anime #WhatToWatch"),
+        ("Caption\n#Anime  ", "  #NewCampaign  ", "Caption\n#Anime #NewCampaign"),
+        ("Caption #Anime  ", "", "Caption #Anime  "),
+        ("Caption #Anime", " \n ", "Caption #Anime"),
+        ("", "#WhatToWatch", "#WhatToWatch"),
+    ],
+)
+def test_build_tiktok_description(monkeypatch, description, suffix, expected):
+    monkeypatch.setattr(settings, "tiktok_description_suffix", suffix)
+    assert UploadPhaseService._build_tiktok_description(description) == expected
 
 
 def _account(tiktok: AccountTikTokConfig | None) -> AccountConfig:

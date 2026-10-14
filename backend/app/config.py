@@ -106,6 +106,10 @@ class Settings(BaseSettings):
     pfm_api_key: str | None = None
     pfm_base_url: str = "https://api.postforme.dev/v1"
 
+    # Temporary campaign suffix, applied only when preparing a TikTok upload.
+    # Empty or unset ATR_TIKTOK_DESCRIPTION_SUFFIX disables it.
+    tiktok_description_suffix: str = ""
+
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
     # Premiere Link: after a /processing Drive export, ask the VPS to auto-launch
     # the project in the Premiere Pro panel (VPS-brokered WebSocket). Uses the

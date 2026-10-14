@@ -748,13 +748,21 @@ class UploadPhaseService:
         )
 
     @classmethod
+    def _build_tiktok_description(cls, description: str) -> str:
+        """Append the current campaign suffix without changing saved metadata."""
+        suffix = settings.tiktok_description_suffix.strip()
+        if not suffix:
+            return description
+        return f"{description.rstrip()} {suffix}" if description.strip() else suffix
+
+    @classmethod
     def _build_tiktok_payload(
         cls,
         account: AccountConfig | None,
         tiktok_description: str,
         thumbnail_timestamp_ms: int | None = None,
     ) -> dict[str, Any] | None:
-        """Payload for the VPS server's Post for Me publish (see server TikTokPayload)."""
+        """Payload for backend Post for Me publishing with the final description."""
         if account is None or account.tiktok is None:
             return None
         tiktok = account.tiktok
@@ -1428,10 +1436,10 @@ class UploadPhaseService:
             list(platform_scheduled_at.values()) or [datetime.now(timezone.utc)],
         )
 
-        # Build the TikTok payload for the VPS scheduler (server-side publish
-        # via Post for Me at slot_time).
+        # Both immediate and scheduled posts use this final TikTok description.
+        tiktok_description = cls._build_tiktok_description(metadata.tiktok.description)
         tiktok_payload = cls._build_tiktok_payload(
-            account, metadata.tiktok.description, thumbnail_timestamp_ms
+            account, tiktok_description, thumbnail_timestamp_ms
         )
 
         # Public share the drive video before upload phase.
@@ -1974,7 +1982,7 @@ class UploadPhaseService:
                         account_id=account_id or project.scheduled_account_id or "",
                         slot_time=discord_slot_time,
                         anime_title=project.anime_name or "Unknown",
-                        description=metadata.tiktok.description,
+                        description=tiktok_description,
                         drive_video_url=direct_drive_download or drive_video_url,
                         platforms_requested=vps_platforms,
                         instagram=ig_payload,
