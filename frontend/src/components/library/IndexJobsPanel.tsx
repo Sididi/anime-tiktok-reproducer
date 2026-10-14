@@ -213,14 +213,20 @@ function StatusIcon({ status }: { status: IndexationJob["status"] }) {
     case "complete":
       return <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />;
     case "error":
+    case "cancelled":
       return <XCircle className="h-4 w-4 text-red-500 shrink-0" />;
     case "queued":
+    case "paused":
       return <Clock className="h-4 w-4 text-amber-400 shrink-0" />;
   }
 }
 
 function statusLabel(job: IndexationJob): string {
   switch (job.status) {
+    case "paused":
+      return "En pause — reprise manuelle";
+    case "cancelled":
+      return "Annulé — fichiers conservés";
     case "queued":
       if (job.job_type === "upload") return "Upload en attente";
       return job.job_type === "update" ? "Mise à jour en attente" : "En attente";

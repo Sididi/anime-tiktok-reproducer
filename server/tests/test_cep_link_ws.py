@@ -87,6 +87,94 @@ def _last_edit_content(discord) -> str:
     return discord.edit_message.await_args.kwargs["content"]
 
 
+@pytest.mark.parametrize("manual", [False, True])
+def test_video_uploaded_reacts_to_original_message_and_confirms_retries(
+    monkeypatch, example_yaml, example_env, tmp_server_dir, manual,
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        requested = datetime.now(UTC) - timedelta(days=10)
+        launch = client.post("/api/internal/cep/launches", headers=INTERNAL_AUTH, json={
+            **LAUNCH_PAYLOAD, "requested_at": requested.isoformat(),
+        }).json()
+        with client.websocket_connect("/api/cep/ws") as ws:
+            ws.send_json(AUTH_FRAME)
+            assert ws.receive_json()["video_upload_reactions"] is True
+            discord.add_reaction.assert_not_called()
+            frame = {
+                "type": "video_uploaded", "project_id": "p1", "notification_id": "n1",
+                "launch_id": None if manual else launch["launch_id"],
+                "started_at": (requested + timedelta(days=9)).isoformat(),
+                "uploaded_at": datetime.now(UTC).isoformat(), "drive_file_id": "video1",
+            }
+            # An expired replay window must not prevent a delayed manual render.
+            for _ in range(2):
+                ws.send_json(frame)
+                ack = _receive_until(ws, "video_uploaded_ack")
+                assert ack["ok"] is True
+                assert ack["project_id"] == "p1"
+                assert ack["notification_id"] == "n1"
+            assert discord.add_reaction.await_count == 2
+            discord.add_reaction.assert_awaited_with(
+                app.state.settings.discord.upload_channel_id, "m1", "✅",
+            )
+
+
+def test_video_reaction_failure_is_retryable_and_not_acknowledged_as_success(
+    monkeypatch, example_yaml, example_env, tmp_server_dir,
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    discord.add_reaction.side_effect = RuntimeError("Discord offline")
+    with TestClient(app) as client:
+        launch = client.post("/api/internal/cep/launches", headers=INTERNAL_AUTH,
+                             json=LAUNCH_PAYLOAD).json()
+        with client.websocket_connect("/api/cep/ws") as ws:
+            ws.send_json(AUTH_FRAME)
+            _receive_until(ws, "auth_ok")
+            frame = {
+                "type": "video_uploaded", "project_id": "p1", "notification_id": "n1",
+                "launch_id": launch["launch_id"], "drive_file_id": "video1",
+                "started_at": "2026-10-14T10:00:00Z", "uploaded_at": "2026-10-14T11:00:00Z",
+            }
+            ws.send_json(frame)
+            ack = _receive_until(ws, "video_uploaded_ack")
+            assert ack["ok"] is False
+            assert ack["retryable"] is True
+            discord.add_reaction.side_effect = None
+            ws.send_json(frame)
+            assert _receive_until(ws, "video_uploaded_ack")["ok"] is True
+
+
+@pytest.mark.parametrize("override,error", [
+    ({"launch_id": "superseded"}, "superseded"),
+    ({"launch_id": None, "started_at": "2026-08-23T10:00:00Z"}, "superseded"),
+    ({"project_id": "missing"}, "No Discord launch record"),
+    ({"uploaded_at": "invalid"}, "Invalid video upload receipt"),
+    ({"drive_file_id": ""}, "Invalid video upload receipt"),
+])
+def test_video_reaction_rejects_stale_unknown_and_invalid_receipts(
+    monkeypatch, example_yaml, example_env, tmp_server_dir, override, error,
+):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        launch = client.post("/api/internal/cep/launches", headers=INTERNAL_AUTH,
+                             json=LAUNCH_PAYLOAD).json()
+        with client.websocket_connect("/api/cep/ws") as ws:
+            ws.send_json(AUTH_FRAME)
+            _receive_until(ws, "auth_ok")
+            ws.send_json({
+                "type": "video_uploaded", "project_id": "p1", "notification_id": "n1",
+                "launch_id": launch["launch_id"], "drive_file_id": "video1",
+                "started_at": "2026-10-14T10:00:00Z", "uploaded_at": "2026-10-14T11:00:00Z",
+                **override,
+            })
+            ack = _receive_until(ws, "video_uploaded_ack")
+            assert ack["ok"] is False
+            assert ack["retryable"] is False
+            assert error in ack["error"]
+            discord.add_reaction.assert_not_called()
+
+
 # ---- helpers ---------------------------------------------------------------
 
 

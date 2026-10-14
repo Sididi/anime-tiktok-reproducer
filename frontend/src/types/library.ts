@@ -36,7 +36,7 @@ export interface IndexationJob {
   library_type: import("./index").LibraryType;
   source_path: string;
   fps: number;
-  status: "queued" | "indexing" | "complete" | "error";
+  status: "queued" | "indexing" | "complete" | "error" | "paused" | "cancelled";
   progress: number;
   phase: string | null;
   message: string | null;

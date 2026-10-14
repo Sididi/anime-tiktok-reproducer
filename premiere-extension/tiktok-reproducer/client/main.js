@@ -33,6 +33,7 @@
 
   var atrConstants = require(getClientFilePath("constants.js"));
   var cepLinkModule = require(getClientFilePath("cep_link.js"));
+  var uploadNotifications = require(getClientFilePath("upload_notifications.js"));
   var hostRpcModule = require(getClientFilePath("host_rpc.js"));
   var hostRpc = hostRpcModule.createHostRpc(function (script, callback) {
     cs.evalScript(script, callback);
@@ -3552,7 +3553,7 @@
             return !!uploadedOutputs[String(outputPath || "")];
           });
 
-        var newState = upsertProjectState(projectId, {
+        var uploadPatch = {
           status: allUploaded ? "uploaded" : "uploaded_partial",
           uploaded_at: nowIso(),
           upload_pending: false,
@@ -3564,7 +3565,19 @@
           last_uploaded_output_path: selectedOutputPath,
           last_upload_result: result,
           last_error: null,
-        });
+        };
+        var videoReceipt = uploadNotifications.createReceipt(
+          freshState, selectedOutputPath, result, nowIso(),
+        );
+        if (videoReceipt) {
+          uploadPatch.video_upload_notification = videoReceipt;
+        }
+        var newState = upsertProjectState(projectId, uploadPatch);
+        // Persist before sending; an unavailable Discord/VPS must not turn a
+        // successful Drive upload into an upload failure or delay cleanup.
+        if (linkClient) {
+          linkClient.flushUploads();
+        }
 
         log(
           "Drive upload complete for " +
@@ -3641,6 +3654,9 @@
 
     var nextPatch = {
       status: acceptance.is_sleeping ? "sleeping_download" : "queued_download",
+      link_launch_id: queueOptions.launchId || null,
+      run_started_at: nowIso(),
+      video_upload_notification: null,
       enqueue_source: source || "manual",
       upload_pending: false,
       cleanup_deleted: false,
@@ -4109,6 +4125,11 @@
       }
       if (state.host_cleanup_error) {
         details.push("Premiere cleanup: " + state.host_cleanup_error);
+      }
+      if (state.video_upload_notification) {
+        var notification = state.video_upload_notification;
+        details.push("Discord video reaction: " + notification.status +
+          (notification.last_error ? " (" + notification.last_error + ")" : ""));
       }
       if (state.cleanup_next_retry_at && state.status === "cleanup_pending") {
         details.push("Next retry: " + state.cleanup_next_retry_at);
@@ -4631,6 +4652,7 @@
       }
       var accepted = queueDownloadImport(projectId, "link", {
         httpReceivedAt: nowIso(),
+        launchId: launch.launch_id,
       });
       var state = getProjectState(projectId) || {};
       if (accepted) {
@@ -4673,6 +4695,33 @@
       },
       log: log,
       onLaunch: handleLinkLaunch,
+      getPendingUploads: function () {
+        return uploadNotifications.pendingFrames(projectStates);
+      },
+      onUploadAcknowledged: function (frame) {
+        var state = getProjectState(frame.project_id);
+        var receipt = uploadNotifications.applyAcknowledgement(
+          state && state.video_upload_notification, frame, nowIso(),
+        );
+        if (!receipt) {
+          return;
+        }
+        var previousError = state.video_upload_notification.last_error;
+        try {
+          upsertProjectState(frame.project_id, { video_upload_notification: receipt });
+        } catch (err) {
+          // upsert updates memory before writing. Keep the receipt pending if
+          // persistence fails, so the link can safely resend it in this session.
+          projectStates[frame.project_id] = state;
+          throw err;
+        }
+        if (receipt.status === "confirmed") {
+          log("Discord video upload reaction confirmed for " + frame.project_id, "success");
+        } else if (receipt.last_error !== previousError) {
+          log("Discord video upload reaction for " + frame.project_id + ": " +
+            receipt.last_error, "warn");
+        }
+      },
       onStateChange: function () {
         syncLinkIndicator();
       },

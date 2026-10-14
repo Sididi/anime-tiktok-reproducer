@@ -91,6 +91,37 @@ Export path must be:
 
 When file is stable for 10s, panel uploads it automatically to the same Drive folder root as `output.mp4` (overwrite/update behavior).
 
+### Discord video completion reaction
+
+After Drive confirms an MP4 upload (`output.mp4` or a monitored `ATR_*.mp4`),
+the bot adds **✅ as a reaction to the original Discord message containing
+the localhost project link**. This means the rendered video is on Drive.
+The existing `Premiere: ✅ accepted` message text only means the panel accepted
+the launch; it does not indicate a finished video.
+
+This works for socket launches, replayed launches, and manual localhost links,
+including renders delayed beyond the seven-day automatic launch replay window.
+It does not wait for the optional no-music WAV or local cleanup. Failed video
+uploads do not create a reaction.
+
+The panel persists the notification with the successful upload and retries
+after reconnecting or restarting Premiere, even if the local folder has been
+deleted. It retries unconfirmed notifications on the link heartbeat (normally
+every 50 seconds, with a 30-second minimum between attempts). Discord failures
+do not fail the Drive upload or block the next project. Project details show
+`Discord video reaction: pending`, `confirmed`, or `rejected`, with error details.
+Receipts for superseded launches are rejected rather than marking a newer
+generation complete. Uploads completed before this feature was installed are
+not backfilled.
+
+Install bundle **1.0.7**, build `2026-10-14-discord-upload-v23`, with Premiere
+and AME closed, and deploy the accompanying `server/` change. The existing
+Premiere Link URL/token must be configured; no Discord credentials are needed
+in the panel. The bot needs Add Reactions and Read Message History permissions
+in the configured upload channel. Older servers keep notifications pending
+until updated. Projects must have an existing Premiere Link launch record
+associated with their original Discord message.
+
 ### Managed export via panel
 
 Select tracked project and click **Export via CEP**.
@@ -134,7 +165,7 @@ Files:
 - `upload_sessions/<project_id>.json` (resumable upload session)
 
 After Premiere restart, tracked project state is restored for UI visibility and manual actions only.
-Queued/in-progress jobs are **not** resumed automatically, export monitors are **not** re-armed automatically, and cleanup retries are **not** restarted automatically.
+Queued/in-progress jobs are **not** resumed automatically, export monitors are **not** re-armed automatically, and cleanup retries are **not** restarted automatically. Pending Discord notifications for already-uploaded videos do resume when Premiere Link reconnects.
 Transient states left by a crash/restart are normalized to manual-intervention
 states when the panel boots again. A pending/failed cleanup exposes **Retry
 cleanup**; if Premiere-side release was already verified, that retry deletes

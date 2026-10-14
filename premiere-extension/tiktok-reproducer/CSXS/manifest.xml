@@ -2,11 +2,11 @@
 <ExtensionManifest xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                    Version="12.0"
                    ExtensionBundleId="com.animetiktok.tiktokreproducer"
-                   ExtensionBundleVersion="1.0.6"
+                   ExtensionBundleVersion="1.0.7"
                    ExtensionBundleName="Tiktok Reproducer">
 
     <ExtensionList>
-        <Extension Id="com.animetiktok.tiktokreproducer.panel" Version="1.0.6" />
+        <Extension Id="com.animetiktok.tiktokreproducer.panel" Version="1.0.7" />
     </ExtensionList>
 
     <ExecutionEnvironment>

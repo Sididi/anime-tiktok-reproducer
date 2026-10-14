@@ -2,23 +2,23 @@ default: gpt
 
 presets:
   gpt:
-    label: "GPT (6 Astra + 5.6 Luna)"
+    label: "GPT (6.1 Sol + 6 Luna)"
     big:
-      openrouter_id: openai/gpt-6-astra
+      openrouter_id: openai/gpt-6.1-sol
       max_output_tokens: 4096
       thinking:
         effort: low
     light:
-      openrouter_id: openai/gpt-5.6-luna
+      openrouter_id: openai/gpt-6-luna
       thinking: null
 
   claude:
-    label: "Claude (Sonnet 5 + Haiku 4.5)"
+    label: "Claude (Sonnet 5.5 + Haiku 5.5)"
     big:
-      openrouter_id: anthropic/claude-sonnet-5
+      openrouter_id: anthropic/claude-sonnet-5.5
       thinking: null
     light:
-      openrouter_id: anthropic/claude-haiku-4.5
+      openrouter_id: anthropic/claude-haiku-5.5
       thinking: null
 
   gemini:

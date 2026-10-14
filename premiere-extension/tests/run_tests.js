@@ -207,7 +207,8 @@ test("concurrent download progress is monotonic and 100% is exact", function () 
   assert.strictEqual(progress.computeConcurrentDownloadedBytes(22, 8), 30);
 });
 
-function createHeartbeatHarness() {
+function createHeartbeatHarness(options) {
+  var opts = options || {};
   var currentTime = 0;
   var intervals = [];
   var sockets = [];
@@ -240,6 +241,8 @@ function createHeartbeatHarness() {
   var link = require(path.join(clientRoot, "cep_link.js"));
   var client = link.createLinkClient({
     WebSocketImpl: FakeWebSocket,
+    getPendingUploads: opts.getPendingUploads,
+    onUploadAcknowledged: opts.onUploadAcknowledged,
     getSettings: function () {
       return { link_url: "ws://test", link_token: "token" };
     },
@@ -270,6 +273,7 @@ function createHeartbeatHarness() {
         type: "auth_ok",
         heartbeat_interval_s: 10,
         pending_count: 0,
+        video_upload_reactions: opts.videoUploadReactions === true,
       });
       return socket;
     },
@@ -281,6 +285,114 @@ function createHeartbeatHarness() {
     },
   };
 }
+
+test("video receipts ignore audio and correlate acknowledgements across restarts", function () {
+  var notifications = require(path.join(clientRoot, "upload_notifications.js"));
+  var state = { link_launch_id: "l1", run_started_at: "2026-10-14T10:00:00Z" };
+  var timestamp = "2026-10-14T11:00:00Z";
+  assert.strictEqual(notifications.createReceipt(state, "output.wav", { drive_file_id: "wav" }, timestamp), null);
+  assert.strictEqual(notifications.createReceipt(state, "output.mp4", {}, timestamp), null);
+  state.video_upload_notification = notifications.createReceipt(state, "output.mp4", { drive_file_id: "mp4" }, timestamp);
+  var restored = JSON.parse(JSON.stringify({ p1: state }));
+  var frames = notifications.pendingFrames(restored);
+  assert.strictEqual(frames.length, 1);
+  assert.strictEqual(frames[0].launch_id, "l1");
+  assert.strictEqual(frames[0].drive_file_id, "mp4");
+  var receipt = restored.p1.video_upload_notification;
+  assert.strictEqual(notifications.applyAcknowledgement(receipt, { notification_id: "stale", ok: true }, timestamp), null);
+  var failed = notifications.applyAcknowledgement(receipt, { notification_id: receipt.notification_id, ok: false, retryable: true, error: "offline" }, timestamp);
+  assert.strictEqual(failed.status, "pending");
+  assert.strictEqual(failed.last_error, "offline");
+  var rejected = notifications.applyAcknowledgement(receipt, { notification_id: receipt.notification_id, ok: false, retryable: false }, timestamp);
+  assert.strictEqual(rejected.status, "rejected");
+  restored.p1.video_upload_notification = notifications.applyAcknowledgement(receipt, { notification_id: receipt.notification_id, ok: true }, timestamp);
+  assert.strictEqual(notifications.pendingFrames(restored).length, 0);
+  assert.strictEqual(restored.p1.video_upload_notification.status, "confirmed");
+});
+
+test("upload notifications wait for server support, retry lost acks, and replay on reconnect", function () {
+  var pending = [{ type: "video_uploaded", project_id: "p1", notification_id: "n1" }];
+  var acknowledged = [];
+  var harness = createHeartbeatHarness({
+    getPendingUploads: function () { return pending; },
+    onUploadAcknowledged: function (frame) { acknowledged.push(frame); pending = []; },
+  });
+  harness.client.flushUploads();
+  var socket = harness.connect();
+  function uploads(ws) { return ws.sent.filter(function (frame) { return frame.type === "video_uploaded"; }); }
+  assert.strictEqual(uploads(socket).length, 0);
+  socket.receive({ type: "auth_ok", video_upload_reactions: true, heartbeat_interval_s: 10 });
+  assert.strictEqual(uploads(socket).length, 1);
+  harness.client.flushUploads();
+  assert.strictEqual(uploads(socket).length, 1);
+  harness.tick(30000);
+  assert.strictEqual(uploads(socket).length, 2);
+  harness.client.stop();
+  socket = harness.connect();
+  socket.receive({ type: "auth_ok", video_upload_reactions: true, heartbeat_interval_s: 10 });
+  assert.strictEqual(uploads(socket).length, 1);
+  socket.receive({ type: "video_uploaded_ack", project_id: "p1", notification_id: "n1", ok: true });
+  assert.strictEqual(acknowledged.length, 1);
+  harness.tick(60000);
+  assert.strictEqual(uploads(socket).length, 1);
+});
+
+test("notification persistence failures cannot fail the link or clear pending receipts", function () {
+  var harness = createHeartbeatHarness({
+    videoUploadReactions: true,
+    getPendingUploads: function () { return [{ type: "video_uploaded", notification_id: "n1" }]; },
+    onUploadAcknowledged: function () { throw new Error("disk busy"); },
+  });
+  var socket = harness.connect();
+  socket.receive({ type: "video_uploaded_ack", notification_id: "n1", ok: true });
+  harness.tick(30000);
+  assert.strictEqual(socket.sent.filter(function (frame) { return frame.type === "video_uploaded"; }).length, 2);
+});
+
+test("only successful video uploads persist a reaction before sending, independently of audio", async function () {
+  var notifications = require(path.join(clientRoot, "upload_notifications.js"));
+  var state = {
+    drive_folder_id: "folder", output_path: "/project/output.mp4",
+    expected_outputs: ["/project/output.mp4", "/project/output_no_music.wav"],
+    run_started_at: "2026-10-14T10:00:00Z",
+  };
+  var flushed = 0;
+  var shouldFail = true;
+  var context = vm.createContext({
+    path: path, UPLOAD_SESSIONS_DIR: "/sessions", uploadNotifications: notifications,
+    fs: { existsSync: function () { return true; }, statSync: function () { return { mtimeMs: 1 }; } },
+    getProjectState: function () { return state; },
+    isDriveConfigured: function () { return true; },
+    getExpectedOutputPaths: function () { return state.expected_outputs; },
+    upsertProjectState: function (id, patch) { Object.assign(state, patch); return state; },
+    buildDrivePayloadBase: function () { return {}; },
+    runDriveTask: function () { return shouldFail ? Promise.reject(new Error("Drive failed")) : Promise.resolve({ drive_file_id: "video" }); },
+    clonePlainObject: function (value) { return Object.assign({}, value); },
+    nowIso: function () { return "2026-10-14T11:00:00Z"; },
+    log: function () {},
+    countUploadedExpectedOutputs: function () { return { total: 0 }; },
+    resetMonitorCandidateSelection: function () {}, armExportMonitor: function () {},
+    disarmExportMonitor: function () {}, maybeAdvanceBatchAfterUpload: function () {},
+    handleBatchFailure: function () {},
+    linkClient: { flushUploads: function () {
+      assert.strictEqual(state.video_upload_notification.status, "pending");
+      assert.ok(state.uploaded_outputs["/project/output.mp4"]);
+      flushed += 1;
+    } },
+  });
+  vm.runInContext(clientFunctionSource("executeUploadOutput", "queueDownloadImport"), context);
+  await assert.rejects(context.executeUploadOutput("p1", false, "watch"), /Drive failed/);
+  assert.strictEqual(flushed, 0);
+  assert.strictEqual(state.video_upload_notification, undefined);
+  shouldFail = false;
+  await context.executeUploadOutput("p1", false, "watch");
+  assert.strictEqual(state.status, "uploaded_partial");
+  assert.strictEqual(flushed, 1);
+  var receipt = state.video_upload_notification;
+  await context.executeUploadOutput("p1", false, "watch", "/project/output_no_music.wav");
+  assert.strictEqual(state.status, "uploaded");
+  assert.strictEqual(state.video_upload_notification, receipt);
+});
 
 test("heartbeat closes after a genuinely unanswered probe", function () {
   var harness = createHeartbeatHarness();
@@ -932,7 +1044,7 @@ test("CEP build gate is synchronized and the fork worker is gone", function () {
   );
   assert.ok(hostBuildMatch);
   assert.strictEqual(hostBuildMatch[1], constants.ATR_BUILD_ID);
-  assert.ok(manifestSource.indexOf('ExtensionBundleVersion="1.0.6"') !== -1);
+  assert.ok(manifestSource.indexOf('ExtensionBundleVersion="1.0.7"') !== -1);
   assert.strictEqual(mainSource.indexOf("childProcess.fork"), -1);
   assert.strictEqual(
     fs.existsSync(path.join(clientRoot, "drive_worker.js")),

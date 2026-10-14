@@ -12,10 +12,14 @@ Protocol (JSON text frames):
                  {"type":"pong","ts"} / {"type":"ping","ts"}
                  {"type":"ack","launch_id","project_id","result",
                   "detail","status","queue_state","batch_phase"}
+                 {"type":"video_uploaded","project_id","notification_id",
+                  "launch_id","started_at","uploaded_at","drive_file_id"}
   hub -> panel : {"type":"auth_ok","server_time","pending_count","heartbeat_interval_s"}
                  {"type":"launch","launch_id","project_id","anime_title","requested_at","replay"}
                  {"type":"ping","ts"} / {"type":"pong","ts"}
                  {"type":"error","code","detail"}
+                 {"type":"video_uploaded_ack","project_id","notification_id",
+                  "ok","retryable","error"}
 """
 from __future__ import annotations
 
@@ -177,6 +181,7 @@ class CepLinkHub:
                     "server_time": _iso(_now()),
                     "pending_count": len(pending),
                     "heartbeat_interval_s": self._heartbeat_interval_s,
+                    "video_upload_reactions": True,
                 },
             )
             for launch in pending:
@@ -224,6 +229,9 @@ class CepLinkHub:
             await self._send(conn, {"type": "pong", "ts": frame.get("ts")})
         elif kind == "ack":
             await self._handle_ack(conn, frame)
+        elif kind == "video_uploaded":
+            conn.last_pong_at = _now()
+            await self._handle_video_uploaded(conn, frame)
         else:
             await self._send_error(conn, "unknown_type", f"unknown frame type {kind!r}")
 
@@ -252,6 +260,69 @@ class CepLinkHub:
             launch_id, project_id, result, detail or "-",
         )
         await self.notify_outcome(updated)
+
+    async def _handle_video_uploaded(self, conn: _Conn, frame: dict[str, Any]) -> None:
+        """Confirm only after Discord accepts the reaction; CEP retries lost acks.
+
+        A manual localhost launch has no launch_id. Its intake timestamp must
+        follow the current Drive export request, so an old offline receipt
+        cannot mark a newer generation complete. Expired launch records remain
+        usable: the user may render well after the automatic replay TTL.
+        """
+        project_id = _opt_str(frame.get("project_id"))
+        notification_id = _opt_str(frame.get("notification_id"))
+        reply = {
+            "type": "video_uploaded_ack",
+            "project_id": project_id,
+            "notification_id": notification_id,
+            "ok": False,
+            "retryable": False,
+            "error": None,
+        }
+        try:
+            started_at = datetime.fromisoformat(str(frame.get("started_at") or ""))
+            uploaded_at = datetime.fromisoformat(str(frame.get("uploaded_at") or ""))
+            if (not project_id or not notification_id or not frame.get("drive_file_id")
+                    or started_at.tzinfo is None or uploaded_at.tzinfo is None
+                    or uploaded_at < started_at):
+                raise ValueError("invalid video upload receipt")
+        except ValueError:
+            reply["error"] = "Invalid video upload receipt"
+            await self._send(conn, reply)
+            return
+
+        launch = await self._store.get(project_id)
+        launch_id = _opt_str(frame.get("launch_id"))
+        if launch is None:
+            reply["error"] = "No Discord launch record for this project"
+        elif ((launch_id and launch_id != launch.launch_id)
+              or (not launch_id and started_at < launch.requested_at)):
+            reply["error"] = "Upload belongs to a superseded project launch"
+        elif not launch.discord_message_id:
+            reply["error"] = "Project launch has no Discord message"
+        else:
+            discord = self._discord_provider()
+            if discord is None:
+                reply["retryable"] = True
+                reply["error"] = "Discord is temporarily unavailable"
+            else:
+                try:
+                    # PUT of the bot's own reaction is idempotent, including
+                    # retries after a disconnect or a server/panel restart.
+                    await asyncio.wait_for(
+                        discord.add_reaction(
+                            self._settings.discord.upload_channel_id,
+                            launch.discord_message_id,
+                            "✅",
+                        ),
+                        timeout=15.0,
+                    )
+                    reply["ok"] = True
+                except Exception:
+                    logger.exception("Discord video reaction failed for %s", project_id)
+                    reply["retryable"] = True
+                    reply["error"] = "Discord reaction failed; will retry"
+        await self._send(conn, reply)
 
     # ---- outbound ------------------------------------------------------------
     async def push(self, launch: CepLaunch) -> bool:

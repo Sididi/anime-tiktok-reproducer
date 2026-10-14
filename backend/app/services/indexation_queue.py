@@ -64,7 +64,7 @@ class IndexationQueueService:
             if job.id in self._jobs:
                 continue
             self._jobs[job.id] = job
-            if job.status not in {"complete", "error"}:
+            if job.status not in {"complete", "error", "cancelled"}:
                 job.status = "queued"
                 job.message = "Resuming interrupted indexation..."
                 self._start_job(job)
@@ -83,7 +83,40 @@ class IndexationQueueService:
         for job in terminal[:max(0, len(terminal) - self.MAX_TERMINAL_JOBS)]:
             await asyncio.to_thread(IndexationJobStore.delete, job.id)
 
+    @staticmethod
+    def _queue_control() -> dict:
+        path = settings.data_dir / "indexation_queue_control.json"
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.exception("Could not read queue control; keeping work paused")
+            return {"paused": True}
+
+    def _hold_job(self, job: IndexationJob) -> bool:
+        control = self._queue_control()
+        if job.id in control.get("cancelled_job_ids", []):
+            job.status = "cancelled"
+            job.phase = "cancelled"
+            job.message = "Cancelled by user; existing files retained"
+        elif control.get("paused") and not (
+            job.source_name in control.get("allowed_upload_names", [])
+            if job.job_type == "upload"
+            else job.id in control.get("allowed_index_job_ids", [])
+        ):
+            job.status = "paused"
+            job.message = "Paused by user; awaiting manual resume"
+        else:
+            return False
+        if job.job_type != "upload":
+            IndexationJobStore.save(job)
+        self._broadcast(job)
+        return True
+
     def _start_job(self, job: IndexationJob) -> None:
+        if self._hold_job(job):
+            return
         task = asyncio.create_task(self._run_job(job))
         self._job_tasks.add(task)
         task.add_done_callback(self._job_tasks.discard)
@@ -213,7 +246,7 @@ class IndexationQueueService:
                 and existing_job.library_type == library_type
                 and IndexationPreflightService.normalize_target_name(existing_job.source_name)
                 == normalized_target
-                and existing_job.status in {"queued", "indexing"}
+                and existing_job.status in {"queued", "indexing", "paused"}
             ):
                 return existing_job.id
 
@@ -573,7 +606,7 @@ class IndexationQueueService:
             if (
                 existing_job.job_type == "upload"
                 and existing_job.publish_id == record.publish_id
-                and existing_job.status in {"queued", "indexing"}
+                and existing_job.status in {"queued", "indexing", "paused"}
             ):
                 return existing_job.id
 
@@ -591,6 +624,8 @@ class IndexationQueueService:
         self._prune_terminal_jobs()
         self._jobs[job.id] = job
         self._broadcast(job)
+        if self._hold_job(job):
+            return job.id
         task = asyncio.create_task(self._run_upload_job(job, record))
         self._upload_tasks[record.publish_id] = task
         self._job_tasks.add(task)
@@ -705,6 +740,21 @@ class IndexationQueueService:
                     job.series_id = str(result["series_id"])
                     job.storage_release_id = str(result["release_id"])
                     job.message = "Release uploaded to Storage Box"
+                    control = self._queue_control()
+                    if job.source_name in control.get("allowed_upload_names", []):
+                        control["allowed_upload_names"].remove(job.source_name)
+                        completed_ids = {
+                            item.id for item in self._jobs.values()
+                            if item.source_name == job.source_name
+                        }
+                        control["allowed_index_job_ids"] = [
+                            job_id for job_id in control.get("allowed_index_job_ids", [])
+                            if job_id not in completed_ids
+                        ]
+                        path = settings.data_dir / "indexation_queue_control.json"
+                        temporary = path.with_suffix(".tmp")
+                        temporary.write_text(json.dumps(control, indent=2), encoding="utf-8")
+                        temporary.replace(path)
                 job.progress = 1.0
                 job.status = "complete"
                 job.error = None

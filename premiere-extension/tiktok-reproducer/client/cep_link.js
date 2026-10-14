@@ -13,8 +13,8 @@
  * Uses the browser-native WebSocket of the CEF panel page (no `ws` package);
  * side-effect free: main.js injects settings, logging and the launch handler.
  *
- * Frames — panel -> VPS: auth (first), pong, ping, ack
- *          VPS -> panel: auth_ok, launch, ping, pong, error
+ * Frames — panel -> VPS: auth (first), pong, ping, ack, video_uploaded
+ *          VPS -> panel: auth_ok, launch, ping, pong, error, video_uploaded_ack
  * Close codes: 4401 auth rejected/timeout, 4400 protocol, 4408 server
  * heartbeat timeout, 1012 server restart, 4000 client heartbeat timeout,
  * 1000 client stop.
@@ -29,6 +29,7 @@ var RECONNECT_MAX_MS = 60000;
 var TEST_TIMEOUT_MS = 8000;
 var MIN_SERVER_HEARTBEAT_INTERVAL_MS = 1000;
 var MAX_SERVER_HEARTBEAT_INTERVAL_MS = 300000;
+var UPLOAD_RETRY_MS = 30000;
 
 var CLOSE_CODES = {
   AUTH_FAILED: 4401,
@@ -98,6 +99,8 @@ function createLinkClient(options) {
       return { result: "error", detail: "no launch handler installed" };
     };
   var onStateChange = opts.onStateChange || function () {};
+  var getPendingUploads = opts.getPendingUploads || function () { return []; };
+  var onUploadAcknowledged = opts.onUploadAcknowledged || function () {};
   var now = opts.now || function () { return new Date(); };
   var setTimeoutFn = opts.setTimeout || setTimeout;
   var clearTimeoutFn = opts.clearTimeout || clearTimeout;
@@ -120,6 +123,7 @@ function createLinkClient(options) {
     last_launch_at: null,
     server_pending_count: null,
     heartbeat_interval_ms: HEARTBEAT_INTERVAL_MS,
+    video_upload_reactions: false,
   };
 
   var socket = null;
@@ -133,6 +137,30 @@ function createLinkClient(options) {
   var lastInboundAt = 0;
   var lastHeartbeatTickAt = 0;
   var outstandingProbeAt = 0;
+  var uploadSentAt = {};
+
+  function flushUploads() {
+    if (!state.authenticated || !state.video_upload_reactions) {
+      return;
+    }
+    // Upload receipts live in project state, not in this socket's lifetime.
+    // A lost acknowledgement is safe: adding the same bot reaction is idempotent.
+    try {
+      var timestamp = now().getTime();
+      getPendingUploads().forEach(function (frame) {
+        var key = frame.notification_id;
+        if (Object.prototype.hasOwnProperty.call(uploadSentAt, key) &&
+            timestamp - uploadSentAt[key] < UPLOAD_RETRY_MS) {
+          return;
+        }
+        if (safeSend(frame)) {
+          uploadSentAt[key] = timestamp;
+        }
+      });
+    } catch (err) {
+      log("Discord upload notification deferred: " + String(err.message || err), "warn");
+    }
+  }
 
   function getState() {
     var copy = {};
@@ -247,6 +275,7 @@ function createLinkClient(options) {
       ) {
         outstandingProbeAt = currentTime;
       }
+      flushUploads();
     }, heartbeatIntervalMs);
   }
 
@@ -323,6 +352,11 @@ function createLinkClient(options) {
         state.last_error = null;
         state.last_connected_at = now().toISOString();
         state.server_pending_count = Number(frame.pending_count || 0);
+        state.video_upload_reactions = frame.video_upload_reactions === true;
+        uploadSentAt = {};
+        if (!state.video_upload_reactions) {
+          log("Premiere Link server needs an update for Discord video upload reactions", "warn");
+        }
         heartbeatIntervalMs = normalizeHeartbeatIntervalMs(
           frame.heartbeat_interval_s,
         );
@@ -337,6 +371,14 @@ function createLinkClient(options) {
           "success",
         );
         emit();
+        flushUploads();
+        break;
+      case "video_uploaded_ack":
+        try {
+          onUploadAcknowledged(frame);
+        } catch (err) {
+          log("Could not save Discord upload acknowledgement: " + String(err.message || err), "warn");
+        }
         break;
       case "ping":
         safeSend({ type: "pong", ts: frame.ts });
@@ -598,6 +640,7 @@ function createLinkClient(options) {
     restart: restart,
     getState: getState,
     testOnce: testOnce,
+    flushUploads: flushUploads,
     isEnabled: function () {
       return isEnabled(getSettings());
     },

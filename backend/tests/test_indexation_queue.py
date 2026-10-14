@@ -729,3 +729,42 @@ async def test_cancel_upload_settles_job_as_cancelled(
     assert upload_job.status == "error"
     assert upload_job.phase == "cancelled"
     assert service._upload_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_queue_pause_survives_restart_with_single_exception(monkeypatch, tmp_path):
+    import json
+
+    jobs = [IndexationJob(source_name=name, source_path=str(tmp_path), library_type=LibraryType.ANIME)
+            for name in ("Allowed", "Waiting", "Cancelled")]
+    for job in jobs:
+        IndexationJobStore.save(job)
+    (settings.data_dir / "indexation_queue_control.json").write_text(json.dumps({
+        "paused": True,
+        "allowed_index_job_ids": [jobs[0].id],
+        "cancelled_job_ids": [jobs[2].id],
+        "allowed_upload_names": ["Allowed"],
+    }))
+    started = []
+
+    async def run(self, job):
+        started.append(job.id)
+
+    monkeypatch.setattr(IndexationQueueService, "_run_job", run)
+    service = IndexationQueueService()
+    await service.resume_pending_indexations()
+    await _drain_job_tasks(service)
+    assert started == [jobs[0].id]
+    assert service._jobs[jobs[1].id].status == "paused"
+    assert service._jobs[jobs[2].id].status == "cancelled"
+    upload_id = service.enqueue_upload(_make_record(tmp_path))
+    assert service._jobs[upload_id].status == "paused"
+    assert not service._upload_tasks
+    assert service._upload_busy_reason() is not None  # allowed index still queued
+    service._jobs[jobs[0].id].status = "complete"
+    assert service._upload_busy_reason() is None  # paused work does not block upload
+    again = IndexationQueueService()
+    await again.resume_pending_indexations()
+    await _drain_job_tasks(again)
+    assert again._jobs[jobs[1].id].status == "paused"
+    assert again._jobs[jobs[2].id].status == "cancelled"
