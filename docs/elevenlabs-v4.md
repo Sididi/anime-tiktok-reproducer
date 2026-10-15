@@ -54,7 +54,7 @@ side rather than submitting both. Missing response IDs clear the audio context
 chain so the next block falls back to its immediate predecessor's text.
 
 Neighbor text comes from the normalized spoken script. The delivery tag
-`[TikTok narrator, rapid]` is added only to the block being generated,
+`[TikTok narrator, rapid]` (or the voice's `audio_control_tags` override) is added only to the block being generated,
 not its neighbors or stored transcripts. Existing post-generation speed,
 silence processing, PCM-to-WAV wrapping, and merging remain in place.
 
@@ -86,6 +86,13 @@ the cached voice configuration.
 Legacy settings remain in existing voice profiles to support switching models;
 v4 only forwards stability and similarity. `default_tts_speed` continues to
 control the post-generation speed slider independently of model settings.
+
+Set `audio_control_tags: ["TikTok narrator"]` on an individual voice to replace
+the default delivery tags with `[TikTok narrator]`, as configured for `bass_v4`.
+Use tag names without brackets; multiple names are joined inside one bracketed
+prefix. An empty list disables the prefix. Omitting the field (or using `null`)
+keeps `[TikTok narrator, energetic, rapid]` for v3 and `[TikTok narrator, rapid]`
+for v4. Other models do not receive these tags.
 
 ## Validation
 

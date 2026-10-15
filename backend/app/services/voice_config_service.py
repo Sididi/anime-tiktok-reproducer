@@ -27,6 +27,8 @@ class VoiceEntry:
     default_tts_speed: float | None = None
     # Premiere clip gain, independent of ElevenLabs generation settings.
     volume_db: float = 0.0
+    # None keeps model defaults; an empty tuple disables delivery tags.
+    audio_control_tags: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +142,18 @@ class VoiceConfigService:
                     raise ValueError(f"Voice '{key}' model_id must be a non-empty string")
                 model_id = model_id.strip()
 
+            audio_control_tags_raw = value.get("audio_control_tags")
+            audio_control_tags: tuple[str, ...] | None = None
+            if audio_control_tags_raw is not None:
+                if not isinstance(audio_control_tags_raw, list):
+                    raise ValueError(f"Voice '{key}' audio_control_tags must be a list")
+                for tag in audio_control_tags_raw:
+                    if not isinstance(tag, str) or not tag.strip() or "[" in tag or "]" in tag:
+                        raise ValueError(
+                            f"Voice '{key}' audio_control_tags entries must be non-empty strings without brackets"
+                        )
+                audio_control_tags = tuple(tag.strip() for tag in audio_control_tags_raw)
+
             # languages (optional)
             languages_raw = value.get("languages")
             languages: tuple[str, ...] | None = None
@@ -205,6 +219,7 @@ class VoiceConfigService:
                 auto_editor_overrides=auto_editor_overrides,
                 default_tts_speed=default_tts_speed,
                 volume_db=volume_db,
+                audio_control_tags=audio_control_tags,
             )
 
         default_key = default_key.strip()

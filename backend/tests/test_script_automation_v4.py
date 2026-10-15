@@ -25,7 +25,14 @@ def test_opting_v3_voice_into_v4_keeps_the_same_segment_layout():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing_request_id", [False, True])
-async def test_v4_run_context_seed_manifest_and_pcm(tmp_path, monkeypatch, missing_request_id):
+@pytest.mark.parametrize("audio_control_tags, prefix", [
+    (None, "[TikTok narrator, rapid] "),
+    (("TikTok narrator",), "[TikTok narrator] "),
+    ((), ""),
+])
+async def test_v4_run_context_seed_manifest_and_pcm(
+    tmp_path, monkeypatch, missing_request_id, audio_control_tags, prefix,
+):
     monkeypatch.setattr(settings, "projects_dir", tmp_path)
     monkeypatch.setattr(settings, "script_automate_enabled", True)
     monkeypatch.setattr(settings, "elevenlabs_api_key", "test-key")
@@ -43,7 +50,7 @@ async def test_v4_run_context_seed_manifest_and_pcm(tmp_path, monkeypatch, missi
     (project_dir / "transcription.json").write_text(source.model_dump_json())
     voice = VoiceEntry(key="test", display_name="Test", elevenlabs_voice_id="voice",
                        model_id="eleven_v4", voice_settings={"stability": 0.4, "similarity_boost": 0.8},
-                       default_tts_speed=1.05)
+                       default_tts_speed=1.05, audio_control_tags=audio_control_tags)
     monkeypatch.setattr(VoiceConfigService, "get_voice", lambda key: voice)
     payload = {"language": "fr", "scenes": [{"scene_index": 0, "text": text}]}
     prepared = Automation.prepare_tts_payload(script_payload=payload, model_id="eleven_v4")
@@ -67,7 +74,7 @@ async def test_v4_run_context_seed_manifest_and_pcm(tmp_path, monkeypatch, missi
     for i, call in enumerate(calls):
         assert call["seed"] == 321
         assert call["language_code"] == "fr"
-        assert call["inputs"] == [{"voice_id": "voice", "text": f"[TikTok narrator, rapid] {chunks[i]}"}]
+        assert call["inputs"] == [{"voice_id": "voice", "text": f"{prefix}{chunks[i]}"}]
         assert "next_text" not in call
         if i < len(chunks) - 1:
             assert call["future_text"] == chunks[i + 1][:100]

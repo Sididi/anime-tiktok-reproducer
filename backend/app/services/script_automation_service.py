@@ -1123,6 +1123,15 @@ class ScriptAutomationService:
                 effective_model = cls.resolve_tts_model_id(model_id=voice.model_id)
                 normalized_model = effective_model.lower()
                 uses_audio_tags = normalized_model.startswith("eleven_v3") or normalized_model == "eleven_v4"
+                narration_prefix = (
+                    cls.V4_NARRATION_CONTROL_PREFIX
+                    if normalized_model == "eleven_v4"
+                    else cls.NARRATION_CONTROL_PREFIX
+                )
+                if voice.audio_control_tags is not None:
+                    narration_prefix = (
+                        f"[{', '.join(voice.audio_control_tags)}]" if voice.audio_control_tags else ""
+                    )
                 prepared_tts = cls.prepare_tts_payload(
                     script_payload=script_payload,
                     target_language=target_language,
@@ -1160,12 +1169,9 @@ class ScriptAutomationService:
                         char_count=segment_char_count,
                     )
 
-                    narration_prefix = (
-                        cls.V4_NARRATION_CONTROL_PREFIX
-                        if normalized_model == "eleven_v4"
-                        else cls.NARRATION_CONTROL_PREFIX
+                    outgoing_text = (
+                        f"{narration_prefix} {chunk}" if uses_audio_tags and narration_prefix else chunk
                     )
-                    outgoing_text = f"{narration_prefix} {chunk}" if uses_audio_tags else chunk
                     synthesize_kwargs: dict[str, Any] = {
                         "voice_id": voice.elevenlabs_voice_id,
                         "text": outgoing_text,

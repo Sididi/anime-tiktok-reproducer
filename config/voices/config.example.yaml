@@ -7,6 +7,9 @@ voices:
     elevenlabs_voice_id: "your_victor_voice_id"
     model_id: "eleven_v3"                    # optional, defaults to global elevenlabs_model_id
     # Opt in to v4 only here: model_id: "eleven_v4". The global base stays multilingual_v2.
+    # Optional for v3/v4: replaces model-default delivery tags; [] disables them.
+    # Use tag names without brackets. Omit to keep the model defaults.
+    # audio_control_tags: ["TikTok narrator"]
     languages: ["fr"]                         # optional, omit = available for all languages
     voice_settings:
       stability: 0.45
