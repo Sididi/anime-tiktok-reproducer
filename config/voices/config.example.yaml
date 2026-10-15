@@ -9,6 +9,7 @@ voices:
     # Opt in to v4 only here: model_id: "eleven_v4". The global base stays multilingual_v2.
     # Optional for v3/v4: replaces model-default delivery tags; [] disables them.
     # Use tag names without brackets. Omit to keep the model defaults.
+    # Default for v3/v4: [TikTok narrator, rapid, understated]
     # audio_control_tags: ["TikTok narrator"]
     languages: ["fr"]                         # optional, omit = available for all languages
     voice_settings:

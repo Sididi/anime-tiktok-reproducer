@@ -26,7 +26,7 @@ def test_opting_v3_voice_into_v4_keeps_the_same_segment_layout():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing_request_id", [False, True])
 @pytest.mark.parametrize("audio_control_tags, prefix", [
-    (None, "[TikTok narrator, rapid] "),
+    (None, "[TikTok narrator, rapid, understated] "),
     (("TikTok narrator",), "[TikTok narrator] "),
     ((), ""),
 ])

@@ -49,8 +49,7 @@ class ScriptAutomationService:
     TTS_HARD_MAX = 800
     # Delivery instruction for expressive models; kept out of transcripts and
     # neighboring text context. V4 has no generation speed setting.
-    NARRATION_CONTROL_PREFIX = "[TikTok narrator, energetic, rapid]"
-    V4_NARRATION_CONTROL_PREFIX = "[TikTok narrator, rapid]"
+    NARRATION_CONTROL_PREFIX = "[TikTok narrator, rapid, understated]"
 
     @classmethod
     def _generate_and_store_elevenlabs_seed(cls, project_id: str) -> int:
@@ -1123,11 +1122,7 @@ class ScriptAutomationService:
                 effective_model = cls.resolve_tts_model_id(model_id=voice.model_id)
                 normalized_model = effective_model.lower()
                 uses_audio_tags = normalized_model.startswith("eleven_v3") or normalized_model == "eleven_v4"
-                narration_prefix = (
-                    cls.V4_NARRATION_CONTROL_PREFIX
-                    if normalized_model == "eleven_v4"
-                    else cls.NARRATION_CONTROL_PREFIX
-                )
+                narration_prefix = cls.NARRATION_CONTROL_PREFIX
                 if voice.audio_control_tags is not None:
                     narration_prefix = (
                         f"[{', '.join(voice.audio_control_tags)}]" if voice.audio_control_tags else ""

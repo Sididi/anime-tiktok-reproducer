@@ -188,7 +188,7 @@ voices:
     volume_db: 6.0 # Premiere gain (-96 to +15 dB)
     elevenlabs_voice_id: "wQjKP9DkO6pDLKdaqFn6"
     model_id: "eleven_v4"
-    audio_control_tags: ["TikTok narrator"]
+    #audio_control_tags: ["TikTok narrator"]
     languages: ["fr"]
     voice_settings:
       stability: 0.5
