@@ -56,9 +56,15 @@ class FacecamService:
 
     @classmethod
     def load(cls, project_id: str) -> FacecamState:
+        from .facecam_story_service import FacecamStoryService
         cls.project(project_id)
         path = cls.directory(project_id) / "state.json"
-        return FacecamState.model_validate_json(path.read_text()) if path.exists() else FacecamState()
+        state = FacecamState.model_validate_json(path.read_text()) if path.exists() else FacecamState()
+        # Also expose the integral option on projects analyzed before it was introduced.
+        # References are installed after the first state write during creation.
+        if (cls.directory(project_id) / "reference_matches.json").exists():
+            state.full_story = FacecamStoryService.full_story(cls.reference(project_id), cls.source_matches(project_id))
+        return state
 
     @classmethod
     def update(cls, project_id: str, values: dict, revision: int | None = None) -> FacecamState:
@@ -71,7 +77,7 @@ class FacecamService:
             state = FacecamState.model_validate({**state.model_dump(), **values})
             directory = cls.directory(project_id)
             directory.mkdir(parents=True, exist_ok=True)
-            write_text_atomic(directory / "state.json", state.model_dump_json(indent=2))
+            write_text_atomic(directory / "state.json", state.model_dump_json(indent=2, exclude={"full_story"}))
             return state
 
     @classmethod
@@ -167,7 +173,8 @@ class FacecamService:
             return None
         if state.stories_fingerprint != FacecamStoryService.fingerprint(cls.reference(project_id), cls.source_matches(project_id)):
             raise ValueError("La source a changé. Relancez l'analyse des histoires avant de continuer.")
-        story = next((s for s in state.stories if s.id == state.selected_story_id), None)
+        story = state.full_story if state.selected_story_id == FacecamStoryService.FULL_STORY_ID else next(
+            (s for s in state.stories if s.id == state.selected_story_id), None)
         if story is None:
             raise ValueError("Choisissez une histoire avant de continuer.")
         return story
@@ -207,15 +214,18 @@ class FacecamService:
             # Never overwrite a draft edited while detection was running.
             if fingerprint != FacecamStoryService.fingerprint(cls.reference(project_id), cls.source_matches(project_id)):
                 raise ValueError("La source a changé pendant l'analyse. Relancez la détection des histoires.")
-            values = {"stories": stories, "stories_fingerprint": fingerprint, "selected_story_id": None}
-            if state.selected_story_id:
+            keep_full_story = (state.selected_story_id == FacecamStoryService.FULL_STORY_ID
+                               and state.stories_fingerprint == fingerprint)
+            values = {"stories": stories, "stories_fingerprint": fingerprint,
+                      "selected_story_id": state.selected_story_id if keep_full_story else None}
+            if state.selected_story_id and not keep_full_story:
                 # A changed source invalidates an earlier selection even before its replacement is chosen.
                 values.update({"revision": revision + 1, "approved_revision": None, "prepared": None,
                                "processed_signature": None, "assignment": [], "montage_map": []})
             state = cls.update(project_id, values, revision)
             if "revision" in values:
                 cls.invalidate_output(project_id)
-            if len(stories) == 1 and not state.blocks:
+            if len(stories) == 1 and not state.blocks and not state.selected_story_id:
                 return cls.select_story(project_id, state.revision, stories[0].id)
             return state
 
@@ -226,15 +236,23 @@ class FacecamService:
             state = cls.load(project_id)
             if state.revision != revision:
                 raise StaleFacecamRevision("Le script a changé. Rechargez la version actuelle.")
-            if story_id not in {s.id for s in state.stories}:
+            full_story = story_id == FacecamStoryService.FULL_STORY_ID
+            if not full_story and story_id not in {s.id for s in state.stories}:
                 raise ValueError("Cette histoire n'existe pas dans l'analyse.")
-            if state.stories_fingerprint != FacecamStoryService.fingerprint(cls.reference(project_id), cls.source_matches(project_id)):
+            reference, matches = cls.reference(project_id), cls.source_matches(project_id)
+            fingerprint = FacecamStoryService.fingerprint(reference, matches)
+            if not full_story and state.stories_fingerprint != fingerprint:
                 raise ValueError("La source a changé. Relancez l'analyse des histoires.")
-            if state.selected_story_id == story_id:
+            if full_story:
+                story = FacecamStoryService.full_story(reference, matches)
+                FacecamStoryService.validate({"stories": [story.model_dump()]}, reference, matches, enforce_budget=False)
+            if state.selected_story_id == story_id and state.stories_fingerprint == fingerprint:
                 return state
             recording = {**state.recording, "reviewed_revision": None} if state.recording else None
             state = cls.update(project_id, {
                 "selected_story_id": story_id, "revision": revision + 1,
+                "stories_fingerprint": fingerprint,
+                "stories": state.stories if state.stories_fingerprint == fingerprint else [],
                 "hooks": [], "opinions": [], "selected_hook": "", "selected_opinion": "", "blocks": [],
                 "approved_revision": None, "assignment": [], "montage_map": [], "estimated_duration_seconds": None,
                 "findings": [], "fact_context": None, "fact_revision": None, "fact_status": "unchecked", "fact_error": None,
@@ -284,11 +302,18 @@ class FacecamService:
         from .facecam_narration_service import FacecamNarrationService
         from .facecam_story_service import FacecamStoryService
         story = cls.require_story(project_id)
-        context = FacecamNarrationService.brief(cls.directory(project_id), cls.context(project_id),
+        source_context = cls.context(project_id)
+        full_story = story is not None and story.id == FacecamStoryService.FULL_STORY_ID
+        if full_story:
+            source_context["preserve_full_story"] = True
+        context = FacecamNarrationService.brief(cls.directory(project_id), source_context,
                                               cls.skeleton(project_id), lambda prompt: cls.llm(project_id, prompt))
         if story:
             context["selected_story"] = story.model_dump(include={"title", "premise", "ending", "steps", "omitted"})
-            context["budget"] = FacecamStoryService.budget(story)
+            if full_story:
+                context["preserve_full_story"] = True
+            else:
+                context["budget"] = FacecamStoryService.budget(story)
         return context
 
     @classmethod

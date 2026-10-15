@@ -7,9 +7,15 @@ La phrase de révélation du titre sera également ajoutée automatiquement.
 Si selected_story est présent, raconte uniquement cette histoire et termine sur son point d'arrivée.
 La sélection des images est déjà faite : ne réintroduis pas les branches et détails écartés.
 Une phrase peut couvrir plusieurs plans ; elle n'a pas à décrire chaque geste à l'écran.
-body_budget donne le nombre de mots réservé au corps, après déduction de l'accroche, de l'opinion
+Si preserve_full_story vaut true, le créateur a choisi de garder toute l'histoire : conserve toutes
+les branches, étapes et conséquences établies dans la fiche, jusqu'à la fin du récit source.
+La durée est libre : ne supprime aucun événement pour viser une minute. Relie les événements
+en un récit fluide, sans recopier la source ni répéter l'accroche ou les dialogues originaux.
+
+Lorsqu'il est fourni, body_budget donne le nombre de mots réservé au corps, après déduction de l'accroche, de l'opinion
 éventuelle et de l'annonce du titre. Vise cette fourchette et ne dépasse jamais son maximum.
-Le budget tient compte des extraits audio conservés et de la carte finale pour viser 65 à 70 secondes.
+Ce budget tient compte des extraits audio conservés et de la carte finale pour viser 65 à 70 secondes.
+Il ne s'applique pas au choix preserve_full_story.
 Si les faits sont trop minces, reste plus court plutôt que répéter ou inventer pour remplir le temps.
 
 Avant d'écrire, détermine la promesse exacte du hook, les faits qui y répondent et la progression qui
@@ -25,7 +31,7 @@ visuels, leur chronologie et leurs relations réelles. Une simple succession res
 Si une opinion est sélectionnée, prépare une transition naturelle vers elle sans la paraphraser à l'avance.
 Finis le corps sur la situation concrète atteinte, pas sur un deuxième bilan de ce qui vient d'être raconté.
 
-La longueur respecte le budget et les faits disponibles, jamais le nombre de mots du texte
+La longueur respecte les faits disponibles et le budget lorsqu'il est fourni, jamais le nombre de mots du texte
 source. N'étire pas un récit mince pour atteindre un quota et ne compresse pas les faits au point de
 perdre leurs liens. Évite la récitation exhaustive et les relances automatiques à chaque phrase.
 Chaque bloc body couvre ses indices, mais sa prose ne se découpe pas plan par plan.

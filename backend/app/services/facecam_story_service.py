@@ -8,14 +8,31 @@ import math
 from pydantic import TypeAdapter
 
 from ..models import MatchList, Transcription
-from ..models.facecam import StoryArc
+from ..models.facecam import ENDING, StoryArc, StoryClip
 
 
 class FacecamStoryService:
+    FULL_STORY_ID = "full-story"
     WORDS_PER_SECOND = 3.35  # Initial estimate, not a measurement of the user's voice.
     TARGET_MIN = 65
     TARGET_MAX = 70
     COVER_SECONDS = 1
+
+    @classmethod
+    def full_story(cls, reference, matches) -> StoryArc:
+        """An application-owned option, available independently of model analysis."""
+        raw_indices = {s.scene_index for s in reference.scenes if s.is_raw}
+        raw_duration = sum(m.end_time - m.start_time for m in matches.matches if m.scene_index in raw_indices)
+        words = sum(len(s.text.split()) for s in reference.scenes if not s.is_raw) + len(ENDING.split())
+        return StoryArc(
+            id=cls.FULL_STORY_ID, title="Garder toute l’histoire",
+            premise="Conserver toutes les étapes du récit source et les extraits audio originaux.",
+            ending="Aller jusqu’à la fin du récit source, sans écarter de branche narrative.",
+            steps=["Reprendre l’ensemble des événements dans leur ordre, sans coupe narrative."],
+            clips=[StoryClip(scene_index=s.scene_index) for s in reference.scenes],
+            raw_duration_seconds=raw_duration,
+            estimated_duration_seconds=round(words / cls.WORDS_PER_SECOND + raw_duration + cls.COVER_SECONDS, 2),
+        )
 
     @staticmethod
     def fingerprint(reference: Transcription, matches: MatchList) -> str:
@@ -40,7 +57,7 @@ class FacecamStoryService:
         return start, end
 
     @classmethod
-    def validate(cls, value, reference, matches) -> list[StoryArc]:
+    def validate(cls, value, reference, matches, *, enforce_budget=True) -> list[StoryArc]:
         if not isinstance(value, dict) or not isinstance(value.get("stories"), list) or not 1 <= len(value["stories"]) <= 6:
             raise ValueError("L'analyse doit identifier au moins une histoire exploitable.")
         stories = TypeAdapter(list[StoryArc]).validate_python(value["stories"])
@@ -70,7 +87,7 @@ class FacecamStoryService:
                     # Actual inserted dialogue plays from the episode at its native speed.
                     raw_duration += match.end_time - match.start_time
             story.raw_duration_seconds = raw_duration
-            if cls.budget(story)["max_words"] < 40:
+            if enforce_budget and cls.budget(story)["max_words"] < 40:
                 raise ValueError("Les extraits originaux occupent trop de temps pour raconter cette histoire en une minute.")
         return stories
 
@@ -100,6 +117,8 @@ class FacecamStoryService:
 
     @classmethod
     def budget(cls, story):
+        if story.id == cls.FULL_STORY_ID:
+            return None
         overhead = story.raw_duration_seconds + cls.COVER_SECONDS
         return {"target_seconds": [cls.TARGET_MIN, cls.TARGET_MAX], "estimated_words_per_second": cls.WORDS_PER_SECOND,
                 "raw_seconds": story.raw_duration_seconds, "cover_seconds": cls.COVER_SECONDS,

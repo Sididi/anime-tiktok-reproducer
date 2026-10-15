@@ -1,17 +1,25 @@
-import { Check, Loader2 } from 'lucide-react';
+import { AlertTriangle, Check, Clock3, Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui';
-import type { FacecamState } from '@/api/facecam';
+import { FULL_STORY_ID, type FacecamState } from '@/api/facecam';
+
+function durationLabel(seconds: number) {
+  const rounded = Math.ceil(seconds);
+  return rounded < 60 ? `${rounded} s` : `${Math.floor(rounded / 60)} min ${String(rounded % 60).padStart(2, '0')} s`;
+}
 
 export function FacecamStories({state, busy, onAnalyze, onSelect}: {
   state: FacecamState; busy: boolean; onAnalyze: () => void; onSelect: (id: string) => void;
 }) {
   const stories = state.stories ?? [];
+  const fullSelected = state.selected_story_id === FULL_STORY_ID;
+  const fullDuration = state.full_story?.estimated_duration_seconds;
+  const tooLong = fullDuration != null && fullDuration > 70;
   return <section className="facecam-card" aria-labelledby="facecam-stories-title">
     <h2 id="facecam-stories-title">1. Choisir l’histoire à raconter</h2>
     <p>{!stories.length
-      ? 'Lancez l’analyse de la source pour repérer les histoires possibles et ce qui mérite votre minute.'
+      ? 'Lancez l’analyse pour trouver un récit de 65–70 s, ou choisissez de garder toute l’histoire.'
       : stories.length === 1
-        ? state.selected_story_id ? 'Une seule histoire détectée : elle est retenue automatiquement.' : 'Une seule histoire détectée. Vous pouvez repartir de ce récit.'
+        ? state.selected_story_id === stories[0].id ? 'Une seule histoire détectée : elle est retenue automatiquement.' : 'Une seule histoire détectée. Vous pouvez choisir ce récit ou garder toute l’histoire.'
         : `${stories.length} histoires détectées. Choisissez celle que vous souhaitez développer.`}</p>
     {!stories.length && <Button variant="outline" disabled={busy} onClick={onAnalyze}>
       {busy && <Loader2 size={16} className="animate-spin mr-2"/>}
@@ -22,6 +30,7 @@ export function FacecamStories({state, busy, onAnalyze, onSelect}: {
       const selected = state.selected_story_id === story.id;
       return <article key={story.id} className={selected ? 'selected' : ''} aria-label={story.title}>
         <h3>{selected && <Check size={16} aria-label="Histoire retenue"/>}{story.title}</h3>
+        <p className="facecam-story-duration"><Clock3 size={16} aria-hidden="true"/>Cible : 65–70 s</p>
         <p>{story.premise}</p>
         <ol>{story.steps.map((step, index) => <li key={index}>{step}</li>)}</ol>
         <p><strong>Point d’arrivée : </strong>{story.ending}</p>
@@ -30,7 +39,25 @@ export function FacecamStories({state, busy, onAnalyze, onSelect}: {
           {selected ? 'Histoire retenue' : state.blocks.length ? 'Repartir de cette histoire' : 'Choisir cette histoire'}
         </Button>
       </article>;
-    })}</div>
-    {!!stories.length && !!state.blocks.length && <p>Repartir d’une autre histoire remplace le brouillon, l’accroche et le point de vue. L’enregistrement devra être vérifié à nouveau.</p>}
+    })}
+      <article className={`facecam-full-story ${fullSelected ? 'selected' : ''}`} aria-label="Garder toute l’histoire">
+        <span className="facecam-story-label">Option intégrale · facultative</span>
+        <h3>{fullSelected && <Check size={16} aria-label="Histoire retenue"/>}Garder toute l’histoire</h3>
+        <p>Conservez toutes les étapes du récit et les extraits audio originaux, sans limiter le script à une minute.</p>
+        <p className={`facecam-story-duration ${tooLong ? 'over-target' : ''}`}>
+          <Clock3 size={18} aria-hidden="true"/>
+          <strong>{fullDuration != null ? `Durée estimée : ${durationLabel(fullDuration)}` : 'Durée estimée indisponible'}</strong>
+        </p>
+        <p className="facecam-story-estimate">Estimation à partir du texte source, des extraits originaux et de la carte finale. La durée finale dépendra de la rédaction, de l’accroche, du point de vue et de votre débit.</p>
+        {tooLong && <div className="facecam-story-warning" role="note">
+          <AlertTriangle size={18} aria-hidden="true"/>
+          <p><strong>Ce récit dépasse la cible de 65–70 s.</strong> La vidéo risque d’être trop longue pour garder l’attention. Privilégiez une histoire plus courte parmi les propositions{!stories.length && ' après analyse'}.</p>
+        </div>}
+        <Button variant="outline" className="h-auto min-h-10" disabled={busy || fullSelected} onClick={() => onSelect(FULL_STORY_ID)}>
+          {fullSelected ? 'Histoire intégrale retenue' : tooLong ? 'Garder toute l’histoire quand même' : 'Garder toute l’histoire'}
+        </Button>
+      </article>
+    </div>
+    {!!state.blocks.length && <p>Repartir d’une autre histoire remplace le brouillon, l’accroche et le point de vue. L’enregistrement devra être vérifié à nouveau.</p>}
   </section>;
 }

@@ -1,7 +1,7 @@
 import {test,expect,type Page} from '@playwright/test';
 import {DEFAULT_FACECAM_AUTO_EDITOR, type FacecamState, type FacecamStory} from '../src/api/facecam';
 
-async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean}) {
+async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; fullDuration?: number; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean}) {
   const id='facecam-browser';
   let checks=0,saves=0,analyses=0;
   let preset='gpt',music='music';
@@ -17,6 +17,8 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
       {id:'opinion',kind:'opinion',text:'Ce choix est intéressant.',scene_indices:[]},{id:'ending',kind:'ending',text:'Le nom de l’anime c’est :',scene_indices:[]}],
     fact_revision:1,fact_status:'complete',fact_error:null,findings:[{quote:'Naruto',start:18,end:24,kind:'uncertain',explanation:'Identité à vérifier.',correction:'Vérifiez le prénom.',sources:[{url:'https://example.org/official',title:'Site officiel'}]}],recording:null,prepared:null,cover:null,job:null};
   if(options?.empty) state={...state,revision:0,blocks:[],selected_hook:'',selected_opinion:'',hooks:[],opinions:[],findings:[],fact_revision:null};
+  state={...state,full_story:{id:'full-story',title:'Garder toute l’histoire',premise:'Le récit complet.',ending:'La fin de la source.',steps:['Toutes les étapes.'],omitted:[],
+    clips:[0,1,2].map(scene_index=>({scene_index,start_word:null,end_word:null})),raw_duration_seconds:10,estimated_duration_seconds:options?.fullDuration??142}};
   if(options?.recording) state={...state,approved_revision:state.revision,auto_editor:{...DEFAULT_FACECAM_AUTO_EDITOR},
     recording:{fingerprint:'take-1',duration:77,transcript:'Imagine ce ninja.',differences:[],reviewed_revision:state.revision},
     prepared:{revision:state.revision,fingerprint:'take-1',preview_music_key:'music',preview_version:'original',
@@ -68,7 +70,7 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
       if(options?.failAnalysis && analyses===1) {state={...state,job:{status:'error',message:'Analyse indisponible.'}};return json(state);}
       const stories=options?.stories??[];
       state={...state,stories,job:{status:'complete'}};
-      if(stories.length===1&&!state.blocks.length) state={...state,selected_story_id:stories[0].id,revision:state.revision+1};
+      if(stories.length===1&&!state.blocks.length&&!state.selected_story_id) state={...state,selected_story_id:stories[0].id,revision:state.revision+1};
       return json(state);
     }
     if(path==='/facecam/story'){
@@ -221,6 +223,43 @@ const storyOptions: FacecamStory[] = [
   {id:'story-2',title:'Le faux débutant',premise:'Un héros accompagne des novices.',ending:'Il décide de les protéger.',steps:['On lui impose un groupe.','Il repère les traces truquées.'],omitted:['Les détails du retour.'],clips:[{scene_index:2,start_word:0,end_word:2}],raw_duration_seconds:0},
 ];
 
+test('the optional full story is always visible, warns about duration and persists its explicit selection',async({page})=>{
+  const f=await fixture(page,{empty:true,stories:storyOptions});
+  const full=page.getByRole('article',{name:'Garder toute l’histoire'});
+  await expect(full).toContainText('Durée estimée : 2 min 22 s');
+  await expect(full.getByRole('note')).toContainText('Privilégiez une histoire plus courte');
+  expect(f.state.selected_story_id).toBeUndefined();
+  await full.getByRole('button',{name:'Garder toute l’histoire quand même'}).click();
+  expect(f.analyses).toBe(0);
+  expect(f.state.selected_story_id).toBe('full-story');
+  await expect(page.getByRole('button',{name:'Choisir l’accroche et le point de vue'})).toBeEnabled();
+  await page.reload();
+  await expect(full.getByRole('button',{name:'Histoire intégrale retenue'})).toBeDisabled();
+  await page.getByRole('button',{name:'Analyser les histoires'}).click();
+  await expect(page.getByRole('article')).toHaveCount(3);
+  await expect(full.getByRole('button',{name:'Histoire intégrale retenue'})).toBeDisabled();
+  await page.getByRole('article',{name:'Le faux débutant'}).getByRole('button',{name:'Choisir cette histoire'}).click();
+  expect(f.state.selected_story_id).toBe('story-2');
+  await expect(full.getByRole('button',{name:'Garder toute l’histoire quand même'})).toBeEnabled();
+});
+
+test('a short full story shows its estimate without an excessive-duration warning',async({page})=>{
+  await fixture(page,{empty:true,fullDuration:65});
+  const full=page.getByRole('article',{name:'Garder toute l’histoire'});
+  await expect(full).toContainText('Durée estimée : 1 min 05 s');
+  await expect(full.getByRole('note')).toHaveCount(0);
+  await expect(full.getByRole('button',{name:'Garder toute l’histoire',exact:true})).toBeEnabled();
+});
+
+test('full story remains selectable after analysis fails',async({page})=>{
+  const f=await fixture(page,{empty:true,failAnalysis:true});
+  await page.getByRole('button',{name:'Analyser les histoires'}).click();
+  await expect(page.getByRole('button',{name:'Réessayer l’analyse'})).toBeVisible();
+  await page.getByRole('article',{name:'Garder toute l’histoire'}).getByRole('button').click();
+  expect(f.state.selected_story_id).toBe('full-story');
+  await expect(page.getByRole('button',{name:'Choisir l’accroche et le point de vue'})).toBeEnabled();
+});
+
 test('new facecam waits for model selection and explicit analysis',async({page})=>{
   const f=await fixture(page,{empty:true,stories:storyOptions});
   await expect(page.getByLabel('Modèle',{exact:true})).toHaveValue('gpt');
@@ -252,6 +291,7 @@ test('a single story is automatically retained without a redundant confirmation'
   await expect(page.getByText('Une seule histoire détectée : elle est retenue automatiquement.')).toBeVisible();
   await expect(page.getByRole('button',{name:'Choisir l’accroche et le point de vue'})).toBeEnabled();
   expect(f.state.selected_story_id).toBe('story-1');
+  await expect(page.getByRole('article',{name:'Garder toute l’histoire'}).getByRole('button')).toBeEnabled();
   await page.reload();
   expect(f.analyses).toBe(1);
 });
@@ -263,7 +303,7 @@ test('failed detection is retryable and cannot unlock the hook step',async({page
   await expect(page.getByRole('button',{name:'Choisir l’accroche et le point de vue'})).toBeDisabled();
   expect(f.analyses).toBe(1);
   await page.getByRole('button',{name:'Réessayer l’analyse'}).click();
-  await expect(page.getByRole('article')).toHaveCount(2);
+  await expect(page.getByRole('article')).toHaveCount(3);
   expect(f.analyses).toBe(2);
 });
 

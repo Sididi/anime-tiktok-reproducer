@@ -43,6 +43,14 @@
 .facecam-stories ul { list-style: disc; }
 .facecam-stories details { margin: 16px 0; font-size: 12px; }
 .facecam-stories summary { cursor: pointer; }
+.facecam-story-label { display: block; margin-bottom: 10px; font-size: 11px; letter-spacing: .04em; opacity: .65; }
+.facecam-stories .facecam-story-duration { display: flex; align-items: center; gap: 8px; opacity: 1; margin: 16px 0; font-variant-numeric: tabular-nums; }
+.facecam-story-duration.over-target { color: #fbbf24; }
+.facecam-stories .facecam-story-estimate { font-size: 12px; }
+.facecam-story-warning { display: flex; align-items: flex-start; gap: 10px; padding: 14px; margin: 16px 0; border: 1px solid #f59e0b60; border-radius: 9px; background: #f59e0b0d; color: #fbbf24; }
+.facecam-story-warning svg { flex-shrink: 0; margin-top: 2px; }
+.facecam-stories .facecam-story-warning p { margin: 0; opacity: 1; font-size: 13px; }
+.facecam-story-warning strong { display: block; margin-bottom: 4px; }
 .facecam-steps { flex-wrap: wrap; }
 .facecam-workspace { display: grid; gap: 24px; align-items: start; }
 .facecam-workspace-content { min-width: 0; }

@@ -64,6 +64,99 @@ def ranges(pid, prompt):
     return {'ranges': [{'scene_index': s['scene_index'], 'start': i*n//len(scenes), 'end': (i+1)*n//len(scenes)} for i, s in enumerate(scenes)]}
 
 
+def test_full_story_is_always_available_and_keeps_all_source_bounds(project, monkeypatch):
+    monkeypatch.setattr(FacecamService, 'llm', lambda *a: pytest.fail('No analysis needed'))
+    original = FacecamService.load(project.id)
+    reference, matches = FacecamService.reference(project.id), FacecamService.source_matches(project.id)
+    full = original.full_story
+    assert full.id == 'full-story' and original.selected_story_id is None and not original.stories
+    assert [c.scene_index for c in full.clips] == [5, 9, 42, 60]
+    assert all(c.start_word is None and c.end_word is None for c in full.clips)
+    assert full.raw_duration_seconds == 20  # Native episode duration, not the 10 s source clip.
+    words = sum(len(s.text.split()) for s in reference.scenes if not s.is_raw) + len(ENDING.split())
+    assert full.estimated_duration_seconds == round(words / 3.35 + 20 + 1, 2)
+    state = FacecamService.select_story(project.id, original.revision, full.id)
+    assert state.selected_story_id == full.id and state.revision == 1
+    assert FacecamService.load(project.id) == state
+    assert FacecamService.select_story(project.id, state.revision, full.id) == state
+    selected, selected_matches, _ = FacecamService.montage_reference(project.id)
+    assert selected == reference and selected_matches == matches
+    with pytest.raises(StaleFacecamRevision):
+        FacecamService.select_story(project.id, original.revision, full.id)
+
+
+def test_full_story_with_long_dialogue_can_be_selected_and_generated_without_condensation(project, monkeypatch):
+    matches = FacecamService.source_matches(project.id)
+    matches.matches[1].end_time = matches.matches[1].start_time + 100
+    (FacecamService.directory(project.id) / 'reference_matches.json').write_text(matches.model_dump_json())
+    state = FacecamService.select_story(project.id, 0, 'full-story')
+    assert state.full_story.estimated_duration_seconds > 100
+    prompts = []
+    def model(pid, prompt):
+        prompts.append(prompt)
+        payload = json.loads(prompt.splitlines()[-1])
+        assert payload['preserve_full_story'] is True
+        if len(prompts) == 1:
+            assert [s['scene_index'] for s in payload['scenes']] == [5, 9, 42, 60]
+            assert payload['scenes'][2]['text'] == 'des gobelins. Mais elle refuse.'
+            return {'premise': 'Un héros revient.', 'protagonist': 'Le héros', 'uncertainties': [], 'sections': [
+                {'id': 'body-5', 'facts': [{'scene_indices': [5], 'text': 'Le héros revient.'}]},
+                {'id': 'body-42', 'facts': [{'scene_indices': [42, 60], 'text': 'Elle refuse, les novices découvrent les traces.'}]}]}
+        assert 'body_budget' not in payload and 'budget' not in payload
+        return {'blocks': [{'id': 'body-5', 'text': 'retour ' * 100}, {'id': 'body-42', 'text': 'suite ' * 300}]}
+    monkeypatch.setattr(FacecamService, 'llm', model)
+    generated = FacecamService.generate(project.id, 'Un héros revient.', '', state.revision)
+    assert len(prompts) == 2  # No retry truncating the complete story.
+    assert generated.estimated_duration_seconds > 200
+    assert [b.scene_indices for b in generated.blocks if b.kind == 'body'] == [[5], [42, 60]]
+    assert [b.scene_indices for b in generated.blocks if b.kind == 'raw'] == [[9]]
+    monkeypatch.setattr(FacecamService, 'llm', ranges)
+    approved = FacecamService.approve(project.id, generated.revision)
+    retained = [m for m in approved.montage_map if m['kind'] != 'outro']
+    assert [m['source_scene_index'] for m in retained] == [5, 9, 42, 60]
+    assert [(m['source_start'], m['source_end']) for m in retained] == [(0, 10), (10, 20), (20, 30), (30, 40)]
+    assert approved.montage_map[-1]['kind'] == 'outro'
+
+
+@pytest.mark.parametrize('with_draft', [False, True])
+def test_analysis_preserves_explicit_full_story_choice(project, monkeypatch, with_draft):
+    old = FacecamService.select_story(project.id, 0, 'full-story')
+    if with_draft:
+        old = write_draft(project)
+    state = detect(project, monkeypatch, option())
+    assert state.selected_story_id == 'full-story'
+    assert state.blocks == old.blocks and state.revision == old.revision
+    assert len(state.stories) == 1 and state.full_story
+
+
+def test_full_story_remains_available_after_analysis_failure_and_switching(project, monkeypatch):
+    with pytest.raises(ValueError):
+        detect(project, monkeypatch, {**option(), 'clips': [{'scene_index': 999}]})
+    assert FacecamService.load(project.id).full_story.id == 'full-story'
+    state = detect(project, monkeypatch, option())
+    old = write_draft(project)
+    full = FacecamService.select_story(project.id, old.revision, 'full-story')
+    assert not full.blocks and not full.selected_hook and full.stories == state.stories
+    assert FacecamService.context(project.id)['scenes'][-1]['scene_index'] == 60
+    short = FacecamService.select_story(project.id, full.revision, 'story-1')
+    assert short.selected_story_id == 'story-1'
+    assert FacecamService.context(project.id)['scenes'][-1]['text'] == 'des gobelins.'
+    assert FacecamStoryService.budget(FacecamService.selected_story(project.id))['target_seconds'] == [65, 70]
+
+
+def test_full_story_refresh_does_not_make_stale_analysis_current(project, monkeypatch):
+    state = detect(project, monkeypatch, option())
+    state = FacecamService.select_story(project.id, state.revision, 'full-story')
+    reference = FacecamService.reference(project.id)
+    reference.scenes[0].text = 'Le récit a changé.'
+    (FacecamService.directory(project.id) / 'reference.json').write_text(reference.model_dump_json())
+    with pytest.raises(ValueError, match='source a changé'):
+        FacecamService.selected_story(project.id)
+    refreshed = FacecamService.select_story(project.id, state.revision, 'full-story')
+    assert refreshed.revision == state.revision + 1 and refreshed.stories == []
+    assert FacecamService.selected_story(project.id).id == 'full-story'
+
+
 def test_single_arc_is_auto_selected_persisted_and_analysis_is_idempotent(project, monkeypatch):
     state = detect(project, monkeypatch, option())
     assert len(state.stories) == 1 and state.selected_story_id == state.stories[0].id

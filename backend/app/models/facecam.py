@@ -31,6 +31,7 @@ class StoryArc(BaseModel):
     omitted: list[str] = Field(default_factory=list)
     clips: list[StoryClip] = Field(min_length=1)
     raw_duration_seconds: float = 0
+    estimated_duration_seconds: float | None = None
 
 
 class ScriptBlock(BaseModel):
@@ -94,6 +95,7 @@ class FacecamAutoEditorSettings(BaseModel):
 class FacecamState(BaseModel):
     revision: int = 0
     stories: list[StoryArc] = Field(default_factory=list)
+    full_story: StoryArc | None = None  # Derived from immutable references when loading.
     stories_fingerprint: str | None = None
     selected_story_id: str | None = None
     montage_map: list[dict[str, Any]] = Field(default_factory=list)

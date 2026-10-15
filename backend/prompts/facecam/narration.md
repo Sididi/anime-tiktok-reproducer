@@ -32,3 +32,5 @@ reformule autour des faits établis. Ne dis jamais « selon les indications », 
 Les extraits originaux retenus occupent une place fixe dans l'histoire sélectionnée. Respecte leurs
 frontières. Les images illustrent la progression : raconter chaque action visible n'est pas obligatoire.
 Si selected_story est fourni, ne développe aucune des branches écartées et réponds à sa promesse.
+Si preserve_full_story vaut true, la promesse porte sur l'ensemble du récit source : conserve toutes
+ses branches et étapes. La durée est libre, sans condensation imposée à 65–70 secondes.

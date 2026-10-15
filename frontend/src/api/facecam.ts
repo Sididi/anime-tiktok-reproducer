@@ -6,7 +6,9 @@ export interface FacecamStory {
   id: string; title: string; premise: string; ending: string; steps: string[]; omitted: string[];
   clips: {scene_index: number; start_word: number | null; end_word: number | null}[];
   raw_duration_seconds: number;
+  estimated_duration_seconds?: number | null;
 }
+export const FULL_STORY_ID = 'full-story';
 export interface FacecamAutoEditorSettings {
   noise_threshold_db: number;
   min_silence_ms: number;
@@ -30,7 +32,7 @@ export function sameAutoEditorSettings(a?: FacecamAutoEditorSettings, b?: Faceca
     .every(key => (a[key] ?? DEFAULT_FACECAM_AUTO_EDITOR[key]) === (b[key] ?? DEFAULT_FACECAM_AUTO_EDITOR[key]));
 }
 export interface FacecamState {
-  stories?: FacecamStory[]; selected_story_id?: string | null; estimated_duration_seconds?: number | null;
+  stories?: FacecamStory[]; full_story?: FacecamStory | null; selected_story_id?: string | null; estimated_duration_seconds?: number | null;
   revision: number; hooks: {id: string; text: string; original: boolean}[]; opinions: {id: string; text: string; original: boolean}[];
   selected_hook: string; selected_opinion: string; blocks: FacecamBlock[]; approved_revision: number | null;
   fact_revision: number | null; fact_status: 'unchecked' | 'complete' | 'unavailable'; fact_error: string | null; findings: Finding[];

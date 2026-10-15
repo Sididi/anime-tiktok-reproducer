@@ -9,7 +9,7 @@ import { FacecamStories } from '@/components/script/FacecamStories';
 import { FacecamPrompter } from '@/components/script/FacecamPrompter';
 import { FacecamAutoEditor } from '@/components/script/FacecamAutoEditor';
 import { MetadataEditorModal } from '@/components/script/MetadataEditorModal';
-import { DEFAULT_FACECAM_AUTO_EDITOR, facecamRequest, uploadFacecam, type FacecamAutoEditorSettings, type FacecamBlock, type FacecamState, type Finding, type RecordingCut } from '@/api/facecam';
+import { DEFAULT_FACECAM_AUTO_EDITOR, FULL_STORY_ID, facecamRequest, uploadFacecam, type FacecamAutoEditorSettings, type FacecamBlock, type FacecamState, type Finding, type RecordingCut } from '@/api/facecam';
 import { useFacecamPreview } from '@/hooks/useFacecamPreview';
 import type { PlatformMetadata, Project } from '@/types';
 import './facecam.css';
@@ -187,9 +187,9 @@ export function FacecamScriptPage({project}: {project: Project}) {
     </section>
     {state.blocks.length > 0 && <section className="facecam-card">
       <div className="flex flex-wrap justify-between items-center gap-3 mb-5"><div><h2>3. Affiner votre script</h2><p>{saved ? 'Brouillon enregistré' : 'Enregistrement…'} · Révision {state.revision}</p></div><div className="flex flex-wrap gap-2"><Button variant="outline" aria-expanded={sourceOpen} aria-controls="facecam-source-video" onClick={e => toggleSource(e.currentTarget)}><Play size={16} className="mr-2"/>Vidéo originale</Button><Button variant="outline" disabled={busy || !saved} onClick={() => void action('/fact-check')}><ShieldCheck size={16} className="mr-2"/>Vérifier les faits</Button><Button disabled={busy || approved || !storyReady} onClick={() => void action('/approve', {})}>{approved ? 'Script validé' : 'Valider le script'}</Button></div></div>
-      <p className="facecam-duration">{wordCount} mots · Cible : 65–70 s
+      <p className="facecam-duration">{wordCount} mots · {state.selected_story_id === FULL_STORY_ID ? 'Histoire intégrale · Durée conseillée : 65–70 s' : 'Cible : 65–70 s'}
         {saved && state.estimated_duration_seconds != null && <> · Estimation : {Math.round(state.estimated_duration_seconds)} s, à confirmer avec votre lecture.
-          {state.estimated_duration_seconds > 70 ? ' Retirez un détail secondaire pour raccourcir.' : state.estimated_duration_seconds < 65 ? ' Une lecture est nécessaire pour vérifier que le montage dépasse une minute.' : ''}</>}
+          {state.estimated_duration_seconds > 70 ? state.selected_story_id === FULL_STORY_ID ? ' Le récit intégral dépasse la durée conseillée. Privilégiez une histoire plus courte pour garder l’attention.' : ' Retirez un détail secondaire pour raccourcir.' : state.estimated_duration_seconds < 65 ? ' Une lecture est nécessaire pour vérifier que le montage dépasse une minute.' : ''}</>}
       </p>
       <div className="facecam-editor-layout"><FacecamEditor blocks={state.blocks} findings={visibleFindings} disabled={!!busy} onChange={edit} onFinding={setFinding}/>
         <aside className="facecam-review" aria-label="Vérification des faits"><h3>Vérification des faits</h3>
