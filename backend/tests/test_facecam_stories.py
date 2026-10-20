@@ -58,10 +58,10 @@ def write_draft(project):
     return FacecamService.save_draft(project.id, state.revision, blocks, blocks[0].text, '')
 
 
-def ranges(pid, prompt):
+def ranges(pid, prompt, **kwargs):
     payload = json.loads(prompt.split('\n', 1)[1])
     n, scenes = len(payload['words']), payload['scenes']
-    return {'ranges': [{'scene_index': s['scene_index'], 'start': i*n//len(scenes), 'end': (i+1)*n//len(scenes)} for i, s in enumerate(scenes)]}
+    return {'boundaries': [i*n//len(scenes) for i in range(1, len(scenes))]}
 
 
 def test_full_story_is_always_available_and_keeps_all_source_bounds(project, monkeypatch):
@@ -220,6 +220,28 @@ def test_leading_raw_hook_and_outro_only_reuse_selected_footage(project, monkeyp
     assert [m['source_scene_index'] for m in approved.montage_map] == [42, 9, 42, 42]
     assert all(m.end_time <= 143.6 for m in ProjectService.load_matches(project.id).matches)
     assert ' '.join(a['text'] for a in approved.assignment).split() == state.spoken_text().split()
+    ProjectService.validate_transcription_scene_alignment(project.id, ProjectService.load_transcription(project.id))
+
+
+def test_sparse_scene_ids_stay_in_source_order_after_assignment_retry(project, monkeypatch):
+    detect(project, monkeypatch, option(indices=(5, 42, 60)))
+    state = write_draft(project)
+    calls = []
+    def generate(pid, prompt, **kwargs):
+        calls.append(json.loads(prompt.split('\n', 1)[1]))
+        if len(calls) == 1:
+            # The former protocol let the model reorder/omit immutable source IDs.
+            return {'ranges': [{'scene_index': i, 'start': n*4, 'end': (n+1)*4}
+                               for n, i in enumerate([42, 60, 5])]}
+        return ranges(pid, prompt)
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    approved = FacecamService.approve(project.id, state.revision)
+    assert len(calls) == 2 and calls[1]['correction']['error']
+    assert [m['source_scene_index'] for m in approved.montage_map] == [5, 42, 60, 60]
+    assert [a['scene_index'] for a in approved.assignment] == [0, 1, 2, 3]
+    assert ' '.join(a['text'] for a in approved.assignment).split() == state.spoken_text().split()
+    matches = ProjectService.load_matches(project.id).matches
+    assert [(m.start_time, m.end_time) for m in matches] == [(100, 120), (140, 143.6), (160, 180), (160, 180)]
     ProjectService.validate_transcription_scene_alignment(project.id, ProjectService.load_transcription(project.id))
 
 

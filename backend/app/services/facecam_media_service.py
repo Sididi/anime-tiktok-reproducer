@@ -5,6 +5,7 @@ import difflib
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import re
 import shutil
@@ -20,6 +21,7 @@ from .facecam_auto_editor import keep_intervals, prepared_is_current, protected_
 
 FPS = 60
 RATE = 48000
+logger = logging.getLogger(__name__)
 
 
 def probe(path: Path) -> dict:
@@ -195,7 +197,9 @@ class FacecamMediaService:
         from .project_service import ProjectService
         payload = {"language": "fr", "scenes": state.assignment}
         reference = ProjectService.load_transcription(project_id)
-        key = hashlib.sha256(json.dumps({"version": 1, "script": payload,
+        # v2 aligns separate speech runs on the uncut clock. Older caches may
+        # contain words stretched into pauses even when below the quality limit.
+        key = hashlib.sha256(json.dumps({"version": 2, "script": payload,
             "reference": reference.model_dump()}, sort_keys=True).encode()).hexdigest()[:20]
         return Path(state.recording["directory"]) / f"alignment-{key}" / "source_transcription.json"
 
@@ -217,7 +221,7 @@ class FacecamMediaService:
     @classmethod
     def source_alignment(cls, project_id: str, state, root: Path, timing: dict):
         """Align the approved script once on the immutable, uncut source audio."""
-        from .forced_alignment import ForcedAlignmentService
+        from .forced_alignment import ForcedAlignmentError, ForcedAlignmentService
         from .project_service import ProjectService
         from .transcriber import TranscriberService
         cache = cls.alignment_cache(project_id, state)
@@ -226,11 +230,26 @@ class FacecamMediaService:
             directory.mkdir(exist_ok=True)
             payload = {"language": "fr", "scenes": state.assignment}
             reference = ProjectService.load_transcription(project_id)
-            with TranscriberService.model_session():
-                alignment = ForcedAlignmentService._align_single_audio(
-                    project_id=project_id, script_payload=payload, reference_transcription=reference,
-                    manifest=cls.manifest(payload), edited_audio_path=root / "voice.wav", align_language="fr",
-                    coarse_model_size="large-v3", output_dir=directory, coarse_words=timing["words"])
+            manifest = ForcedAlignmentService.split_manifest_at_pauses(
+                cls.manifest(payload), timing["words"], timing.get("uncertain_spans", []))
+            try:
+                with TranscriberService.model_session():
+                    alignment = ForcedAlignmentService._align_single_audio(
+                        project_id=project_id, script_payload=payload, reference_transcription=reference,
+                        manifest=manifest, edited_audio_path=root / "voice.wav", align_language="fr",
+                        coarse_model_size="large-v3", output_dir=directory, coarse_words=timing["words"])
+            except ForcedAlignmentError as exc:
+                ForcedAlignmentService.write_alignment_report(directory, exc.report)
+                logger.warning("Facecam source alignment failed for %s; report=%s; issues=%s",
+                               project_id, ForcedAlignmentService.report_path(directory),
+                               [*exc.report.get("global_issues", []),
+                                *(issue for segment in exc.report.get("segments", [])
+                                  for issue in segment.get("issues", []))])
+                raise ForcedAlignmentError(
+                    "L'alignement de la voix au script n'est pas assez fiable pour préparer l'aperçu. "
+                    "Réessayez ; si l'erreur persiste, vérifiez les différences de transcription.",
+                    report=exc.report,
+                ) from exc
             ForcedAlignmentService.write_alignment_report(directory, alignment.report)
             write_text_atomic(cache, alignment.transcription.model_dump_json())
         return Transcription.model_validate_json(cache.read_text()), ForcedAlignmentService.report_path(directory)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import hashlib
+import logging
 import re
 from pathlib import Path
 
@@ -12,7 +13,12 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from .facecam_service import FacecamService
 
 
+logger = logging.getLogger(__name__)
+
+
 class FacecamCoverService:
+    MAX_DISCOVERY_QUERIES = 4
+
     @staticmethod
     def title_queries(title: str) -> list[str]:
         """Library titles can contain both a romanized title and an English alias."""
@@ -24,23 +30,55 @@ class FacecamCoverService:
         return re.sub(r"\W", "", (title or "").casefold())
 
     @classmethod
+    def discovery_queries(cls, title: str) -> list[str]:
+        """Broaden retrieval when catalog word spacing defeats full-title search.
+
+        These terms only discover candidates. They are never used to establish
+        identity: auto-selection still requires the complete title or an alias.
+        """
+        primary = re.sub(r"\([^()]*\)", "", title).strip()
+        terms = list(dict.fromkeys(word for word in re.findall(r"[^\W_]+", primary) if len(word) >= 5))
+        return sorted(terms, key=len, reverse=True)[:cls.MAX_DISCOVERY_QUERIES]
+
+    @classmethod
     def exact_matches(cls, title: str, results: list[dict]) -> list[dict]:
         titles = {cls.normalize_title(value) for value in cls.title_queries(title)}
         return [media for media in results if titles.intersection(
-            cls.normalize_title(value) for value in [*media["title"].values(), *media.get("synonyms", [])] if value
+            cls.normalize_title(value) for value in [*media["title"].values(), *(media.get("synonyms") or [])] if value
         )]
 
     @classmethod
     def search(cls, project_id):
         project = FacecamService.project(project_id)
+        title = project.anime_name or ""
         query = '''query($search:String){Page(perPage:8){media(search:$search,type:ANIME){id title{romaji english native} synonyms coverImage{extraLarge} siteUrl}}}'''
         results = {}
         with httpx.Client(timeout=30) as client:
-            for title in cls.title_queries(project.anime_name or ""):
-                response = client.post("https://graphql.anilist.co", json={"query": query, "variables": {"search": title}})
+            queried = set()
+
+            def fetch(search):
+                queried.add(search.casefold())
+                response = client.post("https://graphql.anilist.co", json={"query": query, "variables": {"search": search}})
                 response.raise_for_status()
-                for media in response.json()["data"]["Page"]["media"]:
+                payload = response.json()
+                page = (payload.get("data") or {}).get("Page")
+                if payload.get("errors") or not isinstance(page, dict) or not isinstance(page.get("media"), list):
+                    raise ValueError("La recherche AniList est indisponible. Réessayez dans quelques instants.")
+                for media in page["media"]:
+                    if (not isinstance(media, dict) or type(media.get("id")) is not int
+                            or not isinstance(media.get("title"), dict)):
+                        raise ValueError("La recherche AniList a renvoyé une réponse invalide. Réessayez.")
                     results[media["id"]] = media
+
+            for search in cls.title_queries(title):
+                fetch(search)
+            if not cls.exact_matches(title, list(results.values())):
+                for search in cls.discovery_queries(title):
+                    if search.casefold() not in queried:
+                        fetch(search)
+            logger.info("Facecam cover lookup project=%s queries=%d candidates=%d exact=%s",
+                        project_id, len(queried), len(results),
+                        [media["id"] for media in cls.exact_matches(title, list(results.values()))])
         return list(results.values())
 
     @classmethod
@@ -80,8 +118,16 @@ class FacecamCoverService:
             return cls.render(project_id)
         results = cls.search(project_id)
         exact = cls.exact_matches(FacecamService.project(project_id).anime_name or "", results)
-        if len(exact) != 1:
-            raise ValueError("Choisissez la bonne couverture dans Facecam, ou importez une image, puis relancez le traitement.")
+        if not exact:
+            raise ValueError(
+                "Aucune correspondance certaine trouvée sur AniList pour le nom de cet anime. "
+                "Vérifiez son nom, choisissez une couverture dans Facecam ou importez une image."
+            )
+        if len(exact) > 1:
+            raise ValueError(
+                "Plusieurs animes correspondent à ce nom sur AniList. Choisissez la bonne couverture "
+                "dans Facecam, puis relancez le traitement."
+            )
         cls.select(project_id, exact[0]["id"])
         return cls.render(project_id)
 

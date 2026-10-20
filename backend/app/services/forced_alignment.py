@@ -51,6 +51,7 @@ class ForcedAlignmentService:
     MIN_WINDOW_SEC = 1.2
     LONG_WORD_ABS_MAX_SEC = 3.0
     LONG_WORD_MEDIAN_FACTOR = 4.0
+    PAUSE_SPLIT_MIN_SEC = 1.0
 
     @classmethod
     def manifest_path(cls, project_id: str) -> Path:
@@ -236,6 +237,81 @@ class ForcedAlignmentService:
             "text": str(segment.get("text") or ""),
             "character_count": int(segment.get("character_count") or 0),
         }
+
+    @classmethod
+    def split_manifest_at_pauses(
+        cls,
+        manifest: dict[str, Any],
+        coarse_words: list[dict[str, Any]],
+        uncertain_spans: list[tuple[float, float]] = (),
+    ) -> dict[str, Any]:
+        """Bound exact alignment by observed pauses without changing scene ownership.
+
+        A long uncut take can make CTC extend a word across several seconds of
+        silence. Only split between adjacent, exactly matched lexical anchors in
+        both the script and ASR. Unmatched words and unresolved ASR spans cannot
+        establish a safe boundary. Audio itself is neither cut nor retimed here.
+        """
+        if manifest.get("mode") != "single_audio":
+            return manifest
+        segments = manifest.get("segments", [])
+        segment_words: list[list[tuple[int, str]]] = []
+        expected: list[tuple[int, int, str]] = []
+        for position, segment in enumerate(segments):
+            words = [(fragment["scene_index"], word)
+                     for fragment in segment.get("scene_fragments", [])
+                     for word in fragment["text"].split()]
+            # Some TTS manifests contain transformed delivery text. Do not split
+            # those using fragments that no longer describe the exact wording.
+            if [word for _, word in words] != str(segment.get("text", "")).split():
+                words = []
+            segment_words.append(words)
+            for index, word in enumerate(str(segment.get("text", "")).split()):
+                token = TranscriberService._normalize_token(word)
+                if token:
+                    expected.append((position, index, token))
+        coarse = [(word, TranscriberService._normalize_token(str(word.get("text") or "")))
+                  for word in coarse_words]
+        coarse = [(word, token) for word, token in coarse if token]
+        mapping = TranscriberService._sequence_align(
+            [token for _, _, token in expected], [token for _, token in coarse])
+        splits: dict[int, list[int]] = {}
+        for index in range(1, len(expected)):
+            left, right = expected[index - 1], expected[index]
+            a, b = mapping[index - 1], mapping[index]
+            if left[0] != right[0] or not segment_words[right[0]]:
+                continue
+            if a is None or b is None or b != a + 1:
+                continue
+            start, end = float(coarse[a][0]["end"]), float(coarse[b][0]["start"])
+            if (not math.isfinite(start) or not math.isfinite(end)
+                    or end - start < cls.PAUSE_SPLIT_MIN_SEC):
+                continue
+            if any(lo < end and hi > start for lo, hi in uncertain_spans):
+                continue
+            splits.setdefault(right[0], []).append(right[1])
+
+        result = []
+        for position, segment in enumerate(segments):
+            if position not in splits:
+                result.append({**segment, "id": len(result), "source_segment_id": segment["id"]})
+                continue
+            words = segment_words[position]
+            bounds = [0, *splits[position], len(words)]
+            for start, end in zip(bounds[:-1], bounds[1:], strict=True):
+                fragments: list[dict[str, Any]] = []
+                for scene_index, word in words[start:end]:
+                    if fragments and fragments[-1]["scene_index"] == scene_index:
+                        fragments[-1]["text"] += " " + word
+                    else:
+                        fragments.append({"scene_index": scene_index, "text": word})
+                text = " ".join(word for _, word in words[start:end])
+                result.append({
+                    **segment, "id": len(result), "source_segment_id": segment["id"],
+                    "text": text, "character_count": len(text), "scene_fragments": fragments,
+                    "scene_indices": list(dict.fromkeys(f["scene_index"] for f in fragments)),
+                })
+        return {**manifest, "segments": result}
 
     @classmethod
     def align_known_script(
@@ -754,6 +830,7 @@ class ForcedAlignmentService:
 
         report = {
             "id": int(segment["id"]),
+            "source_segment_id": int(segment.get("source_segment_id", segment["id"])),
             "scene_indices": [int(value) for value in segment.get("scene_indices", [])],
             "scene_fragments": [
                 {

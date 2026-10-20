@@ -49,11 +49,11 @@ def draft(source):
     return project, state
 
 
-def range_model(pid, prompt):
+def range_model(pid, prompt, **kwargs):
     payload = json.loads(prompt.split('\n',1)[1])
     count = len(payload['words'])
-    indices = [s['scene_index'] for s in payload['scenes']]
-    return {'ranges':[{'scene_index':i, 'start':pos*count//len(indices), 'end':(pos+1)*count//len(indices)} for pos,i in enumerate(indices)]}
+    scenes = len(payload['scenes'])
+    return {'boundaries': [pos*count//scenes for pos in range(1, scenes)]}
 
 
 def narrative_brief():
@@ -203,17 +203,129 @@ def test_approval_preserves_every_word_order_and_raw_boundaries(source,monkeypat
     assert FacecamService.reference(project.id) == reference
 
 
-@pytest.mark.parametrize('ranges', [[{'scene_index':0,'start':1,'end':3}], [{'scene_index':0,'start':0,'end':2}], [{'scene_index':0,'start':0,'end':4}], [{'scene_index':0,'start':False,'end':3}]])
-def test_rejects_missing_duplicate_or_invalid_word_ranges(ranges):
-    with pytest.raises(ValueError): FacecamService.validate_ranges(['un','deux','trois'],ranges,[0])
-
-
 def test_invalid_assignment_keeps_approved_text_unchanged(source,monkeypatch):
+    reference = ProjectService.load_transcription(source.id)
+    reference.scenes[1].is_raw = False
+    ProjectService.save_transcription(source.id, reference)
     project,state=draft(source)
-    monkeypatch.setattr(FacecamService,'llm',lambda *a:{'ranges':[]})
-    with pytest.raises(ValueError): FacecamService.approve(project.id,state.revision)
+    root = ProjectService.get_project_dir(project.id)
+    files = ['facecam/state.json', 'facecam/reference.json', 'facecam/reference_matches.json',
+             'transcription.json', 'matches.json', 'scenes.json']
+    before = {name: (root / name).read_bytes() for name in files}
+    monkeypatch.setattr(FacecamService,'llm',lambda *a, **kw: {'boundaries': []})
+    with pytest.raises(ValueError, match='3 tentatives'):
+        FacecamService.approve(project.id,state.revision)
     assert FacecamService.load(project.id).blocks == state.blocks
     assert FacecamService.load(project.id).approved_revision is None
+    assert {name: (root / name).read_bytes() for name in files} == before
+    assert not (root / 'new_script.json').exists()
+
+
+def test_single_scene_blocks_need_no_model_during_approval(source, monkeypatch):
+    project, state = draft(source)
+    monkeypatch.setattr(FacecamService, 'llm', lambda *a, **kw: pytest.fail('No choice to make'))
+    approved = FacecamService.approve(project.id, state.revision)
+    assert approved.approved_revision == state.revision
+    assert ' '.join(a['text'] for a in approved.assignment).split() == state.spoken_text().split()
+
+
+@pytest.mark.parametrize('fail_second_block', [False, True])
+def test_assignment_keeps_raw_separator_and_commits_only_after_all_blocks(source, monkeypatch, fail_second_block):
+    reference = Transcription(language='fr', scenes=[
+        SceneTranscription(scene_index=i, text=f'Une action dans le plan {i}.',
+                           start_time=i*2, end_time=(i+1)*2, is_raw=i == 2) for i in range(5)])
+    ProjectService.save_transcription(source.id, reference)
+    ProjectService.save_scenes(source.id, SceneList(scenes=[
+        Scene(index=i, start_time=i*2, end_time=(i+1)*2) for i in range(5)]))
+    ProjectService.save_matches(source.id, MatchList(matches=[
+        SceneMatch(scene_index=i, episode='episode.mp4', start_time=20+i*2, end_time=22+i*2,
+                   confidence=1, speed_ratio=1) for i in range(5)]))
+    project, state = draft(source)
+    root = ProjectService.get_project_dir(project.id)
+    files = ['facecam/state.json', 'transcription.json', 'matches.json', 'scenes.json']
+    before = {name: (root / name).read_bytes() for name in files}
+    calls = []
+    def generate(pid, prompt, **kwargs):
+        payload = json.loads(prompt.split('\n', 1)[1])
+        calls.append(payload)
+        if fail_second_block and len(calls) > 1:
+            return {'boundaries': []}
+        return range_model(pid, prompt)
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    if fail_second_block:
+        with pytest.raises(ValueError, match='3 tentatives'):
+            FacecamService.approve(project.id, state.revision)
+        assert len(calls) == 4  # First block succeeded; second exhausted its budget.
+        assert {name: (root / name).read_bytes() for name in files} == before
+        assert not (root / 'new_script.json').exists()
+    else:
+        approved = FacecamService.approve(project.id, state.revision)
+        assert len(calls) == 2
+        assert [pair[1] for pair in calls[0]['words']] == (state.blocks[0].text + ' ' + state.blocks[1].text).split()
+        assert [pair[1] for pair in calls[1]['words']] == state.blocks[3].text.split()
+        assert approved.assignment[2] == {'scene_index': 2, 'text': ''}
+        assert ' '.join(a['text'] for a in approved.assignment).split() == state.spoken_text().split()
+        assert ProjectService.load_matches(project.id).matches[2].start_time == 24
+        assert [s.is_raw for s in ProjectService.load_transcription(project.id).scenes] == [False, False, True, False, False, False]
+        ProjectService.validate_transcription_scene_alignment(project.id, ProjectService.load_transcription(project.id))
+
+
+def test_approval_rejects_stale_layout_before_model_call(source, monkeypatch):
+    project, state = draft(source)
+    state.blocks[1].scene_indices = [42]
+    FacecamService.update(project.id, {'blocks': state.blocks})
+    monkeypatch.setattr(FacecamService, 'llm', lambda *a, **kw: pytest.fail('Invalid layout'))
+    with pytest.raises(ValueError, match='plans du script'):
+        FacecamService.approve(project.id, state.revision)
+    assert FacecamService.load(project.id).approved_revision is None
+
+
+@pytest.mark.parametrize('valid_response', [True, False])
+def test_edit_during_assignment_prevents_commit_and_retry(source, monkeypatch, valid_response):
+    reference = ProjectService.load_transcription(source.id)
+    reference.scenes[1].is_raw = False
+    ProjectService.save_transcription(source.id, reference)
+    project, state = draft(source)
+    calls = []
+    def generate(pid, prompt, **kwargs):
+        calls.append(prompt)
+        state.blocks[1].text = 'Un texte modifié pendant la répartition.'
+        FacecamService.save_draft(pid, state.revision, state.blocks, state.selected_hook, state.selected_opinion)
+        return range_model(pid, prompt) if valid_response else {'boundaries': []}
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    with pytest.raises(StaleFacecamRevision):
+        FacecamService.approve(project.id, state.revision)
+    assert len(calls) == 1
+    current = FacecamService.load(project.id)
+    assert current.revision == state.revision + 1 and current.approved_revision is None
+    assert current.blocks[1].text == state.blocks[1].text
+    assert not (ProjectService.get_project_dir(project.id) / 'new_script.json').exists()
+
+
+def test_failed_source_alignment_saves_report_without_caching_invalid_words(source, monkeypatch, caplog):
+    import contextlib
+    from app.services.forced_alignment import ForcedAlignmentError, ForcedAlignmentService
+    from app.services.transcriber import TranscriberService
+
+    project, state = draft(source)
+    root = FacecamService.directory(project.id) / 'recordings' / 'test'
+    root.mkdir(parents=True)
+    state.recording = {'directory': str(root)}
+    state.assignment = [{'scene_index': 0, 'text': 'Un dragon noir. Puis elle revient.'}]
+    cache = FacecamMediaService.alignment_cache(project.id, state)
+    report = {'status': 'error', 'segments': [{'issues': ["Anomalously long word 'noir.'"]}],
+              'global_issues': []}
+    def fail(**kwargs):
+        raise ForcedAlignmentError('Forced alignment quality check failed for single audio', report=report)
+    monkeypatch.setattr(ForcedAlignmentService, '_align_single_audio', fail)
+    monkeypatch.setattr(TranscriberService, 'model_session', lambda: contextlib.nullcontext())
+    with pytest.raises(ForcedAlignmentError, match="pas assez fiable") as raised:
+        FacecamMediaService.source_alignment(project.id, state, root, {'words': []})
+    assert raised.value.report == report
+    assert not cache.exists()
+    assert json.loads(ForcedAlignmentService.report_path(cache.parent).read_text()) == report
+    assert project.id in caplog.text and 'noir.' in caplog.text
+    assert FacecamService.load(project.id).prepared is None
 
 
 def test_edit_invalidates_recording_review_and_prevents_stale_result(source):

@@ -293,9 +293,11 @@ class FacecamService:
         ]}
 
     @classmethod
-    def llm(cls, project_id, prompt: str) -> Any:
+    def llm(cls, project_id, prompt: str, *, response_schema: dict[str, Any] | None = None,
+            schema_name: str = "response") -> Any:
         project = cls.project(project_id)
-        return LLMService.generate_json_value(prompt, preset_key=project.resolved_llm_preset_key(), tier="big")
+        return LLMService.generate_json_value(prompt, preset_key=project.resolved_llm_preset_key(), tier="big",
+                                             response_schema=response_schema, schema_name=schema_name)
 
     @classmethod
     def narrative_context(cls, project_id: str) -> dict:
@@ -488,30 +490,19 @@ class FacecamService:
             return cls.update(project_id, {"fact_status": "unavailable", "fact_error": str(exc),
                 "findings": [], "fact_revision": None, "fact_context": context}, state.revision)
 
-    @staticmethod
-    def validate_ranges(words: list[str], ranges: list[dict], expected: list[int]) -> list[dict]:
-        if [r.get("scene_index") for r in ranges] != expected:
-            raise ValueError("Les scènes de la répartition ne correspondent pas à la source.")
-        cursor = 0
-        result = []
-        for entry in ranges:
-            start, end = entry.get("start"), entry.get("end")
-            if type(start) is not int or type(end) is not int or start != cursor or end <= start or end > len(words):
-                raise ValueError("Répartition invalide : mots manquants, répétés ou déplacés. Réessayez.")
-            result.append({"scene_index": entry["scene_index"], "text": " ".join(words[start:end])})
-            cursor = end
-        if cursor != len(words):
-            raise ValueError("La répartition ne couvre pas tous les mots approuvés.")
-        return result
-
     @classmethod
     def approve(cls, project_id: str, revision: int):
+        from .facecam_assignment_service import FacecamAssignmentService
+
         state = cls.load(project_id)
         if state.revision != revision:
             raise StaleFacecamRevision("Le script a changé.")
         if not state.blocks or any(not b.text.strip() for b in state.blocks if b.kind != "raw"):
             raise ValueError("Complétez l'accroche, le récit et le point de vue avant de valider.")
         cls.require_story(project_id)
+        expected = cls.skeleton(project_id, include_opinion=any(b.kind == "opinion" for b in state.blocks))
+        if [(b.id, b.kind, b.scene_indices) for b in state.blocks] != [(b.id, b.kind, b.scene_indices) for b in expected]:
+            raise ValueError("Les plans du script ont changé. Régénérez le récit avant de le valider.")
         reference, matches, montage_map = cls.montage_reference(project_id)
         scene_map = {s.scene_index: s for s in reference.scenes}
         from ..models import SceneTranscription
@@ -520,20 +511,19 @@ class FacecamService:
         leading_raw = reference.scenes[0].is_raw
         assignment = []
         bodies = [b for b in state.blocks if b.kind == "body"]
+
+        def generate(prompt, **kwargs):
+            if cls.load(project_id).revision != revision:
+                raise StaleFacecamRevision("Le script a changé. Rechargez la version actuelle.")
+            return cls.llm(project_id, prompt, **kwargs)
+
         for pos, block in enumerate(bodies):
             text = ((state.blocks[0].text + " ") if pos == 0 and not leading_raw else "") + block.text
             words = text.split()
-            result = cls.llm(project_id,
-                "Répartis les mots français approuvés sur leurs scènes originales sans changer aucun mot. "
-                "Priorité 1: placer les actions/noms sur les ancrages visuels suggérés par le texte source; "
-                "priorité 2: équilibrer selon les durées. Les plages sont contiguës, non vides, "
-                "start inclus, end exclus; elles couvrent tous les mots dans l'ordre. "
-                'Retourne {"ranges":[{"scene_index":0,"start":0,"end":5}]}.\n' + json.dumps({
-                    "words": list(enumerate(words)), "scenes": [
-                        {"scene_index": i, "original": scene_map[i].text,
-                         "duration": match_map[i].end_time - match_map[i].start_time} for i in block.scene_indices
-                    ]}, ensure_ascii=False))
-            assignment += cls.validate_ranges(words, result.get("ranges", []), block.scene_indices)
+            assignment += FacecamAssignmentService.assign(words, [
+                {"scene_index": i, "original": scene_map[i].text,
+                 "duration": match_map[i].end_time - match_map[i].start_time} for i in block.scene_indices
+            ], generate, context=f"project={project_id}, block={block.id}")
         by_scene = {r["scene_index"]: r for r in assignment}
         assignment = [{"scene_index": s.scene_index, "text": ""} if s.is_raw else by_scene[s.scene_index] for s in reference.scenes]
         outro_index = max(s.scene_index for s in reference.scenes) + 1
@@ -582,6 +572,8 @@ class FacecamService:
             scene.start_time, scene.end_time = cursor, cursor + length
             scene.words = [w.model_copy(update={"start": w.start + shift, "end": w.end + shift}) for w in scene.words]
             cursor += length
+        if " ".join(row["text"] for row in assignment).split() != state.spoken_text().split():
+            raise ValueError("La répartition ne conserve pas exactement les mots du script.")
         with cls.lock(project_id):
             state = cls.update(project_id, {"approved_revision": revision, "assignment": assignment,
                 "montage_map": montage_map, "prepared": None, "processed_signature": None}, revision)
