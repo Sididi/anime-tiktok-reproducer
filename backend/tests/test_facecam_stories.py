@@ -45,7 +45,7 @@ def option(title='Le retour', indices=(5, 9, 42)):
 
 
 def detect(project, monkeypatch, *options):
-    monkeypatch.setattr(FacecamService, 'llm', lambda *a: {'stories': list(options)})
+    monkeypatch.setattr(FacecamService, 'llm', lambda *a, **k: {'stories': list(options)})
     return FacecamService.analyze_stories(project.id, FacecamService.load(project.id).revision)
 
 
@@ -179,12 +179,17 @@ def test_multiple_arcs_require_a_choice_before_hooks(project, monkeypatch):
         FacecamService.select_story(project.id, state.revision, state.stories[0].id)
 
 
-def test_internal_cut_reaches_montage_without_reintroducing_omitted_events(project, monkeypatch):
+@pytest.mark.parametrize('start_word', [0, None])
+def test_internal_cut_reaches_montage_without_reintroducing_omitted_events(project, monkeypatch, start_word):
     root = ProjectService.get_project_dir('original')
     original_files = {n: (root / n).read_bytes() for n in ['transcription.json', 'matches.json']}
     ref_before = FacecamService.reference(project.id).model_dump_json()
     matches_before = FacecamService.source_matches(project.id).model_dump_json()
-    detect(project, monkeypatch, option())
+    proposal = option()
+    proposal['clips'][-1]['start_word'] = start_word
+    detected = detect(project, monkeypatch, proposal)
+    assert detected.stories[0].clips[-1].start_word == 0
+    assert FacecamService.load(project.id).stories[0].clips[-1].start_word == 0
     context = FacecamService.context(project.id)
     assert [s['scene_index'] for s in context['scenes']] == [5, 9, 42]
     assert context['scenes'][-1]['text'] == 'des gobelins.'
@@ -263,7 +268,7 @@ def test_switching_arc_clears_dependent_state_but_keeps_recording(project, monke
 
 @pytest.mark.parametrize('clips', [[], [{'scene_index': 999}], [{'scene_index': True}],
     [{'scene_index': 42}, {'scene_index': 5}], [{'scene_index': 5}, {'scene_index': 5}],
-    [{'scene_index': 42, 'start_word': 1}], [{'scene_index': 42, 'start_word': 3, 'end_word': 2}],
+    [{'scene_index': 42, 'start_word': 5}], [{'scene_index': 42, 'start_word': 3, 'end_word': 2}],
     [{'scene_index': 42, 'start_word': -1, 'end_word': 2}], [{'scene_index': 42, 'start_word': 0, 'end_word': 99}],
     [{'scene_index': 42, 'start_word': True, 'end_word': 2}], [{'scene_index': 9}],
     [{'scene_index': 5}, {'scene_index': 9, 'start_word': 0, 'end_word': 2}],
@@ -276,10 +281,12 @@ def test_invalid_plan_does_not_persist_partial_analysis(project, monkeypatch, cl
     assert FacecamService.load(project.id).revision == 0
 
 
-def test_partial_start_uses_source_word_time_and_episode_scale(project, monkeypatch):
+@pytest.mark.parametrize('end_word', [5, None])
+def test_partial_start_uses_source_word_time_and_episode_scale(project, monkeypatch, end_word):
     value = option(indices=(42,))
-    value['clips'][0].update(start_word=2, end_word=5)
-    detect(project, monkeypatch, value)
+    value['clips'][0].update(start_word=2, end_word=end_word)
+    state = detect(project, monkeypatch, value)
+    assert state.stories[0].clips[0].end_word == 5
     ref, matches, _ = FacecamService.montage_reference(project.id)
     assert ref.scenes[0].text == 'Mais elle refuse.'
     assert ref.scenes[0].start_time == 22 and ref.scenes[0].end_time == 30
@@ -287,7 +294,7 @@ def test_partial_start_uses_source_word_time_and_episode_scale(project, monkeypa
 
 
 def test_selection_rejects_changed_source_and_analysis_never_overwrites_concurrent_draft(project, monkeypatch):
-    def changed_during_analysis(pid, prompt):
+    def changed_during_analysis(pid, prompt, **kwargs):
         FacecamService.update(pid, {'revision': 1})
         return {'stories': [option()]}
     monkeypatch.setattr(FacecamService, 'llm', changed_during_analysis)
@@ -303,7 +310,38 @@ def test_selection_rejects_changed_source_and_analysis_never_overwrites_concurre
         FacecamService.narrative_context(project.id)
 
 
-def test_selected_story_bounds_reach_brief_and_writer_and_long_body_is_retried(project, monkeypatch):
+def test_failed_reanalysis_keeps_existing_draft_selection_and_approval(project, monkeypatch):
+    detect(project, monkeypatch, option())
+    state = write_draft(project)
+    monkeypatch.setattr(FacecamService, 'llm', ranges)
+    FacecamService.approve(project.id, state.revision)
+    # A source update makes analysis necessary, but no failed proposal may be committed.
+    reference = FacecamService.reference(project.id)
+    reference.scenes[0].text = 'Le héros revient enfin.'
+    (FacecamService.directory(project.id) / 'reference.json').write_text(reference.model_dump_json())
+    previous = (FacecamService.directory(project.id) / 'state.json').read_bytes()
+    with pytest.raises(ValueError, match='3 tentatives'):
+        detect(project, monkeypatch, option(), {**option(), 'clips': [{'scene_index': 42, 'end_word': 99}]})
+    assert (FacecamService.directory(project.id) / 'state.json').read_bytes() == previous
+
+
+def test_source_change_during_corrective_retry_prevents_commit(project, monkeypatch):
+    calls = []
+    def generate(pid, prompt, **kwargs):
+        calls.append(prompt)
+        if len(calls) == 1:
+            return {'stories': [{**option(), 'clips': [{'scene_index': 42, 'end_word': 99}]}]}
+        reference = FacecamService.reference(pid)
+        reference.scenes[0].text = 'La source a changé.'
+        (FacecamService.directory(pid) / 'reference.json').write_text(reference.model_dump_json())
+        return {'stories': [option()]}
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    with pytest.raises(ValueError, match='source a changé pendant'):
+        FacecamService.analyze_stories(project.id, 0)
+    assert len(calls) == 2 and not FacecamService.load(project.id).stories
+
+
+def test_selected_story_bounds_reach_writer_and_long_body_is_saved_without_retry(project, monkeypatch):
     detect(project, monkeypatch, option(indices=(5, 42)))
     prompts = []
     def model(pid, prompt):
@@ -319,15 +357,48 @@ def test_selected_story_bounds_reach_brief_and_writer_and_long_body_is_retried(p
             payload = json.loads(prompt.splitlines()[-1])
             assert payload['selected_story']['title'] == 'Le retour'
             assert payload['budget']['max_words'] == 231
+            assert payload['body_budget']['advisory'] is True
             return {'blocks': [{'id': 'body-5', 'text': 'récit ' * 300}]}
-        assert 'dépasse le budget' in prompt
-        return {'blocks': [{'id': 'body-5', 'text': 'récit ' * 215}]}
+        pytest.fail('An overlong draft must not trigger another paid writing call')
     monkeypatch.setattr(FacecamService, 'llm', model)
     state = FacecamService.generate(project.id, 'Un héros discret.', '', 1)
-    assert len(prompts) == 3
-    assert 65 < state.estimated_duration_seconds < 70
+    assert len(prompts) == 2  # Brief extraction plus a single writing call.
+    assert state.estimated_duration_seconds > 70
     assert [b.scene_indices for b in state.blocks if b.kind == 'body'] == [[5, 42]]
+    assert state.blocks[1].text == ('récit ' * 300).strip()
     assert state.blocks[-1].text == ENDING
+    assert FacecamService.load(project.id) == state
+    archive, = (FacecamService.directory(project.id) / 'generations').glob('*.json')
+    saved = json.loads(archive.read_text())
+    assert saved['revision'] == 1 and saved['hook'] == 'Un héros discret.'
+    assert saved['stories_fingerprint'] == state.stories_fingerprint
+    assert saved['response']['blocks'][0]['text'] == 'récit ' * 300
+    # Duration remains advisory through approval, and updates after manual condensation.
+    monkeypatch.setattr(FacecamService, 'llm', ranges)
+    approved = FacecamService.approve(project.id, state.revision)
+    assert approved.approved_revision == state.revision
+    state.blocks[1].text = 'récit ' * 215
+    shorter = FacecamService.save_draft(project.id, state.revision, state.blocks, state.selected_hook, '')
+    assert 65 < shorter.estimated_duration_seconds < 70
+    assert shorter.approved_revision is None
+
+
+def test_long_hook_and_opinion_do_not_block_writing_with_an_exhausted_budget(project, monkeypatch):
+    selected = detect(project, monkeypatch, option(indices=(5, 42)))
+    monkeypatch.setattr(FacecamService, 'narrative_context', lambda *a: {
+        'budget': FacecamStoryService.budget(selected.stories[0]),
+    })
+    calls = []
+    def generate(pid, prompt):
+        calls.append(prompt)
+        payload = json.loads(prompt.splitlines()[-1])
+        assert payload['body_budget'] == {'min_words': 0, 'max_words': 0, 'advisory': True}
+        return {'blocks': [{'id': 'body-5', 'text': 'Le héros revient et demande une mission.'}]}
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    state = FacecamService.generate(project.id, 'accroche ' * 200, 'opinion ' * 100, selected.revision)
+    assert len(calls) == 1 and state.estimated_duration_seconds > 70
+    assert len(state.selected_hook.split()) == 200 and len(state.selected_opinion.split()) == 100
+    assert state.blocks[1].text == 'Le héros revient et demande une mission.'
 
 
 def test_existing_draft_is_not_replaced_by_single_arc_detection(project, monkeypatch):

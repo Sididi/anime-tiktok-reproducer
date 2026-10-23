@@ -1,7 +1,7 @@
 import type { Project } from '@/types';
 
 export interface FacecamBlock { id: string; kind: 'hook' | 'body' | 'raw' | 'opinion' | 'ending'; text: string; scene_indices: number[] }
-export interface Finding { quote: string; start: number; end: number; kind: 'contradiction' | 'uncertain'; explanation: string; correction: string; sources: {url: string; title: string; kind?: string; text?: string; language?: string}[] }
+export interface Finding { id?: string; quote: string; start: number; end: number; kind: 'contradiction' | 'uncertain'; explanation: string; correction: string; sources: {url: string; title: string; kind?: string; text?: string; language?: string}[] }
 export interface FacecamStory {
   id: string; title: string; premise: string; ending: string; steps: string[]; omitted: string[];
   clips: {scene_index: number; start_word: number | null; end_word: number | null}[];
@@ -35,7 +35,7 @@ export interface FacecamState {
   stories?: FacecamStory[]; full_story?: FacecamStory | null; selected_story_id?: string | null; estimated_duration_seconds?: number | null;
   revision: number; hooks: {id: string; text: string; original: boolean}[]; opinions: {id: string; text: string; original: boolean}[];
   selected_hook: string; selected_opinion: string; blocks: FacecamBlock[]; approved_revision: number | null;
-  fact_revision: number | null; fact_status: 'unchecked' | 'complete' | 'unavailable'; fact_error: string | null; findings: Finding[];
+  findings_revision?: number | null; fact_revision: number | null; fact_status: 'unchecked' | 'complete' | 'unavailable'; fact_error: string | null; findings: Finding[];
   fact_context?: {padding_seconds: number; episodes: {episode: string; status: 'available' | 'partial' | 'unavailable'; language: string | null; note: string | null; windows: {start: string; end: string}[]; cues: {id: string; start: string; end: string; text: string; source_url: string}[]}[]} | null;
   recording: {fingerprint: string; duration: number; transcript: string; differences: {kind: string; expected: string; spoken: string}[]; reviewed_revision: number | null} | null;
   recording_edit?: RecordingEdit | null;

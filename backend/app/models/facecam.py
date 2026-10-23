@@ -14,7 +14,11 @@ class FacecamCandidate(BaseModel):
 
 
 class StoryClip(BaseModel):
-    """Word bounds index the immutable source scene, never generated French words."""
+    """Source word indices; analysis resolves open bounds before persistence.
+
+    A stored clip is whole (null/null) or has two explicit, half-open bounds.
+    These never index generated French words.
+    """
     model_config = ConfigDict(extra="forbid")
     scene_index: StrictInt
     start_word: StrictInt | None = None
@@ -42,6 +46,7 @@ class ScriptBlock(BaseModel):
 
 
 class FacecamFinding(BaseModel):
+    id: str = ""
     quote: str
     start: int
     end: int
@@ -49,6 +54,12 @@ class FacecamFinding(BaseModel):
     explanation: str
     correction: str = ""
     sources: list[dict[str, str]] = Field(default_factory=list)
+
+
+class FindingRange(BaseModel):
+    id: str
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
 
 
 class RecordingCut(BaseModel):
@@ -108,6 +119,7 @@ class FacecamState(BaseModel):
     approved_revision: int | None = None
     assignment: list[dict[str, Any]] = Field(default_factory=list)
     fact_revision: int | None = None
+    findings_revision: int | None = None  # Revision of the anchors, not a new fact check.
     fact_status: Literal["unchecked", "complete", "unavailable"] = "unchecked"
     fact_error: str | None = None
     fact_context: dict[str, Any] | None = None

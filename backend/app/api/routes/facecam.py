@@ -11,7 +11,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from ...models.facecam import FacecamAutoEditorSettings, RecordingCut, ScriptBlock
+from ...models.facecam import FacecamAutoEditorSettings, FindingRange, RecordingCut, ScriptBlock
 from ...services.facecam_service import FacecamService, StaleFacecamRevision
 from ...services.project_service import ProjectService
 
@@ -24,6 +24,7 @@ class DraftRequest(BaseModel):
     blocks: list[ScriptBlock]
     selected_hook: str = ""
     selected_opinion: str = ""
+    finding_ranges: list[FindingRange] | None = None
 
 
 class ActionRequest(BaseModel):
@@ -121,7 +122,7 @@ async def events(project_id: str):
 @router.put("/{project_id}/facecam/draft")
 async def save_draft(project_id: str, request: DraftRequest):
     try:
-        return await asyncio.to_thread(FacecamService.save_draft, project_id, request.revision, request.blocks, request.selected_hook, request.selected_opinion)
+        return await asyncio.to_thread(FacecamService.save_draft, project_id, request.revision, request.blocks, request.selected_hook, request.selected_opinion, request.finding_ranges)
     except ValueError as exc:
         raise HTTPException(409 if isinstance(exc, StaleFacecamRevision) else 400, str(exc)) from exc
 

@@ -13,8 +13,10 @@ La durée est libre : ne supprime aucun événement pour viser une minute. Relie
 en un récit fluide, sans recopier la source ni répéter l'accroche ou les dialogues originaux.
 
 Lorsqu'il est fourni, body_budget donne le nombre de mots réservé au corps, après déduction de l'accroche, de l'opinion
-éventuelle et de l'annonce du titre. Vise cette fourchette et ne dépasse jamais son maximum.
+éventuelle et de l'annonce du titre. Vise cette fourchette indicative en gardant un récit clair et cohérent.
 Ce budget tient compte des extraits audio conservés et de la carte finale pour viser 65 à 70 secondes.
+Il guide la rédaction sans imposer de limite bloquante : le créateur peut condenser le brouillon à la main.
+Si le budget est trop faible ou nul, fournis quand même un récit complet et concis, sans supprimer de bloc.
 Il ne s'applique pas au choix preserve_full_story.
 Si les faits sont trop minces, reste plus court plutôt que répéter ou inventer pour remplir le temps.
 
@@ -31,7 +33,7 @@ visuels, leur chronologie et leurs relations réelles. Une simple succession res
 Si une opinion est sélectionnée, prépare une transition naturelle vers elle sans la paraphraser à l'avance.
 Finis le corps sur la situation concrète atteinte, pas sur un deuxième bilan de ce qui vient d'être raconté.
 
-La longueur respecte les faits disponibles et le budget lorsqu'il est fourni, jamais le nombre de mots du texte
+La longueur dépend des faits disponibles et vise le budget indicatif lorsqu'il est fourni, jamais le nombre de mots du texte
 source. N'étire pas un récit mince pour atteindre un quota et ne compresse pas les faits au point de
 perdre leurs liens. Évite la récitation exhaustive et les relances automatiques à chaque phrase.
 Chaque bloc body couvre ses indices, mais sa prose ne se découpe pas plan par plan.

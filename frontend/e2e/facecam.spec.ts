@@ -15,7 +15,7 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
     blocks:[{id:'hook',kind:'hook',text:'Imagine ce ninja.',scene_indices:[]},{id:'body-0',kind:'body',text:'Naruto poursuit son rêve.',scene_indices:[0]},
       {id:'raw-1',kind:'raw',text:'',scene_indices:[1]},{id:'body-2',kind:'body',text:'Il devient plus fort.',scene_indices:[2]},
       {id:'opinion',kind:'opinion',text:'Ce choix est intéressant.',scene_indices:[]},{id:'ending',kind:'ending',text:'Le nom de l’anime c’est :',scene_indices:[]}],
-    fact_revision:1,fact_status:'complete',fact_error:null,findings:[{quote:'Naruto',start:18,end:24,kind:'uncertain',explanation:'Identité à vérifier.',correction:'Vérifiez le prénom.',sources:[{url:'https://example.org/official',title:'Site officiel'}]}],recording:null,prepared:null,cover:null,job:null};
+    fact_revision:1,fact_status:'complete',fact_error:null,findings:[{id:'finding-1',quote:'Naruto',start:19,end:25,kind:'uncertain',explanation:'Identité à vérifier.',correction:'Vérifiez le prénom.',sources:[{url:'https://example.org/official',title:'Site officiel'}]}],recording:null,prepared:null,cover:null,job:null};
   if(options?.empty) state={...state,revision:0,blocks:[],selected_hook:'',selected_opinion:'',hooks:[],opinions:[],findings:[],fact_revision:null};
   state={...state,full_story:{id:'full-story',title:'Garder toute l’histoire',premise:'Le récit complet.',ending:'La fin de la source.',steps:['Toutes les étapes.'],omitted:[],
     clips:[0,1,2].map(scene_index=>({scene_index,start_word:null,end_word:null})),raw_duration_seconds:10,estimated_duration_seconds:options?.fullDuration??142}};
@@ -78,7 +78,11 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
       state={...state,selected_story_id:data.story_id,revision:state.revision+1,blocks:[],hooks:[],opinions:[],selected_hook:'',selected_opinion:'',approved_revision:null,prepared:null};
       return json(state);
     }
-    if(path==='/facecam/draft'){const data=route.request().postDataJSON();expect(data.revision).toBe(state.revision);state={...state,...data,revision:state.revision+1,approved_revision:null,prepared:null};saves++;return json(state);}
+    if(path==='/facecam/draft'){
+      const data=route.request().postDataJSON();expect(data.revision).toBe(state.revision);
+      const findings=data.finding_ranges?.map((anchor:{id:string;start:number;end:number})=>({...state.findings.find(f=>f.id===anchor.id)!,...anchor}))??state.findings;
+      state={...state,...data,findings,findings_revision:state.revision+1,revision:state.revision+1,approved_revision:null,prepared:null};saves++;return json(state);
+    }
     if(path==='/facecam/selection'){const data=route.request().postDataJSON();state={...state,selected_hook:data.hook,selected_opinion:data.opinion};return json(state);}
     if(path==='/facecam/generate'){const data=route.request().postDataJSON();state={...state,selected_hook:data.hook,selected_opinion:data.opinion,revision:state.revision+1,blocks:state.blocks.filter(b=>b.kind!=='opinion'||data.opinion.trim())};return json(state);}
     if(path==='/facecam/fact-check'){checks++;state={...state,fact_revision:state.revision};return json(state);}
@@ -321,6 +325,23 @@ test('existing drafts are preserved until the user selects an analyzed story',as
   await expect(page.getByRole('article',{name:'Le faux débutant'}).getByRole('button',{name:'Histoire retenue'})).toBeDisabled();
 });
 
+test('an overlong draft stays editable and keeps approval enabled',async({page})=>{
+  const f=await fixture(page);
+  f.state.estimated_duration_seconds=125;
+  f.state.blocks[1].text='Une phrase à condenser. '.repeat(75).trim();
+  await page.reload();
+  await expect(page.getByText('Vous pouvez condenser le texte à la main',{exact:false})).toBeVisible();
+  const approval=page.getByRole('button',{name:'Valider le script',exact:true});
+  await expect(approval).toBeEnabled();
+  const body=page.locator('section[data-facecam="body-0"] p');
+  await body.click();await page.keyboard.press('End');await page.keyboard.type(' Une correction.');
+  await expect.poll(()=>f.saves).toBe(1);
+  await expect(approval).toBeEnabled();
+  await page.reload();
+  await expect(body).toContainText('Une correction.');
+  expect(f.checks).toBe(0);
+});
+
 test('whole-script editing autosaves, keeps raw markers, and only rechecks on request',async({page})=>{
   const f=await fixture(page);
   await expect(page.locator('.facecam-finding')).toHaveCount(1);
@@ -329,7 +350,7 @@ test('whole-script editing autosaves, keeps raw markers, and only rechecks on re
   const body=page.locator('section[data-facecam="body-0"] p');
   await body.click();await page.keyboard.press('End');await page.keyboard.type(' Il avance.');
   await expect.poll(()=>f.saves).toBe(1);
-  await expect(page.locator('.facecam-finding')).toHaveCount(0);
+  await expect(page.locator('.facecam-finding')).toHaveCount(1);
   expect(f.checks).toBe(0);
   await page.reload();
   await expect(body).toContainText('Il avance.');
@@ -339,6 +360,76 @@ test('whole-script editing autosaves, keeps raw markers, and only rechecks on re
   expect(f.checks).toBe(1);
   await expect(page.locator('.facecam-finding')).toHaveCount(1);
   expect(f.state.blocks.at(-1)?.text).toBe('Le nom de l’anime c’est :');
+});
+
+async function reviewedFixture(page:Page) {
+  const f=await fixture(page);
+  f.state.blocks[1].text='Naruto revient. Naruto reste.';
+  const script=f.state.blocks.filter(b=>b.kind!=='raw').map(b=>b.text).join('\n\n');
+  f.state.findings=[
+    {...f.state.findings[0],id:'first',start:script.indexOf('Naruto'),end:script.indexOf('Naruto')+6},
+    {...f.state.findings[0],id:'second',quote:'Il devient plus fort.',start:script.indexOf('Il devient'),end:script.indexOf('Il devient')+21},
+  ];
+  // Python counts code points; both fixture quotes currently use BMP characters.
+  f.state.findings[1].end=f.state.findings[1].start+f.state.findings[1].quote.length;
+  await page.reload();
+  await expect(page.locator('.facecam-finding')).toHaveCount(2);
+  return f;
+}
+
+test('correcting one finding preserves the other through typing save and reload',async({page})=>{
+  const f=await reviewedFixture(page);
+  const second=page.locator('.facecam-fact-item').filter({hasText:'Il devient plus fort.'});
+  await second.click();
+  const body=page.locator('section[data-facecam="body-0"] p');
+  await body.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');
+  await page.keyboard.type('X');
+  await expect(page.locator('.facecam-finding')).toHaveCount(1);
+  await expect(second).toBeVisible();
+  await expect(page.locator('.facecam-fact-detail')).toContainText('Il devient plus fort.');
+  await expect.poll(()=>f.saves).toBe(1);
+  expect(f.state.findings.map(item=>item.id)).toEqual(['second']);
+  await page.reload();
+  await expect(page.locator('.facecam-finding')).toHaveText('Il devient plus fort.');
+  await expect(page.locator('section[data-facecam="body-0"] .facecam-finding')).toHaveCount(0);
+  expect(f.checks).toBe(0);
+});
+
+test('inserting emoji and a paragraph before findings shifts both exact anchors',async({page})=>{
+  const f=await reviewedFixture(page);
+  const before=f.state.findings.map(item=>item.start);
+  const body=page.locator('section[data-facecam="body-0"] p');
+  await body.click();await page.keyboard.press('Home');await page.keyboard.insertText('😀 ');
+  await page.keyboard.press('Enter');
+  await expect(page.locator('.facecam-finding')).toHaveCount(2);
+  await expect.poll(()=>f.saves).toBe(1);
+  expect(f.state.findings.map(item=>item.start)).toEqual(before.map(start=>start+3));
+  await page.reload();
+  await expect(page.locator('.facecam-finding')).toHaveCount(2);
+  expect(f.checks).toBe(0);
+});
+
+test('a delayed autosave cannot resurrect a finding corrected while it was pending',async({page})=>{
+  const f=await reviewedFixture(page);
+  let release:()=>void=()=>{};
+  const held=new Promise<void>(resolve=>{release=resolve;});
+  let requests=0;
+  await page.route('**/facecam/draft',async route=>{
+    requests++;
+    if(requests===1) await held;
+    await route.fallback();
+  });
+  const first=page.locator('section[data-facecam="body-0"] p');
+  await first.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');await page.keyboard.type('X');
+  await expect.poll(()=>requests).toBe(1);
+  const second=page.locator('section[data-facecam="body-2"] p');
+  await second.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');await page.keyboard.type('X');
+  await expect(page.locator('.facecam-finding')).toHaveCount(0);
+  release();
+  await expect.poll(()=>f.saves).toBe(2);
+  await page.reload();
+  await expect(page.locator('.facecam-fact-item')).toHaveCount(0);
+  expect(f.state.findings).toEqual([]);
 });
 
 test('candidate modal has eight choices per step and editable original hook',async({page})=>{

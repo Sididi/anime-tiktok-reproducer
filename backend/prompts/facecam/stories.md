@@ -22,8 +22,13 @@ Un plan retenu peut illustrer une phrase sans que chaque geste y soit raconté. 
 uniquement pour couvrir la source. Chaque scene_index apparaît au plus une fois par histoire.
 Pour retirer le début ou la fin d'un plan, utilise les indices des mots horodatés fournis :
 start_word inclus, end_word exclu. Ces indices appartiennent à la scène source, jamais au français
-que nous allons écrire. Les deux bornes sont null pour conserver le plan entier. Ne fournis aucun
-horaire inventé. Si words est vide, seule la conservation intégrale du plan est possible.
+que nous allons écrire. Chaque borne est un entier ou null : start_word=null signifie le début du
+plan (mot 0), end_word=null signifie la fin du plan (word_count, exclusif). Fournis les deux champs.
+Exemples pour un plan de 8 mots : null/null conserve le plan entier ; null/3 conserve les mots 0 à 2 ;
+3/null conserve les mots 3 à 7 ; 2/5 conserve les mots 2 à 4. Une coupe doit toujours garder au moins
+un mot : 0 <= début < fin <= word_count. N'utilise jamais le nombre de mots de toute la vidéo.
+Ne fournis aucun horaire inventé. Si can_trim est false (raw ou words vide), les deux bornes doivent
+être null : seule la conservation intégrale du plan est possible.
 Exemple : un plan dit « des gobelins. Mais la réceptionniste refuse » ; pour terminer sur la demande
 de mission, retiens seulement les mots avant « Mais », et ne conserve pas le refus dans les steps.
 Les extraits raw pertinents peuvent être retenus, toujours entiers ; un dialogue indispensable

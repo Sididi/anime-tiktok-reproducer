@@ -5,6 +5,7 @@ import StarterKit from '@tiptap/starter-kit';
 import { Plugin, PluginKey } from '@tiptap/pm/state';
 import { Decoration, DecorationSet } from '@tiptap/pm/view';
 import type { FacecamBlock, Finding } from '@/api/facecam';
+import { findingRanges, mapFindings } from './facecamFindings';
 
 const Section = Node.create({name: 'facecamSection', group: 'block', content: 'paragraph+', isolating: true, defining: true,
   addAttributes() { return {id: {default: ''}, kind: {default: 'body'}, scene_indices: {default: []}}; },
@@ -20,20 +21,23 @@ function signature(doc: {content?: JSONContent[]}) {return JSON.stringify(doc.co
 function document(blocks: FacecamBlock[]): JSONContent {return {type: 'doc', content: blocks.map(b => b.kind === 'raw' || b.kind === 'ending' ? {type: 'facecamMarker', attrs: b} : {type: 'facecamSection', attrs: b, content: b.text.split('\n').map(t => ({type: 'paragraph', content: t ? [{type: 'text', text: t}] : []}))})};}
 function blocksFrom(doc: JSONContent): FacecamBlock[] {return (doc.content || []).map(n => ({...n.attrs, text: n.type === 'facecamMarker' ? n.attrs?.text || '' : (n.content || []).map(p => (p.content || []).map(t => t.type === 'hardBreak' ? '\n' : t.text || '').join('')).join('\n')} as FacecamBlock));}
 
-export function FacecamEditor({blocks, findings, disabled, onChange, onFinding}: {blocks: FacecamBlock[]; findings: Finding[]; disabled: boolean; onChange: (blocks: FacecamBlock[]) => void; onFinding: (finding: Finding) => void}) {
+export function FacecamEditor({blocks, findings, disabled, onChange, onFinding}: {blocks: FacecamBlock[]; findings: Finding[]; disabled: boolean; onChange: (blocks: FacecamBlock[], findings: Finding[]) => void; onFinding: (finding: Finding) => void}) {
   const findingsRef = useRef(findings), onChangeRef = useRef(onChange), onFindingRef = useRef(onFinding);
   findingsRef.current = findings; onChangeRef.current = onChange; onFindingRef.current = onFinding;
   const editor = useEditor({extensions: [StarterKit.configure({heading: false, blockquote: false, codeBlock: false, bulletList: false, orderedList: false, horizontalRule: false}), Section, Marker,
     Extension.create({name: 'facecamReview', addProseMirrorPlugins() {return [new Plugin({key: new PluginKey('facecamReview'),
       filterTransaction(tr, state) {return !tr.docChanged || tr.getMeta('facecamLoad') || signature(tr.doc.toJSON()) === signature(state.doc.toJSON());},
-      props: {decorations(state) {const spans: Decoration[] = []; const seen = new Set<number>(); state.doc.descendants((node, pos) => {
-        if (!node.isTextblock) return;
-        findingsRef.current.forEach((f, i) => {const at = node.textContent.indexOf(f.quote); if (at >= 0 && !seen.has(i)) {spans.push(Decoration.inline(pos + 1 + at, pos + 1 + at + f.quote.length, {class: `facecam-finding ${f.kind}`, 'data-finding': String(i), title: f.explanation})); seen.add(i);}});
-      }); return DecorationSet.create(state.doc, spans);}, handleClick(_view, _pos, event) {const target = (event.target as HTMLElement).closest('[data-finding]'); if (!target) return false; const finding = findingsRef.current[Number(target.getAttribute('data-finding'))]; if (finding) onFindingRef.current(finding); return true;}}
+      props: {decorations(state) {return DecorationSet.create(state.doc,
+        findingRanges(state.doc, findingsRef.current).map(({finding: f, index, from, to}) =>
+          Decoration.inline(from, to, {class: `facecam-finding ${f.kind}`, 'data-finding': String(index), title: f.explanation})));},
+      handleClick(_view, _pos, event) {const target = (event.target as HTMLElement).closest('[data-finding]'); if (!target) return false; const finding = findingsRef.current[Number(target.getAttribute('data-finding'))]; if (finding) onFindingRef.current(finding); return true;}}
     })];}})],
     content: document(blocks), editable: !disabled,
     editorProps: {attributes: {class: 'facecam-prose', 'aria-label': 'Script Facecam complet'}},
-    onUpdate: ({editor, transaction}) => {if (transaction.docChanged && !transaction.getMeta("facecamLoad")) onChangeRef.current(blocksFrom(editor.getJSON()));},
+    onUpdate: ({editor, transaction}) => {if (transaction.docChanged && !transaction.getMeta("facecamLoad")) {
+      findingsRef.current = mapFindings(transaction, findingsRef.current);
+      onChangeRef.current(blocksFrom(editor.getJSON()), findingsRef.current);
+    }},
   });
   useEffect(() => {if (!editor) return; if (JSON.stringify(blocksFrom(editor.getJSON()).map(b => [b.id,b.kind,b.text,b.scene_indices])) !== JSON.stringify(blocks.map(b => [b.id,b.kind,b.text,b.scene_indices]))) {const doc = editor.schema.nodeFromJSON(document(blocks)); editor.view.dispatch(editor.state.tr.replaceWith(0, editor.state.doc.content.size, doc.content).setMeta('facecamLoad', true).setMeta('addToHistory', false));}}, [blocks, editor]);
   useEffect(() => {editor?.setEditable(!disabled, false);}, [disabled, editor]);

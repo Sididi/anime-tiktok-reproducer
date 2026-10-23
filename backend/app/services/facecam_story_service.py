@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
+from collections.abc import Callable
+from typing import Any
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from ..models import MatchList, Transcription
 from ..models.facecam import ENDING, StoryArc, StoryClip
+
+
+logger = logging.getLogger(__name__)
 
 
 class FacecamStoryService:
@@ -17,6 +23,83 @@ class FacecamStoryService:
     TARGET_MIN = 65
     TARGET_MAX = 70
     COVER_SECONDS = 1
+    MAX_ATTEMPTS = 3
+
+    @staticmethod
+    def response_schema() -> dict:
+        """The model proposes editorial choices; IDs and durations belong to us."""
+        text = {"type": "string", "minLength": 1}
+        word_bound = {"type": ["integer", "null"], "minimum": 0}
+        return {
+            "type": "object", "additionalProperties": False, "required": ["stories"],
+            "properties": {"stories": {
+                "type": "array", "minItems": 1, "maxItems": 6,
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "required": ["title", "premise", "ending", "steps", "omitted", "clips"],
+                    "properties": {
+                        "title": text, "premise": text, "ending": text,
+                        "steps": {"type": "array", "items": text, "minItems": 1, "maxItems": 6},
+                        "omitted": {"type": "array", "items": text},
+                        "clips": {
+                            "type": "array", "minItems": 1,
+                            "items": {
+                                "type": "object", "additionalProperties": False,
+                                "required": ["scene_index", "start_word", "end_word"],
+                                "properties": {
+                                    "scene_index": {"type": "integer"},
+                                    "start_word": word_bound, "end_word": word_bound,
+                                },
+                            },
+                        },
+                    },
+                },
+            }},
+        }
+
+    @classmethod
+    def analyze(cls, reference: Transcription, matches: MatchList, *, anime: str | None,
+                generate: Callable[..., Any], context: str) -> list[StoryArc]:
+        """Turn fallible model proposals into a complete, validated montage selection."""
+        from .facecam_narration_service import FacecamNarrationService
+
+        match_map = {m.scene_index: m for m in matches.matches}
+        payload = {"anime": anime, "target_seconds": [cls.TARGET_MIN, cls.TARGET_MAX], "scenes": [
+            {"scene_index": s.scene_index, "text": s.text, "raw": s.is_raw,
+             "source_duration": s.duration,
+             "raw_duration": (match_map[s.scene_index].end_time - match_map[s.scene_index].start_time
+                              if s.is_raw and s.scene_index in match_map else 0),
+             "word_count": len(s.words), "can_trim": bool(s.words) and not s.is_raw,
+             "words": [{"index": i, "text": w.text} for i, w in enumerate(s.words)]}
+            for s in reference.scenes]}
+        instructions = FacecamNarrationService.prompt("stories")
+        for attempt in range(1, cls.MAX_ATTEMPTS + 1):
+            # Provider failures are not editorial validation failures: let them propagate.
+            value = generate(instructions + "\n" + json.dumps(payload, ensure_ascii=False),
+                             response_schema=cls.response_schema(), schema_name="facecam_stories")
+            try:
+                return cls.validate(value, reference, matches)
+            except ValueError as exc:
+                if isinstance(exc, ValidationError):
+                    diagnostic = "; ".join(
+                        f"{'.'.join(map(str, e['loc']))}: {e['msg']}"
+                        for e in exc.errors(include_input=False, include_url=False)[:5]
+                    )
+                else:
+                    diagnostic = str(exc)
+                logger.warning("Facecam stories rejected (%s, attempt %d/%d): %s",
+                               context, attempt, cls.MAX_ATTEMPTS, diagnostic)
+                if attempt == cls.MAX_ATTEMPTS:
+                    raise ValueError(
+                        f"L'analyse des histoires reste invalide après {cls.MAX_ATTEMPTS} tentatives. "
+                        f"{diagnostic} Le projet est conservé. Relancez l'analyse."
+                    ) from exc
+                payload["correction"] = {
+                    "previous_response": value, "error": diagnostic,
+                    "instruction": "Corrige les erreurs indiquées sans changer les choix éditoriaux valides. "
+                                   "Retourne toutes les histoires corrigées, pas seulement le plan en erreur.",
+                }
+        raise AssertionError("Unreachable story analysis attempt")
 
     @classmethod
     def full_story(cls, reference, matches) -> StoryArc:
@@ -40,16 +123,34 @@ class FacecamStoryService:
                                         sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     @staticmethod
-    def bounds(scene, clip) -> tuple[float, float]:
-        if (clip.start_word is None) != (clip.end_word is None):
-            raise ValueError("Une coupe doit fournir ses deux bornes de mots.")
-        if clip.start_word is None:
-            return scene.start_time, scene.end_time
+    def normalize_clip(scene, clip: StoryClip) -> StoryClip:
+        """Resolve open source-word bounds once, before slicing text or mapping time.
+
+        null means the corresponding scene edge. Persist either a whole scene
+        (null/null) or an explicit half-open word range, never a one-sided range.
+        Invalid ranges are rejected, not clamped or replaced with whole scenes.
+        """
+        if clip.start_word is None and clip.end_word is None:
+            return clip
         if scene.is_raw:
             raise ValueError("Un extrait audio original retenu doit rester entier.")
-        a, b = clip.start_word, clip.end_word
+        a = 0 if clip.start_word is None else clip.start_word
+        b = len(scene.words) if clip.end_word is None else clip.end_word
         if not scene.words or not 0 <= a < b <= len(scene.words):
-            raise ValueError("Les mots de la coupe ne correspondent pas à la scène source.")
+            raise ValueError(
+                f"La coupe [{a}, {b}[ doit respecter 0 <= start_word < end_word <= {len(scene.words)} "
+                "(nombre de mots du plan source). Sans mots horodatés, conservez le plan entier."
+            )
+        if a == 0 and b == len(scene.words):
+            return clip.model_copy(update={"start_word": None, "end_word": None})
+        return clip.model_copy(update={"start_word": a, "end_word": b})
+
+    @classmethod
+    def bounds(cls, scene, clip) -> tuple[float, float]:
+        clip = cls.normalize_clip(scene, clip)
+        if clip.start_word is None:
+            return scene.start_time, scene.end_time
+        a, b = clip.start_word, clip.end_word
         start = scene.start_time if a == 0 else max(scene.start_time, scene.words[a].start)
         end = scene.end_time if b == len(scene.words) else min(scene.end_time, scene.words[b - 1].end)
         if not math.isfinite(start) or not math.isfinite(end) or end - start < 1 / 60:
@@ -75,14 +176,20 @@ class FacecamStoryService:
             if any(not step.strip() for step in story.steps) or any(not item.strip() for item in story.omitted):
                 raise ValueError("Les étapes et les omissions doivent être explicites.")
             story.id = f"story-{index + 1}"
+            story.estimated_duration_seconds = None
             raw_duration = 0.0
-            for clip in story.clips:
+            for clip_index, clip in enumerate(story.clips):
                 scene, match = scene_map[clip.scene_index], match_map[clip.scene_index]
                 if not match.episode:
                     raise ValueError("Validez la correspondance de chaque plan retenu avant de sélectionner une histoire.")
                 if scene.duration <= 0 or not all(math.isfinite(v) for v in [scene.start_time, scene.end_time, match.start_time, match.end_time]) or match.end_time <= match.start_time:
                     raise ValueError("Une référence de montage a une durée invalide.")
-                cls.bounds(scene, clip)
+                try:
+                    clip = cls.normalize_clip(scene, clip)
+                    cls.bounds(scene, clip)
+                except ValueError as exc:
+                    raise ValueError(f"Histoire {index + 1} (« {story.title} »), plan {scene.scene_index} : {exc}") from exc
+                story.clips[clip_index] = clip
                 if scene.is_raw:
                     # Actual inserted dialogue plays from the episode at its native speed.
                     raw_duration += match.end_time - match.start_time
@@ -100,6 +207,7 @@ class FacecamStoryService:
         for clip in story.clips:
             original = scene_map[clip.scene_index]
             match = match_map[clip.scene_index]
+            clip = cls.normalize_clip(original, clip)
             start, end = cls.bounds(original, clip)
             scale = (match.end_time - match.start_time) / original.duration
             episode_start = match.start_time + (start - original.start_time) * scale

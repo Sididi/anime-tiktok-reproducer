@@ -7,11 +7,12 @@ import os
 import re
 import shutil
 import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
 from ..models import Project, ProjectPhase
-from ..models.facecam import ENDING, FacecamCandidate, FacecamFinding, FacecamState, ScriptBlock
+from ..models.facecam import ENDING, FacecamCandidate, FacecamFinding, FacecamState, FindingRange, ScriptBlock
 from .atomic_files import write_text_atomic
 from .llm_service import LLMService
 from .project_service import ProjectService
@@ -60,6 +61,17 @@ class FacecamService:
         cls.project(project_id)
         path = cls.directory(project_id) / "state.json"
         state = FacecamState.model_validate_json(path.read_text()) if path.exists() else FacecamState()
+        for index, finding in enumerate(state.findings):
+            if not finding.id:
+                finding.id = hashlib.sha256(f"{project_id}:{state.fact_revision}:{index}:{finding.quote}".encode()).hexdigest()[:24]
+        if state.findings_revision is None:
+            # Recover old hidden annotations only when the original quote is unambiguous.
+            if state.fact_revision != state.revision:
+                script = state.spoken_text()
+                state.findings = [f.model_copy(update={"start": script.index(f.quote),
+                    "end": script.index(f.quote) + len(f.quote)}) for f in state.findings
+                    if f.quote and script.count(f.quote) == 1]
+            state.findings_revision = state.revision
         # Also expose the integral option on projects analyzed before it was introduced.
         # References are installed after the first state write during creation.
         if (cls.directory(project_id) / "reference_matches.json").exists():
@@ -192,7 +204,6 @@ class FacecamService:
 
     @classmethod
     def analyze_stories(cls, project_id: str, revision: int):
-        from .facecam_narration_service import FacecamNarrationService
         from .facecam_story_service import FacecamStoryService
         state = cls.load(project_id)
         if state.revision != revision:
@@ -201,15 +212,10 @@ class FacecamService:
         fingerprint = FacecamStoryService.fingerprint(reference, matches)
         if state.stories and state.stories_fingerprint == fingerprint:
             return state
-        match_map = {m.scene_index: m for m in matches.matches}
-        payload = {"anime": cls.project(project_id).anime_name, "target_seconds": [65, 70], "scenes": [
-            {"scene_index": s.scene_index, "text": s.text, "raw": s.is_raw,
-             "source_duration": s.duration,
-             "raw_duration": match_map[s.scene_index].end_time - match_map[s.scene_index].start_time if s.is_raw else 0,
-             "words": [{"index": i, "text": w.text} for i, w in enumerate(s.words)]}
-            for s in reference.scenes]}
-        result = cls.llm(project_id, FacecamNarrationService.prompt("stories") + "\n" + json.dumps(payload, ensure_ascii=False))
-        stories = FacecamStoryService.validate(result, reference, matches)
+        stories = FacecamStoryService.analyze(
+            reference, matches, anime=cls.project(project_id).anime_name,
+            generate=lambda prompt, **kwargs: cls.llm(project_id, prompt, **kwargs), context=f"project={project_id}",
+        )
         with cls.lock(project_id):
             # Never overwrite a draft edited while detection was running.
             if fingerprint != FacecamStoryService.fingerprint(cls.reference(project_id), cls.source_matches(project_id)):
@@ -255,7 +261,7 @@ class FacecamService:
                 "stories": state.stories if state.stories_fingerprint == fingerprint else [],
                 "hooks": [], "opinions": [], "selected_hook": "", "selected_opinion": "", "blocks": [],
                 "approved_revision": None, "assignment": [], "montage_map": [], "estimated_duration_seconds": None,
-                "findings": [], "fact_context": None, "fact_revision": None, "fact_status": "unchecked", "fact_error": None,
+                "findings": [], "findings_revision": revision + 1, "fact_context": None, "fact_revision": None, "fact_status": "unchecked", "fact_error": None,
                 "prepared": None, "processed_signature": None, "recording": recording,
             }, revision)
             cls.invalidate_output(project_id)
@@ -336,7 +342,8 @@ class FacecamService:
         return cls.update(project_id, {kind: candidates}, state.revision)
 
     @classmethod
-    def save_draft(cls, project_id: str, revision: int, blocks: list[ScriptBlock], hook: str, opinion: str):
+    def save_draft(cls, project_id: str, revision: int, blocks: list[ScriptBlock], hook: str, opinion: str,
+                   finding_ranges: list[FindingRange] | None = None):
         # Selections can change before regeneration; validate the actual draft layout.
         expected = cls.skeleton(project_id, include_opinion=any(b.kind == "opinion" for b in blocks))
         if [(b.id, b.kind, b.scene_indices) for b in blocks] != [(b.id, b.kind, b.scene_indices) for b in expected]:
@@ -348,6 +355,12 @@ class FacecamService:
                 block.text = ENDING
         with cls.lock(project_id):
             old = cls.load(project_id)
+            if old.revision != revision:
+                raise StaleFacecamRevision("Le script a changé. Rechargez la version actuelle.")
+            from .facecam_findings import remap_findings, retain_editor_ranges
+            text = "\n\n".join(b.text for b in blocks if b.kind != "raw")
+            findings = (remap_findings(old.blocks, blocks, old.findings) if finding_ranges is None else
+                        retain_editor_ranges(old.findings, finding_ranges, text))
             recording = old.recording
             if recording:
                 from .facecam_media_service import compare_words
@@ -360,6 +373,7 @@ class FacecamService:
                 "revision": revision + 1, "approved_revision": None, "assignment": [],
                 "prepared": None, "processed_signature": None, "recording": recording, "montage_map": [],
                 "estimated_duration_seconds": cls.estimate_duration(project_id, blocks),
+                "findings": findings, "findings_revision": revision + 1,
             }, revision)
             cls.invalidate_output(project_id)
             return state
@@ -379,38 +393,35 @@ class FacecamService:
         hook, opinion = hook.strip(), opinion.strip()
         if not hook:
             raise ValueError("Choisissez une accroche.")
-        if cls.load(project_id).revision != revision:
+        state = cls.load(project_id)
+        if state.revision != revision:
             raise StaleFacecamRevision("Le script a changé. Rechargez la version actuelle.")
         blocks = cls.skeleton(project_id, include_opinion=bool(opinion))
         context = cls.narrative_context(project_id)
         budget = context.get("budget")
         if budget:
             fixed_words = len((hook + " " + opinion + " " + ENDING).split())
-            if fixed_words >= budget["max_words"] - 30:
-                raise ValueError("L'accroche et le point de vue laissent trop peu de place au récit. Raccourcissez-les.")
             context["body_budget"] = {"min_words": max(0, budget["min_words"] - fixed_words),
-                                      "max_words": budget["max_words"] - fixed_words}
+                                      "max_words": max(0, budget["max_words"] - fixed_words),
+                                      "advisory": True}
         prompt = FacecamNarrationService.prompt("narration") + "\n" + FacecamNarrationService.prompt("script")
         request = prompt + "\n" + json.dumps({
             **context, "hook": hook, "opinion": opinion,
             "blocks": [b.model_dump() for b in blocks if b.kind == "body"],
         }, ensure_ascii=False)
         result = cls.llm(project_id, request)
-        # A targeted retry prevents a verbose model from silently ignoring the time budget.
-        if budget and isinstance(result, dict) and isinstance(result.get("blocks"), list):
-            word_count = sum(len(b.get("text", "").split()) for b in result["blocks"]
-                             if isinstance(b, dict) and isinstance(b.get("text"), str))
-            if word_count > context["body_budget"]["max_words"]:
-                result = cls.llm(project_id, request + "\nLe brouillon dépasse le budget. Supprime les détails secondaires, "
-                    "conserve la progression et le point d'arrivée. Respecte impérativement body_budget.max_words.\n"
-                    + json.dumps({"draft": result}, ensure_ascii=False))
+        # Keep the paid response before validation or a concurrent-edit rejection.
+        # Duration is editorial guidance: let the creator condense the saved draft.
+        write_text_atomic(cls.directory(project_id) / "generations" / f"{uuid.uuid4().hex}.json", json.dumps({
+            "revision": revision, "selected_story_id": state.selected_story_id,
+            "stories_fingerprint": state.stories_fingerprint, "hook": hook, "opinion": opinion,
+            "response": result,
+        }, ensure_ascii=False, indent=2))
         bodies = result.get("blocks", []) if isinstance(result, dict) else []
         if (not isinstance(bodies, list) or any(not isinstance(b, dict) or not isinstance(b.get("text"), str) for b in bodies)
                 or [b.get("id") for b in bodies] != [b.id for b in blocks if b.kind == "body"]):
             raise ValueError("La génération n'a pas respecté les extraits originaux. Réessayez.")
         by_id = {b["id"]: b.get("text", "").strip() for b in bodies}
-        if budget and sum(len(t.split()) for t in by_id.values()) > context["body_budget"]["max_words"]:
-            raise ValueError("Le récit dépasse encore le budget d'une minute. Relancez la rédaction.")
         for block in blocks:
             if block.kind == "body":
                 block.text = by_id[block.id]
@@ -478,17 +489,18 @@ class FacecamService:
                     raise ValueError("Une annotation ne correspond pas au texte vérifié. Relancez la vérification.")
                 cited = [source_map[url] for url in finding.get("source_urls", []) if url in source_map]
                 findings.append(FacecamFinding(
+                    id=uuid.uuid4().hex,
                     quote=quote, start=start, end=start + len(quote),
                     kind="contradiction" if finding.get("kind") == "contradiction" and cited else "uncertain",
                     explanation=str(finding.get("explanation", "")), correction=str(finding.get("correction", "")), sources=cited,
                 ))
-            return cls.update(project_id, {"findings": findings, "fact_revision": state.revision,
+            return cls.update(project_id, {"findings": findings, "findings_revision": state.revision, "fact_revision": state.revision,
                 "fact_status": "complete", "fact_error": None, "fact_context": context}, state.revision)
         except StaleFacecamRevision:
             raise
         except Exception as exc:
             return cls.update(project_id, {"fact_status": "unavailable", "fact_error": str(exc),
-                "findings": [], "fact_revision": None, "fact_context": context}, state.revision)
+                "findings": [], "findings_revision": state.revision, "fact_revision": None, "fact_context": context}, state.revision)
 
     @classmethod
     def approve(cls, project_id: str, revision: int):

@@ -160,6 +160,30 @@ def test_malformed_narration_does_not_replace_draft(source, monkeypatch, result)
     with pytest.raises(ValueError):
         FacecamService.generate(project.id, 'Accroche.', 'Opinion.', state.revision)
     assert FacecamService.load(project.id).blocks == state.blocks
+    archive, = (FacecamService.directory(project.id) / 'generations').glob('*.json')
+    saved = json.loads(archive.read_text())
+    assert saved['response'] == result and saved['revision'] == state.revision
+    assert saved['hook'] == 'Accroche.' and saved['opinion'] == 'Opinion.'
+
+
+def test_generation_rejected_after_concurrent_edit_keeps_paid_response(source, monkeypatch):
+    project, original = draft(source)
+    monkeypatch.setattr(FacecamService, 'narrative_context', lambda *a: narrative_brief())
+    response = {'blocks': [{'id': 'body-0', 'text': 'Un nouveau début.'},
+                           {'id': 'body-2', 'text': 'Une nouvelle fin.'}]}
+    def generate(*args):
+        changed = original.model_copy(deep=True)
+        changed.blocks[1].text = 'Une modification manuelle à conserver.'
+        FacecamService.save_draft(project.id, original.revision, changed.blocks,
+                                  original.selected_hook, original.selected_opinion)
+        return response
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    with pytest.raises(StaleFacecamRevision):
+        FacecamService.generate(project.id, 'Accroche.', '', original.revision)
+    assert FacecamService.load(project.id).blocks[1].text == 'Une modification manuelle à conserver.'
+    archive, = (FacecamService.directory(project.id) / 'generations').glob('*.json')
+    saved = json.loads(archive.read_text())
+    assert saved['response'] == response and saved['revision'] == original.revision
 
 
 def test_stale_generation_is_rejected_before_calling_model(source, monkeypatch):
@@ -349,6 +373,74 @@ def test_fact_checker_fails_closed_and_keeps_evidence(source,monkeypatch):
     def fail(*a,**k): raise RuntimeError('Research offline')
     monkeypatch.setattr(OpenRouterService,'research',fail)
     assert FacecamService.fact_check(project.id).fact_status=='unavailable'
+
+
+def checked_draft(source):
+    project, state = draft(source)
+    text = state.spoken_text()
+    quotes = ['Naruto poursuit son rêve.', 'Naruto poursuit son rêve.']
+    starts = [text.index(quotes[0]), text.index(quotes[1], text.index(quotes[0]) + 1)]
+    findings = [{'id': str(i), 'quote': quote, 'start': start, 'end': start + len(quote),
+                 'kind': 'contradiction', 'explanation': f'Erreur {i}',
+                 'sources': [{'url': 'https://example.org/official', 'title': 'Source'}]}
+                for i, (quote, start) in enumerate(zip(quotes, starts))]
+    return project, FacecamService.update(project.id, {'findings': findings, 'fact_revision': state.revision,
+        'findings_revision': state.revision, 'fact_status': 'complete', 'fact_context': {'evidence': 'kept'}})
+
+
+def test_edit_removes_only_touched_finding_and_remaps_other_block_after_raw(source):
+    project, checked = checked_draft(source)
+    blocks = checked.model_copy(deep=True).blocks
+    blocks[1].text = 'Sasuke poursuit sa mission.'
+    saved = FacecamService.save_draft(project.id, checked.revision, blocks, checked.selected_hook, checked.selected_opinion)
+    assert [f.id for f in saved.findings] == ['1']
+    remaining = saved.findings[0]
+    assert saved.spoken_text()[remaining.start:remaining.end] == remaining.quote
+    assert remaining.sources == checked.findings[1].sources and saved.fact_context == checked.fact_context
+    assert saved.fact_revision == checked.revision and saved.findings_revision == saved.revision
+    assert FacecamService.load(project.id).findings == saved.findings
+
+
+def test_editor_ranges_keep_exact_repeated_occurrence_and_dismissals(source):
+    from app.models.facecam import FindingRange
+    project, checked = checked_draft(source)
+    blocks = checked.model_copy(deep=True).blocks
+    blocks[0].text = '😀 Une nouvelle accroche.'
+    text = '\n\n'.join(b.text for b in blocks if b.kind != 'raw')
+    last = text.rindex(checked.findings[1].quote)
+    saved = FacecamService.save_draft(project.id, checked.revision, blocks, '', '',
+        [FindingRange(id='1', start=last, end=last + len(checked.findings[1].quote))])
+    assert [f.id for f in saved.findings] == ['1']
+    assert saved.findings[0].start == last
+    # No resurrection on the next save, even if an identical quote still exists.
+    saved = FacecamService.save_draft(project.id, saved.revision, saved.blocks, '', '', [])
+    assert FacecamService.load(project.id).findings == []
+
+
+@pytest.mark.parametrize('anchor', [{'id': 'invented', 'start': 0, 'end': 3}, {'id': '0', 'start': 0, 'end': 3}])
+def test_invalid_editor_ranges_never_replace_review_or_draft(source, anchor):
+    from app.models.facecam import FindingRange
+    project, checked = checked_draft(source)
+    with pytest.raises(ValueError, match='repère'):
+        FacecamService.save_draft(project.id, checked.revision, checked.blocks, '', '', [FindingRange(**anchor)])
+    assert FacecamService.load(project.id) == checked
+
+
+def test_legacy_hidden_findings_recover_only_unique_unchanged_quotes(source):
+    project, checked = checked_draft(source)
+    path = FacecamService.directory(project.id) / 'state.json'
+    data = json.loads(path.read_text())
+    data.pop('findings_revision')
+    data['revision'] += 1
+    data['blocks'][1]['text'] = 'Un passage corrigé.'
+    data['findings'][0]['quote'] = 'Texte supprimé.'
+    for finding in data['findings']:
+        finding.pop('id')
+    path.write_text(json.dumps(data))
+    loaded = FacecamService.load(project.id)
+    assert len(loaded.findings) == 1 and loaded.findings[0].quote == checked.findings[1].quote
+    assert loaded.spoken_text()[loaded.findings[0].start:loaded.findings[0].end] == loaded.findings[0].quote
+    assert FacecamService.load(project.id).findings == loaded.findings
 
 
 def test_fact_context_preserves_between_shot_dialogue_and_uses_source_timestamps(source, monkeypatch, tmp_path):

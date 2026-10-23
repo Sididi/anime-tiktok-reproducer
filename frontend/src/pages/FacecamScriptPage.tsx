@@ -53,8 +53,9 @@ export function FacecamScriptPage({project}: {project: Project}) {
     const dirty = editVersion.current !== savedVersion.current;
     if (stateRef.current && next.revision < stateRef.current.revision) return;
     if (next.recording_edit && !next.recording_edit.applied && next.recording_edit.id !== stateRef.current?.recording_edit?.id) setCutsOpen(true);
-    const merged = dirty ? {...next, blocks: draft.current} : next;
+    const merged = dirty ? {...next, blocks: draft.current, findings: stateRef.current?.findings ?? []} : next;
     stateRef.current = merged; draft.current = merged.blocks; setState(merged);
+    setFinding(current => current ? merged.findings.find(f => f.id === current.id) ?? null : null);
   }, []);
   const saveMusic = useCallback((music_key: string | null) => setSettings(previous => previous ? {...previous, music_key} : previous), []);
   const preview = useFacecamPreview({id, state, musicKey: settings?.music_key ?? null, settingsLoaded: !!settings,
@@ -117,17 +118,23 @@ export function FacecamScriptPage({project}: {project: Project}) {
     if (savePromise.current) await savePromise.current;
     if (editVersion.current === savedVersion.current || !stateRef.current) return;
     const version = editVersion.current, snapshot = draft.current, revision = stateRef.current.revision;
+    const findings = stateRef.current.findings;
     const operation = (async () => {
-      const next = await facecamRequest(id, '/draft', 'PUT', {revision, blocks: snapshot, selected_hook: hook, selected_opinion: opinion});
+      const next = await facecamRequest(id, '/draft', 'PUT', {revision, blocks: snapshot, selected_hook: hook, selected_opinion: opinion,
+        finding_ranges: findings.every(f => f.id) ? findings.map(({id, start, end}) => ({id, start, end})) : undefined});
       savedVersion.current = version; apply(next); setSaved(editVersion.current === version);
     })();
     savePromise.current = operation;
     try {await operation;} finally {savePromise.current = null;}
     if (editVersion.current !== savedVersion.current) await flush();
   }
-  function edit(blocks: FacecamBlock[]) {
-    draft.current = blocks; editVersion.current++; setSaved(false); setFinding(null);
-    setState(previous => previous ? {...previous, blocks} : previous);
+  function edit(blocks: FacecamBlock[], findings: Finding[]) {
+    draft.current = blocks; editVersion.current++; setSaved(false);
+    setFinding(current => current ? findings.find(f => f.id === current.id) ?? null : null);
+    if (stateRef.current) {
+      stateRef.current = {...stateRef.current, blocks, findings};
+      setState(stateRef.current);
+    }
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {void flush().catch(e => setError(e.message));}, 700);
   }
@@ -155,7 +162,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
     catch(e) {setError((e as Error).message);} finally {setWorking(false);}
   }
   if (!state) return <div className="p-8">{error || 'Chargement de Facecam…'}</div>;
-  const visibleFindings = state.fact_revision === state.revision && saved ? state.findings : [];
+  const visibleFindings = state.findings;
   const options = stage === 'hooks' ? state.hooks : state.opinions;
   const selection = stage === 'hooks' ? hook : opinion;
   const select = stage === 'hooks' ? setHook : setOpinion;
@@ -189,11 +196,12 @@ export function FacecamScriptPage({project}: {project: Project}) {
       <div className="flex flex-wrap justify-between items-center gap-3 mb-5"><div><h2>3. Affiner votre script</h2><p>{saved ? 'Brouillon enregistré' : 'Enregistrement…'} · Révision {state.revision}</p></div><div className="flex flex-wrap gap-2"><Button variant="outline" aria-expanded={sourceOpen} aria-controls="facecam-source-video" onClick={e => toggleSource(e.currentTarget)}><Play size={16} className="mr-2"/>Vidéo originale</Button><Button variant="outline" disabled={busy || !saved} onClick={() => void action('/fact-check')}><ShieldCheck size={16} className="mr-2"/>Vérifier les faits</Button><Button disabled={busy || approved || !storyReady} onClick={() => void action('/approve', {})}>{approved ? 'Script validé' : 'Valider le script'}</Button></div></div>
       <p className="facecam-duration">{wordCount} mots · {state.selected_story_id === FULL_STORY_ID ? 'Histoire intégrale · Durée conseillée : 65–70 s' : 'Cible : 65–70 s'}
         {saved && state.estimated_duration_seconds != null && <> · Estimation : {Math.round(state.estimated_duration_seconds)} s, à confirmer avec votre lecture.
-          {state.estimated_duration_seconds > 70 ? state.selected_story_id === FULL_STORY_ID ? ' Le récit intégral dépasse la durée conseillée. Privilégiez une histoire plus courte pour garder l’attention.' : ' Retirez un détail secondaire pour raccourcir.' : state.estimated_duration_seconds < 65 ? ' Une lecture est nécessaire pour vérifier que le montage dépasse une minute.' : ''}</>}
+          {state.estimated_duration_seconds > 70 ? state.selected_story_id === FULL_STORY_ID ? ' Le récit intégral dépasse la durée conseillée. Privilégiez une histoire plus courte pour garder l’attention.' : ' Vous pouvez condenser le texte à la main ; cette estimation ne bloque pas la validation.' : state.estimated_duration_seconds < 65 ? ' Une lecture est nécessaire pour vérifier que le montage dépasse une minute.' : ''}</>}
       </p>
       <div className="facecam-editor-layout"><FacecamEditor blocks={state.blocks} findings={visibleFindings} disabled={!!busy} onChange={edit} onFinding={setFinding}/>
         <aside className="facecam-review" aria-label="Vérification des faits"><h3>Vérification des faits</h3>
-          {state.fact_status === 'unavailable' ? <p role="alert">Vérification indisponible. {state.fact_error}</p> : state.fact_revision !== state.revision || !saved ? <p>Le texte a changé ou n’a pas encore été vérifié. Relancez la vérification quand vous le souhaitez.</p> : <p>{visibleFindings.length ? `${visibleFindings.length} point(s) à examiner.` : 'Aucune anomalie signalée par la recherche.'} Les corrections restent à votre appréciation.</p>}
+          {state.fact_status === 'unavailable' ? <p role="alert">Vérification indisponible. {state.fact_error}</p> : state.fact_revision == null ? <p>Ce texte n’a pas encore été vérifié.</p> : <p>{visibleFindings.length ? `${visibleFindings.length} point(s) à examiner.` : state.fact_revision !== state.revision || !saved ? 'Aucun signalement restant.' : 'Aucune anomalie signalée par la recherche.'} Les corrections restent à votre appréciation.
+            {(state.fact_revision !== state.revision || !saved) && <> Les passages modifiés n’ont pas été revérifiés ; les autres signalements sont conservés.</>}</p>}
           {state.fact_context && <details className="facecam-evidence-context"><summary>Sous-titres transmis à la vérification</summary><p>Horaires dans les épisodes sources · marge de {state.fact_context.padding_seconds} s. Les dialogues ne permettent pas de vérifier tous les détails visuels.</p>
             {state.fact_context.episodes.length === 0 && <p>Aucun épisode associé disponible. Vérification web uniquement.</p>}
             {state.fact_context.episodes.map((episode, i) => <details key={i}><summary>{episode.episode} · {episode.cues.length} réplique(s){episode.language ? ` · ${episode.language}` : ''}</summary>
@@ -201,7 +209,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
               <div className="facecam-evidence-cues">{episode.cues.map(c => <p key={c.id}><a href={c.source_url} target="_blank" rel="noreferrer">{c.start}–{c.end}</a><br/>{c.text}</p>)}</div>
             </details>)}
           </details>}
-          {visibleFindings.map((f, i) => <button key={i} className={`facecam-fact-item ${f.kind}`} onClick={() => setFinding(f)}>{f.kind === 'contradiction' ? 'À corriger' : 'À vérifier'} — {f.quote}</button>)}
+          {visibleFindings.map((f, i) => <button key={f.id ?? i} className={`facecam-fact-item ${f.kind}`} onClick={() => setFinding(f)}>{f.kind === 'contradiction' ? 'À corriger' : 'À vérifier'} — {f.quote}</button>)}
           {finding && <div className="facecam-fact-detail"><strong>{finding.quote}</strong><p>{finding.explanation}</p>{finding.correction && <p><b>Suggestion :</b> {finding.correction}</p>}{finding.sources.map(s => <div key={s.url}><a href={s.url} target="_blank" rel="noreferrer">{s.title}<ExternalLink size={12}/></a>{s.kind === 'subtitle' && s.text && <blockquote>{s.text}</blockquote>}</div>)}<button onClick={() => setFinding(null)} className="underline mt-3">Fermer</button></div>}
         </aside></div>
     </section>}
