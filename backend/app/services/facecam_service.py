@@ -405,28 +405,34 @@ class FacecamService:
                                       "max_words": max(0, budget["max_words"] - fixed_words),
                                       "advisory": True}
         prompt = FacecamNarrationService.prompt("narration") + "\n" + FacecamNarrationService.prompt("script")
-        request = prompt + "\n" + json.dumps({
+        payload = {
             **context, "hook": hook, "opinion": opinion,
             "blocks": [b.model_dump() for b in blocks if b.kind == "body"],
-        }, ensure_ascii=False)
+        }
+        request = prompt + "\n" + json.dumps(payload, ensure_ascii=False)
         result = cls.llm(project_id, request)
-        # Keep the paid response before validation or a concurrent-edit rejection.
-        # Duration is editorial guidance: let the creator condense the saved draft.
-        write_text_atomic(cls.directory(project_id) / "generations" / f"{uuid.uuid4().hex}.json", json.dumps({
+        # Archive each paid response before validation or a concurrent-edit rejection.
+        archive_path = cls.directory(project_id) / "generations" / f"{uuid.uuid4().hex}.json"
+        archive = {
             "revision": revision, "selected_story_id": state.selected_story_id,
             "stories_fingerprint": state.stories_fingerprint, "hook": hook, "opinion": opinion,
             "response": result,
-        }, ensure_ascii=False, indent=2))
-        bodies = result.get("blocks", []) if isinstance(result, dict) else []
-        if (not isinstance(bodies, list) or any(not isinstance(b, dict) or not isinstance(b.get("text"), str) for b in bodies)
-                or [b.get("id") for b in bodies] != [b.id for b in blocks if b.kind == "body"]):
-            raise ValueError("La génération n'a pas respecté les extraits originaux. Réessayez.")
-        by_id = {b["id"]: b.get("text", "").strip() for b in bodies}
+        }
+        write_text_atomic(archive_path, json.dumps(archive, ensure_ascii=False, indent=2))
+        FacecamNarrationService.validate_body(result, blocks)
+        if cls.load(project_id).revision != revision:
+            raise StaleFacecamRevision("Le script a changé. Rechargez la version actuelle.")
+        # One editorial pass, independent of duration; no word-count retry loop.
+        edit_request = FacecamNarrationService.prompt("oral_edit") + "\n" + json.dumps({
+            **payload, "draft_blocks": result["blocks"],
+        }, ensure_ascii=False)
+        edited = cls.llm(project_id, edit_request)
+        archive.update(draft_response=result, response=edited)
+        write_text_atomic(archive_path, json.dumps(archive, ensure_ascii=False, indent=2))
+        by_id = FacecamNarrationService.validate_body(edited, blocks)
         for block in blocks:
             if block.kind == "body":
                 block.text = by_id[block.id]
-                if not block.text:
-                    raise ValueError("Un passage du récit est vide.")
             elif block.kind == "hook":
                 block.text = hook.strip()
             elif block.kind == "opinion":

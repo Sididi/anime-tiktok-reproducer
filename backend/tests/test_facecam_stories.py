@@ -106,7 +106,8 @@ def test_full_story_with_long_dialogue_can_be_selected_and_generated_without_con
         return {'blocks': [{'id': 'body-5', 'text': 'retour ' * 100}, {'id': 'body-42', 'text': 'suite ' * 300}]}
     monkeypatch.setattr(FacecamService, 'llm', model)
     generated = FacecamService.generate(project.id, 'Un héros revient.', '', state.revision)
-    assert len(prompts) == 2  # No retry truncating the complete story.
+    assert len(prompts) == 3  # Extraction, writing, oral edit; no duration-based retry.
+    assert json.loads(prompts[-1].splitlines()[-1])['draft_blocks'][1]['text'] == 'suite ' * 300
     assert generated.estimated_duration_seconds > 200
     assert [b.scene_indices for b in generated.blocks if b.kind == 'body'] == [[5], [42, 60]]
     assert [b.scene_indices for b in generated.blocks if b.kind == 'raw'] == [[9]]
@@ -341,7 +342,7 @@ def test_source_change_during_corrective_retry_prevents_commit(project, monkeypa
     assert len(calls) == 2 and not FacecamService.load(project.id).stories
 
 
-def test_selected_story_bounds_reach_writer_and_long_body_is_saved_without_retry(project, monkeypatch):
+def test_selected_story_bounds_reach_writer_and_editor_without_duration_retry(project, monkeypatch):
     detect(project, monkeypatch, option(indices=(5, 42)))
     prompts = []
     def model(pid, prompt):
@@ -353,16 +354,18 @@ def test_selected_story_bounds_reach_writer_and_long_body_is_saved_without_retry
             return {'premise': 'Le héros revient.', 'protagonist': 'Le héros', 'uncertainties': [],
                     'sections': [{'id': 'body-5', 'facts': [{'scene_indices': [5, 42], 'text': 'Le héros revient et demande une mission.'}]}]}
         assert 'La mission des novices.' in prompt  # Explicitly excluded branch, not source narration.
-        if len(prompts) == 2:
+        if len(prompts) in {2, 3}:
             payload = json.loads(prompt.splitlines()[-1])
             assert payload['selected_story']['title'] == 'Le retour'
             assert payload['budget']['max_words'] == 231
             assert payload['body_budget']['advisory'] is True
+            if len(prompts) == 3:
+                assert payload['draft_blocks'][0]['text'] == 'récit ' * 300
             return {'blocks': [{'id': 'body-5', 'text': 'récit ' * 300}]}
-        pytest.fail('An overlong draft must not trigger another paid writing call')
+        pytest.fail('An overlong edited draft must not trigger another paid writing call')
     monkeypatch.setattr(FacecamService, 'llm', model)
     state = FacecamService.generate(project.id, 'Un héros discret.', '', 1)
-    assert len(prompts) == 2  # Brief extraction plus a single writing call.
+    assert len(prompts) == 3  # Brief extraction, writing and exactly one oral edit.
     assert state.estimated_duration_seconds > 70
     assert [b.scene_indices for b in state.blocks if b.kind == 'body'] == [[5, 42]]
     assert state.blocks[1].text == ('récit ' * 300).strip()
@@ -396,7 +399,7 @@ def test_long_hook_and_opinion_do_not_block_writing_with_an_exhausted_budget(pro
         return {'blocks': [{'id': 'body-5', 'text': 'Le héros revient et demande une mission.'}]}
     monkeypatch.setattr(FacecamService, 'llm', generate)
     state = FacecamService.generate(project.id, 'accroche ' * 200, 'opinion ' * 100, selected.revision)
-    assert len(calls) == 1 and state.estimated_duration_seconds > 70
+    assert len(calls) == 2 and state.estimated_duration_seconds > 70
     assert len(state.selected_hook.split()) == 200 and len(state.selected_opinion.split()) == 100
     assert state.blocks[1].text == 'Le héros revient et demande une mission.'
 

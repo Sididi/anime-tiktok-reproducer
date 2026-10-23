@@ -84,7 +84,7 @@ def test_narrative_brief_is_shared_but_source_prose_never_reaches_writer(source,
     FacecamService.candidates(project.id, 'opinions')
     assert 'Une accroche choisie.' in prompts[-1]
     state = FacecamService.generate(project.id, 'Une accroche choisie.', 'Un avis précis.', initial.revision)
-    assert len(prompts) == 4  # One extraction shared by all three writing steps.
+    assert len(prompts) == 5  # Shared extraction, hooks, opinions, draft, oral edit.
     assert [b.id for b in state.blocks] == ['hook', 'body-0', 'raw-1', 'body-2', 'opinion', 'ending']
     assert state.blocks[2].text == '' and state.blocks[-1].text == ENDING
     assert state.blocks[0].text == 'Une accroche choisie.'
@@ -164,6 +164,104 @@ def test_malformed_narration_does_not_replace_draft(source, monkeypatch, result)
     saved = json.loads(archive.read_text())
     assert saved['response'] == result and saved['revision'] == state.revision
     assert saved['hook'] == 'Accroche.' and saved['opinion'] == 'Opinion.'
+
+
+@pytest.mark.parametrize('opinion', ['', 'Un avis choisi.'])
+def test_oral_edit_uses_facts_and_draft_but_only_replaces_body(source, monkeypatch, opinion):
+    project, old = draft(source)
+    context = {**narrative_brief(), 'uncertainties': ['Son intention est inconnue.'],
+               'selected_story': {'ending': 'Il devient ninja.'},
+               'timeline': [{'id': 'body-0'}, {'id': 'raw-1'}, {'id': 'body-2'}],
+               'original_dialogue': [{'scene_index': 1, 'text': 'Dialogue original.'}]}
+    monkeypatch.setattr(FacecamService, 'narrative_context', lambda *a: context)
+    first = {'blocks': [{'id': 'body-0', 'text': 'Naruto arrive avec un objectif.'},
+                        {'id': 'body-2', 'text': 'Il devient finalement ninja.'}]}
+    edited = {'blocks': [{'id': 'body-0', 'text': 'Naruto arrive.'},
+                         {'id': 'body-2', 'text': 'Il devient ninja.'}]}
+    calls = []
+    def generate(pid, prompt):
+        payload = json.loads(prompt.splitlines()[-1])
+        calls.append(payload)
+        if len(calls) == 1:
+            assert 'draft_blocks' not in payload
+            return first
+        assert payload['draft_blocks'] == first['blocks']
+        for key, value in context.items():
+            assert payload[key] == value
+        assert payload['hook'] == 'Une accroche choisie.' and payload['opinion'] == opinion
+        assert 'Naruto est ici.' not in prompt  # Source prose still stays outside writing.
+        return edited
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    state = FacecamService.generate(project.id, 'Une accroche choisie.', opinion, old.revision)
+    assert len(calls) == 2 and state.revision == old.revision + 1
+    assert [b.text for b in state.blocks if b.kind == 'body'] == ['Naruto arrive.', 'Il devient ninja.']
+    assert [(b.id, b.scene_indices, b.text) for b in state.blocks if b.kind == 'raw'] == [('raw-1', [1], '')]
+    assert state.blocks[0].text == 'Une accroche choisie.' and state.blocks[-1].text == ENDING
+    assert [b.text for b in state.blocks if b.kind == 'opinion'] == ([opinion] if opinion else [])
+    archive, = (FacecamService.directory(project.id) / 'generations').glob('*.json')
+    saved = json.loads(archive.read_text())
+    assert saved['draft_response'] == first and saved['response'] == edited
+
+
+@pytest.mark.parametrize('edited', [None, {'blocks': []},
+    {'blocks': [{'id': 'body-0', 'text': 'Début.'}, {'id': 'body-2', 'text': '  '}]},
+    {'blocks': [{'id': 'body-2', 'text': 'Fin.'}, {'id': 'body-0', 'text': 'Début.'}]},
+    {'blocks': [{'id': 'body-0', 'text': 'Début.'}, {'id': 'body-0', 'text': 'Fin.'}]},
+    {'blocks': [{'id': 'body-0', 'text': 'Début.'}, {'id': 'raw-1', 'text': 'Dialogue.'},
+                {'id': 'body-2', 'text': 'Fin.'}]}])
+def test_invalid_oral_edit_preserves_current_draft_and_archives_both_responses(source, monkeypatch, edited):
+    project, old = draft(source)
+    monkeypatch.setattr(FacecamService, 'narrative_context', lambda *a: narrative_brief())
+    first = {'blocks': [{'id': 'body-0', 'text': 'Début.'}, {'id': 'body-2', 'text': 'Fin.'}]}
+    responses = iter([first, edited])
+    monkeypatch.setattr(FacecamService, 'llm', lambda *a: next(responses))
+    with pytest.raises(ValueError):
+        FacecamService.generate(project.id, 'Accroche.', '', old.revision)
+    assert FacecamService.load(project.id) == old
+    archive, = (FacecamService.directory(project.id) / 'generations').glob('*.json')
+    saved = json.loads(archive.read_text())
+    assert saved['draft_response'] == first and saved['response'] == edited
+
+
+def test_oral_edit_provider_failure_keeps_paid_draft_without_overwriting_current_script(source, monkeypatch):
+    project, old = draft(source)
+    monkeypatch.setattr(FacecamService, 'narrative_context', lambda *a: narrative_brief())
+    first = {'blocks': [{'id': 'body-0', 'text': 'Début.'}, {'id': 'body-2', 'text': 'Fin.'}]}
+    calls = []
+    def generate(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            return first
+        raise RuntimeError('Provider unavailable')
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    with pytest.raises(RuntimeError, match='Provider unavailable'):
+        FacecamService.generate(project.id, 'Accroche.', '', old.revision)
+    assert len(calls) == 2 and FacecamService.load(project.id) == old
+    archive, = (FacecamService.directory(project.id) / 'generations').glob('*.json')
+    assert json.loads(archive.read_text())['response'] == first
+
+
+def test_concurrent_manual_edit_during_oral_edit_keeps_manual_script(source, monkeypatch):
+    project, old = draft(source)
+    monkeypatch.setattr(FacecamService, 'narrative_context', lambda *a: narrative_brief())
+    first = {'blocks': [{'id': 'body-0', 'text': 'Premier début.'}, {'id': 'body-2', 'text': 'Première fin.'}]}
+    edited = {'blocks': [{'id': 'body-0', 'text': 'Début.'}, {'id': 'body-2', 'text': 'Fin.'}]}
+    calls = []
+    def generate(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            return first
+        changed = old.model_copy(deep=True)
+        changed.blocks[1].text = 'Texte corrigé à la main.'
+        FacecamService.save_draft(project.id, old.revision, changed.blocks, old.selected_hook, old.selected_opinion)
+        return edited
+    monkeypatch.setattr(FacecamService, 'llm', generate)
+    with pytest.raises(StaleFacecamRevision):
+        FacecamService.generate(project.id, 'Accroche.', '', old.revision)
+    assert FacecamService.load(project.id).blocks[1].text == 'Texte corrigé à la main.'
+    archive, = (FacecamService.directory(project.id) / 'generations').glob('*.json')
+    saved = json.loads(archive.read_text())
+    assert saved['draft_response'] == first and saved['response'] == edited
 
 
 def test_generation_rejected_after_concurrent_edit_keeps_paid_response(source, monkeypatch):

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Check, ChevronRight, Loader2, Video, RefreshCw, ShieldCheck, Upload, ExternalLink, X, Play, Scissors } from 'lucide-react';
+import { Check, ChevronRight, Loader2, Video, RefreshCw, ShieldCheck, Upload, ExternalLink, X, Play, Scissors, Eye, EyeOff } from 'lucide-react';
 import { Button } from '@/components/ui';
 import { ProjectManagedVideoPlayer } from '@/components/video/ProjectManagedVideoPlayer';
 import type { ManagedVideoPlayerHandle } from '@/components/video/ManagedVideoPlayer';
@@ -30,6 +30,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const [delivery, setDelivery] = useState<{status: string} | null>(project.facecam_delivery ?? null);
   const [sourceOpen, setSourceOpen] = useState(false), [sourceLoaded, setSourceLoaded] = useState(false);
   const [cutsOpen, setCutsOpen] = useState(false);
+  const [showFactReview, setShowFactReview] = useState(true);
   const closeCuts = useCallback(() => setCutsOpen(false), []);
   const recordingPlayer = useRef<HTMLVideoElement>(null);
   const sourcePlayer = useRef<ManagedVideoPlayerHandle>(null);
@@ -193,13 +194,13 @@ export function FacecamScriptPage({project}: {project: Project}) {
       {!!hook.trim() && <Button disabled={busy || !storyReady} onClick={() => {if (state.blocks.length && !window.confirm('Remplacer le brouillon actuel par une nouvelle génération ?')) return; void generate();}}>{state.blocks.length ? 'Régénérer le script' : 'Générer mon script'}</Button>}
     </section>
     {state.blocks.length > 0 && <section className="facecam-card">
-      <div className="flex flex-wrap justify-between items-center gap-3 mb-5"><div><h2>3. Affiner votre script</h2><p>{saved ? 'Brouillon enregistré' : 'Enregistrement…'} · Révision {state.revision}</p></div><div className="flex flex-wrap gap-2"><Button variant="outline" aria-expanded={sourceOpen} aria-controls="facecam-source-video" onClick={e => toggleSource(e.currentTarget)}><Play size={16} className="mr-2"/>Vidéo originale</Button><Button variant="outline" disabled={busy || !saved} onClick={() => void action('/fact-check')}><ShieldCheck size={16} className="mr-2"/>Vérifier les faits</Button><Button disabled={busy || approved || !storyReady} onClick={() => void action('/approve', {})}>{approved ? 'Script validé' : 'Valider le script'}</Button></div></div>
+      <div className="flex flex-wrap justify-between items-center gap-3 mb-5"><div><h2>3. Affiner votre script</h2><p>{saved ? 'Brouillon enregistré' : 'Enregistrement…'} · Révision {state.revision}</p></div><div className="flex flex-wrap gap-2"><Button variant="outline" aria-expanded={sourceOpen} aria-controls="facecam-source-video" onClick={e => toggleSource(e.currentTarget)}><Play size={16} className="mr-2"/>Vidéo originale</Button><Button variant="outline" disabled={busy || !saved} onClick={() => {setShowFactReview(true); void action('/fact-check');}}><ShieldCheck size={16} className="mr-2"/>Vérifier les faits</Button><Button variant="outline" aria-expanded={showFactReview} aria-controls="facecam-fact-review" onClick={() => setShowFactReview(show => !show)}>{showFactReview ? <EyeOff size={16} className="mr-2"/> : <Eye size={16} className="mr-2"/>}{showFactReview ? 'Masquer les annotations' : 'Afficher les annotations'}</Button><Button disabled={busy || approved || !storyReady} onClick={() => void action('/approve', {})}>{approved ? 'Script validé' : 'Valider le script'}</Button></div></div>
       <p className="facecam-duration">{wordCount} mots · {state.selected_story_id === FULL_STORY_ID ? 'Histoire intégrale · Durée conseillée : 65–70 s' : 'Cible : 65–70 s'}
         {saved && state.estimated_duration_seconds != null && <> · Estimation : {Math.round(state.estimated_duration_seconds)} s, à confirmer avec votre lecture.
           {state.estimated_duration_seconds > 70 ? state.selected_story_id === FULL_STORY_ID ? ' Le récit intégral dépasse la durée conseillée. Privilégiez une histoire plus courte pour garder l’attention.' : ' Vous pouvez condenser le texte à la main ; cette estimation ne bloque pas la validation.' : state.estimated_duration_seconds < 65 ? ' Une lecture est nécessaire pour vérifier que le montage dépasse une minute.' : ''}</>}
       </p>
-      <div className="facecam-editor-layout"><FacecamEditor blocks={state.blocks} findings={visibleFindings} disabled={!!busy} onChange={edit} onFinding={setFinding}/>
-        <aside className="facecam-review" aria-label="Vérification des faits"><h3>Vérification des faits</h3>
+      <div className={`facecam-editor-layout${showFactReview ? '' : ' review-hidden'}`}><FacecamEditor blocks={state.blocks} findings={visibleFindings} showFindings={showFactReview} disabled={!!busy} onChange={edit} onFinding={setFinding}/>
+        <aside id="facecam-fact-review" className="facecam-review" hidden={!showFactReview} aria-label="Vérification des faits"><h3>Vérification des faits</h3>
           {state.fact_status === 'unavailable' ? <p role="alert">Vérification indisponible. {state.fact_error}</p> : state.fact_revision == null ? <p>Ce texte n’a pas encore été vérifié.</p> : <p>{visibleFindings.length ? `${visibleFindings.length} point(s) à examiner.` : state.fact_revision !== state.revision || !saved ? 'Aucun signalement restant.' : 'Aucune anomalie signalée par la recherche.'} Les corrections restent à votre appréciation.
             {(state.fact_revision !== state.revision || !saved) && <> Les passages modifiés n’ont pas été revérifiés ; les autres signalements sont conservés.</>}</p>}
           {state.fact_context && <details className="facecam-evidence-context"><summary>Sous-titres transmis à la vérification</summary><p>Horaires dans les épisodes sources · marge de {state.fact_context.padding_seconds} s. Les dialogues ne permettent pas de vérifier tous les détails visuels.</p>

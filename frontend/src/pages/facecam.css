@@ -74,3 +74,6 @@
   .facecam-source-player { height: min(28dvh, 220px); }
   .facecam-source p { display: none; }
 }
+
+.facecam-editor-layout.review-hidden { grid-template-columns: minmax(0, 1fr); }
+.facecam-review[hidden] { display: none; }

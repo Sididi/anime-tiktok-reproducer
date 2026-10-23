@@ -51,6 +51,18 @@ class FacecamNarrationService:
         return (PROMPTS / f"{name}.md").read_text(encoding="utf-8")
 
     @staticmethod
+    def validate_body(value, blocks) -> dict[str, str]:
+        bodies = value.get("blocks", []) if isinstance(value, dict) else []
+        if (not isinstance(bodies, list)
+                or any(not isinstance(b, dict) or not isinstance(b.get("text"), str) for b in bodies)
+                or [b.get("id") for b in bodies] != [b.id for b in blocks if b.kind == "body"]):
+            raise ValueError("La génération n'a pas respecté les extraits originaux. Réessayez.")
+        texts = {b["id"]: b["text"].strip() for b in bodies}
+        if any(not text for text in texts.values()):
+            raise ValueError("Un passage du récit est vide.")
+        return texts
+
+    @staticmethod
     def validate_brief(value, blocks) -> NarrativeBrief:
         brief = NarrativeBrief.model_validate(value)
         bodies = [b for b in blocks if b.kind == "body"]

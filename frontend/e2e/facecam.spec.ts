@@ -377,6 +377,32 @@ async function reviewedFixture(page:Page) {
   return f;
 }
 
+test('hidden annotations keep tracking edits and can be restored without another fact check',async({page})=>{
+  const f=await reviewedFixture(page);
+  const hide=page.getByRole('button',{name:'Masquer les annotations',exact:true});
+  const show=page.getByRole('button',{name:'Afficher les annotations',exact:true});
+  await hide.click();
+  await expect(show).toHaveAttribute('aria-expanded','false');
+  await expect(page.locator('.facecam-finding')).toHaveCount(0);
+  await expect(page.locator('.facecam-review')).toBeHidden();
+  await show.click();
+  await expect(hide).toHaveAttribute('aria-expanded','true');
+  await expect(page.locator('.facecam-finding')).toHaveCount(2);
+  await expect(page.locator('.facecam-review')).toBeVisible();
+  expect(f.saves).toBe(0);
+  await hide.click();
+  const body=page.locator('section[data-facecam="body-0"] p');
+  await body.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');
+  await page.keyboard.type('X');
+  await expect.poll(()=>f.saves).toBe(1);
+  await expect(page.locator('.facecam-finding')).toHaveCount(0);
+  await show.click();
+  await expect(page.locator('.facecam-finding')).toHaveText('Il devient plus fort.');
+  await expect(page.locator('.facecam-fact-item')).toHaveCount(1);
+  expect(f.state.findings.map(item=>item.id)).toEqual(['second']);
+  expect(f.checks).toBe(0);
+});
+
 test('correcting one finding preserves the other through typing save and reload',async({page})=>{
   const f=await reviewedFixture(page);
   const second=page.locator('.facecam-fact-item').filter({hasText:'Il devient plus fort.'});
