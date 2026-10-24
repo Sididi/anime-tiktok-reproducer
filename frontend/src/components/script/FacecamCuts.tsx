@@ -41,6 +41,7 @@ export function FacecamCuts({projectId, edit, busy, job, onClose, onApply, onAna
   const [requestPending, setRequestPending] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null), video = useRef<HTMLVideoElement>(null), container = useRef<HTMLDivElement>(null);
   const wave = useRef<WaveSurfer | null>(null), regions = useRef<Regions | null>(null), syncing = useRef(false);
+  const zoomAnchor = useRef<{time: number; x: number} | null>(null);
   const draftRef = useRef(draft), applyingRef = useRef(false);
   const audition = useRef<{mode: 'original' | 'cut'; stop?: number; cuts?: RecordingCut[]}>({mode: 'cut'});
   const applying = requestPending || (submitted !== null && job?.status !== 'error');
@@ -142,8 +143,30 @@ export function FacecamCuts({projectId, edit, busy, job, onClose, onApply, onAna
     if (waveReady && selecting && !applying) return regions.current?.enableDragSelection({color: '#ef777744', minLength: 1 / 60});
   }, [selecting, waveReady, applying]);
   useEffect(() => {
-    if (waveReady && container.current) wave.current?.zoom(container.current.clientWidth / edit.duration * zoom);
+    const instance = wave.current;
+    if (!waveReady || !instance) return;
+    const pixelsPerSecond = instance.getWidth() / edit.duration * zoom;
+    instance.zoom(pixelsPerSecond);
+    if (zoomAnchor.current) {
+      instance.setScroll(zoomAnchor.current.time * pixelsPerSecond - zoomAnchor.current.x);
+      zoomAnchor.current = null;
+    }
   }, [zoom, waveReady, edit.duration]);
+  useEffect(() => {
+    const node = container.current, instance = wave.current;
+    if (!waveReady || !node || !instance) return;
+    const onWheel = (event: WheelEvent) => {
+      if (Math.abs(event.deltaX) >= Math.abs(event.deltaY) || event.shiftKey) return;
+      event.preventDefault();
+      const x = Math.max(0, Math.min(instance.getWidth(), event.clientX - instance.getWrapper().getBoundingClientRect().left - instance.getScroll()));
+      const pixelsPerSecond = instance.getWrapper().scrollWidth / edit.duration;
+      zoomAnchor.current = {time: (instance.getScroll() + x) / pixelsPerSecond, x};
+      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? node.clientHeight : 1);
+      setZoom(current => Math.max(1, Math.min(20, current * Math.exp(-delta * .002))));
+    };
+    node.addEventListener('wheel', onWheel, {passive: false});
+    return () => node.removeEventListener('wheel', onWheel);
+  }, [waveReady, edit.duration]);
 
   // rAF checks cut boundaries every display frame; timeupdate alone can lag 250 ms.
   useEffect(() => {
@@ -182,9 +205,10 @@ export function FacecamCuts({projectId, edit, busy, job, onClose, onApply, onAna
     setActive(cut.id);
     const suggestion = suggestions.get(cut.id);
     const nextWord = data?.words.find(w => w.start >= cut.end + 2.5);
-    const stop = Math.min(edit.duration, suggestion ? nextWord?.end ?? cut.end + 4 : cut.end + 2);
-    play(Math.max(0, cut.start - 1.5), stop, cut, playbackMode);
-    wave.current?.setScrollTime(Math.max(0, cut.start - 3));
+    const start = playbackMode === 'original' ? cut.start : Math.max(0, cut.start - 1.5);
+    const stop = playbackMode === 'original' ? cut.end : Math.min(edit.duration, suggestion ? nextWord?.end ?? cut.end + 4 : cut.end + 2);
+    play(start, stop, cut, playbackMode);
+    wave.current?.setScrollTime(Math.max(0, start - .5));
   }
   function togglePlayback() {
     if (video.current?.paused) play();
@@ -238,9 +262,9 @@ export function FacecamCuts({projectId, edit, busy, job, onClose, onApply, onAna
           <Button variant="ghost" size="sm" disabled={applying} onClick={() => setMarker(video.current?.currentTime ?? 0)}>Début [I]</Button>
           <Button variant="ghost" size="sm" disabled={marker === null || applying} onClick={() => add(marker!, video.current?.currentTime ?? 0)}>Fin [O]</Button>
           <Button variant="ghost" size="icon" disabled={!history.length || applying} aria-label="Annuler la dernière modification" onClick={undo}><Undo2 size={16}/></Button>
-          <label>Zoom <input type="range" aria-label="Zoom de la forme d’onde" min="1" max="20" step="1" value={zoom} disabled={!waveReady} onChange={e => setZoom(Number(e.target.value))}/></label>
+          <label>Zoom <input type="range" aria-label="Zoom de la forme d’onde" min="1" max="20" step="0.01" value={zoom} disabled={!waveReady} onChange={e => {zoomAnchor.current = null; setZoom(Number(e.target.value));}}/></label>
         </div>
-        <p className="facecam-cuts-hint">{selecting ? 'Glissez sur la forme d’onde pour créer une coupe, puis ajustez ses bords.' : marker !== null ? `Début marqué à ${cutTime(marker)}. Placez la lecture à la fin puis appuyez sur O.` : 'Cliquez pour vous déplacer. Glissez les bords d’un passage pour affiner la coupe.'}</p>
+        <p className="facecam-cuts-hint">{selecting ? 'Glissez sur la forme d’onde pour créer une coupe, puis ajustez ses bords.' : marker !== null ? `Début marqué à ${cutTime(marker)}. Placez la lecture à la fin puis appuyez sur O.` : 'Cliquez pour vous déplacer. Molette pour zoomer à cet endroit. Glissez les bords d’un passage pour affiner la coupe.'}</p>
         {selected && <fieldset className="facecam-cuts-bounds" disabled={applying}><legend>Ajuster le passage sélectionné</legend>
           <label>Début (s)<input aria-label="Début de la coupe" type="number" min="0" max={edit.duration} step="0.01" value={Number(selected.start.toFixed(3))} onChange={e => changeBound('start', e.target.valueAsNumber)}/></label>
           <label>Fin (s)<input aria-label="Fin de la coupe" type="number" min="0" max={edit.duration} step="0.01" value={Number(selected.end.toFixed(3))} onChange={e => changeBound('end', e.target.valueAsNumber)}/></label>
@@ -256,6 +280,7 @@ export function FacecamCuts({projectId, edit, busy, job, onClose, onApply, onAna
         {edit.analysis_status === 'analyzing' && <p className="facecam-cuts-analysis" role="status"><Loader2 size={15} className="animate-spin"/> Analyse des reprises… Vous pouvez déjà couper manuellement.</p>}
         {edit.analysis_status === 'error' && <div className="facecam-cuts-analysis" role="status"><p>{edit.analysis_error}</p><button disabled={busy} onClick={() => void onAnalyze().catch(e => setError(e.message))}>Réessayer l’analyse</button></div>}
         <p className="facecam-cuts-legend"><span className="high">Reprise nette</span> précochée · <span>À vérifier</span> conservée</p>
+        <p className="facecam-cuts-hint">Écouter lit le passage depuis son début. Raccord démarre 1,5 s avant et saute le passage pour écouter la transition, même décoché.</p>
         {!ordered.length && edit.analysis_status !== 'analyzing' && <p className="facecam-cuts-empty">Aucune reprise évidente signalée. Écoutez votre prise ou ajoutez une coupe manuelle.</p>}
         <div className="facecam-cuts-list">{ordered.map((cut, index) => {
           const suggestion = suggestions.get(cut.id);
@@ -266,8 +291,8 @@ export function FacecamCuts({projectId, edit, busy, job, onClose, onApply, onAna
               {!suggestion && <button disabled={applying} aria-label={`Supprimer la coupe manuelle ${index + 1}`} onClick={() => commit(draft.cuts.filter(c => c.id !== cut.id))}><Trash2 size={14}/></button>}</div>
             <button className="facecam-cuts-range" disabled={applying} onClick={() => {setActive(cut.id); if (video.current) video.current.currentTime = cut.start; wave.current?.setScrollTime(Math.max(0, cut.start - 2));}}>{cutTime(cut.start)} – {cutTime(cut.end)} <span>· {(cut.end - cut.start).toFixed(1)} s</span></button>
             {suggestion && <><p className="facecam-cuts-quote">« {suggestion.removed_text} »</p><p className="facecam-cuts-reason">{suggestion.reason}</p><details><summary>Reprise conservée</summary><p>« {suggestion.retained_text} »</p></details></>}
-            <div className="facecam-cuts-listen"><Button variant="ghost" size="sm" disabled={applying} onClick={() => listen(cut, 'original')}><Play size={13}/> Écouter</Button>
-              <Button variant="ghost" size="sm" disabled={applying} onClick={() => listen(cut, 'cut')}><Scissors size={13}/> Raccord</Button></div>
+            <div className="facecam-cuts-listen"><Button variant="ghost" size="sm" disabled={applying} title="Écouter le passage original, du début à la fin de la coupe" onClick={() => listen(cut, 'original')}><Play size={13}/> Écouter</Button>
+              <Button variant="ghost" size="sm" disabled={applying} title="Écouter la transition en sautant ce passage, même décoché" onClick={() => listen(cut, 'cut')}><Scissors size={13}/> Raccord</Button></div>
           </article>;
         })}</div>
       </aside>

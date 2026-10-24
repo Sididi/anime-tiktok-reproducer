@@ -4,6 +4,13 @@ Analyse du 23 octobre 2026, centrée sur les quinze dernières publications acce
 [@theomcx](https://www.tiktok.com/@theomcx). Préférence retenue : français très oral,
 un peu d'argot et un ton plus cash quand le récit s'y prête.
 
+**Évolution du 24 octobre :** le retour du créateur précise la méthode souhaitée : moments clés,
+mise en ordre, mots chocs et hyperbolisation, puis liaisons narratives. Les prompts encouragent
+désormais explicitement « complètement fou », « absolument dingue » et les formulations catchy,
+y compris dans la deuxième passe et sans opinion sélectionnée. Les observations et comparaisons
+ci-dessous décrivent la version du 23 octobre ; ses restrictions sur les intensifs sont remplacées
+par la [direction actuelle](facecam.md#narrative-generation).
+
 Le changement porte sur le choix des mots, les accroches et la coupe des paragraphes. Le générateur
 dispose désormais d'exemples concrets de reformulation et d'une passe de réécriture distincte après
 le premier brouillon. Sur les trois cas comparés, le corps final compte **17 à 37 % de mots en moins**.

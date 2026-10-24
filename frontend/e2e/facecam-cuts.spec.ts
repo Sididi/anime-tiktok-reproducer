@@ -140,6 +140,61 @@ test('manual cuts, precise adjustment, undo and local drafts survive closing and
   expect(f.errors).toEqual([]);
 });
 
+test('wheel zoom keeps the time under the pointer and leaves the playhead in place', async ({page}) => {
+  await fixture(page);
+  const modal = page.getByRole('dialog', {name: 'Nettoyer votre prise'});
+  const slider = modal.getByRole('slider', {name: 'Zoom de la forme d’onde'});
+  await expect(slider).toBeEnabled();
+  const waveform = modal.getByLabel('Forme d’onde audio');
+  const scroll = waveform.locator('[part="scroll"]');
+  const wrapper = waveform.locator('[part="wrapper"]');
+  const video = modal.getByLabel('Prise originale à monter');
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2);
+  await video.evaluate((v: HTMLVideoElement) => {v.currentTime = 8;});
+  const bounds = (await scroll.boundingBox())!;
+  const x = bounds.width * .6;
+  const pointerTime = async () => (await scroll.evaluate(el => el.scrollLeft) + x) / (await wrapper.evaluate(el => el.scrollWidth)) * 12;
+  const before = await pointerTime();
+  const top = await modal.evaluate(el => el.scrollTop);
+  await page.mouse.move(bounds.x + x, bounds.y + 50);
+  await page.mouse.wheel(0, -350);
+  await expect.poll(async () => Number(await slider.inputValue())).toBeGreaterThan(1.5);
+  await expect.poll(pointerTime).toBeCloseTo(before, 1);
+  expect(await modal.evaluate(el => el.scrollTop)).toBe(top);
+  expect(await video.evaluate((v: HTMLVideoElement) => v.currentTime)).toBeCloseTo(8, 2);
+  // A horizontal pan must change the next wheel anchor, even at the same pointer position.
+  await scroll.evaluate(el => {el.scrollLeft += 60;});
+  const panned = await pointerTime();
+  await page.mouse.wheel(0, -200);
+  await expect.poll(async () => Number(await slider.inputValue())).toBeGreaterThan(2.5);
+  await expect.poll(pointerTime).toBeCloseTo(panned, 1);
+  await page.mouse.wheel(0, 2000);
+  await expect(slider).toHaveValue('1');
+  await expect.poll(() => scroll.evaluate(el => el.scrollLeft)).toBe(0);
+});
+
+test('original preview seeks exactly to a cut while raccord auditions an unchecked removal', async ({page}) => {
+  await fixture(page);
+  const modal = page.getByRole('dialog', {name: 'Nettoyer votre prise'});
+  const video = modal.getByLabel('Prise originale à monter');
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.readyState)).toBeGreaterThanOrEqual(2);
+  // Observe actual seek requests rather than allowing playback to catch up from an early seek.
+  await video.evaluate((v: HTMLVideoElement & {seeks?: number[]}) => {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime')!;
+    v.seeks = [];
+    Object.defineProperty(v, 'currentTime', {get() {return descriptor.get!.call(v);}, set(value: number) {v.seeks!.push(value); descriptor.set!.call(v, value);}});
+  });
+  const passage = modal.getByRole('article', {name: 'Passage 2', exact: true});
+  await passage.getByRole('button', {name: 'Écouter', exact: true}).click();
+  expect(await video.evaluate((v: HTMLVideoElement & {seeks: number[]}) => v.seeks[0])).toBe(5);
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.paused)).toBe(true);
+  expect(await video.evaluate((v: HTMLVideoElement) => v.currentTime)).toBeCloseTo(6, 1);
+  await passage.getByRole('button', {name: 'Raccord', exact: true}).click();
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement & {seeks: number[]}) => v.seeks.includes(3.5))).toBe(true);
+  await expect.poll(() => video.evaluate((v: HTMLVideoElement & {seeks: number[]}) => v.seeks.includes(6))).toBe(true);
+  await expect(modal.getByLabel('Retirer le passage 2')).not.toBeChecked();
+});
+
 test('drag creates a manual cut, resize adjusts it, and a replacement starts a fresh edit', async ({page}) => {
   await fixture(page, {applied: true});
   await expect(page.getByRole('dialog', {name: 'Nettoyer votre prise'})).not.toBeVisible();

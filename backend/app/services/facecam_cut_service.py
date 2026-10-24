@@ -13,6 +13,7 @@ from pathlib import Path
 
 from ..models.facecam import RecordingCut, RecordingEdit, RecordingSuggestion
 from .atomic_files import write_text_atomic
+from .facecam_cut_timing import cached_cut_timing, refine_cut_timing
 from .facecam_service import FacecamService, StaleFacecamRevision
 
 FPS = 60
@@ -187,15 +188,22 @@ class FacecamCutService:
         try:
             cls.source_preview(root)
             waveform(root, edit.duration)
-            timing = FacecamMediaService.speech_timing(root)
+            timing = refine_cut_timing(root, FacecamMediaService.speech_timing(root), edit.duration)
             words = timing["words"]
             FacecamService.update(project_id, {"job": {"status": "processing", "step": "Repérage des reprises",
                 "message": "Repérage des reprises · les cuts manuels sont déjà disponibles"}})
             prompt = (Path(__file__).parents[2] / "prompts/facecam/recording_cuts.md").read_text()
             payload = {"script_context": state.spoken_text(), "words": [
                 {"i": i, "text": word_text(w), "start": w["start"], "end": w["end"]} for i, w in enumerate(words)]}
-            suggestions = validate_suggestions(FacecamService.llm(project_id, prompt + "\n" + json.dumps(payload, ensure_ascii=False)),
-                words, edit.duration, timing.get("uncertain_spans", []))
+            response = FacecamService.llm(project_id, prompt + "\n" + json.dumps(payload, ensure_ascii=False))
+            suggestions = validate_suggestions(response, words, edit.duration, timing.get("uncertain_spans", []))
+            write_text_atomic(root / "cut_analysis.json", json.dumps({
+                "source_fingerprint": edit.source_fingerprint,
+                "prompt_hash": hashlib.sha256(prompt.encode()).hexdigest(),
+                "timing_key": timing.get("source_key"), "word_count": len(words),
+                "recovery_windows": timing.get("recovery_windows", []), "response": response,
+                "suggestions": [s.model_dump() for s in suggestions],
+            }, ensure_ascii=False))
             edit.suggestions = suggestions
             edit.analysis_status = "ready"
         except Exception:
@@ -217,7 +225,8 @@ class FacecamCutService:
             raise StaleFacecamRevision("L'enregistrement a changé. Rouvrez le montage.")
         root = Path(edit.source_directory)
         timing_path = root / "speech_timing.json"
-        words = json.loads(timing_path.read_text()).get("words", []) if timing_path.is_file() else []
+        timing = json.loads(timing_path.read_text()) if timing_path.is_file() else {"words": []}
+        words = (cached_cut_timing(root, timing, edit.duration) or timing).get("words", [])
         return {"id": edit.id, "duration": edit.duration, "peaks": waveform(root, edit.duration),
             "words": [{"text": word_text(w), "start": w["start"], "end": w["end"]} for w in words]}
 
