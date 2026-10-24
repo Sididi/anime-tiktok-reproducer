@@ -82,6 +82,58 @@ def test_transformed_text_and_audio_parts_are_not_split_using_wrong_fragments():
     assert Alignment.split_manifest_at_pauses(original, words) == original
 
 
+@pytest.mark.parametrize("hyphen", ["-", "\u2010", "\u2011"])
+def test_hyphenated_asr_anchor_splits_pause_inside_scene_and_bounds_next_window(hyphen):
+    original = manifest([
+        {"scene_index": 23, "text": "un autre"},
+        {"scene_index": 24, "text": "monde. Là"},
+        {"scene_index": 25, "text": "bas, c'est complètement fou."},
+    ])
+    before = copy.deepcopy(original)
+    words = [timed(word, start) for word, start in [
+        ("un", 40.5), ("autre", 40.8), ("monde.", 41),
+        (f"Là{hyphen}bas,", 45.5), ("c'est", 46.5), ("complètement", 47), ("fou.", 47.5),
+    ]]
+    result = Alignment.split_manifest_at_pauses(original, words)
+    assert original == before
+    assert fragments(result) == fragments(original)
+    assert [s["text"] for s in result["segments"]] == [
+        "un autre monde.", "Là bas, c'est complètement fou."]
+    assert [s["scene_indices"] for s in result["segments"]] == [[23, 24], [24, 25]]
+    windows = Alignment._build_segment_windows(
+        segments=result["segments"], coarse_words=words, total_duration=50)
+    assert windows[0]["end"] == pytest.approx(41.2 + Alignment.WINDOW_PADDING_SEC)
+    # The whole recognized compound belongs in the right window. Matching only
+    # c'est would start too late and cut off the spoken Là-bas.
+    assert windows[1]["start"] == pytest.approx(45.5 - Alignment.WINDOW_PADDING_SEC)
+    uncertain = Alignment.split_manifest_at_pauses(original, words, [(42, 44)])
+    assert len(uncertain["segments"]) == 1
+
+
+def test_hyphenated_script_anchor_matches_spaced_asr_without_rewriting_script():
+    original = manifest([{"scene_index": 5, "text": "Son grand-père. Puis elle revient."}])
+    words = [timed(word, start) for word, start in [
+        ("Son", .5), ("grand", .8), ("père.", 1.1), ("Puis", 9), ("elle", 9.3), ("revient.", 9.6),
+    ]]
+    result = Alignment.split_manifest_at_pauses(original, words)
+    assert fragments(result) == fragments(original)
+    assert [s["text"] for s in result["segments"]] == ["Son grand-père.", "Puis elle revient."]
+
+
+@pytest.mark.parametrize("script,observed", [
+    ("Un monde. Là haut revient.", [("Un", .5), ("monde.", .8), ("Là-bas", 9), ("revient.", 9.5)]),
+    ("Un monde. Là-bas revient.", [("Un", .5), ("monde.", .8), ("Là", 9), ("haut", 9.3), ("revient.", 9.5)]),
+    ("Un grand-père revient.", [("Un", .5), ("grand", .8), ("père", 9), ("revient.", 9.5)]),
+    ("Un grand père revient.", [("Un", .5), ("grand-père", .8), ("revient.", 1.3)]),
+    ("Un monde. Là bas revient.", [("Un", .5), ("monde.", .8), ("ailleurs", 4), ("Là-bas", 9), ("revient.", 9.5)]),
+])
+def test_compound_partial_matches_and_internal_boundaries_never_establish_pause(script, observed):
+    original = manifest([{"scene_index": 5, "text": script}])
+    result = Alignment.split_manifest_at_pauses(original, [timed(word, start) for word, start in observed])
+    assert len(result["segments"]) == 1
+    assert fragments(result) == fragments(original)
+
+
 def test_real_alignment_pipeline_recovers_long_pause_without_relaxing_quality(tmp_path, monkeypatch):
     text = "Un dragon noir. Puis elle revient."
     original = manifest([{"scene_index": 7, "text": text}])

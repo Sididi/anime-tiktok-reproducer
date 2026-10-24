@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import shutil
 import tempfile
 import wave
@@ -238,6 +239,12 @@ class ForcedAlignmentService:
             "character_count": int(segment.get("character_count") or 0),
         }
 
+    @staticmethod
+    def _anchor_tokens(word: str) -> list[str]:
+        """Match hyphenated ASR words to spaced script words, without rewriting either."""
+        return [token for part in re.split(r"[-\u2010\u2011]", word)
+                if (token := TranscriberService._normalize_token(part))]
+
     @classmethod
     def split_manifest_at_pauses(
         cls,
@@ -257,6 +264,7 @@ class ForcedAlignmentService:
         segments = manifest.get("segments", [])
         segment_words: list[list[tuple[int, str]]] = []
         expected: list[tuple[int, int, str]] = []
+        expected_groups: dict[tuple[int, int], list[int]] = {}
         for position, segment in enumerate(segments):
             words = [(fragment["scene_index"], word)
                      for fragment in segment.get("scene_fragments", [])
@@ -267,14 +275,29 @@ class ForcedAlignmentService:
                 words = []
             segment_words.append(words)
             for index, word in enumerate(str(segment.get("text", "")).split()):
-                token = TranscriberService._normalize_token(word)
-                if token:
+                for token in cls._anchor_tokens(word):
+                    expected_groups.setdefault((position, index), []).append(len(expected))
                     expected.append((position, index, token))
-        coarse = [(word, TranscriberService._normalize_token(str(word.get("text") or "")))
-                  for word in coarse_words]
-        coarse = [(word, token) for word, token in coarse if token]
+        coarse = []
+        coarse_groups: dict[int, list[int]] = {}
+        for index, word in enumerate(coarse_words):
+            for token in cls._anchor_tokens(str(word.get("text") or "")):
+                coarse_groups.setdefault(index, []).append(len(coarse))
+                coarse.append((index, word, token))
         mapping = TranscriberService._sequence_align(
-            [token for _, _, token in expected], [token for _, token in coarse])
+            [token for _, _, token in expected], [token for _, _, token in coarse])
+        reverse_mapping = {value: index for index, value in enumerate(mapping) if value is not None}
+
+        def consecutive(values):
+            return (all(value is not None for value in values)
+                    and all(b == a + 1 for a, b in zip(values, values[1:])))
+
+        # A partial match such as "Là haut" vs "Là-bas" is not a safe anchor.
+        # Every component of both boundary words must match contiguously.
+        matched_expected = {key for key, indices in expected_groups.items()
+                            if consecutive([mapping[i] for i in indices])}
+        matched_coarse = {key for key, indices in coarse_groups.items()
+                          if consecutive([reverse_mapping.get(i) for i in indices])}
         splits: dict[int, list[int]] = {}
         for index in range(1, len(expected)):
             left, right = expected[index - 1], expected[index]
@@ -283,7 +306,13 @@ class ForcedAlignmentService:
                 continue
             if a is None or b is None or b != a + 1:
                 continue
-            start, end = float(coarse[a][0]["end"]), float(coarse[b][0]["start"])
+            # Never split inside a written or recognized compound, even if ASR
+            # places its components on opposite sides of a pause.
+            if (left[:2] == right[:2] or coarse[a][0] == coarse[b][0]
+                    or left[:2] not in matched_expected or right[:2] not in matched_expected
+                    or coarse[a][0] not in matched_coarse or coarse[b][0] not in matched_coarse):
+                continue
+            start, end = float(coarse[a][1]["end"]), float(coarse[b][1]["start"])
             if (not math.isfinite(start) or not math.isfinite(end)
                     or end - start < cls.PAUSE_SPLIT_MIN_SEC):
                 continue
@@ -941,25 +970,21 @@ class ForcedAlignmentService:
     ) -> list[dict[str, float]]:
         coarse_entries: list[dict[str, Any]] = []
         for word in coarse_words:
-            norm = TranscriberService._normalize_token(str(word.get("text") or ""))
-            if not norm:
-                continue
-            coarse_entries.append({
-                "norm": norm,
-                "start": float(word["start"]),
-                "end": float(word["end"]),
-            })
+            for norm in cls._anchor_tokens(str(word.get("text") or "")):
+                coarse_entries.append({
+                    "norm": norm,
+                    "start": float(word["start"]),
+                    "end": float(word["end"]),
+                })
 
         expected_entries: list[dict[str, Any]] = []
         for segment in segments:
             for raw_word in str(segment.get("text") or "").split():
-                norm = TranscriberService._normalize_token(raw_word)
-                if not norm:
-                    continue
-                expected_entries.append({
-                    "segment_id": int(segment["id"]),
-                    "norm": norm,
-                })
+                for norm in cls._anchor_tokens(raw_word):
+                    expected_entries.append({
+                        "segment_id": int(segment["id"]),
+                        "norm": norm,
+                    })
 
         mapping = TranscriberService._sequence_align(
             [entry["norm"] for entry in expected_entries],
