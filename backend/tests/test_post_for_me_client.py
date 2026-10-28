@@ -38,24 +38,30 @@ def _mock_client(monkeypatch, handler):
     monkeypatch.setattr(PostForMeClient, "_client", classmethod(client))
 
 
-def test_build_post_body_schedules_utc_iso():
+@pytest.mark.parametrize("platform", ["tiktok", "tiktok_business"])
+def test_build_post_body_schedules_utc_iso(platform):
     at = datetime(2026, 12, 25, 18, 0, tzinfo=timezone.utc)
     body = build_post_body(
         social_account_id="spc_1",
         media_url="https://pfm/media/1",
         caption="cap",
+        post_for_me_platform=platform,
         scheduled_at=at,
     )
     assert body["scheduled_at"] == "2026-12-25T18:00:00+00:00"
     assert body["social_accounts"] == ["spc_1"]
-    assert body["platform_configurations"]["tiktok"]["privacy_status"] == "public"
+    assert body["platform_configurations"][platform]["privacy_status"] == "public"
+    assert body["media"] == [{"url": "https://pfm/media/1", "skip_processing": True}]
 
 
-def test_build_post_body_instant_omits_scheduled_at():
+@pytest.mark.parametrize("platform", ["tiktok", "tiktok_business"])
+def test_build_post_body_instant_omits_scheduled_at(platform):
     body = build_post_body(
-        social_account_id="spc_1", media_url="https://pfm/media/1", caption="cap"
+        social_account_id="spc_1", media_url="https://pfm/media/1", caption="cap",
+        post_for_me_platform=platform,
     )
     assert "scheduled_at" not in body
+    assert body["media"] == [{"url": "https://pfm/media/1", "skip_processing": True}]
 
 
 def test_build_post_body_rejects_unknown_connector():

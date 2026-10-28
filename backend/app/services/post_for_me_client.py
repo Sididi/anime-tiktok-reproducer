@@ -168,7 +168,9 @@ def build_post_body(
     body: dict[str, Any] = {
         "caption": caption,
         "social_accounts": [social_account_id],
-        "media": [{"url": media_url}],
+        # Send the finished export directly; PFM's conversion can fail on
+        # otherwise valid TikTok videos.
+        "media": [{"url": media_url, "skip_processing": True}],
         "platform_configurations": {
             post_for_me_platform: {
                 "privacy_status": privacy_status,

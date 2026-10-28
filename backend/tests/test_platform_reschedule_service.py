@@ -443,6 +443,9 @@ def test_notify_tiktok_updates_scheduled_pfm_post(monkeypatch):
     assert result.status == "ok"
     assert updates and updates[0][0] == "sp_123"
     assert updates[0][1]["scheduled_at"] == new_at.isoformat()
+    assert updates[0][1]["media"] == [
+        {"url": "https://pfm/media/1", "skip_processing": True}
+    ]
     assert project.tiktok_pfm.scheduled_at == new_at
 
 

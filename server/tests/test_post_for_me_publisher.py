@@ -118,7 +118,7 @@ async def test_happy_path(fake, tmp_path):
     body = fake.created_posts[0]
     assert body["social_accounts"] == ["spc_1"]
     assert body["caption"] == "my caption"
-    assert body["media"] == [{"url": "https://media.example/abc.mp4"}]
+    assert body["media"] == [{"url": "https://media.example/abc.mp4", "skip_processing": True}]
     assert body["platform_configurations"]["tiktok"]["privacy_status"] == "public"
     # binary was uploaded once
     assert fake.upload_puts == [fake.video_bytes]
@@ -145,6 +145,7 @@ async def test_business_platform_options_use_business_configuration(fake, tmp_pa
     fake.results_sequence = [[{"social_account_id": "spc_1", "success": True,
                                "platform_data": {"url": "u"}, "error": None}]]
     await _publish(fake, tmp_path, post_for_me_platform="tiktok_business")
+    assert fake.created_posts[0]["media"][0]["skip_processing"] is True
     configurations = fake.created_posts[0]["platform_configurations"]
     assert "tiktok" not in configurations
     assert configurations["tiktok_business"] == {
@@ -245,7 +246,9 @@ async def test_retry_after_failed_reuses_media_and_creates_new_post(fake, tmp_pa
     assert result.success is True
     assert len(fake.created_posts) == 1   # new post created
     assert fake.upload_puts == []         # media reused, no re-upload
-    assert fake.created_posts[0]["media"] == [{"url": "https://media.example/abc.mp4"}]
+    assert fake.created_posts[0]["media"] == [
+        {"url": "https://media.example/abc.mp4", "skip_processing": True}
+    ]
 
 
 async def test_create_post_includes_thumbnail_timestamp(fake, tmp_path):
@@ -257,7 +260,11 @@ async def test_create_post_includes_thumbnail_timestamp(fake, tmp_path):
     )
     assert result.success is True
     assert fake.created_posts[0]["media"] == [
-        {"url": "https://media.example/abc.mp4", "thumbnail_timestamp_ms": 2350}
+        {
+            "url": "https://media.example/abc.mp4",
+            "skip_processing": True,
+            "thumbnail_timestamp_ms": 2350,
+        }
     ]
 
 
@@ -273,6 +280,7 @@ async def test_create_post_includes_thumbnail_url(fake, tmp_path):
     assert result.success is True
     assert fake.created_posts[0]["media"] == [{
         "url": "https://media.example/abc.mp4",
+        "skip_processing": True,
         "thumbnail_timestamp_ms": 500,
         "thumbnail_url": "https://drive.example/cover.jpg",
     }]
@@ -286,7 +294,9 @@ async def test_create_post_omits_thumbnail_when_none(fake, tmp_path):
         publish_state=state,
     )
     assert result.success is True
-    assert fake.created_posts[0]["media"] == [{"url": "https://media.example/abc.mp4"}]
+    assert fake.created_posts[0]["media"] == [
+        {"url": "https://media.example/abc.mp4", "skip_processing": True}
+    ]
 
 
 async def test_create_post_http_error_is_failure(fake, tmp_path):

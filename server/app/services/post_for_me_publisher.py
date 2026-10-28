@@ -355,7 +355,8 @@ async def create_tiktok_post(
             detail=_stage_detail("create_post", "no staged media_url"),
             publish_state=state,
         )
-    media_item: dict[str, Any] = {"url": media_url}
+    # Match the backend: publish finished TikTok exports without PFM conversion.
+    media_item: dict[str, Any] = {"url": media_url, "skip_processing": True}
     if thumbnail_timestamp_ms is not None:
         media_item["thumbnail_timestamp_ms"] = int(thumbnail_timestamp_ms)
     if thumbnail_url is not None:

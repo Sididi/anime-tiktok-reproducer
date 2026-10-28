@@ -127,6 +127,11 @@ can be resubmitted after the account configuration changes.
 
 ## Notes & limits
 
+- **Media processing:** both TikTok connectors send `media[].skip_processing: true`
+  for new posts and backend reschedules. The finished export goes to TikTok without
+  Post for Me transcoding, so it must already meet TikTok's media requirements.
+  This avoids PFM conversion failures on otherwise valid exports. Existing posts
+  already scheduled in PFM retain their submitted settings until updated.
 - **Connector limits:** the consumer Direct Post API has both per-creator posting caps
   and an app-wide active-creator quota. `tiktok_business` avoids the latter, but normal
   Post for Me and TikTok rate limits still apply.
