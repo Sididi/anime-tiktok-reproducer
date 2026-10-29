@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Check, ChevronRight, Loader2, Video, RefreshCw, ShieldCheck, Upload, ExternalLink, X, Play, Scissors, Eye, EyeOff } from 'lucide-react';
+import { Check, ChevronRight, Loader2, Video, RefreshCw, ShieldCheck, Upload, ExternalLink, X, Play, Scissors, Eye, EyeOff, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui';
 import { ProjectManagedVideoPlayer } from '@/components/video/ProjectManagedVideoPlayer';
 import type { ManagedVideoPlayerHandle } from '@/components/video/ManagedVideoPlayer';
@@ -49,10 +49,13 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const dialog = useRef<HTMLDialogElement>(null), draft = useRef<FacecamBlock[]>([]), editVersion = useRef(0), savedVersion = useRef(0);
   const savePromise = useRef<Promise<void> | null>(null), saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const currentRevision = state?.revision ?? 0;
+  const originalMode = state?.generation_mode === 'original';
   const approved = state?.approved_revision === currentRevision && !!state?.blocks.length && saved;
   const apply = useCallback((next: FacecamState) => {
     const dirty = editVersion.current !== savedVersion.current;
     if (stateRef.current && next.revision < stateRef.current.revision) return;
+    if (next.selected_hook !== stateRef.current?.selected_hook) setHook(next.selected_hook);
+    if (next.selected_opinion !== stateRef.current?.selected_opinion) setOpinion(next.selected_opinion);
     if (next.recording_edit && !next.recording_edit.applied && next.recording_edit.id !== stateRef.current?.recording_edit?.id) setCutsOpen(true);
     const merged = dirty ? {...next, blocks: draft.current, findings: stateRef.current?.findings ?? []} : next;
     stateRef.current = merged; draft.current = merged.blocks; setState(merged);
@@ -169,7 +172,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const select = stage === 'hooks' ? setHook : setOpinion;
   const previewReady = preview.previewReady;
   const cutsPending = !!state.recording_edit && !state.recording_edit.applied;
-  const storyReady = !!state.selected_story_id || (!state.stories?.length && state.blocks.length > 0);
+  const storyReady = originalMode || !!state.selected_story_id || (!state.stories?.length && state.blocks.length > 0);
   const wordCount = state.blocks.filter(b => b.kind !== 'raw').reduce((n, b) => n + (b.text.trim() ? b.text.trim().split(/\s+/).length : 0), 0);
   return <main className="facecam-page">
     <header className="flex flex-wrap items-start justify-between gap-4">
@@ -186,18 +189,23 @@ export function FacecamScriptPage({project}: {project: Project}) {
         <p>Gardez la vidéo sous les yeux pendant l’écriture.</p>
       </aside>
       <div className="facecam-workspace-content">
-    <section className="facecam-card"><h2>Modèle de rédaction</h2><p>Choisissez le modèle, puis lancez l’analyse des histoires. Ce choix s’applique aux prochaines générations.</p><div className="facecam-settings">{settings && <label>Modèle<select aria-label="Modèle" disabled={busy} value={settings.llm_preset} onChange={e => void updateSetting('llm_preset', e.target.value)}>{settings.models.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label>}</div></section>
+    <section className="facecam-card"><h2>Modèle de rédaction</h2><p>Ce choix s’applique aux prochaines générations{originalMode ? ' de votre présentation originale.' : ' et à l’analyse des histoires.'}</p><div className="facecam-settings">{settings && <label>Modèle<select aria-label="Modèle" disabled={busy} value={settings.llm_preset} onChange={e => void updateSetting('llm_preset', e.target.value)}>{settings.models.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label>}</div></section>
     <FacecamStories state={state} busy={!!busy || !settings} onAnalyze={() => void action('/stories/analyze', {})} onSelect={storyId => void selectStory(storyId)}/>
     <section className="facecam-card">
-      <div className="flex flex-wrap justify-between items-center gap-3"><div><h2>2. Choisir votre angle</h2><p>{storyReady ? 'Une accroche pour cette histoire, un point de vue facultatif.' : 'Choisissez d’abord l’histoire à raconter.'}</p></div><Button variant="outline" disabled={busy || !storyReady} onClick={() => {setStage('hooks'); dialog.current?.showModal();}}>Choisir l’accroche et le point de vue</Button></div>
+      <div className="flex flex-wrap justify-between items-center gap-3"><div><h2>2. Choisir votre angle</h2><p>{originalMode ? 'Une accroche pour présenter l’anime, un point de vue facultatif.' : storyReady ? 'Une accroche pour cette histoire, un point de vue facultatif.' : 'Choisissez d’abord l’histoire à raconter.'}</p></div><Button variant="outline" disabled={busy || !storyReady} onClick={() => {setStage('hooks'); dialog.current?.showModal();}}>Choisir l’accroche et le point de vue</Button></div>
       {(hook || opinion) && <div className="facecam-choice-summary"><blockquote><small>ACCROCHE</small>{hook || 'À choisir'}</blockquote><blockquote><small>POINT DE VUE</small>{opinion.trim() || 'Sans point de vue'}</blockquote></div>}
       {!!hook.trim() && <Button disabled={busy || !storyReady} onClick={() => {if (state.blocks.length && !window.confirm('Remplacer le brouillon actuel par une nouvelle génération ?')) return; void generate();}}>{state.blocks.length ? 'Régénérer le script' : 'Générer mon script'}</Button>}
     </section>
     {state.blocks.length > 0 && <section className="facecam-card">
       <div className="flex flex-wrap justify-between items-center gap-3 mb-5"><div><h2>3. Affiner votre script</h2><p>{saved ? 'Brouillon enregistré' : 'Enregistrement…'} · Révision {state.revision}</p></div><div className="flex flex-wrap gap-2"><Button variant="outline" aria-expanded={sourceOpen} aria-controls="facecam-source-video" onClick={e => toggleSource(e.currentTarget)}><Play size={16} className="mr-2"/>Vidéo originale</Button><Button variant="outline" disabled={busy || !saved} onClick={() => {setShowFactReview(true); void action('/fact-check');}}><ShieldCheck size={16} className="mr-2"/>Vérifier les faits</Button><Button variant="outline" aria-expanded={showFactReview} aria-controls="facecam-fact-review" onClick={() => setShowFactReview(show => !show)}>{showFactReview ? <EyeOff size={16} className="mr-2"/> : <Eye size={16} className="mr-2"/>}{showFactReview ? 'Masquer les annotations' : 'Afficher les annotations'}</Button><Button disabled={busy || approved || !storyReady} onClick={() => void action('/approve', {})}>{approved ? 'Script validé' : 'Valider le script'}</Button></div></div>
-      <p className="facecam-duration">{wordCount} mots · {state.selected_story_id === FULL_STORY_ID ? 'Histoire intégrale · Durée conseillée : 65–70 s' : 'Cible : 65–70 s'}
+      <div className="facecam-original-option">
+        <div><h3>{originalMode ? 'Présentation originale' : 'Une nouvelle approche de l’anime'}</h3><p>Gardez l’accroche et le point de vue de votre script. Recréez tout le récit depuis la prémisse de l’anime : 60–75 s, sans gros spoilers ni dialogues originaux.</p></div>
+        <Button variant="outline" disabled={busy || !state.blocks.some(b => b.kind === 'hook' && b.text.trim())} onClick={() => void action('/generate-original', {})}><Sparkles size={16} className="mr-2"/>Recréer de zéro</Button>
+      </div>
+      {originalMode && !!state.original_brief?.sources.length && <details className="mb-4"><summary>Sources de la présentation</summary><ul>{state.original_brief.sources.map(source => <li key={source.url}><a href={source.url} target="_blank" rel="noreferrer">{source.title}<ExternalLink size={12} className="inline ml-1"/></a></li>)}</ul>{state.original_brief.uncertainties.map((note, index) => <p key={index}>{note}</p>)}</details>}
+      <p className="facecam-duration">{wordCount} mots · {originalMode ? 'Présentation originale · Cible : 60–75 s' : state.selected_story_id === FULL_STORY_ID ? 'Histoire intégrale · Durée conseillée : 65–70 s' : 'Cible : 65–70 s'}
         {saved && state.estimated_duration_seconds != null && <> · Estimation : {Math.round(state.estimated_duration_seconds)} s, à confirmer avec votre lecture.
-          {state.estimated_duration_seconds > 70 ? state.selected_story_id === FULL_STORY_ID ? ' Le récit intégral dépasse la durée conseillée. Privilégiez une histoire plus courte pour garder l’attention.' : ' Vous pouvez condenser le texte à la main ; cette estimation ne bloque pas la validation.' : state.estimated_duration_seconds < 65 ? ' Une lecture est nécessaire pour vérifier que le montage dépasse une minute.' : ''}</>}
+          {state.estimated_duration_seconds > (originalMode ? 75 : 70) ? state.selected_story_id === FULL_STORY_ID ? ' Le récit intégral dépasse la durée conseillée. Privilégiez une histoire plus courte pour garder l’attention.' : ' Vous pouvez condenser le texte à la main ; cette estimation ne bloque pas la validation.' : state.estimated_duration_seconds < (originalMode ? 60 : 65) ? ' Une lecture est nécessaire pour vérifier que le montage dépasse une minute.' : ''}</>}
       </p>
       <div className={`facecam-editor-layout${showFactReview ? '' : ' review-hidden'}`}><FacecamEditor blocks={state.blocks} findings={visibleFindings} showFindings={showFactReview} disabled={!!busy} onChange={edit} onFinding={setFinding}/>
         <aside id="facecam-fact-review" className="facecam-review" hidden={!showFactReview} aria-label="Vérification des faits"><h3>Vérification des faits</h3>
@@ -214,7 +222,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
           {finding && <div className="facecam-fact-detail"><strong>{finding.quote}</strong><p>{finding.explanation}</p>{finding.correction && <p><b>Suggestion :</b> {finding.correction}</p>}{finding.sources.map(s => <div key={s.url}><a href={s.url} target="_blank" rel="noreferrer">{s.title}<ExternalLink size={12}/></a>{s.kind === 'subtitle' && s.text && <blockquote>{s.text}</blockquote>}</div>)}<button onClick={() => setFinding(null)} className="underline mt-3">Fermer</button></div>}
         </aside></div>
     </section>}
-    <section className="facecam-card" hidden={!state.blocks.length}><h2>4. Votre enregistrement</h2><p>Lisez uniquement votre narration, sans les extraits audio originaux ni le titre final. Vous pourrez retirer les ratés après l’import. Les silences seront coupés et les extraits réinsérés automatiquement.</p>
+    <section className="facecam-card" hidden={!state.blocks.length}><h2>4. Votre enregistrement</h2><p>{originalMode ? 'Lisez votre narration en continu, sans prononcer le titre final. Vous pourrez retirer les ratés après l’import ; les silences seront coupés automatiquement.' : 'Lisez uniquement votre narration, sans les extraits audio originaux ni le titre final. Vous pourrez retirer les ratés après l’import. Les silences seront coupés et les extraits réinsérés automatiquement.'}</p>
       <FacecamPrompter projectId={id} title={project.anime_name || 'Facecam'} revision={state.revision} blocks={state.blocks} saved={saved} busy={!!busy} prepare={flush}/>
       <label className={`facecam-upload ${!approved || busy ? 'disabled' : ''}`}><Upload size={24}/><span>{state.recording ? 'Remplacer l’enregistrement' : 'Importer votre vidéo'}<small>MP4 ou MOV avec son</small></span><input type="file" accept="video/mp4,video/quicktime,.mp4,.mov" disabled={!approved || busy} onChange={e => {const file = e.target.files?.[0]; if(file) void importFile(file, 'recording'); e.target.value = '';}}/></label>
       {!approved && <p>Validez votre script avant d’importer une vidéo.</p>}{upload !== null && <progress max={100} value={upload} aria-label="Envoi du fichier"/>}
@@ -232,7 +240,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
       </>}
       {previewReady && state.prepared?.cut_report && <p>{state.prepared.cut_report.removed_seconds.toFixed(1)} s de pauses retirées · {state.prepared.cut_report.cut_count} coupes · {state.prepared.cut_report.protected_word_count} mots protégés.</p>}
       {previewReady && state.prepared?.duration_seconds != null && <p>Durée montée, carte finale comprise : {state.prepared.duration_seconds.toFixed(1)} s.
-        {state.prepared.duration_seconds <= 60 ? ' Le montage ne dépasse pas encore une minute : ajustez le récit et enregistrez une nouvelle prise.' : state.prepared.duration_seconds > 70 ? ' Le montage dépasse la cible de 65–70 s.' : ''}</p>}
+        {state.prepared.duration_seconds <= 60 ? ' Le montage ne dépasse pas encore une minute : ajustez le récit et enregistrez une nouvelle prise.' : state.prepared.duration_seconds > (originalMode ? 75 : 70) ? ` Le montage dépasse la cible de ${originalMode ? '60–75' : '65–70'} s.` : ''}</p>}
     </section>
     <section className="facecam-card"><h2>Finition et publication</h2><div className="facecam-settings">
       {settings && <><label>Musique<select aria-label="Musique" disabled={preview.controlsDisabled} value={preview.selectedMusic || ''} onChange={e => preview.changeMusic(e.target.value)}>{settings.music.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}</select></label><p>La musique est incluse dans l’aperçu audio.</p></>}

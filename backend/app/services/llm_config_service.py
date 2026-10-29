@@ -71,6 +71,11 @@ class LLMConfigService:
         return cls.get_config().script_repair
 
     @classmethod
+    def fact_check_entry(cls) -> LLMPresetEntry:
+        """A dedicated light model, independent of the writing preset."""
+        return cls.get_config().fact_check
+
+    @classmethod
     def list_presets(cls) -> list[tuple[str, LLMPreset]]:
         cfg = cls.get_config()
         return list(cfg.presets.items())

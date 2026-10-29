@@ -77,3 +77,7 @@
 
 .facecam-editor-layout.review-hidden { grid-template-columns: minmax(0, 1fr); }
 .facecam-review[hidden] { display: none; }
+.facecam-original-option { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem; margin-bottom: 1rem; border: 1px solid hsl(var(--border)); border-radius: .75rem; }
+.facecam-original-option > div { flex: 1 1 20rem; }
+.facecam-original-option h3 { font-weight: 600; }
+.facecam-original-option p { margin-bottom: 0; }

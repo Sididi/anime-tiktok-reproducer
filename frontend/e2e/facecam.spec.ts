@@ -1,7 +1,7 @@
 import {test,expect,type Page} from '@playwright/test';
 import {DEFAULT_FACECAM_AUTO_EDITOR, type FacecamState, type FacecamStory} from '../src/api/facecam';
 
-async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; fullDuration?: number; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean}) {
+async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; fullDuration?: number; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean; failOriginal?: boolean; delayedOriginal?: boolean}) {
   const id='facecam-browser';
   let checks=0,saves=0,analyses=0;
   let preset='gpt',music='music';
@@ -10,6 +10,9 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
   let conflictingRequests=0;
   const analysisPresets:string[]=[];
   const previews: {revision: number; auto_editor: typeof DEFAULT_FACECAM_AUTO_EDITOR}[]=[];
+  const originalRequests: {revision: number}[]=[];
+  const scriptRequests: {revision: number; hook: string; opinion: string}[]=[];
+  let finishOriginal: (() => void) | undefined;
   let state:FacecamState={revision:1,approved_revision:null,selected_hook:'Imagine ce ninja.',selected_opinion:'Ce choix est intéressant.',
     hooks:Array.from({length:8},(_,i)=>({id:`hook-${i}`,text:`Accroche ${i+1}`,original:i===0})),opinions:Array.from({length:8},(_,i)=>({id:`opinion-${i}`,text:`Avis ${i+1}`,original:false})),
     blocks:[{id:'hook',kind:'hook',text:'Imagine ce ninja.',scene_indices:[]},{id:'body-0',kind:'body',text:'Naruto poursuit son rêve.',scene_indices:[0]},
@@ -75,7 +78,7 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
     }
     if(path==='/facecam/story'){
       const data=route.request().postDataJSON();expect(data.revision).toBe(state.revision);
-      state={...state,selected_story_id:data.story_id,revision:state.revision+1,blocks:[],hooks:[],opinions:[],selected_hook:'',selected_opinion:'',approved_revision:null,prepared:null};
+      state={...state,generation_mode:data.story_id==='original'?'original':'story',selected_story_id:data.story_id==='original'?null:data.story_id,revision:state.revision+1,blocks:[],hooks:[],opinions:[],selected_hook:'',selected_opinion:'',approved_revision:null,prepared:null};
       return json(state);
     }
     if(path==='/facecam/draft'){
@@ -84,14 +87,109 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
       state={...state,...data,findings,findings_revision:state.revision+1,revision:state.revision+1,approved_revision:null,prepared:null};saves++;return json(state);
     }
     if(path==='/facecam/selection'){const data=route.request().postDataJSON();state={...state,selected_hook:data.hook,selected_opinion:data.opinion};return json(state);}
-    if(path==='/facecam/generate'){const data=route.request().postDataJSON();state={...state,selected_hook:data.hook,selected_opinion:data.opinion,revision:state.revision+1,blocks:state.blocks.filter(b=>b.kind!=='opinion'||data.opinion.trim())};return json(state);}
+    if(path.startsWith('/facecam/candidates/')){
+      const kind=path.endsWith('/hooks')?'hooks':'opinions';
+      state={...state,[kind]:Array.from({length:8},(_,i)=>({id:`${kind}-${i}`,text:`${kind==='hooks'?'Accroche':'Avis'} ${i+1}`,original:false}))};
+      return json(state);
+    }
+    if(path==='/facecam/generate'){
+      const data=route.request().postDataJSON();scriptRequests.push(data);
+      state={...state,selected_hook:data.hook,selected_opinion:data.opinion,revision:state.revision+1,
+        blocks:state.generation_mode==='original' ? [
+          {id:'hook',kind:'hook',text:data.hook,scene_indices:[]},
+          {id:'body-original',kind:'body',text:'Une présentation entièrement nouvelle.',scene_indices:[0,2]},
+          ...(data.opinion.trim()?[{id:'opinion',kind:'opinion' as const,text:data.opinion,scene_indices:[]}]:[]),
+          {id:'ending',kind:'ending',text:'Le nom de l’anime c’est :',scene_indices:[]},
+        ] : state.blocks.filter(b=>b.kind!=='opinion'||data.opinion.trim())};return json(state);
+    }
+    if(path==='/facecam/generate-original'){
+      const data=route.request().postDataJSON();originalRequests.push(data);expect(data.revision).toBe(state.revision);
+      expect(Object.keys(data)).toEqual(['revision']);
+      if(options?.failOriginal) {state={...state,job:{status:'error',message:'La recherche est indisponible. Le script est conservé.'}};return json(state);}
+      finishOriginal=()=>{
+        state={...state,generation_mode:'original',selected_story_id:null,revision:state.revision+1,
+          selected_hook:state.blocks.find(b=>b.kind==='hook')!.text,selected_opinion:state.blocks.find(b=>b.kind==='opinion')?.text??'',
+          blocks:[state.blocks[0],{id:'body-original',kind:'body',text:'Une présentation entièrement nouvelle.',scene_indices:[0,2]},...state.blocks.filter(b=>b.kind==='opinion'||b.kind==='ending')],
+          original_brief:{sources:[{url:'https://example.org/anime',title:'Synopsis officiel'}],uncertainties:[]},
+          approved_revision:null,prepared:null,findings:[],fact_revision:null,job:{status:'complete'}};
+        releaseJob?.();
+      };
+      if(options?.delayedOriginal){jobDone=new Promise<void>(resolve=>{releaseJob=resolve;});state={...state,job:{status:'processing',step:'Création d’un script original'}};}
+      else finishOriginal();
+      return json(state);
+    }
     if(path==='/facecam/fact-check'){checks++;state={...state,fact_revision:state.revision};return json(state);}
     return route.fulfill({status:404,json:{detail:'Unused fixture endpoint'}});
   });
   await page.goto(`/project/${id}/script`);
   await expect(page.getByRole('heading',{name:'Naruto',exact:true})).toBeVisible();
-  return {analysisPresets,previews,completePreview:()=>finishPreview?.(),get conflictingRequests(){return conflictingRequests;},get state(){return state;},get saves(){return saves;},get checks(){return checks;},get analyses(){return analyses;}};
+  return {analysisPresets,previews,originalRequests,scriptRequests,completeOriginal:()=>finishOriginal?.(),completePreview:()=>finishPreview?.(),get conflictingRequests(){return conflictingRequests;},get state(){return state;},get saves(){return saves;},get checks(){return checks;},get analyses(){return analyses;}};
 }
+
+test('original presentation is selectable immediately and needs only one script generation',async({page})=>{
+  const f=await fixture(page,{empty:true});
+  await page.getByRole('button',{name:'Choisir la présentation originale',exact:true}).click();
+  expect(f.analyses).toBe(0);expect(f.scriptRequests).toHaveLength(0);expect(f.state.blocks).toHaveLength(0);
+  await page.reload();
+  await expect(page.getByRole('button',{name:'Présentation originale retenue',exact:true})).toBeDisabled();
+  await page.getByRole('button',{name:'Choisir l’accroche et le point de vue',exact:true}).click();
+  const modal=page.locator('dialog[open]');
+  await modal.getByRole('button',{name:'Proposer 8 variantes',exact:true}).click();
+  await modal.getByRole('button',{name:'OPTION 1 Accroche 1',exact:true}).click();
+  await modal.getByRole('button',{name:'Choisir le point de vue',exact:true}).click();
+  await modal.getByRole('button',{name:/Sans point de vue/}).click();
+  await modal.getByRole('button',{name:'Générer mon script',exact:true}).click();
+  await expect(page.locator('section[data-facecam="body-original"]')).toContainText('Une présentation entièrement nouvelle.');
+  expect(f.analyses).toBe(0);expect(f.scriptRequests).toHaveLength(1);expect(f.originalRequests).toHaveLength(0);
+  expect(f.scriptRequests[0]).toEqual({revision:1,hook:'Accroche 1',opinion:''});
+  await expect(page.locator('[data-facecam-marker="raw-1"]')).toHaveCount(0);
+  await expect(page.getByRole('button',{name:'Valider le script',exact:true})).toBeEnabled();
+});
+
+test('original generation saves manual edits first, keeps the angle and survives reload',async({page})=>{
+  const f=await fixture(page,{recording:true});
+  const hook=page.locator('section[data-facecam="hook"] p');
+  await hook.fill('Mon accroche corrigée.');
+  await page.getByRole('button',{name:'Recréer de zéro',exact:true}).click();
+  await expect(page.locator('section[data-facecam="body-original"]')).toContainText('Une présentation entièrement nouvelle.');
+  expect(f.saves).toBe(1);expect(f.originalRequests).toEqual([{revision:2}]);
+  await expect(hook).toHaveText('Mon accroche corrigée.');
+  await expect(page.locator('section[data-facecam="opinion"]')).toHaveText('Ce choix est intéressant.');
+  await expect(page.locator('[data-facecam-marker="raw-1"]')).toHaveCount(0);
+  await expect(page.locator('.facecam-choice-summary')).toContainText('Mon accroche corrigée.');
+  await expect(page.getByRole('button',{name:'Valider le script',exact:true})).toBeEnabled();
+  expect(f.state.prepared).toBeNull();expect(f.state.approved_revision).toBeNull();
+  await page.reload();
+  await expect(page.locator('section[data-facecam="body-original"]')).toBeVisible();
+  await expect(page.locator('.facecam-duration')).toContainText('60–75 s');
+  await page.getByText('Sources de la présentation',{exact:true}).click();
+  await expect(page.getByRole('link',{name:'Synopsis officiel'})).toHaveAttribute('href','https://example.org/anime');
+});
+
+test('original generation is unavailable before a script and preserves it on failure',async({page})=>{
+  await fixture(page,{empty:true});
+  await expect(page.getByRole('button',{name:'Recréer de zéro',exact:true})).toHaveCount(0);
+  await page.unrouteAll({behavior:'wait'});
+  const f=await fixture(page,{failOriginal:true});
+  await page.getByRole('button',{name:'Recréer de zéro',exact:true}).click();
+  await expect(page.locator('.facecam-status')).toContainText('Le script est conservé.');
+  await expect(page.locator('section[data-facecam="body-0"]')).toContainText('Naruto poursuit son rêve.');
+  expect(f.state.revision).toBe(1);
+  await expect(page.getByRole('button',{name:'Recréer de zéro',exact:true})).toBeEnabled();
+});
+
+test('original generation blocks conflicting actions and reattaches after reload',async({page})=>{
+  const f=await fixture(page,{delayedOriginal:true});
+  await page.getByRole('button',{name:'Recréer de zéro',exact:true}).click();
+  await expect(page.getByRole('button',{name:'Recréer de zéro',exact:true})).toBeDisabled();
+  await expect(page.getByRole('button',{name:'Valider le script',exact:true})).toBeDisabled();
+  await page.reload();
+  await expect(page.getByRole('button',{name:'Recréer de zéro',exact:true})).toBeDisabled();
+  f.completeOriginal();
+  await expect(page.locator('section[data-facecam="body-original"]')).toBeVisible();
+  await expect(page.getByRole('button',{name:'Recréer de zéro',exact:true})).toBeEnabled();
+  expect(f.originalRequests).toHaveLength(1);
+});
 
 test('autoeditor tweaks regenerate preview and persist without invalidating script or recording',async({page})=>{
   const f=await fixture(page,{recording:true});
@@ -240,7 +338,7 @@ test('the optional full story is always visible, warns about duration and persis
   await page.reload();
   await expect(full.getByRole('button',{name:'Histoire intégrale retenue'})).toBeDisabled();
   await page.getByRole('button',{name:'Analyser les histoires'}).click();
-  await expect(page.getByRole('article')).toHaveCount(3);
+  await expect(page.getByRole('article')).toHaveCount(4);
   await expect(full.getByRole('button',{name:'Histoire intégrale retenue'})).toBeDisabled();
   await page.getByRole('article',{name:'Le faux débutant'}).getByRole('button',{name:'Choisir cette histoire'}).click();
   expect(f.state.selected_story_id).toBe('story-2');
@@ -307,7 +405,7 @@ test('failed detection is retryable and cannot unlock the hook step',async({page
   await expect(page.getByRole('button',{name:'Choisir l’accroche et le point de vue'})).toBeDisabled();
   expect(f.analyses).toBe(1);
   await page.getByRole('button',{name:'Réessayer l’analyse'}).click();
-  await expect(page.getByRole('article')).toHaveCount(3);
+  await expect(page.getByRole('article')).toHaveCount(4);
   expect(f.analyses).toBe(2);
 });
 

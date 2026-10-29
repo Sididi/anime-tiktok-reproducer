@@ -465,7 +465,7 @@ def test_fact_checker_fails_closed_and_keeps_evidence(source,monkeypatch):
     from app.services.openrouter_service import OpenRouterService
     project,state=draft(source)
     monkeypatch.setattr(OpenRouterService,'research',lambda *a,**k: {'text':'Official evidence','sources':[{'url':'https://example.org/official','title':'Official'}]})
-    monkeypatch.setattr(FacecamService,'llm',lambda *a: {'findings':[{'quote':'Naruto','kind':'contradiction','explanation':'Wrong claim','source_urls':['https://example.org/official','https://invented.test']}]})
+    monkeypatch.setattr(OpenRouterService,'generate_json_value_with_entry',lambda *a, **kw: {'findings':[{'quote':'Naruto','kind':'contradiction','explanation':'Wrong claim','source_urls':['https://example.org/official','https://invented.test']}]})
     checked=FacecamService.fact_check(project.id)
     assert checked.fact_revision==state.revision and len(checked.findings[0].sources)==1
     def fail(*a,**k): raise RuntimeError('Research offline')
@@ -591,12 +591,12 @@ def test_fact_checker_passes_episode_evidence_to_both_stages_and_serves_citation
     def research(prompt, **kwargs):
         prompts.append(prompt)
         return {'text':'Evidence','sources':[{'url':'https://official.example','title':'Official'}]}
-    def annotate(pid,prompt):
+    def annotate(prompt, **kwargs):
         prompts.append(prompt)
         return {'findings':[{'quote':'Naruto','kind':'contradiction','explanation':'Voir le dialogue.',
             'source_urls':[subtitle['url'],'/api/invented']} ]}
     monkeypatch.setattr(OpenRouterService,'research',research)
-    monkeypatch.setattr(FacecamService,'llm',annotate)
+    monkeypatch.setattr(OpenRouterService,'generate_json_value_with_entry',annotate)
     checked=FacecamService.fact_check(project.id)
     assert checked.fact_context == context and checked.fact_revision==state.revision
     assert checked.findings[0].sources == [subtitle]

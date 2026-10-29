@@ -9,6 +9,7 @@ export interface FacecamStory {
   estimated_duration_seconds?: number | null;
 }
 export const FULL_STORY_ID = 'full-story';
+export const ORIGINAL_STORY_ID = 'original';
 export interface FacecamAutoEditorSettings {
   noise_threshold_db: number;
   min_silence_ms: number;
@@ -32,6 +33,8 @@ export function sameAutoEditorSettings(a?: FacecamAutoEditorSettings, b?: Faceca
     .every(key => (a[key] ?? DEFAULT_FACECAM_AUTO_EDITOR[key]) === (b[key] ?? DEFAULT_FACECAM_AUTO_EDITOR[key]));
 }
 export interface FacecamState {
+  generation_mode?: 'story' | 'original';
+  original_brief?: {sources: {url: string; title: string}[]; uncertainties: string[]} | null;
   stories?: FacecamStory[]; full_story?: FacecamStory | null; selected_story_id?: string | null; estimated_duration_seconds?: number | null;
   revision: number; hooks: {id: string; text: string; original: boolean}[]; opinions: {id: string; text: string; original: boolean}[];
   selected_hook: string; selected_opinion: string; blocks: FacecamBlock[]; approved_revision: number | null;

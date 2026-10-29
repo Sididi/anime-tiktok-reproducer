@@ -92,15 +92,27 @@ def download(directory: Path, entry: dict) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
     video = folder / "video.mp4"
     if video.exists():
-        probe(video)
-        return video
+        try:
+            probe(video)
+            return video
+        except (ValueError, subprocess.CalledProcessError):
+            video.unlink()  # Never reuse a silent/partial research download.
+    # TikTok sometimes advertises audio on a silent best-format stream. Retry
+    # the same publication's download format, never substitute an older video.
+    formats = ("b[ext=mp4][acodec!=none]/b[acodec!=none]/best", "download")
     with (folder / "download.log").open("w") as log:
-        subprocess.run(YTDLP + ["--no-playlist", "--no-progress", "--write-info-json",
-            "-f", "b[ext=mp4][acodec!=none]/b[acodec!=none]/best", "--remux-video", "mp4",
-            "-o", str(folder / "video.%(ext)s"), entry["url"]],
-            stdout=log, stderr=log, timeout=300, check=True)
-    probe(video)
-    return video
+        for index, video_format in enumerate(formats):
+            try:
+                subprocess.run(YTDLP + ["--no-playlist", "--no-progress", "--write-info-json",
+                    "-f", video_format, "--remux-video", "mp4",
+                    "-o", str(folder / "video.%(ext)s"), entry["url"]],
+                    stdout=log, stderr=log, timeout=300, check=True)
+                probe(video)
+                return video
+            except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                video.unlink(missing_ok=True)
+                if index == len(formats) - 1:
+                    raise
 
 
 # Remove only the branded opening, never later story content. Raw ASR is retained.

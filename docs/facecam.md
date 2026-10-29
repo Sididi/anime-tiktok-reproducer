@@ -110,6 +110,37 @@ The AniList identity and cover remain under `facecam/`, outside `output/`. Ambig
 
 Cover lookup searches parenthesized aliases as well as the full library title (for example `Kill Ao (Kill Blue)`). If those searches yield no exact identity, up to four longer words from the main title are searched to discover candidates despite differences in word spacing. Discovery terms never establish identity: auto-selection still requires one unique full title/alias/synonym match after ignoring case, punctuation and spacing. Results are deduplicated by AniList ID. Empty, ambiguous and unavailable-catalog outcomes have separate errors; a partial GraphQL response cannot trigger a selection. Existing selected or uploaded covers remain cached. Processing preflight errors display the server's corrective message and a route back to Facecam.
 
+## Original anime introduction
+
+**Présentation originale** can also be selected immediately under **Choisir l’histoire à raconter**,
+without analyzing source stories or generating an initial script. Selecting the option makes no
+LLM calls. The first request for hook/opinion suggestions researches and caches the anime brief;
+the first script reuses it. A directly typed hook also works, and a failed first draft retains the
+brief for retry. Selecting a source story clears this original context.
+
+After generating a script, **Recréer de zéro** preserves the current editor's exact hook and optional
+opinion and researches the anime to write a fresh introduction. It targets 60–75 seconds, focuses on
+the premise and setup without major spoilers, and uses continuous narration without original-dialogue
+inserts. The previous script, selected story, source narration and scene descriptions never enter its
+research/writing calls. Available narration shots remain illustrations assigned after writing.
+
+`generation_mode: original` persists through edits, approval and reloads; old states default to `story`.
+New proposals and regenerations stay in the original mode until a source story is selected again.
+Sources are exposed beside the script. Previous state, research and generation responses are archived
+under `facecam/generations/original-*.json`; failed or stale generations preserve the current draft.
+Changing the script invalidates approval and prepared output. The usual advisory fact check runs afterward.
+
+Both stages of **Vérifier les faits** (web research and structured annotations) use the dedicated
+`fact_check` entry in `config/llm/config.yaml`: `google/gemini-3.8-flash`, low reasoning, with a
+4,096-token output cap. They previously used the writing preset's big model. This also applies to
+automatic checks after generation and to projects using Grok, whose existing big/light preset
+entries are identical. There is no automatic fallback to the writing model on failure. Web search
+still runs and may incur its own costs; writing and initial anime research keep their existing models.
+
+The [50-publication analysis and implementation notes](facecam-original-2026-10-29.md) explain the
+editorial approach, scope, provenance and limitations. The [reviewed inventory](facecam-original-corpus-2026-10-29.csv)
+links every publication; creator transcripts remain local research artifacts and never enter production prompts.
+
 ## Editor delivery
 
 Facecam exports `SPM_facecam_<anime>_<project_id>.zip` with ZIP64, streamed files, complete episodes, original recording, silent normalized camera, real narration, music, cover/title card, presets, expanded subtitle MOGRTs/timings, JSX, Windows launcher, script, and French instructions. Media references are checked before delivery. It bypasses shared-source prewarming, folder synchronization and Premiere Link. Only the ZIP is uploaded or updated; editor files are preserved.

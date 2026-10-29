@@ -6,6 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 from facecam_corpus import analysis_text, latest
+import facecam_corpus
 
 
 def test_latest_deduplicates_and_sorts_pins_by_publication_date():
@@ -37,3 +38,24 @@ def test_branded_opening_is_excluded_without_losing_story(intro):
 def test_reference_to_brand_later_in_account_news_is_not_cut_with_story():
     text = "C'est fini. Je vous présente un nouvel animé tous les jours. Nouvelle intro !"
     assert analysis_text('theomcx', text) == (text, '')
+
+
+@pytest.mark.parametrize('cached_silent', [True, False])
+def test_silent_download_retries_same_publication_with_audio(tmp_path, monkeypatch, cached_silent):
+    entry = {'id': '123', 'url': 'https://www.tiktok.com/@theomcx/video/123'}
+    video = tmp_path / 'videos/123/video.mp4'
+    video.parent.mkdir(parents=True)
+    if cached_silent:
+        video.write_bytes(b'silent')
+    attempts = []
+    def run(command, **kwargs):
+        assert command[-1] == entry['url']
+        attempts.append(command[command.index('-f') + 1])
+        video.write_bytes(b'audio' if attempts[-1] == 'download' else b'silent')
+    def probe(path):
+        if path.read_bytes() != b'audio':
+            raise ValueError('Missing audio')
+    monkeypatch.setattr(facecam_corpus.subprocess, 'run', run)
+    monkeypatch.setattr(facecam_corpus, 'probe', probe)
+    assert facecam_corpus.download(tmp_path, entry) == video
+    assert len(attempts) == 2 and attempts[-1] == 'download'

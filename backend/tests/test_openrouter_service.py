@@ -73,6 +73,21 @@ def test_build_reasoning_none():
     assert OpenRouterService._build_reasoning(entry) is None
 
 
+def test_research_explicit_light_model_is_sent_to_provider_without_big_fallback(monkeypatch):
+    import json
+    entry = LLMPresetEntry(openrouter_id='google/light-test', max_output_tokens=4096)
+    monkeypatch.setattr(OpenRouterService, '_resolve_entry', lambda **kw: pytest.fail('Unexpected preset resolution'))
+    def respond(request):
+        body = json.loads(request.content)
+        assert body['model'] == 'google/light-test' and body['max_output_tokens'] == 4096
+        assert body['tools'][0]['type'] == 'openrouter:web_search'
+        return httpx.Response(200, json={'output': [{'content': [{'text': 'Evidence.', 'annotations': [
+            {'url_citation': {'url': 'https://example.org/source', 'title': 'Source'}}]}]}]})
+    client = httpx.Client(transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(httpx, 'Client', lambda **kw: client)
+    assert OpenRouterService.research('Verify', entry=entry)['text'] == 'Evidence.'
+
+
 def test_generate_text_uses_preset_big_by_default(monkeypatch):
     fake_client = MagicMock()
     fake_client.chat.completions.create.return_value = _make_chat_response("hello")

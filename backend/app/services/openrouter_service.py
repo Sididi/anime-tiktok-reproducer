@@ -28,10 +28,11 @@ class OpenRouterService:
     _client: OpenAI | None = None
 
     @classmethod
-    def research(cls, prompt: str, *, preset_key: str | None = None) -> dict[str, Any]:
+    def research(cls, prompt: str, *, preset_key: str | None = None,
+                 entry: LLMPresetEntry | None = None) -> dict[str, Any]:
         """Grounded research uses Responses; preserve actual provider citations."""
         import httpx
-        entry = cls._resolve_entry(preset_key=preset_key, tier="big")
+        entry = entry if entry is not None else cls._resolve_entry(preset_key=preset_key, tier="big")
         body: dict[str, Any] = {
             "model": entry.openrouter_id, "input": prompt,
             "tools": [{"type": "openrouter:web_search", "parameters": {

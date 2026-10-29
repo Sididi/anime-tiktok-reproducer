@@ -105,6 +105,8 @@ class FacecamAutoEditorSettings(BaseModel):
 
 class FacecamState(BaseModel):
     revision: int = 0
+    generation_mode: Literal["story", "original"] = "story"
+    original_brief: dict[str, Any] | None = None
     stories: list[StoryArc] = Field(default_factory=list)
     full_story: StoryArc | None = None  # Derived from immutable references when loading.
     stories_fingerprint: str | None = None

@@ -161,6 +161,19 @@ async def fact_check(project_id: str):
     return await _job(project_id, "Vérification des faits", FacecamService.fact_check)
 
 
+@router.post("/{project_id}/facecam/generate-original")
+async def generate_original(project_id: str, request: ActionRequest):
+    from ...services.facecam_original_service import FacecamOriginalService
+
+    def generate_and_check(pid, revision):
+        FacecamOriginalService.generate(pid, revision)
+        FacecamService.update(pid, {"job": {"status": "processing", "step": "Vérification des faits", "progress": 0.8}})
+        FacecamService.fact_check(pid)
+
+    return await _job(project_id, "Création d’un script original · recherche sur l’anime",
+                      generate_and_check, request.revision)
+
+
 @router.get("/{project_id}/facecam/fact-evidence/{source_id}")
 async def fact_evidence(project_id: str, source_id: str):
     state = _state(project_id)

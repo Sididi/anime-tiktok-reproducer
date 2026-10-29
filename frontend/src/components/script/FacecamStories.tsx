@@ -1,6 +1,6 @@
-import { AlertTriangle, Check, Clock3, Loader2 } from 'lucide-react';
+import { AlertTriangle, Check, Clock3, Loader2, Sparkles } from 'lucide-react';
 import { Button } from '@/components/ui';
-import { FULL_STORY_ID, type FacecamState } from '@/api/facecam';
+import { FULL_STORY_ID, ORIGINAL_STORY_ID, type FacecamState } from '@/api/facecam';
 
 function durationLabel(seconds: number) {
   const rounded = Math.ceil(seconds);
@@ -12,12 +12,13 @@ export function FacecamStories({state, busy, onAnalyze, onSelect}: {
 }) {
   const stories = state.stories ?? [];
   const fullSelected = state.selected_story_id === FULL_STORY_ID;
+  const originalSelected = state.generation_mode === 'original';
   const fullDuration = state.full_story?.estimated_duration_seconds;
   const tooLong = fullDuration != null && fullDuration > 70;
   return <section className="facecam-card" aria-labelledby="facecam-stories-title">
     <h2 id="facecam-stories-title">1. Choisir l’histoire à raconter</h2>
-    <p>{!stories.length
-      ? 'Lancez l’analyse pour trouver un récit de 65–70 s, ou choisissez de garder toute l’histoire.'
+    <p>{originalSelected ? 'Vous partez directement de l’anime. Choisissez maintenant votre accroche et votre point de vue.' : !stories.length
+      ? 'Présentez l’anime de zéro, analysez la vidéo source pour choisir une histoire, ou gardez son récit intégral.'
       : stories.length === 1
         ? state.selected_story_id === stories[0].id ? 'Une seule histoire détectée : elle est retenue automatiquement.' : 'Une seule histoire détectée. Vous pouvez choisir ce récit ou garder toute l’histoire.'
         : `${stories.length} histoires détectées. Choisissez celle que vous souhaitez développer.`}</p>
@@ -26,7 +27,18 @@ export function FacecamStories({state, busy, onAnalyze, onSelect}: {
       {busy ? 'Analyse en cours…' : state.job?.status === 'error' ? 'Réessayer l’analyse' : 'Analyser les histoires'}
     </Button>}
     {!!stories.length && state.job?.status === 'error' && <Button variant="outline" disabled={busy} onClick={onAnalyze}>Actualiser l’analyse</Button>}
-    <div className="facecam-stories">{stories.map(story => {
+    <div className="facecam-stories">
+      <article className={originalSelected ? 'selected' : ''} aria-label="Présentation originale">
+        <span className="facecam-story-label">Depuis l’anime · sans histoire source</span>
+        <h3><Sparkles size={16} aria-hidden="true"/> Présentation originale</h3>
+        <p className="facecam-story-duration"><Clock3 size={16} aria-hidden="true"/>Cible : 60–75 s</p>
+        <p>Créez directement un récit depuis la prémisse de l’anime, sans gros spoilers ni dialogues originaux imposés.</p>
+        <p>Aucune analyse des histoires ni génération préalable de script nécessaire. Vous choisissez ensuite votre accroche et votre point de vue.</p>
+        <Button variant={originalSelected ? 'outline' : 'default'} disabled={busy || originalSelected} onClick={() => onSelect(ORIGINAL_STORY_ID)}>
+          {originalSelected ? 'Présentation originale retenue' : 'Choisir la présentation originale'}
+        </Button>
+      </article>
+      {stories.map(story => {
       const selected = state.selected_story_id === story.id;
       return <article key={story.id} className={selected ? 'selected' : ''} aria-label={story.title}>
         <h3>{selected && <Check size={16} aria-label="Histoire retenue"/>}{story.title}</h3>

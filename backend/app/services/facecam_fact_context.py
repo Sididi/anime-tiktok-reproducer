@@ -50,9 +50,12 @@ class FacecamFactContext:
         matches = (MatchList.model_validate_json(reference.read_text()) if reference.exists()
                    else ProjectService.load_matches(project_id))
         transcription = FacecamService.reference(project_id)
-        if FacecamService.load(project_id).selected_story_id:
+        state = FacecamService.load(project_id)
+        if state.selected_story_id or state.generation_mode == "original":
             transcription, matches, _ = FacecamService.montage_reference(project_id)
-        original = {s.scene_index: s.text for s in transcription.scenes}
+        # An original introduction may cover different events. Its illustrations
+        # provide subtitle evidence, never a source narration to reconstruct.
+        original = {} if state.generation_mode == "original" else {s.scene_index: s.text for s in transcription.scenes}
         episodes = {}
         for match in matches.matches if matches else []:
             if not match.episode or not all(math.isfinite(t) for t in (match.start_time, match.end_time)) or match.end_time <= match.start_time:
