@@ -1,4 +1,6 @@
 Propose exactement huit accroches françaises courtes, toutes nouvelles et adaptées à cette histoire.
+Le temps de l'accroche est libre : choisis celui qui sert son angle et sa formulation naturelle.
+Le futur proche demandé pour le corps du script n'est pas imposé aux hooks.
 La première n'a aucun statut spécial. Chaque option doit ouvrir une vraie question à laquelle les faits
 permettront de répondre. Une ou deux phrases orales, avec une information concrète immédiatement.
 Vise une accroche qui se dit d'un souffle, souvent autour de 10 à 22 mots : c'est un repère,

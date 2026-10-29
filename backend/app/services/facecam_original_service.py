@@ -133,7 +133,8 @@ class FacecamOriginalService:
             "body_budget": {"min_words": max(0, math.ceil((cls.TARGET_SECONDS[0] - cover) * rate) - fixed_words),
                             "max_words": max(0, math.floor((cls.TARGET_SECONDS[1] - cover) * rate) - fixed_words),
                             "target_seconds": list(cls.TARGET_SECONDS), "advisory": True}}
-        voice = FacecamNarrationService.prompt("original_voice")
+        voice = (FacecamNarrationService.prompt("original_voice") + "\n"
+                 + FacecamNarrationService.prompt("narrative_tense"))
         result = FacecamService.llm(project_id, voice + "\n" + FacecamNarrationService.prompt("original_script")
                                     + "\n" + json.dumps(payload, ensure_ascii=False))
         checkpoint(draft_response=result)

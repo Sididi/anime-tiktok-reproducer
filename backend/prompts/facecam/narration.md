@@ -31,17 +31,22 @@ Principes de narration :
   d'animation ou de plateforme de diffusion non documentés.
 
 Choix des mots et densité orale :
+- Garde un fil conducteur : le désir, le problème ou le contraste qui rend cette histoire
+  intéressante. Fais comprendre ce que les faits changent pour le personnage. Une précision sur
+  une règle, une limite ou une conséquence peut remplacer un descriptif vague sans ajouter une scène.
+  Garde les liens et les réactions brèves qui donnent du relief ; une narration dense n'est pas
+  une liste d'actions. N'ajoute pas un événement uniquement parce qu'il reste de la place.
 - Mets le personnage et le verbe au premier plan : qui fait quoi, qu'est-ce que ça lui coûte ?
-  Préfère « il fuit », « elle le trahit », « il se fait virer » aux périphrases abstraites, si ces faits
+  Préfère « il va fuir », « elle va le trahir », « il va se faire virer » aux périphrases abstraites, si ces faits
   sont établis. Amplifie la manière de les raconter tout en conservant les événements réels.
   N'échange pas « blessé » contre « massacré », un soupçon contre une certitude, ou un risque contre un fait.
 - Autorise un peu d'argot courant : « ce type », « se faire avoir », « se barrer », « foutu », « cheaté »
   pour un pouvoir qui le justifie. Choisis ce qui sonne naturel dans la phrase, sans quota ni accumulation.
   « C'est pas », « il a plus rien » peuvent sonner juste à l'oral ; pas d'écriture SMS ni d'élisions illisibles.
-- Enlève les amorces qui retardent le verbe : « il va alors décider de », « il se retrouve dans
-  l'obligation de », « c'est à ce moment précis que ». Présent ou futur proche sont possibles ; évite
-  l'empilement « va + commencer à + essayer de ». Garde l'intention, la tentative ou l'incertitude
-  lorsqu'elles changent réellement le sens : « tente de fuir » ne veut pas dire « s'enfuit ».
+- Enlève les amorces qui retardent le verbe : « c'est à ce moment précis que », « il va alors se
+  retrouver dans l'obligation de ». Le futur proche reste direct : « il va fuir ». Évite l'empilement
+  « va + commencer à + essayer de ». Garde l'intention, la tentative ou l'incertitude lorsqu'elles
+  changent réellement le sens : « il va tenter de fuir » ne veut pas dire « il va s'enfuir ».
 - Choisis un détail qui rend la règle ou l'enjeu évident, puis avance. Un chiffre, un objet ou un geste
   décisif vaut mieux qu'une liste d'adjectifs. Ne raconte pas les déplacements, regards, réactions ou
   manipulations intermédiaires s'ils ne changent ni la compréhension ni l'issue.
@@ -71,31 +76,32 @@ Exemples originaux de faits mis en relief, à adapter uniquement si les faits co
 - Fait : un débutant peut utiliser l'équipement réservé au niveau 60.
   Narration : « Son pouvoir est complètement fou : niveau 1, il porte déjà du stuff de niveau 60. »
 - Faits : elle gagne le duel, puis les gardes l'arrêtent à cause de cette victoire.
-  Narration : « Elle gagne. Et là, retournement complètement dingue : c'est pour ça qu'on l'arrête. »
+  Narration : « Elle va gagner le duel. Et là, retournement complètement dingue : les gardes vont
+  l'arrêter à cause de cette victoire. »
 - Faits : une main crée la matière, l'autre peut l'effacer.
   Narration : « Une main crée la matière. L'autre l'efface. Un pouvoir absolument fou. »
 
 Exemples originaux de resserrage, uniquement si les faits correspondent (pas de formules à recycler) :
-- « Il se retrouve dans l'obligation de dissimuler sa véritable identité. » → « Il doit cacher qui il est. »
+- « Il se retrouve dans l'obligation de dissimuler sa véritable identité. » → « Il va devoir cacher qui il est. »
 - « Elle commence à parcourir les ouvrages et découvre que cette médecine accuse plusieurs siècles
-  de retard. » → « Elle ouvre les livres : leur médecine a des siècles de retard. »
+  de retard. » → « Elle va ouvrir les livres et découvrir que leur médecine a des siècles de retard. »
 - « Il possède une capacité lui permettant de fabriquer des armes, mais ne dispose d'aucun moyen
   de les utiliser lui-même. » → « Il peut fabriquer des armes. Mais pas s'en servir. »
 - « S'il venait à perdre ce pouvoir, il risquerait d'être exclu de sa propre famille. »
   → « Sans ce pouvoir, sa famille risque de le virer. » Le risque reste un risque.
 - « Il tente de s'enfuir, mais les gardes l'empêchent de quitter la pièce. »
-  → « Il essaie de fuir. Les gardes le bloquent. » Il n'a pas réussi à partir.
+  → « Il va essayer de fuir, mais les gardes vont le bloquer. » Il n'a pas réussi à partir.
 
 À l'échelle d'un passage, condense l'idée, pas seulement les mots. Exemples originaux :
 - Trop expliqué : « On vient alors la prévenir que son frère va lui poser des questions sur les remèdes.
   Elle décide donc de se rendre à la bibliothèque pour vérifier si elle arrive à comprendre les livres
   de ce monde. Elle constate sur place que leur médecine est en retard de plusieurs siècles. »
-  Plus direct : « Son frère va la tester sur les remèdes. Elle consulte les livres : leur médecine
-  a des siècles de retard. » Le trajet et la vérification de lecture sont absorbés dans l'action utile.
+  Plus direct : « Son frère va la tester sur les remèdes. Elle va consulter les livres et découvrir
+  que leur médecine a des siècles de retard. » Le trajet et la vérification de lecture sont absorbés dans l'action utile.
 - Trop expliqué : « Tout le monde le croit mort alors qu'il est pourtant encore bien vivant.
   Il décide donc de profiter de cette situation pour se créer une nouvelle identité et recommencer
   sa vie au bas de l'échelle en tant que simple aventurier. »
-  Plus direct : « Tout le monde le croit mort. Il en profite : nouveau nom, retour parmi les débutants. »
+  Plus direct : « Tout le monde le croit mort. Il va en profiter : nouveau nom, retour parmi les débutants. »
   Pas besoin de rappeler qu'un personnage en train d'agir est vivant.
 
 Contraintes : français naturel à lire à voix haute ; faits de la fiche seulement ; noms propres conservés

@@ -102,8 +102,9 @@ mesurable et la présence de l’enfant suffisent à démontrer la puissance du 
 d’apprentissage sont regroupées par compétences avant l’épreuve qui en montre le résultat.
 
 La leçon n’est pas de raccourcir toutes les phrases. Une règle, une preuve et une conséquence
-peuvent remplacer une liste de capacités ou une scène racontée geste par geste. Le nouveau moteur
-demande environ cinq à huit faits utiles, puis sélectionne ceux qui portent la présentation.
+peuvent remplacer une liste de capacités ou une scène racontée geste par geste. Le moteur prépare
+une réserve d'informations utiles plus riche que le futur script, puis sélectionne celles qui
+portent la présentation. Aucun quota ne doit pousser à empiler des anecdotes faibles.
 Il peut écarter un nom, un trajet, une discussion et un objet sans perdre le mécanisme de l’œuvre.
 Une information déjà contenue dans le hook est acquise ; le corps avance vers ce qu’elle déclenche.
 
@@ -111,12 +112,38 @@ Les premiers essais avaient encore tendance à raconter une rencontre à l’uni
 Les consignes ont donc été renforcées sur ce point précis : présenter la relation et ce qu’elle
 met en mouvement, sans rejouer les invitations, les présentations et les déplacements.
 
+La demande de réduire le descriptif avait conduit à pousser l'ajout de développements et à
+limiter la mise en place à deux phrases/environ un quart du corps. Le retour du créateur sur
+**Dragon Hatching** a montré que ce réglage dégradait la narration en succession d'événements.
+Ces contraintes ont été retirées. Le moteur du récit et la promesse du hook guident désormais
+la sélection : une règle précise, une motivation établie ou une conséquence personnelle peuvent
+approfondir le même enjeu, sans ajouter la scène suivante. La réécriture préserve une construction
+qui fonctionne et les liaisons ou réactions utiles, en corrigeant les passages descriptifs faibles.
+La cible reste 60–75 secondes, sans nouvelle passe payante ni gros spoiler. Le futur proche reste
+le temps principal des événements, avec les exceptions pertinentes.
+
+Une relecture ciblée de sept transcriptions du corpus confirme pourquoi le contexte ne doit pas
+être éliminé mécaniquement. [I Want to End This Love Game](https://www.tiktok.com/@theomcx/video/7629005813876821270)
+développe une même règle et le malentendu qu'elle entretient. [Kill Blue](https://www.tiktok.com/@theomcx/video/7627886716187151638)
+fait porter sa présentation sur le décalage entre les compétences du personnage et sa mission.
+[Le dernier train](https://www.tiktok.com/@theomcx/video/7701752831459495201) raconte davantage une
+scène, mais ses détails successifs transforment la gêne, la complicité et la compréhension de
+l'identité de l'autre. Une scène n'est donc pas exclue par principe : son intérêt commande sa place.
+Il s'agit d'une relecture du corpus déjà collecté, sans nouvelle collecte ni nouvelle transcription.
+
+Le cas Dragon Hatching a aussi révélé une incohérence : l'identité d'humain réincarné était dans
+`premise` et `protagonist`, mais la consigne limitait le corps à `setup_facts`, centré sur les
+péripéties. Ces champs de contexte sont maintenant utilisables. La fiche fraîche doit également
+conserver les éléments essentiels de prémisse parmi ses faits cités. Les incertitudes priment
+sur tous les champs ; `narrative_engine` reste un guide narratif et non une preuve supplémentaire.
+
 ### Une narration liée, avec des conséquences nettes
 
 Le présent installe souvent une règle ou une situation ; le futur proche accompagne les changements.
 Des phrases assez longues gardent ensemble une intention, une action et son résultat, puis une
 phrase brève donne du poids à la conséquence. Les connecteurs d’opposition sont fréquents, mais
-leur présence seule ne produit aucune progression. Une relance doit apporter un fait nouveau.
+leur présence seule ne produit aucune progression. Une relance fait évoluer la compréhension
+ou l'attente ; elle n'exige pas un événement supplémentaire.
 
 Dans [The Vermilion Mask](https://www.tiktok.com/@theomcx/video/7695797702210243873), se défendre
 risque de reproduire le problème qui a créé la quête. Dans
@@ -200,6 +227,91 @@ L’accès direct, le partage de la recherche, la reprise après échec et ce ro
 la suite mise à jour : 300 tests backend ciblés et 30 scénarios navigateur, avec compilation et lint réussis.
 
 ## Vérification et artefacts
+
+### Correction de la narration après le retour sur Dragon Hatching
+
+Le projet confirmé par le créateur est `00ab034f4bec`, en présentation originale. Les comparaisons
+utilisent son accroche exacte, sa fiche et son modèle configuré, sans remplacer son script enregistré.
+Une référence reprend les consignes antérieures à la révision de densité, avec la même consigne
+de futur proche, pour isoler autant que possible le changement de construction.
+
+Les premiers essais de correction restaient trop linéaires et ajoutaient parfois un commentaire
+après chaque péripétie. Leurs résultats ne sont pas présentés comme une réussite. Les dernières
+consignes ont été simplifiées autour de la sélection d'un fil conducteur avant les faits ; un
+exemple entièrement inventé illustre comment la même règle peut devenir un problème personnel.
+La recherche et l'extraction demandent aussi les motivations et le contexte utiles, sans imposer
+un déroulé par épisode. Aucun extrait de theomcx n'est injecté dans les prompts de production.
+
+| Dernier essai relu | Mode | Mots, textes fixes compris | Durée estimée |
+| --- | --- | ---: | ---: |
+| Dragon Hatching | Présentation originale, fiche existante | 232 | 70,3 s |
+| Love Unseen Beneath the Clear Night Sky | Présentation originale, fiche existante | 236 | 71,4 s |
+| I Became a Legend After My 10 Year-Long Last Stand | Histoire sélectionnée | 197 | 59,8 s |
+
+Dragon Hatching rétablit l'identité d'humain réincarné et présente le désir de se rapprocher des
+humains avant les rencontres qui vont compliquer ce désir. Son choix d'évolution retrouve ainsi
+une raison personnelle. La romance développe le contraste et la détermination qui rapprochent
+les personnages, en écartant plusieurs gestes intermédiaires des essais précédents. Le cas
+classique conserve son histoire sélectionnée et son point d'arrivée. La chronologie reste
+présente là où elle sert le récit : le correctif ne demande pas de la brouiller.
+
+Un essai distinct a réexécuté l'extraction de la fiche Dragon Hatching depuis la recherche déjà
+payée : l'identité et la prémisse figurent bien parmi les faits cités. Les derniers essais de
+rédaction réutilisent volontairement les anciennes fiches pour vérifier le chemin des projets
+existants. Aucune nouvelle recherche web ni vérification factuelle complète n'a été lancée dans
+cette comparaison. Les réserves de sources restent applicables, notamment les événements de
+Dragon Hatching provenant d'un récapitulatif secondaire et l'accroche conservée à l'identique.
+
+**155 tests ciblés passent** après la dernière modification. Ils contrôlent les contrats de
+génération et la conservation des textes, pas la qualité littéraire. La revue de ces quelques
+sorties est qualitative ; elle ne garantit pas une amélioration systématique ni une durée réelle.
+La cible est indicative et le cas classique reste plus court. Aucun modèle, nombre de passes de
+production ou routage de vérification des faits n'a changé pour cette correction narrative.
+
+Les comparaisons, entrées, prompts exacts, réponses, scripts d'évaluation et `review.json` sont
+conservés dans `backend/data/research/facecam-narrative-rebalance-2026-10-29/`, ignoré par Git.
+Les essais finaux originaux sont `dragon-final-narrative/` et `romance-final-narrative/` ; le cas
+classique est `classic-rebalanced/`. `dragon-full-pipeline/` conserve l'essai d'extraction révisée
+avec une version intermédiaire des consignes de rédaction. Les brouillons des projets restent intacts.
+
+### Essais de la révision sur la densité, avant correction narrative
+
+Ces essais décrivent la révision antérieure au retour sur Dragon Hatching. Ils montrent un
+élargissement des informations et des limites de durée ; ils ne démontrent pas à eux seuls
+une amélioration de la narration. Les consignes de mise en place et d'ajout de faits évaluées
+ci-dessous ont depuis été corrigées comme décrit plus haut.
+
+Deux nouveaux essais complets utilisent des copies isolées des projets Pharmacy et Love Unseen,
+avec leur modèle de rédaction configuré, `google/gemini-4-argon`. Les ajustements suivants
+réutilisent la recherche payée et, selon l'étape testée, la fiche ou le premier brouillon.
+Tous les essais sont conservés sous `evaluation-density/`, avec leurs prompts et réponses ;
+les scripts des projets utilisés par le créateur ne sont pas remplacés.
+
+La réserve recherchée contient davantage d'événements : Pharmacy dépasse la seule découverte
+des pouvoirs pour raconter les premiers soins et l'ouverture de l'officine, une étape décrite
+dans le [synopsis officiel de l'épisode 4](https://isekai-yakkyoku.jp/story/04.html). Love Unseen
+avance vers le refus du club, les démarches pour acheter des feux d'artifice et leur annulation
+au festival, décrits dans les [synopsis officiels des épisodes 3 à 6](https://sh-anime.shochiku.co.jp/kakekoi/story/).
+
+| Essai revu | Ancienne version | Nouvelle version | Durée estimée |
+| --- | ---: | ---: | ---: |
+| Pharmacy, reprise de la passe éditoriale | 231 mots | 246 mots | 74,4 s |
+| Love Unseen, dernière rédaction et réécriture | 225 mots | 260 mots | 78,6 s |
+
+Les textes fixes sont conservés. Le second essai dépasse encore légèrement la cible : les
+consignes de sélection et de longueur restent indicatives, sans suppression automatique de mots
+ni boucle payante de régénération. Les essais intermédiaires montrent aussi que réclamer un
+nombre de faits favorise parfois des anecdotes faibles ; les consignes finales n'imposent donc
+aucun quota. La progression est enrichie, mais les formulations et raccourcis factuels demandent
+toujours une relecture. Cette revue éditoriale et ces contrôles ponctuels de sources ne constituent
+pas une nouvelle vérification factuelle exhaustive.
+
+**155 tests ciblés** passent sur les parcours de génération Facecam, présentation originale,
+histoires sélectionnées et analyse d'histoires. Ils vérifient les contrats et la conservation
+des textes, pas la qualité littéraire. Aucun changement d'API, de modèle ou de nombre de passes
+n'est nécessaire pour cette révision.
+
+### Vérification initiale de la fonctionnalité
 
 Les tests couvrent l’absence de l’ancien récit dans tous les appels de rédaction, la conservation
 exacte des textes retouchés, le point de vue facultatif, les erreurs à chaque étape, les citations,

@@ -16,6 +16,12 @@ Ne fournis aucune phrase de narration prête à lire, aucune citation ni métaph
 
 Donne une prémisse concrète et un protagoniste (nom connu, rôle, objectif si explicitement établi).
 Pour chaque body_block, condense en faits sobres les actions, obstacles et conséquences établis.
+Préserve les informations qui donnent de la profondeur : condition ou limite précise d'un pouvoir,
+raison explicite d'un choix, tentative, résultat et effet sur une relation ou un rapport de force.
+Ne remplace pas ces faits par « il découvre ses pouvoirs », « ils se rapprochent » ou « il affronte
+des difficultés » quand la source raconte concrètement ce qui se passe. La neutralité concerne
+la formulation, pas la suppression des détails décisifs. Regroupe la logistique sans perdre
+une information distincte qui permet au rédacteur d'avancer dans l'histoire choisie.
 Un fait peut regrouper plusieurs plans consécutifs. Ses scene_indices doivent couvrir exactement
 tous les indices du bloc, une seule fois et dans l'ordre. Conserve aussi un plan sans fait narratif
 en le signalant explicitement ; ne lui invente pas d'action. Aucune traversée d'une frontière raw.

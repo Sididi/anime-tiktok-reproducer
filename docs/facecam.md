@@ -68,6 +68,44 @@ The October 23 revision makes the voice conversational, direct and occasionally 
 
 The October 24 revision follows the creator's requested construction method: identify the real key moments, put them in narrative order, give those moments striking wording and expressive hyperbole, then connect them into a flowing spoken story. Within each body block, the writer follows the events' actual chronology and the selected story's steps and ending; a source opening with a teaser followed by a flashback must not accidentally make that earlier event the conclusion. No fact may move across an original-dialogue boundary. This preparation stays inside the writing call; it adds no model call or response field. Both writing and oral editing explicitly encourage phrases such as “complètement fou” and “absolument dingue”, attached to a concrete event. Editing preserves or strengthens those accents instead of removing them simply to minimize word count. Hooks and opinions use the same voice. An empty opinion still allows expressive narration, while omitting the separate personal recommendation or concluding opinion. Full-story mode prioritizes the strongest moments without dropping secondary events or branches.
 
+The October 29 narrative correction keeps a central desire, problem or contrast as the thread of
+the presentation. Greater depth comes from a useful factual detail that clarifies that thread;
+it does not require adding the next event. The earlier density instructions overemphasized new
+events and capped setup at two sentences/a quarter of the body. Those caps and the instruction
+to fill freed space with unused events have been removed. Editing preserves a good draft's
+construction, useful transitions and the narrator's brief reactions while tightening weak
+descriptions. Selected-story scope and protected dialogue boundaries still apply.
+For original introductions, the writer selects the narrative thread before selecting facts,
+including when a cached brief reads like an episode list. Premise and protagonist fields are
+available for necessary context, alongside the detailed cited setup facts; uncertainties still
+take precedence. Fresh extraction also retains that context among cited facts. An invented
+example illustrates the approach without including creator transcripts in production prompts.
+
+Narrative validation uses isolated snapshots of Dragon Hatching, a romance and a selected-story
+case. The final original examples contain 232 and 236 words, approximately 70.3 and 71.4 seconds;
+the selected-story example contains 197 words. Fixed text and near-future narration are retained.
+The 155 targeted tests pass; prose quality was reviewed separately and is not guaranteed by those
+tests. Inputs, outputs, intermediate trials and the review are under ignored
+`backend/data/research/facecam-narrative-rebalance-2026-10-29/`. Research was reused and project
+drafts were not replaced. See the [detailed review](facecam-original-2026-10-29.md) for limits.
+
+Both Facecam modes now tell the body's actions, discoveries, decisions and consequences primarily
+in French **futur proche** (`va/vont + infinitive`). The shared `narrative_tense.md` instructions are
+included in both writing and editing calls, so condensation keeps this tense. Present tense remains
+natural for identities, lasting states and world rules; earlier events keep their appropriate past
+tense, while hypotheses and risks preserve their grammar and uncertainty. Fixed hooks, opinions,
+original audio and the title-reveal phrase keep their wording; hook suggestions can use any suitable
+tense. This is a generation instruction, without mechanical conversion of existing drafts or any
+additional model call. Factual research and brief extraction retain neutral wording.
+Fact checking treats this tense as storytelling rather than evidence of uncertainty, while still
+checking the event, chronology and modality. Suggested corrections retain an appropriate existing tense.
+
+Validation: 155 targeted Facecam tests pass. Two small fictional live-model cases exercise writing
+and editing with the GPT preset for a source story containing a protected dialogue boundary, and
+the Gemini preset for an original introduction. Both retain near-future action sequences, present
+states/world rules, past backstory and conditional risks after editing. Prompts and outputs are
+under ignored `backend/data/research/facecam-tense-2026-10-29/`; no user project was regenerated.
+
 Expressive emphasis can intensify how an event is told; it does not change a power's capabilities, quantities, chronology or uncertainty. The factual brief remains neutral. Both fact-checking stages distinguish an expressive judgment (“ce pouvoir est complètement fou”) from a factual assertion (“ce pouvoir détruit une planète”); the latter still needs evidence. This editorial update supersedes the October 23 prompts' blanket discouragement of intensifiers.
 
 October 24 validation: 170 targeted tests pass. Live generation used three frozen Facecam briefs with their configured GPT/Gemini presets, three sets of eight hooks, one set of eight opinions, and two full-story examples containing a protected dialogue boundary. Editorial review confirms that expressive phrasing survives the final rewrite and the teaser/flashback case reaches its chosen endpoint; some repetition remains possible. The full-story examples keep their secondary branch and conditional risk. Inputs, prompt snapshots, early iterations and final outputs are retained under ignored `backend/data/research/facecam-key-moments-2026-10-24/evaluation/`, with `review-summary.json` recording the checks. No extra production call was added by this revision.
@@ -120,9 +158,22 @@ brief for retry. Selecting a source story clears this original context.
 
 After generating a script, **Recréer de zéro** preserves the current editor's exact hook and optional
 opinion and researches the anime to write a fresh introduction. It targets 60–75 seconds, focuses on
-the premise and setup without major spoilers, and uses continuous narration without original-dialogue
+the premise and early developments without major spoilers, and uses continuous narration without original-dialogue
 inserts. The previous script, selected story, source narration and scene descriptions never enter its
 research/writing calls. Available narration shots remain illustrations assigned after writing.
+
+Research seeks the work's defining premise, supported motivations, rules, limits and personal stakes.
+Early events can demonstrate them; the brief must not become an episode-by-episode outline.
+Writing and candidates can use `premise` and `protagonist` for introductory context, and `setup_facts`
+for detailed rules/events, with `uncertainties` taking precedence. Previously only `setup_facts`
+was permitted, which could omit essential context present only in the summary fields of cached
+briefs. Fresh briefs now also retain that essential context among their cited facts. The
+`narrative_engine` guides construction without serving as evidence for additional claims.
+There is no setup-length quota or automatic addition of events after a cut. The writer is explicitly
+instructed to reconstruct a coherent introduction even when an older cached brief lists episodes.
+Major twists and late resolutions stay excluded; exhausting the facts warrants a shorter script.
+The call count and duration target are unchanged. Initial cached briefs are still reused without
+automatic paid refresh; **Recréer de zéro** performs fresh research using these instructions.
 
 `generation_mode: original` persists through edits, approval and reloads; old states default to `story`.
 New proposals and regenerations stay in the original mode until a source story is selected again.

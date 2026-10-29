@@ -1,4 +1,6 @@
 Écris le corps d'une présentation de fiction face caméra à partir de la fiche factuelle fournie.
+Fais progresser les événements au futur proche, avec les exceptions de sens précisées dans la
+consigne de temps. Le hook peut employer un autre temps sans imposer celui du corps.
 Le créateur a choisi hook et, éventuellement, opinion : ils encadreront automatiquement le corps.
 Ne les recopie pas. Si opinion est vide, aucun paragraphe d'avis ne sera ajouté : n'en invente pas,
 n'ajoute ni recommandation personnelle ni bilan final, et termine directement le récit avant la révélation du titre.
@@ -28,6 +30,9 @@ Une courte formule catchy ou un intensif utile n'est pas du remplissage à suppr
 Si le budget est trop faible ou nul, fournis quand même un récit complet et concis, sans supprimer de bloc.
 Il ne s'applique pas au choix preserve_full_story.
 Si les faits sont trop minces, reste plus court plutôt que répéter ou inventer pour remplir le temps.
+Approfondis ce qui rend cette histoire intéressante : le désir du personnage, une règle précise,
+le coût d'un choix, la portée d'un événement. Remplace un descriptif faible par une précision utile
+de la fiche, sans ajouter automatiquement une scène ni raccourcir les liens qui font tenir le récit.
 
 Construis le récit en quatre temps, avant de rédiger les paragraphes finaux :
 1. Liste silencieusement les vrais moments clés de l'histoire choisie : ce qui déclenche l'action,
@@ -48,6 +53,10 @@ Construis le récit en quatre temps, avant de rédiger les paragraphes finaux :
    elles donnent envie d'entendre le moment suivant. Garde seulement le contexte nécessaire entre eux.
 Cette préparation reste interne : retourne le récit, pas la liste ni le plan. En mode preserve_full_story,
 hiérarchise les moments forts tout en conservant toutes les branches et étapes, y compris secondaires.
+Les moments clés développent un même fil conducteur. La chronologie vérifie leur ordre réel ;
+elle ne suffit pas à construire la narration. Fais comprendre ce qui attire le personnage,
+ce qui le met en difficulté et la portée des bascules. Si le texte énumère ses activités,
+reprends sa construction plutôt que de rajouter des connecteurs.
 Lorsqu'elle est présente, l'opinion donne un regard au récit entier, elle n'est pas un avis interchangeable collé à la fin.
 Écris ensuite un récit continu par macro-séquences. On doit avoir envie de savoir
 ce que le personnage va faire, pas seulement constater ce que chaque plan montre.
@@ -71,6 +80,8 @@ Ne résume pas le dernier bloc par un faux cliffhanger si ses faits donnent déj
 
 Avant de rendre le texte, fais une passe silencieuse de coupe et d'oralisation :
 - Pour chaque phrase, repère sa fonction : moment clé, contexte indispensable, liaison ou accent expressif.
+  Une précision peut éclairer un enjeu vague, sans obligation d'apporter un événement nouveau
+  à chaque phrase. Garde le contexte, les liens et les réactions qui font comprendre la situation.
   Supprime les doubles explications ; préserve une formule courte qui fait frapper le moment.
   Regroupe les gestes secondaires dans leur résultat.
   Vérifie aussi les doublons à distance : un risque annoncé, puis reformulé juste avant sa conséquence,
@@ -82,6 +93,8 @@ Avant de rendre le texte, fais une passe silencieuse de coupe et d'oralisation :
   artificiellement une phrase fluide en trois fragments. Lis mentalement le résultat face caméra.
 - Vérifie : accroche payée, progression claire, titre absent, pas de fait inventé ni de faux vécu,
   pas de doublon hook/opinion/raw. Garde tous les blocs et les frontières des extraits originaux.
+  Vérifie aussi le futur proche des actions et conséquences, sans convertir les états, règles,
+  antériorités ou hypothèses qui nécessitent un autre temps.
   En mode preserve_full_story, coupe les mots inutiles, jamais les événements ni les branches.
 Retourne uniquement {"blocks":[{"id":"identifiant body fourni","text":"paragraphes du récit"}]}.
 Conserve exactement tous les identifiants body, dans l'ordre. Pas de markdown ni de commentaire.
