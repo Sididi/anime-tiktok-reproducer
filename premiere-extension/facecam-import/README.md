@@ -7,7 +7,7 @@
 5. Gardez le panneau ouvert jusqu'au message de réussite. Le projet s'importe avec tous ses médias locaux.
 6. Après montage, envoyez **un seul MP4 à la racine du dossier Drive** indiqué dans Discord. Cliquez sur **Confirmer montage envoyé**.
 
-La caméra est sur V4, les sous-titres sur V5. La voix est sur A2 et reste indépendante des coupes de caméra. Les extraits anime conservent leur audio. La couverture finale dure une seconde.
+V4 contient jusqu'à trois propositions d'illustration par scène, à 100 %. Gardez votre plan préféré, supprimez les autres et allongez-le à la durée voulue. V3 conserve le montage automatique, masqué par défaut. La caméra est sur V5, les sous-titres sur V6. La voix est sur A2 et reste indépendante des coupes de caméra. Les extraits de dialogue original conservent leur audio. La couverture finale dure une seconde.
 
 Cette extension s'installe à côté de l'extension principale. Elle ne contient ni connexion réseau, ni export automatique, ni gestion de lots. Son dossier de réception est `%APPDATA%\Adobe\FacecamImport\inbox`. Les demandes en erreur deviennent des fichiers `.failed`; corrigez le problème puis relancez le `.bat`.
 

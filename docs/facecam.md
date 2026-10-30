@@ -196,11 +196,89 @@ links every publication; creator transcripts remain local research artifacts and
 
 Facecam exports `SPM_facecam_<anime>_<project_id>.zip` with ZIP64, streamed files, complete episodes, original recording, silent normalized camera, real narration, music, cover/title card, presets, expanded subtitle MOGRTs/timings, JSX, Windows launcher, script, and French instructions. Media references are checked before delivery. It bypasses shared-source prewarming, folder synchronization and Premiere Link. Only the ZIP is uploaded or updated; editor files are preserved.
 
-Premiere exports now provide **V4 · Illustrations 100 %**, immediately above the existing automatic montage on V3. V3 is hidden by default with a nonfatal manual-eye fallback. V4 keeps every V3 clip's source cuts and timeline start, uses native playback speed, and receives the same foreground geometry and preset. A clip ends at its native duration or the next clip's start, whichever comes first; gaps remain open and overwritten tails cannot reappear. The last clip stops before the one-second title card. V5 contains the camera and final card, V6 the subtitles, and V7–V8 the optional overlays. V1 remains the automatic montage's blurred background and can therefore differ from V4.
+Premiere exports provide **V4 · Illustrations 100 %**, above the automatic montage on V3.
+V4 now presents **the current shot plus up to two alternatives per narration scene**. It deliberately
+shortens the first shot and divides that scene's available timeline interval between the proposals.
+Every proposal plays at 100%; a short source leaves a gap. Slots never cross the scene's end, the
+next scene's start or the final card. Scenes too short for 0.5-second previews receive fewer choices.
+Original-dialogue picture spans remain protected. Keep the desired clip, remove the others and extend
+it in Premiere: video-only subclips retain access to the complete source episode.
 
-A separate editorial pass adds a generous selection of useful illustrations from the immutable original matches between retained scene anchors. It evaluates each candidate against the approved final script, including useful images whose original narration was omitted, while excluding unrelated removed branches. It never changes the story, words, V3 selection or existing source trims. The prompt is `backend/prompts/facecam/editor_track.md`; decisions and reasons are cached in `facecam/editor_selection.json`, keyed by script, references, selected story, prompt and model preset. Voice-speed changes reuse the selection. Invalid model responses fail explicitly instead of silently reverting to a sparse track. The model uses source text descriptions, not a fresh visual analysis of the footage.
+The search covers **only local episodes already present in the project's immutable matches**. It
+first reads the prepared narration's final timing and skips raw dialogue, outro and scenes with no
+room for another 0.5-second preview. One text request uses the complete script, neighboring narration
+and local subtitles to locate a promising 12-second window for each eligible scene. Existing matches
+provide fallback locations, including when subtitles are absent. This can find shots outside the
+project's original matches, without indexing entire episodes.
 
-Added shots are preplaced proportionally between the retained starts, in source order. Dense spans can produce very short clips; editors can move or extend the video-only subclips into the original episodes. Original-dialogue picture spans are protected. Candidates that cannot fit between anchors at 60 fps are reported in the generated `FACECAM.editor_track.skipped` payload. References outside the first/last retained anchor are excluded; legacy drafts lacking a source montage map receive the existing clips at 100 % without inferred additions. Required extra episodes are inspected and packaged, and ZIP validation checks every V4 media reference. Facecam specialization leaves the shared JSX template and generated non-Facecam scripts unchanged. Existing processed exports require JSX regeneration or processing to receive this track.
+Only the selected windows are decoded, by seeking into the original local videos. Local cuts delimit
+frame-indexed candidates. At most two subsequent vision requests inspect contact sheets containing
+two actual frames per candidate and choose up to two alternatives per scene. The model cannot supply
+timestamps: selected IDs resolve to measured native source frames. Overlapping original shots are
+removed before vision; unknown IDs and incorrect scene assignments are rejected. Images must match
+the narration's characters, appearance and action; subtitles alone are not visual evidence.
+
+Work is bounded to **three model requests, 24 windows of 12 seconds, 96 proposed shots and 32 eligible
+scenes** per selection. If there are more eligible scenes, those with room for more alternatives take
+priority, then narration order. CPU decoding uses two workers. The default active-work deadline is
+180 seconds (`ATR_FACECAM_ILLUSTRATION_TIMEOUT_SECONDS`), with at most 60 seconds for each model request.
+Failures stop explicitly; there are no automatic paid retries. This targeted approach may miss suitable
+shots elsewhere in an episode and does not claim an exhaustive visual understanding of it.
+
+`facecam_illustrations` in `config/llm/config.yaml` independently selects **Gemini 3.8 Flash**, with
+minimal reasoning. Request output limits are 1,536 tokens for localization and 3,072 for visual
+selection. Local window images are shared between projects in `backend/data/cache/facecam_windows/`.
+Selections, raw model responses and reports live under `facecam/targeted_selection/<fingerprint>/`.
+Source identity, subtitle, narration, eligible-slot, prompt or model changes invalidate the relevant
+cache. Repeating processing with unchanged inputs reuses completed results without model calls.
+Original matches, the approved script and V3 are not modified. Legacy drafts without an authoritative
+narration assignment receive only their existing shots.
+
+**The entire targeted search shares a $0.15 spending ceiling**, including localization, vision and
+manual retries for the same narration/source context. It can be lowered with
+`ATR_FACECAM_ILLUSTRATION_BUDGET_USD` but cannot be configured above $0.15. Prompt, model and search-limit
+changes do not reset its ledger, stored separately in `facecam/targeted_budgets/<context>/usage.json`.
+The older per-episode and selection budget settings apply only to the retired exhaustive index path;
+normal Facecam processing no longer invokes that path.
+
+Before each request the application checks current OpenRouter rates, caps provider prices and reserves
+conservative spending using UTF-8 byte counts, bounded image allowances and maximum output tokens.
+Reported actual costs replace reservations afterward; unknown costs and timeouts keep their reservation.
+The next request is blocked if its reservation would exceed the shared ceiling. This is an application
+spending guard, not a provider-side hard billing guarantee. Completed stages survive failures so that
+retries do not repeat successful requests. No fallback to the writing model is used.
+
+V3 remains hidden by default with a nonfatal manual-eye fallback. V4 receives the foreground effects;
+V5 holds the camera and final card, V6 the subtitles, V7–V8 optional overlays. V1 still follows the
+automatic montage and may differ from V4. New candidates preserve their episode's own frame rate,
+including true 24 fps versus 23.976 fps. Export packages the exact selection embedded in the JSX,
+without another LLM call, and rejects media outside the project's allowed episodes. Existing exports
+need processing/JSX regeneration to receive the new V4 proposals.
+
+Visual descriptions are sampled evidence, not an exhaustive understanding of every motion between
+frames. Automated tests cover placement, cache invalidation, malformed selections, budget accounting,
+source clocks and packaging. A real Premiere import on Windows remains necessary to validate the
+editor interaction in Adobe itself.
+
+The previous exhaustive implementation was retired after project `7ae4b8126a0a` required 1,232 shot
+analyses and 65 requests for **$0.93384075**. It proposed 127 alternatives, of which 93 did not fit the
+final timeline. The targeted implementation filters those scenes before any paid work and never
+calls the full-episode visual index. Its regression tests include aggregate cost accounting, retry
+reservations, no-reset ledgers, deadline enforcement and real 24 fps random-access decoding.
+
+Targeted evaluation on October 29, 2026, on the same project and three allowed episodes: the final
+configuration made **3 model requests for $0.03242775 in 65.24 seconds**, including uncached local
+window decoding. It reviewed 44 proposed shots in 24 windows and selected **20 alternatives for 17
+scenes**. All 20 fit V4; none was discarded during placement, and all 66 original clips were retained.
+A cached selection plus placement took 1.57 seconds with no model request. Both development trials
+together cost **$0.06498225** in the same ledger; an initial HTTP 404 routing rejection did not reach a
+model and is recorded separately at zero cost. Eight final proposals were checked against their actual
+sampled images; this is a spot check, not a full editorial-quality evaluation. The stricter visual
+prompt rejects indirect theme associations such as a skill-status card for a narrated sword swing.
+The targeted search can therefore offer fewer alternatives than the previous exhaustive selection.
+The benchmark left the delivered JSX, ZIP and project state intact. Evidence is under the ignored
+local directory `backend/data/research/facecam-targeted-7ae4b8126a0a/`. The relevant backend regression
+suite passed 332 tests; Premiere interaction still requires the Windows acceptance check below.
 
 Install the independent [Facecam Import extension](../premiere-extension/facecam-import/README.md). Build its distributable with `python scripts/package_facecam_extension.py`. Extracted projects must work without shared source folders or the primary extension. Premiere and its Facecam Import panel must be open.
 

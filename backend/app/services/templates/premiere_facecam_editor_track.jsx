@@ -14,8 +14,9 @@
     if (existing) return existing;
     var source = getOrImportClip(part.clipName);
     if (!source || !source.createSubClip) throw new Error("Source V4 introuvable : " + part.clipName);
-    var sourceIn = buildRawTimeFromSourceFrame(part.source_in_frame, false);
-    var sourceOut = buildRawTimeFromSourceFrame(part.source_out_frame, false);
+    // New episode candidates carry their own native clock (24 != 23.976).
+    var sourceIn = part.source_fps ? buildRawTimeFromSeconds(part.source_in) : buildRawTimeFromSourceFrame(part.source_in_frame, false);
+    var sourceOut = part.source_fps ? buildRawTimeFromSeconds(part.source_out) : buildRawTimeFromSourceFrame(part.source_out_frame, false);
     // No hard boundaries: the editor can extend the subclip into the episode.
     // Adobe's parameter order is takeVideo, takeAudio. Audio must not touch A2/A4+.
     var subclip = source.createSubClip(name, sourceIn.ticks, sourceOut.ticks, 0, 1, 0);

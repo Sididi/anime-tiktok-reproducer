@@ -454,11 +454,11 @@ async def test_processing_keeps_editorial_cuts_instead_of_extending_them(project
         return 24.0
     monkeypatch.setattr(ProcessingService, 'detect_first_source_fps', fps)
     monkeypatch.setattr(ProcessingService, '_resolve_source_reference', lambda episode, **k: (tmp_path / (episode + '.mp4'), episode + '.mp4'))
-    if extra_episode:
-        from app.services.facecam_editor_track import FacecamEditorTrackService
-        # The original source ID can collide with a reindexed V3 scene; neither source may disappear.
-        monkeypatch.setattr(FacecamEditorTrackService, 'selected_matches', lambda _: [
-            SceneMatch(scene_index=0, episode='extra', start_time=30, end_time=32, confidence=1, speed_ratio=1)])
+    from app.services.facecam_editor_track import FacecamEditorTrackService
+    # Isolate source normalization from the independent, paid visual search.
+    # The original source ID can collide with a reindexed V3 scene; neither source may disappear.
+    monkeypatch.setattr(FacecamEditorTrackService, 'selected_matches', lambda _, **kw: [
+        SceneMatch(scene_index=0, episode='extra', start_time=30, end_time=32, confidence=1, speed_ratio=1)] if extra_episode else [])
     detected = []
     monkeypatch.setattr(GapResolutionService, 'calculate_gaps', lambda *a, **k: detected.append(a) or [])
     reached_export = []

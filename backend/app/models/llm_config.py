@@ -52,6 +52,10 @@ class LLMConfig(BaseModel):
     default: str = Field(..., min_length=1)
     presets: dict[str, LLMPreset]
     translation: LLMPresetEntry | None = None
+    facecam_illustrations: LLMPresetEntry = Field(default_factory=lambda: LLMPresetEntry(
+        openrouter_id="google/gemini-3.8-flash", max_output_tokens=4096,
+        thinking=GeminiThinking(effort="minimal"),
+    ))
     fact_check: LLMPresetEntry = Field(default_factory=lambda: LLMPresetEntry(
         openrouter_id="google/gemini-3.8-flash", max_output_tokens=4096,
         thinking=GeminiThinking(effort="low"),

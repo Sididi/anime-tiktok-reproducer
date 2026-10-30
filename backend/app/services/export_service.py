@@ -712,7 +712,9 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             if FacecamEditorTrackService.payload_from_jsx(jsx_path.read_text(encoding="utf-8")):
                 editor_instructions = (
                     "V3 : montage automatique masqué (réactivable avec l'oeil). V4 : illustrations à 100 %, mêmes effets, sélection élargie.\n"
-                    "V4 conserve les coupes source de V3 ; les ajouts sont préplacés entre ses repères. Les trous sont volontaires.\n"
+                    "V4 propose jusqu'à 3 plans par scène : le plan initial raccourci et jusqu'à 2 alternatives issues des épisodes locaux.\n"
+                    "Gardez le plan qui vous convient, supprimez les autres, puis allongez-le dans l'épisode à la durée souhaitée.\n"
+                    "Les propositions restent à 100 % dans la durée de leur scène ; les trous sont volontaires et les dialogues originaux protégés.\n"
                     "V5 : facecam et carte finale. V6 : sous-titres. Le fond flou V1 suit le montage automatique.\n"
                 )
             entries[-1].inline_content = (

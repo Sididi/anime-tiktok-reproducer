@@ -76,6 +76,10 @@ class LLMConfigService:
         return cls.get_config().fact_check
 
     @classmethod
+    def facecam_illustrations_entry(cls) -> LLMPresetEntry:
+        return cls.get_config().facecam_illustrations
+
+    @classmethod
     def list_presets(cls) -> list[tuple[str, LLMPreset]]:
         cfg = cls.get_config()
         return list(cfg.presets.items())

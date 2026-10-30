@@ -62,3 +62,13 @@ music:
     display_name: "Joyful Chess"
     file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/joyful chess.wav"
     volume_db: -28
+
+  carol_of_the_bells_alt:
+    display_name: "Carol of the Bells (alt version)"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/carol of the bells (alt version).wav"
+    volume_db: -29
+
+  hxh_epic:
+    display_name: "HxH Epic"
+    file_path: "/home/sid/Projects/anime-tiktok-reproducer/assets/music/hxh epic.wav"
+    volume_db: -25

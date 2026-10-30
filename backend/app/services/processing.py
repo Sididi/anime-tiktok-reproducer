@@ -3302,7 +3302,22 @@ class ProcessingService:
                 from .facecam_editor_track import FacecamEditorTrackService
                 yield ProcessingProgress("processing", "editor_illustrations", 0.4,
                                          "Sélection des illustrations supplémentaires pour V4...")
-                extra_matches = await asyncio.to_thread(FacecamEditorTrackService.selected_matches, project.id)
+                import threading
+                illustration_cancel = threading.Event()
+                illustration_task = asyncio.create_task(asyncio.to_thread(
+                    FacecamEditorTrackService.selected_matches, project.id, cancel_event=illustration_cancel))
+                try:
+                    while not illustration_task.done():
+                        done, _ = await asyncio.wait({illustration_task}, timeout=5)
+                        if not done:
+                            yield ProcessingProgress("processing", "editor_illustrations", 0.4,
+                                "Recherche ciblée de plans V4 dans les sous-titres et images locales...")
+                    extra_matches = illustration_task.result()
+                finally:
+                    illustration_cancel.set()
+                    if not illustration_task.done():
+                        # The current request may finish; no later paid batch may start.
+                        illustration_task.add_done_callback(lambda task: None if task.cancelled() else task.exception())
                 next_index = max((m.scene_index for m in matches), default=-1) + 1
                 normalization_matches = [*matches, *[
                     m.model_copy(update={"scene_index": next_index + i}) for i, m in enumerate(extra_matches)

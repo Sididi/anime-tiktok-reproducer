@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     startup_max_concurrent: int = Field(default=4, ge=1, le=8)
     download_max_concurrent: int = Field(default=3, ge=1, le=6)
     scene_detection_max_concurrent: int = Field(default=2, ge=1, le=4)
+    # All stages of the targeted V4 search share this project budget, including retries.
+    facecam_illustration_budget_usd: float = Field(default=0.15, gt=0, le=0.15)
+    facecam_illustration_timeout_seconds: int = Field(default=180, ge=30, le=300)
+    # Legacy full-episode indexing is no longer called by Facecam processing.
+    facecam_illustration_episode_budget_usd: float = Field(default=0.50, gt=0, le=10)
+    facecam_illustration_selection_budget_usd: float = Field(default=0.15, gt=0, le=10)
+    facecam_illustration_min_preview_seconds: float = Field(default=0.5, ge=0.1, le=5)
     gpu_max_concurrent: int = Field(default=2, ge=1, le=2)
     transcription_batch_size: int = Field(default=4, ge=1, le=8)
 
