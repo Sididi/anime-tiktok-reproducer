@@ -109,6 +109,15 @@ def test_ranking_prefers_main_title_then_episode_count_then_literal_spelling():
     season1, season2 = media(3, "Hataraku Saibou", 13), media(4, "Hataraku Saibou!!", 8, popularity=99)
     assert Covers.rank("Cells at Work! (Hataraku Saibou)", [season2, season1], 13)[0]["id"] == 3
     assert Covers.rank("Cells at Work! (Hataraku Saibou)", [season2, season1], None)[0]["id"] == 3
+    yamada, ore = media(7, "Yamada-kun to Lv999 no Koi wo Suru", 13), media(8, "Ore Monogatari!!", 24, popularity=99)
+    ore["title"]["english"] = "My Love Story!!"
+    assert Covers.rank("Yamada-kun to Lv999 no Koi wo Suru (My Love Story)", [ore, yamada], 24)[0]["id"] == 7
+    ova, tv = media(9, "Ushio to Tora", 10, format="OVA"), media(10, "Ushio to Tora (TV)", 26, ["Ushio and Tora"])
+    ova["title"]["english"], tv["title"]["english"] = "Ushio and Tora", "Ushio and Tora (TV)"
+    assert Covers.rank("Ushio and Tora", [ova, tv], 26)[0]["id"] == 10
+    season2 = media(11, "Kekkon Yubiwa Monogatari II", 13, ["Kekkon Yubiwa Monogatari 2nd Season"])
+    assert Covers.exact_matches("Kekkon Yubiwa Monogatari (Tales of Wedding Rings)", [season2]) == []
+    assert Covers.normalize_title("Title II") != Covers.normalize_title("Title III")
     ova, tv = media(5, "Bucchigiri", 4, format="OVA"), media(6, "BUCCHIGIRI?!", 12)
     assert Covers.rank("Bucchigiri", [ova, tv], 12)[0]["id"] == 6
 

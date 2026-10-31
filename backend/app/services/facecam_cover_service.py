@@ -52,8 +52,10 @@ class FacecamCoverService:
         # Drop Latin accents only: Japanese voiced marks are meaningful and recompose under NFKC.
         text = unicodedata.normalize("NFKC", re.sub(r"[\u0300-\u036f]", "", unicodedata.normalize("NFKD", title or "")))
         words = re.findall(r"[^\W_]+", text.casefold().replace("&", " and "))
-        text = "".join("o" if word == "wo" else word for word in words).replace("ou", "o")
-        return re.sub(r"([aeiou])\1+", r"\1", text)
+        # Per word, so "Monogatari II" stays distinct from "Monogatari"; roman numerals are kept intact.
+        return "".join(word if re.fullmatch(r"[ivx]+", word) else
+                       re.sub(r"([aeiou])\1+", r"\1", "o" if word == "wo" else word.replace("ou", "o"))
+                       for word in words)
 
     @classmethod
     def discovery_queries(cls, title: str) -> list[str]:
@@ -75,8 +77,14 @@ class FacecamCoverService:
         return next(iter(cls.title_queries(title)), "")
 
     @staticmethod
-    def media_titles(media: dict) -> list[str]:
-        return [value for value in [*(media.get("title") or {}).values(), *(media.get("synonyms") or [])] if value]
+    def main_titles(media: dict) -> list[str]:
+        # "Ushio to Tora (TV)" is the same title as the library's "Ushio and Tora".
+        titles = [value for value in (media.get("title") or {}).values() if value]
+        return list(dict.fromkeys([*titles, *(re.sub(r"\s*\((?:TV|\d{4})\)\s*$", "", value) for value in titles)]))
+
+    @classmethod
+    def media_titles(cls, media: dict) -> list[str]:
+        return [*cls.main_titles(media), *(value for value in media.get("synonyms") or [] if value)]
 
     @classmethod
     def exact_matches(cls, title: str, results: list[dict]) -> list[dict]:
@@ -96,16 +104,20 @@ class FacecamCoverService:
     def rank(cls, title: str, matches: list[dict], episodes: int | None) -> list[dict]:
         """Order equally named entries (seasons differing by "!!", remakes, OVAs, spin-offs).
 
-        A main-title match beats a synonym ("Black Clover" over "Petit Clover"), then the library
+        The library's own name beats its parenthesized alias ("Yamada-kun to Lv999 (My Love Story)" is not
+        "Ore Monogatari!!", English "My Love Story!!"); a main-title match beats a synonym ("Black Clover"
+        over "Petit Clover"); then the library
         episode count decides, then the literal spelling, then real works over specials, then popularity.
         """
         aliases = cls.title_queries(title)
         names = {cls.normalize_title(value) for value in aliases}
+        own = {cls.normalize_title(value) for value in aliases[:2]}
         literal = {re.sub(r"\s+", " ", value.casefold()) for value in aliases}
         def key(media):
-            main = [value for value in (media.get("title") or {}).values() if value]
+            main = cls.main_titles(media)
             gap = abs(media["episodes"] - episodes) if episodes and media.get("episodes") else 10_000
-            return (not names.intersection(cls.normalize_title(value) for value in main), gap,
+            return (not own.intersection(map(cls.normalize_title, cls.media_titles(media))),
+                    not names.intersection(cls.normalize_title(value) for value in main), gap,
                     not literal.intersection(re.sub(r"\s+", " ", value.casefold()) for value in main),
                     media.get("format") in {"SPECIAL", "MUSIC", "CM", "PV"}, -(media.get("popularity") or 0))
         return sorted(matches, key=key)
