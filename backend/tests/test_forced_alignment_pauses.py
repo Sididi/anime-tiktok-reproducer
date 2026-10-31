@@ -73,6 +73,37 @@ def test_uncertain_unmatched_and_short_pauses_do_not_create_windows(script, word
     assert fragments(result) == fragments(original)
 
 
+def test_misheard_name_after_pause_anchors_split_and_opens_next_window():
+    # eac765251992: script "Mele", ASR "Mel" was the only boundary of a 2.76 s
+    # pause, so "rénovation." stretched over it and alignment failed.
+    original = manifest([
+        {"scene_index": 3, "text": "pour financer la rénovation."},
+        {"scene_index": 4, "text": "Mele vit à l’écart des habitants."},
+    ])
+    words = [timed(word, start) for word, start in [
+        ("pour", 10.5), ("financer", 10.9), ("la", 11.3), ("rénovation.", 11.6),
+        ("Mel", 14.8), ("vit", 15.2), ("à", 15.4), ("l'écart", 15.6), ("des", 16), ("habitants.", 16.3),
+    ]]
+    result = Alignment.split_manifest_at_pauses(original, words)
+    assert fragments(result) == fragments(original)
+    assert [s["text"] for s in result["segments"]] == [
+        "pour financer la rénovation.", "Mele vit à l’écart des habitants."]
+    windows = Alignment._build_segment_windows(
+        segments=result["segments"], coarse_words=words, total_duration=20)
+    assert windows[1]["start"] == pytest.approx(14.8 - Alignment.WINDOW_PADDING_SEC)
+    assert windows[1]["end"] == pytest.approx(16.5 + Alignment.WINDOW_PADDING_SEC)
+
+
+@pytest.mark.parametrize("script,asr", [
+    ("rénovation. Mele vit", ["rénovation.", "Zorg", "vit"]),  # not a near-homophone
+    ("rénovation. Mele dort vit", ["rénovation.", "Mel", "vit"]),  # not 1:1
+])
+def test_unrelated_or_unbracketed_substitution_does_not_anchor_a_pause(script, asr):
+    original = manifest([{"scene_index": 3, "text": script}])
+    words = [timed(word, start) for word, start in zip(asr, [11.6, 14.8, 15.2])]
+    assert len(Alignment.split_manifest_at_pauses(original, words)["segments"]) == 1
+
+
 def test_transformed_text_and_audio_parts_are_not_split_using_wrong_fragments():
     original = manifest([{"scene_index": 7, "text": "Un dragon noir. Puis revient."}])
     words = [timed("Un", .5), timed("dragon", .8), timed("noir.", 1.1), timed("Puis", 9), timed("revient.", 9.3)]

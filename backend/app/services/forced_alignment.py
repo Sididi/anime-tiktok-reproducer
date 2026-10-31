@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import math
 import re
@@ -53,6 +54,7 @@ class ForcedAlignmentService:
     LONG_WORD_ABS_MAX_SEC = 3.0
     LONG_WORD_MEDIAN_FACTOR = 4.0
     PAUSE_SPLIT_MIN_SEC = 1.0
+    ANCHOR_SUBSTITUTION_MIN_RATIO = 0.6
 
     @classmethod
     def manifest_path(cls, project_id: str) -> Path:
@@ -242,8 +244,24 @@ class ForcedAlignmentService:
     @staticmethod
     def _anchor_tokens(word: str) -> list[str]:
         """Match hyphenated ASR words to spaced script words, without rewriting either."""
+        # Scripts write l\u2019\u00e9cart, the ASR writes l'\u00e9cart; the normalizer keeps only '.
+        word = word.replace("\u2019", "'")
         return [token for part in re.split(r"[-\u2010\u2011]", word)
                 if (token := TranscriberService._normalize_token(part))]
+
+    @classmethod
+    def _anchor_mapping(cls, expected: list[str], coarse: list[str]) -> list[int | None]:
+        mapping = TranscriberService._sequence_align(expected, coarse)
+        # A near-homophone between two matched neighbours (script "Mele", ASR
+        # "Mel") holds the same place in the audio, so it may anchor a pause
+        # and open its window. A word missing from either side still never does.
+        for index in range(1, len(mapping) - 1):
+            before, after = mapping[index - 1], mapping[index + 1]
+            if (mapping[index] is None and before is not None and after == before + 2
+                    and difflib.SequenceMatcher(None, expected[index], coarse[before + 1]).ratio()
+                    >= cls.ANCHOR_SUBSTITUTION_MIN_RATIO):
+                mapping[index] = before + 1
+        return mapping
 
     @classmethod
     def split_manifest_at_pauses(
@@ -284,7 +302,7 @@ class ForcedAlignmentService:
             for token in cls._anchor_tokens(str(word.get("text") or "")):
                 coarse_groups.setdefault(index, []).append(len(coarse))
                 coarse.append((index, word, token))
-        mapping = TranscriberService._sequence_align(
+        mapping = cls._anchor_mapping(
             [token for _, _, token in expected], [token for _, _, token in coarse])
         reverse_mapping = {value: index for index, value in enumerate(mapping) if value is not None}
 
@@ -986,7 +1004,7 @@ class ForcedAlignmentService:
                         "norm": norm,
                     })
 
-        mapping = TranscriberService._sequence_align(
+        mapping = cls._anchor_mapping(
             [entry["norm"] for entry in expected_entries],
             [entry["norm"] for entry in coarse_entries],
         )
