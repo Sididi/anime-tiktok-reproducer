@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.models import SceneTranscription, Transcription, Word
 from app.models.facecam import FacecamAutoEditorSettings, FacecamState
 from app.services.facecam_auto_editor import (
-    keep_intervals, prepared_is_current, protected_spans, settings_signature, verify_speech_retained,
+    UNCERTAIN_SILENCE_DB, audible_spans, keep_intervals, prepared_is_current, protected_spans, settings_signature,
+    verify_speech_retained,
 )
 
 
@@ -41,6 +42,35 @@ def test_overlapping_silences_are_merged_and_uncertain_speech_is_protected():
     keep = keep_intervals(3, [(0, 2.3), (1.5, 3)], speech=speech)
     assert keep == [(46, 123)]
     verify_speech_retained(keep, speech, 3)
+
+
+def test_silent_part_of_an_uncertain_span_is_cut_but_audible_part_stays_protected(tmp_path):
+    import array
+    import wave
+    from app.services.facecam_media_service import detect_silences
+    # be95568850fb: a 2.1 s pause between two sentences came back from the ASR
+    # as "speech without words" and was never cut.
+    path = tmp_path / 'voice.wav'
+    level = {(0, 1): 8000, (1, 3.2): 3, (3.2, 3.5): 200, (3.5, 4): 0, (4, 5): 8000}
+    samples = array.array('h')
+    for (a, b), value in level.items():
+        samples.extend(value if i % 2 else -value for i in range(round((b - a) * 48000)))
+    with wave.open(str(path), 'wb') as stream:
+        stream.setparams((1, 2, 48000, 0, 'NONE', 'not compressed'))
+        stream.writeframes(samples.tobytes())
+    words = [{'start': .1, 'end': .95}, {'start': 4.05, 'end': 4.9}]
+    settings = FacecamAutoEditorSettings(noise_threshold_db=-20, margin_before_ms=0, margin_after_ms=0)
+    silences = detect_silences(path, -20, .12, 5)
+    quiet = detect_silences(path, min(-20, UNCERTAIN_SILENCE_DB), .12, 5)
+    # The -44 dB murmur at 3.2-3.5 s is silence for the user threshold only.
+    uncertain = audible_spans([(1, 4)], quiet)
+    assert [(round(a, 1), round(b, 1)) for a, b in uncertain] == [(3.2, 3.5)]
+    speech = protected_spans(words, uncertain)
+    keep = keep_intervals(5, silences, settings, speech)
+    verify_speech_retained(keep, speech, 5)
+    assert sum(b - a for a, b in keep) / 60 < 3
+    assert any(a <= 3.2 * 60 and b >= 3.5 * 60 for a, b in keep)
+    assert audible_spans([(1, 4)], []) == [(1, 4)]
 
 
 def test_last_partial_frame_retains_speech_instead_of_truncating_it():

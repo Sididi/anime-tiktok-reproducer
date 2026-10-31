@@ -11,6 +11,9 @@ FPS = 60
 ALGORITHM_VERSION = 2
 WORD_LEAD_SECONDS = 0.03
 WORD_TAIL_SECONDS = 0.05
+# Uncertain ASR spans are released only where the take is silent at this
+# level, so a whispered word the ASR missed survives a loose user threshold.
+UNCERTAIN_SILENCE_DB = -45.0
 
 
 def settings_signature(settings: FacecamAutoEditorSettings) -> str:
@@ -47,6 +50,29 @@ def protected_spans(words: list[dict], uncertain_spans=()) -> list[tuple[float, 
     return merged
 
 
+def subtract_intervals(intervals, holes) -> list[tuple[float, float]]:
+    remaining = list(intervals)
+    for lo, hi in holes:
+        kept = []
+        for a, b in remaining:
+            if hi <= a or lo >= b:
+                kept.append((a, b))
+            else:
+                if a < lo:
+                    kept.append((a, lo))
+                if hi < b:
+                    kept.append((hi, b))
+        remaining = kept
+    return remaining
+
+
+def audible_spans(uncertain_spans, silences) -> list[tuple[float, float]]:
+    """Silero merges pauses shorter than 2 s, so a plain pause between two
+    sentences comes back from the ASR as "speech without words". Only its
+    audible parts can hide a missed word."""
+    return subtract_intervals([(float(a), float(b)) for a, b in uncertain_spans], silences)
+
+
 def keep_intervals(duration: float, silences: list[tuple[float, float]],
                    settings: FacecamAutoEditorSettings | None = None,
                    speech: list[tuple[float, float]] = ()) -> list[tuple[int, int]]:
@@ -65,19 +91,7 @@ def keep_intervals(duration: float, silences: list[tuple[float, float]],
             continue
         start = max(0, start + settings.margin_after_ms / 1000 if start > 0 else 0)
         end = min(duration, end - settings.margin_before_ms / 1000 if end < duration - 1e-5 else duration)
-        candidates = [(start, end)]
-        for lo, hi in speech:
-            remaining = []
-            for a, b in candidates:
-                if hi <= a or lo >= b:
-                    remaining.append((a, b))
-                else:
-                    if a < lo:
-                        remaining.append((a, lo))
-                    if hi < b:
-                        remaining.append((hi, b))
-            candidates = remaining
-        for a, b in candidates:
+        for a, b in subtract_intervals([(start, end)], speech):
             a, b = max(0, math.ceil(a * FPS - 1e-7)), total if b >= duration - 1e-7 else min(total, math.floor(b * FPS + 1e-7))
             if b - a >= 2:  # Avoid one-frame edits that add jitter without useful time savings.
                 cuts.append((a, b))

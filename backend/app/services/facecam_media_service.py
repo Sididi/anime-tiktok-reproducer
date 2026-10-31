@@ -17,7 +17,10 @@ from pathlib import Path
 from ..models import Transcription
 from .facecam_service import FacecamService
 from .atomic_files import write_text_atomic
-from .facecam_auto_editor import keep_intervals, prepared_is_current, protected_spans, settings_signature, verify_speech_retained
+from .facecam_auto_editor import (
+    UNCERTAIN_SILENCE_DB, audible_spans, keep_intervals, prepared_is_current, protected_spans, settings_signature,
+    verify_speech_retained,
+)
 
 FPS = 60
 RATE = 48000
@@ -36,6 +39,22 @@ def ffmpeg(args: list[str], timeout=1800):
     if result.returncode:
         raise RuntimeError("Préparation média impossible : " + result.stderr.decode(errors="replace")[-1200:])
     return result
+
+
+def detect_silences(wav: Path, noise_db: float, min_seconds: float, duration: float) -> list[tuple[float, float]]:
+    detection = ffmpeg(["-i", str(wav), "-af", f"silencedetect=noise={noise_db}dB:d={min_seconds}", "-f", "null", "-"])
+    silence_start, silences = None, []
+    for line in detection.stderr.decode(errors="replace").splitlines():
+        match = re.search(r"silence_start: ([\d.]+)", line)
+        if match:
+            silence_start = float(match[1])
+        match = re.search(r"silence_end: ([\d.]+)", line)
+        if match and silence_start is not None:
+            silences.append((silence_start, float(match[1])))
+            silence_start = None
+    if silence_start is not None:
+        silences.append((silence_start, duration))
+    return silences
 
 
 def compare_words(expected: str, actual: str) -> list[dict]:
@@ -295,26 +314,17 @@ class FacecamMediaService:
         work.mkdir(exist_ok=True)
         wav = root / "voice.wav"
         timing = cls.speech_timing(root)
-        speech = protected_spans(timing["words"], timing.get("uncertain_spans", []))
         tuning = state.auto_editor
-        detection = ffmpeg(["-i", str(wav), "-af",
-            f"silencedetect=noise={tuning.noise_threshold_db}dB:d={tuning.min_silence_ms / 1000}", "-f", "null", "-"])
-        silence_start, silences = None, []
-        for line in detection.stderr.decode(errors="replace").splitlines():
-            match = re.search(r"silence_start: ([\d.]+)", line)
-            if match:
-                silence_start = float(match[1])
-            match = re.search(r"silence_end: ([\d.]+)", line)
-            if match and silence_start is not None:
-                silences.append((silence_start, float(match[1])))
-                silence_start = None
         duration = ProcessingService._probe_wav_duration(wav)
         media_cache = root / "source_media.json"
         if not media_cache.is_file():  # One metadata probe for recordings imported before caching.
             write_text_atomic(media_cache, json.dumps({"camera_duration": float(probe(root / "facecam.mp4")["format"]["duration"])}))
         duration = min(duration, json.loads(media_cache.read_text())["camera_duration"])
-        if silence_start is not None:
-            silences.append((silence_start, duration))
+        silences = detect_silences(wav, tuning.noise_threshold_db, tuning.min_silence_ms / 1000, duration)
+        quiet = detect_silences(wav, min(tuning.noise_threshold_db, UNCERTAIN_SILENCE_DB),
+                                tuning.min_silence_ms / 1000, duration)
+        uncertain = audible_spans(timing.get("uncertain_spans", []), quiet)
+        speech = protected_spans(timing["words"], uncertain)
         keep = keep_intervals(duration, silences, tuning, speech)
         verify_speech_retained(keep, speech, duration)
         if not keep:
@@ -360,7 +370,8 @@ class FacecamMediaService:
             "removed_seconds": max(0, duration - sum(b - a for a, b in keep) / FPS),
             "cut_count": len(keep) - 1 + int(keep[0][0] > 0) + int(keep[-1][1] < math.ceil(duration * FPS - 1e-7)),
             "protected_word_count": len(timing["words"]), "clipped_word_count": 0,
-            "uncertain_span_count": len(timing.get("uncertain_spans", []))}
+            "uncertain_span_count": len(timing.get("uncertain_spans", [])),
+            "protected_uncertain_seconds": round(sum(b - a for a, b in uncertain), 3)}
         write_text_atomic(work / "cut_report.json", json.dumps(cut_report, indent=2))
         prepared = {"revision": state.revision, "fingerprint": state.recording["fingerprint"], "directory": str(work),
             "auto_editor": tuning.model_dump(), "auto_editor_signature": signature, "cut_report": cut_report,
