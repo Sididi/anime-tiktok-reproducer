@@ -99,17 +99,19 @@ class FacecamEditorTrackService:
     @classmethod
     def selected_matches(cls, project_id, *, cancel_event=None):
         from .facecam_visual_candidates import FacecamVisualCandidates
-        return FacecamVisualCandidates.matches(FacecamVisualCandidates.select(project_id, cancel_event=cancel_event))
+        from .facecam_placement_service import FacecamPlacementService
+        return FacecamVisualCandidates.matches(FacecamPlacementService.candidates(project_id))
 
     @classmethod
     def build(cls, project, scenes, source_rate):
         from .facecam_service import FacecamService
         from .facecam_visual_candidates import FacecamVisualCandidates
+        from .facecam_placement_service import FacecamPlacementService
         from .facecam_visual_index import FacecamVisualIndex
         from .processing import ProcessingService
 
         state = FacecamService.load(project.id)
-        candidates = FacecamVisualCandidates.select(project.id)
+        candidates = FacecamPlacementService.candidates(project.id)
         resolved = {}
         for candidate, match in zip(candidates, FacecamVisualCandidates.matches(candidates)):
             resolved.update(ProcessingService.resolve_scene_sources([match],

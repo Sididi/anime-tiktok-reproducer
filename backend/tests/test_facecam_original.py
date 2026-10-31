@@ -6,6 +6,7 @@ import pytest
 from test_facecam import source, draft, range_model  # noqa: F401 -- shared project fixture
 from app.models.facecam import ENDING, FacecamState
 from app.services.facecam_service import FacecamService, StaleFacecamRevision
+from facecam_workflow_helpers import approve_and_assign, validate_recording
 from app.services.facecam_original_service import FacecamOriginalService
 from app.services.openrouter_service import OpenRouterService
 from app.services.project_service import ProjectService
@@ -82,7 +83,7 @@ def test_original_can_be_edited_reloaded_approved_and_generated_again(source, mo
     state = FacecamService.save_draft(project.id, state.revision, state.blocks, state.selected_hook, state.selected_opinion)
     assert FacecamService.load(project.id).generation_mode == 'original'
     monkeypatch.setattr(FacecamService, 'llm', range_model)
-    approved = FacecamService.approve(project.id, state.revision)
+    approved = approve_and_assign(project.id, state.revision)
     assert approved.approved_revision == state.revision
     assert ' '.join(s['text'] for s in approved.assignment).split() == state.spoken_text().split()
     assert [m['source_scene_index'] for m in approved.montage_map] == [0, 2, 2]
@@ -111,7 +112,7 @@ def test_short_original_script_can_use_illustrations_from_a_much_longer_source(s
     (root / 'reference_matches.json').write_text(matches.model_dump_json())
     writers(monkeypatch)
     new = FacecamOriginalService.generate(project.id, state.revision)
-    approved = FacecamService.approve(project.id, new.revision)
+    approved = approve_and_assign(project.id, new.revision)
     assert approved.approved_revision == new.revision
     assert ' '.join(s['text'] for s in approved.assignment).split() == new.spoken_text().split()
     assert len(approved.assignment) < 80

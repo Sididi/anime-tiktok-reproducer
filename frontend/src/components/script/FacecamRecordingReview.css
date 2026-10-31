@@ -1,0 +1,15 @@
+.facecam-recording-review{margin-top:24px;padding-top:24px;border-top:1px solid hsl(var(--border))}
+.facecam-recording-review>header{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.facecam-review-kicker{font-size:10px;letter-spacing:.12em;color:#a5b4fc}
+.facecam-recording-review h3{font-size:18px!important;margin-top:5px}
+.facecam-review-save{font-size:12px;color:#94a3b8}
+.facecam-recording-legend{display:flex;gap:20px;flex-wrap:wrap;margin:16px 0;font-size:12px;color:#cbd5e1}
+.facecam-recording-legend span{display:flex;align-items:center;gap:7px}.facecam-recording-legend i{width:10px;height:10px;border-radius:3px}.facecam-recording-legend .old{background:#fca5a5}.facecam-recording-legend .new{background:#86efac}
+.facecam-recording-prose{padding:24px;border:1px solid hsl(var(--border));border-radius:12px;background:hsl(var(--background));min-height:200px}
+.facecam-recording-old{background:#ef444415;color:#fca5a5;text-decoration:line-through;text-decoration-color:#f87171;cursor:pointer;border-radius:3px}
+.facecam-recording-suggestion{display:inline;border:1px solid #22c55e50;border-radius:4px;background:#22c55e15;color:#86efac;font:inherit;line-height:1.5;padding:0 4px;margin:0 3px;vertical-align:baseline;cursor:pointer;text-decoration:none}
+.facecam-recording-suggestion:hover,.facecam-recording-suggestion:focus-visible{background:#22c55e30;outline:2px solid #86efac;outline-offset:1px}.facecam-recording-suggestion.delete{font-size:12px;padding:0 3px}
+.facecam-recording-toolbar{display:flex;gap:16px;justify-content:flex-end;margin-bottom:10px}.facecam-recording-toolbar button{font-size:12px;color:#a5b4fc}.facecam-recording-toolbar button:disabled{color:#64748b}
+.facecam-recording-review>footer{display:flex;gap:20px;align-items:center;justify-content:space-between;margin-top:20px}.facecam-recording-review>footer strong{font-size:13px}.facecam-recording-review>footer p{font-size:12px;max-width:450px;margin:5px 0}
+.facecam-recording-review>footer>button{white-space:normal;height:auto;min-height:40px;padding-top:10px;padding-bottom:10px;text-align:center}
+@media(max-width:650px){.facecam-recording-prose{padding:16px}.facecam-recording-review>footer{align-items:stretch;flex-direction:column}.facecam-recording-review>header{align-items:flex-start}.facecam-review-save{font-size:11px}}

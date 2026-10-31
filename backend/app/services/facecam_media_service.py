@@ -156,6 +156,7 @@ class FacecamMediaService:
         }
         # Publish the editor before ASR/LLM work so manual cuts are available immediately.
         FacecamService.update(project_id, {"prepared": None, "processed_signature": None,
+            "recording_review": None, "placement": None,
             "recording": recording, "recording_edit": FacecamCutService.new_edit(recording)}, state.revision)
         FacecamService.invalidate_output(project_id)
         return FacecamCutService.analyze(project_id)
@@ -167,7 +168,7 @@ class FacecamMediaService:
             raise ValueError("Importez votre enregistrement.")
         if state.recording_edit and not state.recording_edit.applied:
             raise ValueError("Validez d'abord les coupes de l'enregistrement.")
-        return FacecamService.update(project_id, {"recording": {**state.recording, "reviewed_revision": revision}, "prepared": None}, revision)
+        raise ValueError("Validez le texte dans la relecture complète de l'enregistrement.")
 
     @staticmethod
     def save_speech_timing(root: Path, words: list[dict], uncertain_spans: list):
@@ -283,6 +284,8 @@ class FacecamMediaService:
             raise ValueError("Validez d'abord les coupes de l'enregistrement.")
         if state.recording.get("reviewed_revision") != state.revision:
             raise ValueError("Vérifiez les différences entre votre script et votre enregistrement.")
+        if not state.assignment or (state.placement and not state.placement.assignment_complete):
+            raise ValueError("Attendez la répartition du texte enregistré sur les scènes.")
         if cls.prepared_audio_exists(state):
             return state
         root = Path(state.recording["directory"])

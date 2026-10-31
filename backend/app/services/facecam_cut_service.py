@@ -296,11 +296,11 @@ class FacecamCutService:
         recording = {"fingerprint": fingerprint, "directory": str(root), "original_name": edit.original_name,
             "source_directory": edit.source_directory, "duration": duration, "scale": edit.scale,
             "transcript": spoken, "differences": differences,
-            "reviewed_revision": revision if not differences else None}
+            "reviewed_revision": None}
         with FacecamService.lock(project_id):
             cls.validate_request(project_id, revision, edit_id, version, cuts)
             updated = edit.model_copy(update={"cuts": cuts, "applied": True, "version": version + 1})
             result = FacecamService.update(project_id, {"recording": recording, "recording_edit": updated,
-                "prepared": None, "processed_signature": None}, revision)
+                "prepared": None, "processed_signature": None, "recording_review": None, "placement": None}, revision)
             FacecamService.invalidate_output(project_id)
             return result

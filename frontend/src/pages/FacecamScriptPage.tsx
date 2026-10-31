@@ -8,6 +8,7 @@ import { FacecamEditor } from '@/components/script/FacecamEditor';
 import { FacecamStories } from '@/components/script/FacecamStories';
 import { FacecamPrompter } from '@/components/script/FacecamPrompter';
 import { FacecamAutoEditor } from '@/components/script/FacecamAutoEditor';
+import { FacecamRecordingReview } from '@/components/script/FacecamRecordingReview';
 import { MetadataEditorModal } from '@/components/script/MetadataEditorModal';
 import { DEFAULT_FACECAM_AUTO_EDITOR, FULL_STORY_ID, facecamRequest, uploadFacecam, type FacecamAutoEditorSettings, type FacecamBlock, type FacecamState, type Finding, type RecordingCut } from '@/api/facecam';
 import { useFacecamPreview } from '@/hooks/useFacecamPreview';
@@ -30,6 +31,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const [delivery, setDelivery] = useState<{status: string} | null>(project.facecam_delivery ?? null);
   const [sourceOpen, setSourceOpen] = useState(false), [sourceLoaded, setSourceLoaded] = useState(false);
   const [cutsOpen, setCutsOpen] = useState(false);
+  const [reviewDirty, setReviewDirty] = useState(false);
   const [showFactReview, setShowFactReview] = useState(true);
   const closeCuts = useCallback(() => setCutsOpen(false), []);
   const recordingPlayer = useRef<HTMLVideoElement>(null);
@@ -63,7 +65,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
   }, []);
   const saveMusic = useCallback((music_key: string | null) => setSettings(previous => previous ? {...previous, music_key} : previous), []);
   const preview = useFacecamPreview({id, state, musicKey: settings?.music_key ?? null, settingsLoaded: !!settings,
-    approved, working: working || cutsOpen, apply, saveMusic, onError: setError});
+    approved, working: working || cutsOpen || reviewDirty, apply, saveMusic, onError: setError});
   const busy = working || preview.requestBusy || state?.job?.status === 'processing';
   const loadMetadata = useCallback(() => fetch(`/api/projects/${id}/metadata`).then(async response => {
     if (response.ok) {const result = await response.json(); setMetadata(result.metadata);}
@@ -170,7 +172,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const options = stage === 'hooks' ? state.hooks : state.opinions;
   const selection = stage === 'hooks' ? hook : opinion;
   const select = stage === 'hooks' ? setHook : setOpinion;
-  const previewReady = preview.previewReady;
+  const previewReady = preview.previewReady && !reviewDirty;
   const cutsPending = !!state.recording_edit && !state.recording_edit.applied;
   const storyReady = originalMode || !!state.selected_story_id || (!state.stories?.length && state.blocks.length > 0);
   const wordCount = state.blocks.filter(b => b.kind !== 'raw').reduce((n, b) => n + (b.text.trim() ? b.text.trim().split(/\s+/).length : 0), 0);
@@ -207,7 +209,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
         {saved && state.estimated_duration_seconds != null && <> · Estimation : {Math.round(state.estimated_duration_seconds)} s, à confirmer avec votre lecture.
           {state.estimated_duration_seconds > (originalMode ? 75 : 70) ? state.selected_story_id === FULL_STORY_ID ? ' Le récit intégral dépasse la durée conseillée. Privilégiez une histoire plus courte pour garder l’attention.' : ' Vous pouvez condenser le texte à la main ; cette estimation ne bloque pas la validation.' : state.estimated_duration_seconds < (originalMode ? 60 : 65) ? ' Une lecture est nécessaire pour vérifier que le montage dépasse une minute.' : ''}</>}
       </p>
-      <div className={`facecam-editor-layout${showFactReview ? '' : ' review-hidden'}`}><FacecamEditor blocks={state.blocks} findings={visibleFindings} showFindings={showFactReview} disabled={!!busy} onChange={edit} onFinding={setFinding}/>
+      <div className={`facecam-editor-layout${showFactReview ? '' : ' review-hidden'}`}><FacecamEditor blocks={state.blocks} findings={visibleFindings} showFindings={showFactReview} disabled={!!busy || reviewDirty} onChange={edit} onFinding={setFinding}/>
         <aside id="facecam-fact-review" className="facecam-review" hidden={!showFactReview} aria-label="Vérification des faits"><h3>Vérification des faits</h3>
           {state.fact_status === 'unavailable' ? <p role="alert">Vérification indisponible. {state.fact_error}</p> : state.fact_revision == null ? <p>Ce texte n’a pas encore été vérifié.</p> : <p>{visibleFindings.length ? `${visibleFindings.length} point(s) à examiner.` : state.fact_revision !== state.revision || !saved ? 'Aucun signalement restant.' : 'Aucune anomalie signalée par la recherche.'} Les corrections restent à votre appréciation.
             {(state.fact_revision !== state.revision || !saved) && <> Les passages modifiés n’ont pas été revérifiés ; les autres signalements sont conservés.</>}</p>}
@@ -224,19 +226,18 @@ export function FacecamScriptPage({project}: {project: Project}) {
     </section>}
     <section className="facecam-card" hidden={!state.blocks.length}><h2>4. Votre enregistrement</h2><p>{originalMode ? 'Lisez votre narration en continu, sans prononcer le titre final. Vous pourrez retirer les ratés après l’import ; les silences seront coupés automatiquement.' : 'Lisez uniquement votre narration, sans les extraits audio originaux ni le titre final. Vous pourrez retirer les ratés après l’import. Les silences seront coupés et les extraits réinsérés automatiquement.'}</p>
       <FacecamPrompter projectId={id} title={project.anime_name || 'Facecam'} revision={state.revision} blocks={state.blocks} saved={saved} busy={!!busy} prepare={flush}/>
-      <label className={`facecam-upload ${!approved || busy ? 'disabled' : ''}`}><Upload size={24}/><span>{state.recording ? 'Remplacer l’enregistrement' : 'Importer votre vidéo'}<small>MP4 ou MOV avec son</small></span><input type="file" accept="video/mp4,video/quicktime,.mp4,.mov" disabled={!approved || busy} onChange={e => {const file = e.target.files?.[0]; if(file) void importFile(file, 'recording'); e.target.value = '';}}/></label>
+      <label className={`facecam-upload ${!approved || busy ? 'disabled' : ''}`}><Upload size={24}/><span>{state.recording ? 'Remplacer l’enregistrement' : 'Importer votre vidéo'}<small>MP4 ou MOV avec son</small></span><input type="file" accept="video/mp4,video/quicktime,.mp4,.mov" disabled={!approved || busy || reviewDirty} onChange={e => {const file = e.target.files?.[0]; if(file) void importFile(file, 'recording'); e.target.value = '';}}/></label>
       {!approved && <p>Validez votre script avant d’importer une vidéo.</p>}{upload !== null && <progress max={100} value={upload} aria-label="Envoi du fichier"/>}
       {state.recording && <div className="facecam-recording"><video ref={recordingPlayer} controls src={`/api/projects/${id}/facecam/recording?v=${state.recording.fingerprint}`} preload="metadata"/>
-        <div><Button variant="outline" disabled={working || preview.requestBusy || (!!busy && !state.recording_edit)} onClick={() => void openCuts()}><Scissors size={16} className="mr-2"/>{cutsPending ? 'Vérifier les coupes' : 'Modifier les coupes'}</Button>
-          {cutsPending ? <p>Vérifiez les reprises et validez votre prise avant la transcription définitive.</p> : <><h3 className="mt-4">Texte enregistré</h3><p className="max-h-48 overflow-auto">{state.recording.transcript}</p>
-          {state.recording.differences.length > 0 && <details open={state.recording.reviewed_revision !== state.revision}><summary>{state.recording.differences.length} différence(s) à vérifier</summary><ul>{state.recording.differences.map((d,i) => <li key={i}><del>{d.expected || '(ajout)'}</del><ins>{d.spoken || '(omis)'}</ins></li>)}</ul></details>}
-          {state.recording.reviewed_revision !== state.revision && <Button variant="outline" disabled={busy || !approved} onClick={() => void action('/recording/review', {})}>J’ai vérifié les différences</Button>}
-          <p className="text-sm">Modifiez le script si votre lecture a changé, ou acceptez les écarts de transcription après écoute.</p></>}
+        <div><Button variant="outline" disabled={working || reviewDirty || preview.requestBusy || (!!busy && !state.recording_edit)} onClick={() => void openCuts()}><Scissors size={16} className="mr-2"/>{cutsPending ? 'Vérifier les coupes' : 'Modifier les coupes'}</Button>
+          {cutsPending ? <p>Vérifiez les reprises et validez votre prise avant la transcription définitive.</p> : <p>Écoutez votre prise pendant la relecture du texte ci-dessous.</p>}
         </div></div>}
+      {state.recording && !cutsPending && <FacecamRecordingReview key={state.recording.fingerprint} projectId={id} state={state}
+        disabled={!!busy || !saved} onState={apply} onDirtyChange={setReviewDirty}/>}
       {state.recording && !cutsPending && <>
         <FacecamAutoEditor value={preview.tuning} defaults={settings?.auto_editor_defaults ?? DEFAULT_FACECAM_AUTO_EDITOR} disabled={preview.controlsDisabled}
           pending={preview.pending} automatic={preview.enabled} onChange={preview.changeTuning}/>
-        <div className="mt-5 flex flex-wrap items-center gap-4"><Button disabled={busy || !settings || !approved || state.recording.reviewed_revision !== state.revision} onClick={preview.prepare}>Préparer l’aperçu audio</Button>{previewReady && <audio key={state.prepared?.preview_version} controls aria-label="Aperçu audio Facecam" src={`/api/projects/${id}/facecam/preview?r=${state.revision}&v=${state.prepared?.preview_version}`} preload="metadata"/>}</div>
+        <div className="mt-5 flex flex-wrap items-center gap-4"><Button disabled={busy || reviewDirty || !settings || !approved || state.recording.reviewed_revision !== state.revision || state.placement?.status !== 'complete'} onClick={preview.prepare}>Préparer l’aperçu audio</Button>{previewReady && <audio key={state.prepared?.preview_version} controls aria-label="Aperçu audio Facecam" src={`/api/projects/${id}/facecam/preview?r=${state.revision}&v=${state.prepared?.preview_version}`} preload="metadata"/>}</div>
       </>}
       {previewReady && state.prepared?.cut_report && <p>{state.prepared.cut_report.removed_seconds.toFixed(1)} s de pauses retirées · {state.prepared.cut_report.cut_count} coupes · {state.prepared.cut_report.protected_word_count} mots protégés.</p>}
       {previewReady && state.prepared?.duration_seconds != null && <p>Durée montée, carte finale comprise : {state.prepared.duration_seconds.toFixed(1)} s.

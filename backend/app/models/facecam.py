@@ -93,6 +93,36 @@ class RecordingEdit(BaseModel):
     applied: bool = False
 
 
+class RecordingWordChange(BaseModel):
+    id: str
+    block_id: str
+    kind: Literal["insert", "delete", "replace"]
+    start: int
+    end: int
+    expected: str
+    spoken: str
+    replacement: str
+
+
+class RecordingReview(BaseModel):
+    id: str
+    revision: int
+    fingerprint: str
+    version: int = 0
+    blocks: list[ScriptBlock]
+    changes: list[RecordingWordChange] = Field(default_factory=list)
+    validated_revision: int | None = None
+
+
+class FacecamPlacement(BaseModel):
+    key: str
+    revision: int
+    fingerprint: str
+    status: Literal["pending", "running", "complete", "error"] = "pending"
+    assignment_complete: bool = False
+    error: str | None = None
+
+
 class FacecamAutoEditorSettings(BaseModel):
     """Real-voice silence detection; word protection is always enabled."""
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -128,6 +158,8 @@ class FacecamState(BaseModel):
     findings: list[FacecamFinding] = Field(default_factory=list)
     recording: dict[str, Any] | None = None
     recording_edit: RecordingEdit | None = None
+    recording_review: RecordingReview | None = None
+    placement: FacecamPlacement | None = None
     auto_editor: FacecamAutoEditorSettings = Field(default_factory=FacecamAutoEditorSettings)
     prepared: dict[str, Any] | None = None
     preview_enabled: bool = False

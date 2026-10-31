@@ -15,6 +15,7 @@ from app.models import Project, ProjectPhase, Scene, SceneList, MatchList, Scene
 from app.models.facecam import ENDING
 from app.services.project_service import ProjectService
 from app.services.facecam_service import FacecamService, StaleFacecamRevision
+from facecam_workflow_helpers import approve_and_assign, validate_recording
 from app.services.facecam_media_service import compare_words, keep_intervals, camera_segments, FacecamMediaService
 
 
@@ -111,7 +112,7 @@ def test_optional_opinion_can_be_generated_edited_approved_and_restored(source, 
         FacecamService.save_draft(project.id, state.revision,
             [b for b in state.blocks if b.kind != 'raw'], state.selected_hook, '')
     monkeypatch.setattr(FacecamService, 'llm', range_model)
-    state = FacecamService.approve(project.id, state.revision)
+    state = approve_and_assign(project.id, state.revision)
     assert state.approved_revision == state.revision
     assert state.assignment[-1]['text'] == ENDING
     assert ProjectService.load_transcription(project.id).scenes[-1].text == ENDING
@@ -314,7 +315,7 @@ def test_approval_preserves_every_word_order_and_raw_boundaries(source,monkeypat
     ProjectService.save_transcription(source.id, reference)
     project,state = draft(source)
     monkeypatch.setattr(FacecamService,'llm',range_model)
-    result = FacecamService.approve(project.id,state.revision)
+    result = approve_and_assign(project.id,state.revision)
     assert ' '.join(r['text'] for r in result.assignment).split() == state.spoken_text().split()
     current = ProjectService.load_transcription(project.id)
     assert [r['text'] for r,s in zip(result.assignment,current.scenes) if s.is_raw] == [''] * sum(s.is_raw for s in reference.scenes)
@@ -330,15 +331,16 @@ def test_invalid_assignment_keeps_approved_text_unchanged(source,monkeypatch):
     reference.scenes[1].is_raw = False
     ProjectService.save_transcription(source.id, reference)
     project,state=draft(source)
+    validate_recording(project.id, state.revision)
     root = ProjectService.get_project_dir(project.id)
     files = ['facecam/state.json', 'facecam/reference.json', 'facecam/reference_matches.json',
              'transcription.json', 'matches.json', 'scenes.json']
     before = {name: (root / name).read_bytes() for name in files}
     monkeypatch.setattr(FacecamService,'llm',lambda *a, **kw: {'boundaries': []})
     with pytest.raises(ValueError, match='3 tentatives'):
-        FacecamService.approve(project.id,state.revision)
+        FacecamService.assign_scenes(project.id,state.revision)
     assert FacecamService.load(project.id).blocks == state.blocks
-    assert FacecamService.load(project.id).approved_revision is None
+    assert FacecamService.load(project.id).approved_revision == state.revision
     assert {name: (root / name).read_bytes() for name in files} == before
     assert not (root / 'new_script.json').exists()
 
@@ -346,7 +348,7 @@ def test_invalid_assignment_keeps_approved_text_unchanged(source,monkeypatch):
 def test_single_scene_blocks_need_no_model_during_approval(source, monkeypatch):
     project, state = draft(source)
     monkeypatch.setattr(FacecamService, 'llm', lambda *a, **kw: pytest.fail('No choice to make'))
-    approved = FacecamService.approve(project.id, state.revision)
+    approved = approve_and_assign(project.id, state.revision)
     assert approved.approved_revision == state.revision
     assert ' '.join(a['text'] for a in approved.assignment).split() == state.spoken_text().split()
 
@@ -363,6 +365,7 @@ def test_assignment_keeps_raw_separator_and_commits_only_after_all_blocks(source
         SceneMatch(scene_index=i, episode='episode.mp4', start_time=20+i*2, end_time=22+i*2,
                    confidence=1, speed_ratio=1) for i in range(5)]))
     project, state = draft(source)
+    validate_recording(project.id, state.revision)
     root = ProjectService.get_project_dir(project.id)
     files = ['facecam/state.json', 'transcription.json', 'matches.json', 'scenes.json']
     before = {name: (root / name).read_bytes() for name in files}
@@ -376,12 +379,12 @@ def test_assignment_keeps_raw_separator_and_commits_only_after_all_blocks(source
     monkeypatch.setattr(FacecamService, 'llm', generate)
     if fail_second_block:
         with pytest.raises(ValueError, match='3 tentatives'):
-            FacecamService.approve(project.id, state.revision)
+            FacecamService.assign_scenes(project.id, state.revision)
         assert len(calls) == 4  # First block succeeded; second exhausted its budget.
         assert {name: (root / name).read_bytes() for name in files} == before
         assert not (root / 'new_script.json').exists()
     else:
-        approved = FacecamService.approve(project.id, state.revision)
+        approved = FacecamService.assign_scenes(project.id, state.revision)
         assert len(calls) == 2
         assert [pair[1] for pair in calls[0]['words']] == (state.blocks[0].text + ' ' + state.blocks[1].text).split()
         assert [pair[1] for pair in calls[1]['words']] == state.blocks[3].text.split()
@@ -398,7 +401,7 @@ def test_approval_rejects_stale_layout_before_model_call(source, monkeypatch):
     FacecamService.update(project.id, {'blocks': state.blocks})
     monkeypatch.setattr(FacecamService, 'llm', lambda *a, **kw: pytest.fail('Invalid layout'))
     with pytest.raises(ValueError, match='plans du script'):
-        FacecamService.approve(project.id, state.revision)
+        approve_and_assign(project.id, state.revision)
     assert FacecamService.load(project.id).approved_revision is None
 
 
@@ -416,7 +419,7 @@ def test_edit_during_assignment_prevents_commit_and_retry(source, monkeypatch, v
         return range_model(pid, prompt) if valid_response else {'boundaries': []}
     monkeypatch.setattr(FacecamService, 'llm', generate)
     with pytest.raises(StaleFacecamRevision):
-        FacecamService.approve(project.id, state.revision)
+        approve_and_assign(project.id, state.revision)
     assert len(calls) == 1
     current = FacecamService.load(project.id)
     assert current.revision == state.revision + 1 and current.approved_revision is None
@@ -863,7 +866,7 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     from app.models.facecam import FacecamAutoEditorSettings
     project,state=draft(source)
     monkeypatch.setattr(FacecamService,'llm',range_model)
-    state=FacecamService.approve(project.id,state.revision)
+    state=approve_and_assign(project.id,state.revision)
     root=FacecamService.directory(project.id)/'recordings'/'test';root.mkdir(parents=True)
     with wave.open(str(root/'voice.wav'),'wb') as wav:
         wav.setparams((1,2,48000,0,'NONE','not compressed'))

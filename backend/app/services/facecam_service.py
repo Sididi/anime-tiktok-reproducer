@@ -239,7 +239,8 @@ class FacecamService:
             if state.selected_story_id and not keep_full_story:
                 # A changed source invalidates an earlier selection even before its replacement is chosen.
                 values.update({"revision": revision + 1, "approved_revision": None, "prepared": None,
-                               "processed_signature": None, "assignment": [], "montage_map": []})
+                               "processed_signature": None, "assignment": [], "montage_map": [],
+                               "recording_review": None, "placement": None})
             state = cls.update(project_id, values, revision)
             if "revision" in values:
                 cls.invalidate_output(project_id)
@@ -279,6 +280,7 @@ class FacecamService:
                 "approved_revision": None, "assignment": [], "montage_map": [], "estimated_duration_seconds": None,
                 "findings": [], "findings_revision": revision + 1, "fact_context": None, "fact_revision": None, "fact_status": "unchecked", "fact_error": None,
                 "prepared": None, "processed_signature": None, "recording": recording,
+                "recording_review": None, "placement": None,
             }, revision)
             cls.invalidate_output(project_id)
             return state
@@ -400,7 +402,7 @@ class FacecamService:
                 text = "\n\n".join(b.text for b in blocks if b.kind != "raw")
                 differences = compare_words(text, recording.get("transcript", ""))
                 recording = {**recording, "differences": differences,
-                    "reviewed_revision": revision + 1 if not differences and (not old.recording_edit or old.recording_edit.applied) else None}
+                    "reviewed_revision": None}
             mode = generation_mode or old.generation_mode
             generation_values = {}
             if generation_mode is not None:
@@ -413,6 +415,7 @@ class FacecamService:
                 "blocks": blocks, "selected_hook": hook, "selected_opinion": opinion,
                 "revision": revision + 1, "approved_revision": None, "assignment": [],
                 "prepared": None, "processed_signature": None, "recording": recording, "montage_map": [],
+                "recording_review": None, "placement": None,
                 "estimated_duration_seconds": cls.estimate_duration(project_id, blocks, generation_mode=mode),
                 "findings": findings, "findings_revision": revision + 1,
                 **generation_values,
@@ -577,12 +580,35 @@ class FacecamService:
 
     @classmethod
     def approve(cls, project_id: str, revision: int):
+        """Approve the writing draft without assigning scenes or invoking a model."""
+        with cls.lock(project_id):
+            state = cls.load(project_id)
+            if state.revision != revision:
+                raise StaleFacecamRevision("Le script a changé.")
+            if not state.blocks or any(not b.text.strip() for b in state.blocks if b.kind != "raw"):
+                raise ValueError("Complétez l'accroche, le récit et le point de vue avant de valider.")
+            cls.require_story(project_id)
+            expected = cls.skeleton(project_id, include_opinion=any(b.kind == "opinion" for b in state.blocks))
+            if [(b.id, b.kind, b.scene_indices) for b in state.blocks] != [(b.id, b.kind, b.scene_indices) for b in expected]:
+                raise ValueError("Les plans du script ont changé. Régénérez le récit avant de le valider.")
+            if state.approved_revision == revision:
+                return state
+            return cls.update(project_id, {"approved_revision": revision}, revision)
+
+    @classmethod
+    def assign_scenes(cls, project_id: str, revision: int):
         from .facecam_assignment_service import FacecamAssignmentService
 
         state = cls.load(project_id)
+        if (not state.recording or state.recording.get("reviewed_revision") != revision
+                or state.approved_revision != revision or not state.placement
+                or state.placement.revision != revision):
+            raise ValueError("Validez le texte enregistré avant de répartir les scènes.")
+        if state.placement.assignment_complete:
+            return state
         if state.revision != revision:
             raise StaleFacecamRevision("Le script a changé.")
-        if not state.blocks or any(not b.text.strip() for b in state.blocks if b.kind != "raw"):
+        if not state.blocks or not any(b.text.strip() for b in state.blocks if b.kind in {"hook", "body"}):
             raise ValueError("Complétez l'accroche, le récit et le point de vue avant de valider.")
         cls.require_story(project_id)
         expected = cls.skeleton(project_id, include_opinion=any(b.kind == "opinion" for b in state.blocks))
@@ -604,42 +630,72 @@ class FacecamService:
         match_map = {m.scene_index: m for m in matches.matches}
         matches.matches = [match_map[s.scene_index] for s in reference.scenes]
         leading_raw = reference.scenes[0].is_raw
+        illustrations = [(match_map[s.scene_index], origin) for s, origin in zip(reference.scenes, montage_map, strict=True)
+                         if not s.is_raw]
         assignment = []
         bodies = [b for b in state.blocks if b.kind == "body"]
 
         def generate(prompt, **kwargs):
-            if cls.load(project_id).revision != revision:
-                raise StaleFacecamRevision("Le script a changé. Rechargez la version actuelle.")
+            current = cls.load(project_id)
+            if current.revision != revision or not current.placement or current.placement.key != state.placement.key:
+                raise StaleFacecamRevision("La relecture a changé. Rechargez la version actuelle.")
             return cls.llm(project_id, prompt, **kwargs)
 
+        from .facecam_illustration_llm import write_json
+        from .facecam_visual_index import fingerprint
+        retained = {s.scene_index for s in reference.scenes if s.is_raw}
         for pos, block in enumerate(bodies):
             text = ((state.blocks[0].text + " ") if pos == 0 and not leading_raw else "") + block.text
             words = text.split()
-            assignment += FacecamAssignmentService.assign(words, [
-                {"scene_index": i, "original": scene_map[i].text,
-                 "duration": match_map[i].end_time - match_map[i].start_time} for i in block.scene_indices if i in scene_map
-            ], generate, context=f"project={project_id}, block={block.id}")
+            targets = [{"scene_index": i, "original": scene_map[i].text,
+                        "duration": match_map[i].end_time - match_map[i].start_time}
+                       for i in block.scene_indices if i in scene_map]
+            if not words:
+                continue
+            if len(words) < len(targets):
+                positions = [0] if len(words) == 1 else [round(i * (len(targets) - 1) / (len(words) - 1)) for i in range(len(words))]
+                targets = [targets[i] for i in positions]
+            retained.update(t["scene_index"] for t in targets)
+            cache = cls.directory(project_id) / "placements" / state.placement.key / (
+                "assignment-" + fingerprint([words, targets]) + ".json")
+            if cache.exists():
+                rows = json.loads(cache.read_text())
+                if ([r["scene_index"] for r in rows] != [t["scene_index"] for t in targets]
+                        or " ".join(r["text"] for r in rows).split() != words):
+                    raise ValueError("La répartition enregistrée ne correspond plus au texte validé.")
+            else:
+                rows = FacecamAssignmentService.assign(words, targets, generate, context=f"project={project_id}, block={block.id}")
+                write_json(cache, rows)
+            assignment += rows
+        reference.scenes = [s for s in reference.scenes if s.scene_index in retained]
+        montage_map = [origin for origin in montage_map if origin["source_scene_index"] in retained]
+        matches.matches = [match_map[s.scene_index] for s in reference.scenes]
+        # If the take omitted every body paragraph after a leading raw insert,
+        # its hook/outro can still reuse footage from the selected story.
+        illustrations = [(match_map[s.scene_index], origin) for s, origin in zip(reference.scenes, montage_map, strict=True)
+                         if not s.is_raw] or illustrations
         by_scene = {r["scene_index"]: r for r in assignment}
         assignment = [{"scene_index": s.scene_index, "text": ""} if s.is_raw else by_scene[s.scene_index] for s in reference.scenes]
         outro_index = max(s.scene_index for s in reference.scenes) + 1
         outro_text = " ".join(b.text for b in state.blocks if b.kind in {"opinion", "ending"})
-        assignment.append({"scene_index": outro_index, "text": outro_text})
         pipeline_reference = reference.model_copy(deep=True)
-        end = reference.scenes[-1].end_time
-        duration = max(3.0, len(outro_text.split()) / 2.7)
-        pipeline_reference.scenes.append(SceneTranscription(scene_index=outro_index, text=outro_text,
-            start_time=end, end_time=end + duration))
-        last = matches.matches[-1]
-        if state.selected_story_id or state.generation_mode == "original":
-            last_pos = max(i for i, s in enumerate(reference.scenes) if not s.is_raw)
-            # Reuse a selected illustration; never resurrect the excluded next action for the outro.
-            matches.matches.append(matches.matches[last_pos].model_copy(deep=True, update={"scene_index": outro_index}))
-            montage_map.append({**montage_map[last_pos], "kind": "outro"})
-        else:
-            matches.matches.append(last.model_copy(update={"scene_index": outro_index,
-                "start_time": last.end_time, "end_time": last.end_time + duration, "speed_ratio": 1.0}))
-            montage_map.append({"source_scene_index": None, "kind": "outro"})
-        if leading_raw:
+        if outro_text.strip():
+            assignment.append({"scene_index": outro_index, "text": outro_text})
+            end = reference.scenes[-1].end_time
+            duration = max(3.0, len(outro_text.split()) / 2.7)
+            pipeline_reference.scenes.append(SceneTranscription(scene_index=outro_index, text=outro_text,
+                start_time=end, end_time=end + duration))
+            last = matches.matches[-1]
+            if state.selected_story_id or state.generation_mode == "original":
+                illustration, origin = illustrations[-1]
+                # Reuse a selected illustration; never resurrect the excluded next action for the outro.
+                matches.matches.append(illustration.model_copy(deep=True, update={"scene_index": outro_index}))
+                montage_map.append({**origin, "kind": "outro"})
+            else:
+                matches.matches.append(last.model_copy(update={"scene_index": outro_index,
+                    "start_time": last.end_time, "end_time": last.end_time + duration, "speed_ratio": 1.0}))
+                montage_map.append({"source_scene_index": None, "kind": "outro"})
+        if leading_raw and state.blocks[0].text.strip():
             # An opening original-dialogue scene must remain after the selected hook.
             hook_duration = max(1.0, len(state.blocks[0].text.split()) / 2.7)
             first = matches.matches[0]
@@ -647,9 +703,9 @@ class FacecamService:
                 scene.start_time += hook_duration
                 scene.end_time += hook_duration
             if state.selected_story_id:
-                first_pos = next(i for i, s in enumerate(reference.scenes) if not s.is_raw)
-                matches.matches.insert(0, matches.matches[first_pos].model_copy(deep=True))
-                montage_map.insert(0, {**montage_map[first_pos], "kind": "hook"})
+                illustration, origin = illustrations[0]
+                matches.matches.insert(0, illustration.model_copy(deep=True))
+                montage_map.insert(0, {**origin, "kind": "hook"})
             else:
                 matches.matches.insert(0, first.model_copy(update={"start_time": max(0, first.start_time - hook_duration),
                     "end_time": max(hook_duration, first.start_time), "speed_ratio": 1.0}))
@@ -670,8 +726,9 @@ class FacecamService:
         if " ".join(row["text"] for row in assignment).split() != state.spoken_text().split():
             raise ValueError("La répartition ne conserve pas exactement les mots du script.")
         with cls.lock(project_id):
-            state = cls.update(project_id, {"approved_revision": revision, "assignment": assignment,
-                "montage_map": montage_map, "prepared": None, "processed_signature": None}, revision)
+            current = cls.load(project_id)
+            if current.revision != revision or not current.placement or current.placement.key != state.placement.key:
+                raise StaleFacecamRevision("La relecture a changé pendant la répartition.")
             cls.invalidate_output(project_id)
             ProjectService.save_transcription(project_id, pipeline_reference)
             from ..models import Scene, SceneList
@@ -679,4 +736,7 @@ class FacecamService:
                 start_time=s.start_time, end_time=s.end_time) for s in pipeline_reference.scenes]))
             ProjectService.save_matches(project_id, matches)
             write_text_atomic(ProjectService.get_project_dir(project_id) / "new_script.json", json.dumps({"language": "fr", "scenes": assignment}, ensure_ascii=False))
+            state = cls.update(project_id, {"assignment": assignment, "montage_map": montage_map,
+                "prepared": None, "processed_signature": None,
+                "placement": current.placement.model_copy(update={"assignment_complete": True})}, revision)
         return state

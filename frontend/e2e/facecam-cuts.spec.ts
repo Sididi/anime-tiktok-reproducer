@@ -45,6 +45,11 @@ async function fixture(page: Page, options: {analyzing?: boolean; failApply?: bo
     const json = (data: unknown) => route.fulfill({json: data});
     if (path === '') return json({id, anime_name: 'Naruto', project_mode: 'facecam', library_type: 'anime', phase: 'script_restructure', source_paths: []});
     if (path === '/facecam') return json(state);
+    if (path === '/facecam/recording/review') {
+      state = {...state, recording_review: (state.recording_review?.fingerprint === state.recording!.fingerprint ? state.recording_review : null) ?? {id:'review', revision:state.revision,
+        fingerprint:state.recording!.fingerprint, version:0, blocks:structuredClone(state.blocks), changes:[], validated_revision:null}};
+      return json(state);
+    }
     if (path === '/metadata') return json({metadata: null});
     if (path === '/facecam/settings') return json({llm_preset: 'gpt', music_key: 'music', models: [{key: 'gpt', label: 'GPT'}], music: [{key: 'music', label: 'Musique'}], auto_editor_defaults: DEFAULT_FACECAM_AUTO_EDITOR});
     if (path === '/facecam/recording/cuts') return json({id: state.recording_edit!.id, duration: 12,
@@ -134,7 +139,8 @@ test('manual cuts, precise adjustment, undo and local drafts survive closing and
   await expect(modal.getByLabel('Retirer le passage 3')).toBeChecked();
   await modal.getByRole('button', {name: 'Valider les coupes et continuer'}).click();
   await expect(modal).not.toBeVisible();
-  await expect(page.getByText('Transcription définitive après les coupes.')).toBeVisible();
+  await expect(page.getByLabel('Relecture du texte enregistré', {exact:true})).toBeVisible();
+  await expect(page.getByRole('button', {name:'Valider le texte et placer les scènes'})).toBeEnabled();
   expect(f.requests[0].cuts.filter(c => c.enabled)).toHaveLength(2);
   expect(f.requests[0].cuts.find(c => c.origin === 'manual')).toMatchObject({start: 8, end: 9.5});
   expect(f.errors).toEqual([]);

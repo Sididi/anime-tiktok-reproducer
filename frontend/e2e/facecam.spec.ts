@@ -28,13 +28,24 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
       ...(options.legacyPreview?{}:{auto_editor:{...DEFAULT_FACECAM_AUTO_EDITOR},auto_editor_signature:'signature-0'})}};
   if(options?.noPreview) state={...state,prepared:null};
   if(options?.unreviewed && state.recording) state={...state,preview_enabled:true,prepared:null,recording:{...state.recording,reviewed_revision:null}};
+  if (state.recording) state = {...state,
+    recording_review: {id:'review-1', revision:state.revision, fingerprint:state.recording.fingerprint, version:0,
+      blocks:structuredClone(state.blocks), changes:[], validated_revision:options?.unreviewed?null:state.revision},
+    placement: options?.unreviewed ? null : {key:'placement-1', revision:state.revision, fingerprint:state.recording.fingerprint,
+      status:'complete', assignment_complete:true, error:null}};
   await page.route(url=>url.pathname.startsWith('/api/'),async route=>{
     const path=new URL(route.request().url()).pathname.replace(`/api/projects/${id}`,'');
     const json=(body:unknown)=>route.fulfill({json:body});
     if(path==='')return json({id,anime_name:'Naruto',project_mode:'facecam',library_type:'anime',phase:'script_restructure',source_paths:[]});
     if(path==='/facecam')return json(state);
     if(path==='/facecam/recording/review' && state.recording) {
-      state={...state,recording:{...state.recording,reviewed_revision:state.revision}};
+      if (!state.recording_review || state.recording_review.revision !== state.revision || state.recording_review.fingerprint !== state.recording.fingerprint) {
+        state = {...state, recording_review:{id:`review-${state.revision}`, revision:state.revision,
+          fingerprint:state.recording.fingerprint, version:0, blocks:structuredClone(state.blocks), changes:[], validated_revision:null}};
+      }
+      if (route.request().method() === 'POST') state={...state,recording:{...state.recording,reviewed_revision:state.revision},
+        recording_review:{...state.recording_review!,validated_revision:state.revision},
+        placement:{key:'placement-1',revision:state.revision,fingerprint:state.recording.fingerprint,status:'complete',assignment_complete:true,error:null}};
       return json(state);
     }
     if(path==='/facecam/settings'){
@@ -139,7 +150,7 @@ test('original presentation is selectable immediately and needs only one script 
   await modal.getByRole('button',{name:'Choisir le point de vue',exact:true}).click();
   await modal.getByRole('button',{name:/Sans point de vue/}).click();
   await modal.getByRole('button',{name:'Générer mon script',exact:true}).click();
-  await expect(page.locator('section[data-facecam="body-original"]')).toContainText('Une présentation entièrement nouvelle.');
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-original"]')).toContainText('Une présentation entièrement nouvelle.');
   expect(f.analyses).toBe(0);expect(f.scriptRequests).toHaveLength(1);expect(f.originalRequests).toHaveLength(0);
   expect(f.scriptRequests[0]).toEqual({revision:1,hook:'Accroche 1',opinion:''});
   await expect(page.locator('[data-facecam-marker="raw-1"]')).toHaveCount(0);
@@ -148,19 +159,19 @@ test('original presentation is selectable immediately and needs only one script 
 
 test('original generation saves manual edits first, keeps the angle and survives reload',async({page})=>{
   const f=await fixture(page,{recording:true});
-  const hook=page.locator('section[data-facecam="hook"] p');
+  const hook=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="hook"] p');
   await hook.fill('Mon accroche corrigée.');
   await page.getByRole('button',{name:'Recréer de zéro',exact:true}).click();
-  await expect(page.locator('section[data-facecam="body-original"]')).toContainText('Une présentation entièrement nouvelle.');
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-original"]')).toContainText('Une présentation entièrement nouvelle.');
   expect(f.saves).toBe(1);expect(f.originalRequests).toEqual([{revision:2}]);
   await expect(hook).toHaveText('Mon accroche corrigée.');
-  await expect(page.locator('section[data-facecam="opinion"]')).toHaveText('Ce choix est intéressant.');
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="opinion"]')).toHaveText('Ce choix est intéressant.');
   await expect(page.locator('[data-facecam-marker="raw-1"]')).toHaveCount(0);
   await expect(page.locator('.facecam-choice-summary')).toContainText('Mon accroche corrigée.');
   await expect(page.getByRole('button',{name:'Valider le script',exact:true})).toBeEnabled();
   expect(f.state.prepared).toBeNull();expect(f.state.approved_revision).toBeNull();
   await page.reload();
-  await expect(page.locator('section[data-facecam="body-original"]')).toBeVisible();
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-original"]')).toBeVisible();
   await expect(page.locator('.facecam-duration')).toContainText('60–75 s');
   await page.getByText('Sources de la présentation',{exact:true}).click();
   await expect(page.getByRole('link',{name:'Synopsis officiel'})).toHaveAttribute('href','https://example.org/anime');
@@ -173,7 +184,7 @@ test('original generation is unavailable before a script and preserves it on fai
   const f=await fixture(page,{failOriginal:true});
   await page.getByRole('button',{name:'Recréer de zéro',exact:true}).click();
   await expect(page.locator('.facecam-status')).toContainText('Le script est conservé.');
-  await expect(page.locator('section[data-facecam="body-0"]')).toContainText('Naruto poursuit son rêve.');
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"]')).toContainText('Naruto poursuit son rêve.');
   expect(f.state.revision).toBe(1);
   await expect(page.getByRole('button',{name:'Recréer de zéro',exact:true})).toBeEnabled();
 });
@@ -186,7 +197,7 @@ test('original generation blocks conflicting actions and reattaches after reload
   await page.reload();
   await expect(page.getByRole('button',{name:'Recréer de zéro',exact:true})).toBeDisabled();
   f.completeOriginal();
-  await expect(page.locator('section[data-facecam="body-original"]')).toBeVisible();
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-original"]')).toBeVisible();
   await expect(page.getByRole('button',{name:'Recréer de zéro',exact:true})).toBeEnabled();
   expect(f.originalRequests).toHaveLength(1);
 });
@@ -314,7 +325,7 @@ test('automatic preview resumes after reviewing a new take with changed music',a
   await page.getByLabel('Musique',{exact:true}).selectOption('other');
   await page.waitForTimeout(650);
   expect(f.previews).toHaveLength(0);
-  await page.getByRole('button',{name:'J’ai vérifié les différences'}).click();
+  await page.getByRole('button',{name:'Valider le texte et placer les scènes'}).click();
   await expect.poll(()=>f.previews.length).toBe(1);
   await expect(page.getByRole('button',{name:'Passer au traitement'})).toBeEnabled();
   expect(f.state.prepared?.preview_music_key).toBe('other');
@@ -413,9 +424,9 @@ test('existing drafts are preserved until the user selects an analyzed story',as
   const f=await fixture(page,{stories:storyOptions});
   expect(f.analyses).toBe(0);
   await page.getByRole('button',{name:'Analyser les histoires'}).click();
-  await expect(page.locator('section[data-facecam="body-0"]')).toBeVisible();
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"]')).toBeVisible();
   await page.getByRole('article',{name:'Le faux débutant'}).getByRole('button',{name:'Repartir de cette histoire'}).click();
-  await expect(page.locator('section[data-facecam="body-0"]')).toHaveCount(0);
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"]')).toHaveCount(0);
   expect(f.state.blocks).toEqual([]);
   expect(f.state.selected_hook).toBe('');
   await expect(page.locator('.facecam-choice-summary')).toHaveCount(0);
@@ -431,7 +442,7 @@ test('an overlong draft stays editable and keeps approval enabled',async({page})
   await expect(page.getByText('Vous pouvez condenser le texte à la main',{exact:false})).toBeVisible();
   const approval=page.getByRole('button',{name:'Valider le script',exact:true});
   await expect(approval).toBeEnabled();
-  const body=page.locator('section[data-facecam="body-0"] p');
+  const body=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] p');
   await body.click();await page.keyboard.press('End');await page.keyboard.type(' Une correction.');
   await expect.poll(()=>f.saves).toBe(1);
   await expect(approval).toBeEnabled();
@@ -445,7 +456,7 @@ test('whole-script editing autosaves, keeps raw markers, and only rechecks on re
   await expect(page.locator('.facecam-finding')).toHaveCount(1);
   await page.locator('.facecam-finding').click();
   await expect(page.getByRole('link',{name:'Site officiel'})).toBeVisible();
-  const body=page.locator('section[data-facecam="body-0"] p');
+  const body=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] p');
   await body.click();await page.keyboard.press('End');await page.keyboard.type(' Il avance.');
   await expect.poll(()=>f.saves).toBe(1);
   await expect(page.locator('.facecam-finding')).toHaveCount(1);
@@ -489,7 +500,7 @@ test('hidden annotations keep tracking edits and can be restored without another
   await expect(page.locator('.facecam-review')).toBeVisible();
   expect(f.saves).toBe(0);
   await hide.click();
-  const body=page.locator('section[data-facecam="body-0"] p');
+  const body=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] p');
   await body.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');
   await page.keyboard.type('X');
   await expect.poll(()=>f.saves).toBe(1);
@@ -505,7 +516,7 @@ test('correcting one finding preserves the other through typing save and reload'
   const f=await reviewedFixture(page);
   const second=page.locator('.facecam-fact-item').filter({hasText:'Il devient plus fort.'});
   await second.click();
-  const body=page.locator('section[data-facecam="body-0"] p');
+  const body=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] p');
   await body.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');
   await page.keyboard.type('X');
   await expect(page.locator('.facecam-finding')).toHaveCount(1);
@@ -515,14 +526,14 @@ test('correcting one finding preserves the other through typing save and reload'
   expect(f.state.findings.map(item=>item.id)).toEqual(['second']);
   await page.reload();
   await expect(page.locator('.facecam-finding')).toHaveText('Il devient plus fort.');
-  await expect(page.locator('section[data-facecam="body-0"] .facecam-finding')).toHaveCount(0);
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] .facecam-finding')).toHaveCount(0);
   expect(f.checks).toBe(0);
 });
 
 test('inserting emoji and a paragraph before findings shifts both exact anchors',async({page})=>{
   const f=await reviewedFixture(page);
   const before=f.state.findings.map(item=>item.start);
-  const body=page.locator('section[data-facecam="body-0"] p');
+  const body=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] p');
   await body.click();await page.keyboard.press('Home');await page.keyboard.insertText('😀 ');
   await page.keyboard.press('Enter');
   await expect(page.locator('.facecam-finding')).toHaveCount(2);
@@ -543,10 +554,10 @@ test('a delayed autosave cannot resurrect a finding corrected while it was pendi
     if(requests===1) await held;
     await route.fallback();
   });
-  const first=page.locator('section[data-facecam="body-0"] p');
+  const first=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] p');
   await first.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');await page.keyboard.type('X');
   await expect.poll(()=>requests).toBe(1);
-  const second=page.locator('section[data-facecam="body-2"] p');
+  const second=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-2"] p');
   await second.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');await page.keyboard.type('X');
   await expect(page.locator('.facecam-finding')).toHaveCount(0);
   release();
@@ -596,14 +607,14 @@ test('optional opinion stays skipped after reload and allows generation and edit
   const generation=page.waitForRequest(r=>r.url().endsWith('/facecam/generate'));
   await modal.getByRole('button',{name:'Générer mon script',exact:true}).click();
   expect((await generation).postDataJSON().opinion).toBe('');
-  await expect(page.locator('section[data-facecam="opinion"]')).toHaveCount(0);
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="opinion"]')).toHaveCount(0);
   await expect(page.getByText('Extrait audio original',{exact:true})).toBeVisible();
-  const body=page.locator('section[data-facecam="body-0"] p');
+  const body=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] p');
   await body.click();await page.keyboard.press('End');await page.keyboard.type(' Sans avis.');
   await expect.poll(()=>f.saves).toBe(1);
   await page.reload();
   await expect(body).toContainText('Sans avis.');
-  await expect(page.locator('section[data-facecam="opinion"]')).toHaveCount(0);
+  await expect(page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="opinion"]')).toHaveCount(0);
 });
 
 test('processing shows the backend correction and a return to Facecam',async({page})=>{

@@ -416,6 +416,9 @@ class ProcessingService:
         After fixing the local file, attempts to reupload the corrected
         version to the storage box so subsequent downloads are clean.
         """
+        from .facecam_placement_service import FacecamPlacementService
+        from .facecam_visual_index import file_identity
+        original_identity = file_identity(source_path)
         normalize_reason = AnimeLibraryService._describe_premiere_audio_normalization_reason(
             probe
         )
@@ -443,7 +446,12 @@ class ProcessingService:
                 raise RuntimeError(
                     f"Audio-normalized output failed validation: {source_path.name}"
                 )
+            if file_identity(source_path) != original_identity:
+                raise RuntimeError(f"Source changed during audio normalization: {source_path.name}")
             await asyncio.to_thread(tmp_path.replace, source_path)
+            # Video is stream-copied. Keep already validated Facecam choices
+            # reusable across every project sharing this episode.
+            FacecamPlacementService.preserve_audio_normalization(original_identity, file_identity(source_path))
         except Exception:
             if tmp_path.exists():
                 with suppress(OSError):
@@ -3301,7 +3309,7 @@ class ProcessingService:
             if project.project_mode == "facecam":
                 from .facecam_editor_track import FacecamEditorTrackService
                 yield ProcessingProgress("processing", "editor_illustrations", 0.4,
-                                         "Sélection des illustrations supplémentaires pour V4...")
+                                         "Chargement des illustrations V4 validées...")
                 import threading
                 illustration_cancel = threading.Event()
                 illustration_task = asyncio.create_task(asyncio.to_thread(
@@ -3311,12 +3319,12 @@ class ProcessingService:
                         done, _ = await asyncio.wait({illustration_task}, timeout=5)
                         if not done:
                             yield ProcessingProgress("processing", "editor_illustrations", 0.4,
-                                "Recherche ciblée de plans V4 dans les sous-titres et images locales...")
+                                "Vérification des sources des illustrations V4 validées...")
                     extra_matches = illustration_task.result()
                 finally:
                     illustration_cancel.set()
                     if not illustration_task.done():
-                        # The current request may finish; no later paid batch may start.
+                        # Let the read-only source verification finish in its worker.
                         illustration_task.add_done_callback(lambda task: None if task.cancelled() else task.exception())
                 next_index = max((m.scene_index for m in matches), default=-1) + 1
                 normalization_matches = [*matches, *[

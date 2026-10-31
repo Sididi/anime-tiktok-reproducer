@@ -6,7 +6,41 @@ Facecam is a separate project mode for anime sources. Create it beside Duplicate
 
 Opening a Facecam does not start generation. Choose the writing model above the story section, then click “Analyser les histoires” to detect the stories present in its source. Model changes are saved before analysis can start. A single story is selected automatically; when several distinct arcs exist, choose one before the hook. Cards show the premise, progression, endpoint and omitted material. Alternative hooks on the same arc are not separate stories. Existing drafts are preserved: detection is explicitly started, and choosing a story resets the draft and its dependent results. Choices persist across reloads; failed detection is retryable.
 
-Then choose/edit one of eight hooks and, optionally, one of eight opinions, generate, edit the full script, approve, record, clean up failed takes, review transcription discrepancies, prepare the mixed audio preview, and process. “Sans point de vue” clears the selected opinion; an empty opinion omits that block when generating and takes the story directly to the fixed title-reveal phrase. This choice survives reloads and can be changed before regenerating. Retained original-dialogue markers cannot be removed in the text editor. The fixed closing phrase introduces a visual title reveal; do not speak the anime title.
+Then choose/edit one of eight hooks and, optionally, one of eight opinions, generate, edit the full script, approve it for recording, record, clean up failed takes, review the complete recorded script, validate it to place scenes and prepare the audio preview, then process. Writing approval makes no scene-assignment or illustration calls. “Sans point de vue” clears the selected opinion; an empty opinion omits that block when generating and takes the story directly to the fixed title-reveal phrase. This choice survives reloads and can be changed before regenerating. Retained original-dialogue markers cannot be removed in the text editor. The fixed closing phrase introduces a visual title reveal; do not speak the anime title.
+
+## Full-script recording review and deferred scene placement
+
+After the final transcription of the edited take, **Relire le texte enregistré** displays the complete
+script with the original-dialogue markers. Detected omissions/replacements underline the original
+words in red; green inline buttons show the recognized wording. Clicking a suggestion accepts that
+specific change. All suggestions begin pending: **unaccepted changes keep the original wording**.
+The text is directly editable, including undetected additions/removals and the actual spoken closing
+phrase. Raw-dialogue markers and section identity remain protected. Undo/redo is available.
+
+Edits autosave a separate `recording_review` draft without changing the approved script or calling a
+model. The draft and pending suggestions survive reloads. Saves carry the recording identity, document
+revision and review version; stale tabs or replaced recordings cannot overwrite another review. A
+failed save keeps the local text and blocks validation until saving succeeds. Even a perfect transcript
+with zero differences needs explicit validation.
+
+**Valider le texte et placer les scènes** commits the reviewed wording and starts one resumable job:
+word assignment, synchronization with the recording, V4 illustration selection, then the mixed audio
+preview. A corrected script receives a new approved revision; fact annotations are remapped, without
+claiming a fresh fact check. A blank optional paragraph or omitted closing phrase introduces no invented
+words. If a narrated passage now has fewer words than reference shots, only a spread of those shots is
+retained before assigning its words.
+
+`placement` records the validated revision/recording, stage and completion. Duplicate validation clicks,
+HTTP retries, page reloads and concurrent workers reuse the same placement. Successful assignment
+blocks are cached in `facecam/placements/<key>/assignment-*.json`; a later failure does not pay to
+reassign those blocks. The committed V4 choice is stored alongside them in `candidates.json`.
+Processing and JSX generation only read that choice: they cannot launch a search. Silence, speed and
+music changes reuse the selection, adapting preview lengths locally when fewer slots fit. An
+app-managed audio-only episode repair also preserves the visual selection. Other episode file
+replacements remain rejected as stale. A new take
+or an edited review requires explicit validation again. Interrupted jobs offer **Reprendre le placement
+des scènes**, preserving completed work. Audio-preview failures preserve completed scene placement.
+No real project recording or paid model call is needed by the workflow's regression/browser tests.
 
 ## Recording cleanup before transcription review
 
@@ -116,9 +150,9 @@ Scripts based on a detected arc target 65–70 seconds including retained dialog
 
 Each returned script response is saved atomically under `facecam/generations/` before validation or draft persistence, alongside its input revision, story fingerprint, hook and opinion. A malformed response or concurrent-edit rejection therefore remains recoverable locally without another generation call; recovery must still validate the block layout and current revision. Older rejected responses from before this archive existed are not recreated retroactively.
 
-Approval physically filters and trims the matched episode clips. Word timestamps on the original TikTok clock map proportionally into each confirmed episode interval; the export later snaps these bounds to source frames. This assumes the existing match's linear time mapping, not a fresh visual cut detector. A cut is therefore as accurate as the source ASR and match. Every output scene is reindexed with a contiguous provisional timeline, while `montage_map` retains original scene IDs, source bounds, episode bounds and cut word indices. The immutable `reference*.json` files are not rewritten. Selected clips keep their original relative order. A single sentence may span several retained shots.
+After recording-review validation, scene assignment physically filters and trims the matched episode clips. Word timestamps on the original TikTok clock map proportionally into each confirmed episode interval; the export later snaps these bounds to source frames. This assumes the existing match's linear time mapping, not a fresh visual cut detector. A cut is therefore as accurate as the source ASR and match. Every output scene is reindexed with a contiguous provisional timeline, while `montage_map` retains original scene IDs, source bounds, episode bounds and cut word indices. The immutable `reference*.json` files are not rewritten. Selected clips keep their original relative order. A single sentence may span several retained shots.
 
-Word assignment keeps scene identity and order in application code. The model only proposes the `N − 1` word boundaries between `N` consecutive narration shots; it cannot reorder, omit or invent scene IDs. Boundaries must be strictly increasing integers, cover the complete approved text and leave at least one word per shot. Original-dialogue markers separate independent assignments. A single shot (or exactly one word per shot) needs no model call. Invalid structured responses receive up to two corrective retries with the validation diagnostic. Persistent failure leaves the draft and pipeline untouched; it never substitutes an arbitrary duration-based split. A passage with fewer words than shots is rejected with a request to lengthen it or select a story with fewer shots. Structural checks preserve words and shots but do not guarantee perfect semantic correspondence.
+Word assignment keeps scene identity and order in application code. The model only proposes the `N − 1` word boundaries between `N` consecutive narration shots; it cannot reorder, omit or invent scene IDs. Boundaries must be strictly increasing integers, cover the complete approved text and leave at least one word per shot. Original-dialogue markers separate independent assignments. A single shot (or exactly one word per shot) needs no model call. Invalid structured responses receive up to two corrective retries with the validation diagnostic. Persistent failure leaves the draft and pipeline untouched; it never substitutes an arbitrary duration-based split. A recorded passage with fewer words than shots retains a spread of its existing shots before assignment; it is never padded with invented speech. Structural checks preserve words and shots but do not guarantee perfect semantic correspondence.
 
 Hook/outro illustrations reuse retained footage rather than extending into an excluded event. Automatic gap filling is disabled for these editorial selections so it cannot silently undo a cut; the continuous camera track covers narration when an anime illustration runs short at the playback speed floor. Original dialogue retains native timing. Older drafts without a selected story keep their existing montage behavior.
 
@@ -126,7 +160,7 @@ The research method, observations and implementation tradeoffs are documented in
 
 The [October 23 oral-style analysis](facecam-oral-style-2026-10-23.md) examines the latest 15 accessible theomcx publications, with a fresh download, two local ASR passes and comparisons on three existing Facecam briefs. Its media, transcripts and generation samples are under ignored `backend/data/research/facecam-2026-10-23/`. Existing project scripts are not regenerated by this change; new hooks/opinions and script generations use the new instructions.
 
-`facecam/state.json` stores revisioned drafts, choices, research citations, approvals, word assignments, recording hashes, the silence-cut map, alignment references, preview identity, and VPS delivery status. `facecam/reference*.json` retain the original script and matches even when approval creates extra hook/outro pipeline scenes. Research runs automatically after generation and otherwise only on request. Contradictions and uncertainty are advisory. Editing a flagged passage removes only its annotation. Untouched annotations keep their citations and follow text offsets during editing, autosave and reload, including across original-dialogue markers. Editor transactions preserve the exact occurrence of repeated quotes; the server validates submitted anchors against existing finding IDs and the saved text. `findings_revision` tracks anchor positions separately from `fact_revision`, which remains the revision actually checked: editing never claims a fresh fact check. Legacy hidden findings are recovered only when their unchanged quote occurs exactly once. Failed research never counts as a successful check.
+`facecam/state.json` stores revisioned drafts, choices, research citations, approvals, word assignments, recording hashes, the silence-cut map, alignment references, preview identity, and VPS delivery status. `facecam/reference*.json` retain the original script and matches even when final recording validation creates extra hook/outro pipeline scenes. Research runs automatically after generation and otherwise only on request. Contradictions and uncertainty are advisory. Editing a flagged passage removes only its annotation. Untouched annotations keep their citations and follow text offsets during editing, autosave and reload, including across original-dialogue markers. Editor transactions preserve the exact occurrence of repeated quotes; the server validates submitted anchors against existing finding IDs and the saved text. `findings_revision` tracks anchor positions separately from `fact_revision`, which remains the revision actually checked: editing never claims a fresh fact check. Legacy hidden findings are recovered only when their unchanged quote occurs exactly once. Failed research never counts as a successful check.
 
 Fact checks also receive the actual library subtitle dialogue from the first to the last selected matched interval in each episode, padded by 30 seconds on both sides (all original matches for legacy drafts). Dialogue between selected shots is retained: scenes between 02:00 and 06:00 supply subtitles from 01:30 to 06:30. One text track is selected (French preferred, then English, then another available language). Episode names, source timestamps, original scene anchors, and complete overlapping cues go to both research and annotation steps. The panel exposes this snapshot and allows findings to cite individual dialogue excerpts. Missing/image-only subtitles and context-budget limits are disclosed. Dialogue is not proof of an unseen visual detail, and absence from an excerpt is not treated as a contradiction. Existing drafts are not automatically rechecked after this upgrade.
 
@@ -231,8 +265,9 @@ selection. Local window images are shared between projects in `backend/data/cach
 Selections, raw model responses and reports live under `facecam/targeted_selection/<fingerprint>/`.
 Source identity, subtitle, narration, eligible-slot, prompt or model changes invalidate the relevant
 cache. Repeating processing with unchanged inputs reuses completed results without model calls.
-Original matches, the approved script and V3 are not modified. Legacy drafts without an authoritative
-narration assignment receive only their existing shots.
+Original source matches are not modified. The reviewed script supplies the authoritative narration
+assignment. Legacy projects must explicitly validate the recording review before new processing;
+existing assignments can be reused when their words are unchanged.
 
 **The entire targeted search shares a $0.15 spending ceiling**, including localization, vision and
 manual retries for the same narration/source context. It can be lowered with

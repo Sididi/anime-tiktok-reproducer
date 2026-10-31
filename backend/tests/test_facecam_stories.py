@@ -14,6 +14,7 @@ from app.models.transcription import Word
 from app.models.facecam import ENDING
 from app.services.project_service import ProjectService
 from app.services.facecam_service import FacecamService, StaleFacecamRevision
+from facecam_workflow_helpers import approve_and_assign, validate_recording
 from app.services.facecam_story_service import FacecamStoryService
 from app.services.facecam_media_service import FacecamMediaService
 
@@ -112,7 +113,7 @@ def test_full_story_with_long_dialogue_can_be_selected_and_generated_without_con
     assert [b.scene_indices for b in generated.blocks if b.kind == 'body'] == [[5], [42, 60]]
     assert [b.scene_indices for b in generated.blocks if b.kind == 'raw'] == [[9]]
     monkeypatch.setattr(FacecamService, 'llm', ranges)
-    approved = FacecamService.approve(project.id, generated.revision)
+    approved = approve_and_assign(project.id, generated.revision)
     retained = [m for m in approved.montage_map if m['kind'] != 'outro']
     assert [m['source_scene_index'] for m in retained] == [5, 9, 42, 60]
     assert [(m['source_start'], m['source_end']) for m in retained] == [(0, 10), (10, 20), (20, 30), (30, 40)]
@@ -197,7 +198,7 @@ def test_internal_cut_reaches_montage_without_reintroducing_omitted_events(proje
     assert 'refuse' not in json.dumps(context)
     state = write_draft(project)
     monkeypatch.setattr(FacecamService, 'llm', ranges)
-    approved = FacecamService.approve(project.id, state.revision)
+    approved = approve_and_assign(project.id, state.revision)
     reference = ProjectService.load_transcription(project.id)
     matches = ProjectService.load_matches(project.id).matches
     assert [s.scene_index for s in reference.scenes] == [0, 1, 2, 3]
@@ -221,11 +222,28 @@ def test_leading_raw_hook_and_outro_only_reuse_selected_footage(project, monkeyp
     detect(project, monkeypatch, option(indices=(9, 42)))
     state = write_draft(project)
     monkeypatch.setattr(FacecamService, 'llm', ranges)
-    approved = FacecamService.approve(project.id, state.revision)
+    approved = approve_and_assign(project.id, state.revision)
     assert [m['kind'] for m in approved.montage_map] == ['hook', 'raw', 'body', 'outro']
     assert [m['source_scene_index'] for m in approved.montage_map] == [42, 9, 42, 42]
     assert all(m.end_time <= 143.6 for m in ProjectService.load_matches(project.id).matches)
     assert ' '.join(a['text'] for a in approved.assignment).split() == state.spoken_text().split()
+    ProjectService.validate_transcription_scene_alignment(project.id, ProjectService.load_transcription(project.id))
+
+
+def test_recording_review_can_omit_all_body_words_after_a_leading_raw_insert(project, monkeypatch):
+    from app.services.facecam_recording_review import FacecamRecordingReview as Review
+    detect(project, monkeypatch, option(indices=(9, 42)))
+    state = write_draft(project)
+    state = validate_recording(project.id, state.revision)
+    review = state.recording_review
+    blocks = [b.model_copy(update={'text': ''}) if b.kind == 'body' else b for b in review.blocks]
+    state = Review.save(project.id, state.revision, review.id, review.version, blocks, [])
+    state = Review.validate(project.id, state.revision, review.id, state.recording_review.version)
+    monkeypatch.setattr(FacecamService, 'llm', lambda *a, **kw: pytest.fail('No body words to assign'))
+    assigned = FacecamService.assign_scenes(project.id, state.revision)
+    assert [m['kind'] for m in assigned.montage_map] == ['hook', 'raw', 'outro']
+    assert [m['source_scene_index'] for m in assigned.montage_map] == [42, 9, 42]
+    assert ' '.join(a['text'] for a in assigned.assignment).split() == state.spoken_text().split()
     ProjectService.validate_transcription_scene_alignment(project.id, ProjectService.load_transcription(project.id))
 
 
@@ -241,7 +259,7 @@ def test_sparse_scene_ids_stay_in_source_order_after_assignment_retry(project, m
                                for n, i in enumerate([42, 60, 5])]}
         return ranges(pid, prompt)
     monkeypatch.setattr(FacecamService, 'llm', generate)
-    approved = FacecamService.approve(project.id, state.revision)
+    approved = approve_and_assign(project.id, state.revision)
     assert len(calls) == 2 and calls[1]['correction']['error']
     assert [m['source_scene_index'] for m in approved.montage_map] == [5, 42, 60, 60]
     assert [a['scene_index'] for a in approved.assignment] == [0, 1, 2, 3]
@@ -315,7 +333,7 @@ def test_failed_reanalysis_keeps_existing_draft_selection_and_approval(project, 
     detect(project, monkeypatch, option())
     state = write_draft(project)
     monkeypatch.setattr(FacecamService, 'llm', ranges)
-    FacecamService.approve(project.id, state.revision)
+    approve_and_assign(project.id, state.revision)
     # A source update makes analysis necessary, but no failed proposal may be committed.
     reference = FacecamService.reference(project.id)
     reference.scenes[0].text = 'Le héros revient enfin.'
@@ -378,7 +396,7 @@ def test_selected_story_bounds_reach_writer_and_editor_without_duration_retry(pr
     assert saved['response']['blocks'][0]['text'] == 'récit ' * 300
     # Duration remains advisory through approval, and updates after manual condensation.
     monkeypatch.setattr(FacecamService, 'llm', ranges)
-    approved = FacecamService.approve(project.id, state.revision)
+    approved = approve_and_assign(project.id, state.revision)
     assert approved.approved_revision == state.revision
     state.blocks[1].text = 'récit ' * 215
     shorter = FacecamService.save_draft(project.id, state.revision, state.blocks, state.selected_hook, '')
@@ -414,7 +432,7 @@ def test_changed_source_cannot_keep_an_approved_selection_after_reanalysis(proje
     detect(project, monkeypatch, option())
     state = write_draft(project)
     monkeypatch.setattr(FacecamService, 'llm', ranges)
-    state = FacecamService.approve(project.id, state.revision)
+    state = approve_and_assign(project.id, state.revision)
     FacecamService.update(project.id, {'prepared': {'revision': state.revision}, 'processed_signature': 'old'})
     reference = FacecamService.reference(project.id)
     reference.scenes[0].text = 'Le héros est de retour.'
@@ -424,7 +442,7 @@ def test_changed_source_cannot_keep_an_approved_selection_after_reanalysis(proje
     assert analyzed.approved_revision is analyzed.prepared is analyzed.processed_signature is None
     assert analyzed.blocks == state.blocks  # Still readable until the user chooses a replacement.
     with pytest.raises(ValueError, match='choisissez'):
-        FacecamService.approve(project.id, analyzed.revision)
+        approve_and_assign(project.id, analyzed.revision)
 
 
 @pytest.mark.asyncio
@@ -436,7 +454,7 @@ async def test_processing_keeps_editorial_cuts_instead_of_extending_them(project
     detect(project, monkeypatch, option(indices=(42,)))
     state = write_draft(project)
     monkeypatch.setattr(FacecamService, 'llm', ranges)
-    state = FacecamService.approve(project.id, state.revision)
+    state = approve_and_assign(project.id, state.revision)
     work = tmp_path / 'prepared'
     work.mkdir()
     (work / 'narration.wav').write_bytes(b'test voice copied before the checkpoint')

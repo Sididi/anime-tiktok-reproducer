@@ -93,6 +93,7 @@ def context(tmp_path, monkeypatch):
     prepared.mkdir()
     state.prepared = {"directory": str(prepared), "cover_start": 6}
     set_timing(state, [(0, 6, False)])
+    state.recording = {"fingerprint": "take", "reviewed_revision": state.revision}
     matches = MatchList(matches=[SceneMatch(scene_index=0, episode=str(path), start_time=1, end_time=2,
                                            confidence=1, speed_ratio=1)])
     monkeypatch.setattr(FacecamService, "project", lambda _: project)
@@ -306,6 +307,9 @@ def test_visual_description_cannot_invent_or_omit_shot_ids():
 def test_build_and_export_use_discovered_media_without_reselecting(context, monkeypatch):
     state, _, _, calls, path = context
     monkeypatch.setattr(ProcessingService, "_resolve_source_reference", lambda episode, **kw: (Path(episode), Path(episode).stem))
+    from app.services.facecam_placement_service import FacecamPlacementService
+    selected = Candidates.select("visual")
+    monkeypatch.setattr(FacecamPlacementService, "candidates", lambda _: selected)
     project = FacecamService.project("visual")
     scenes = [scene(0, 0, 6, 1, 2)]
     plan = Editor.build(project, scenes, FrameRateInfo(24, True))

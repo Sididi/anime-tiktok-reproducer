@@ -1156,6 +1156,8 @@ async def process_project(project_id: str):
         from ...services.facecam_cover_service import FacecamCoverService
         from ...services.facecam_auto_editor import prepared_is_current
         state = FacecamService.load(project_id)
+        if not state.placement or state.placement.status != "complete":
+            raise HTTPException(400, "Validez la relecture de l'enregistrement et attendez le placement des scènes.")
         if not state.prepared or state.approved_revision != state.revision:
             raise HTTPException(400, "Validez le script et préparez l'aperçu Facecam.")
         if not prepared_is_current(state) or not state.prepared.get("preview_version"):

@@ -50,6 +50,17 @@ class RecordingCutsRequest(BaseModel):
     cuts: list[RecordingCut] = Field(max_length=200)
 
 
+class RecordingReviewRequest(BaseModel):
+    revision: int
+    review_id: str
+    version: int
+
+
+class RecordingReviewDraftRequest(RecordingReviewRequest):
+    blocks: list[ScriptBlock]
+    resolved_ids: list[str] = Field(default_factory=list)
+
+
 def _require_idle(project_id):
     if project_id in FacecamService._processing or (project_id in _jobs and not _jobs[project_id].done()):
         raise HTTPException(409, "Attendez la fin de l'opération Facecam.")
@@ -99,6 +110,8 @@ async def get_facecam(project_id: str):
     state = _state(project_id)
     if state.job and state.job.get("status") == "processing" and (project_id not in _jobs or _jobs[project_id].done()):
         values = {"job": {"status": "error", "message": "Opération interrompue. Vous pouvez réessayer."}}
+        if state.placement and state.placement.status == "running":
+            values["placement"] = state.placement.model_copy(update={"status": "error", "error": "Placement interrompu. Reprenez les étapes restantes."})
         if state.recording_edit and state.recording_edit.analysis_status == "analyzing":
             values["recording_edit"] = state.recording_edit.model_copy(update={"analysis_status": "error",
                 "analysis_error": "Analyse interrompue. Vous pouvez couper manuellement ou réessayer."})
@@ -185,7 +198,11 @@ async def fact_evidence(project_id: str, source_id: str):
 
 @router.post("/{project_id}/facecam/approve")
 async def approve(project_id: str, request: ActionRequest):
-    return await _job(project_id, "Répartition sur les scènes", FacecamService.approve, request.revision)
+    _require_idle(project_id)
+    try:
+        return await asyncio.to_thread(FacecamService.approve, project_id, request.revision)
+    except ValueError as exc:
+        raise HTTPException(409 if isinstance(exc, StaleFacecamRevision) else 400, str(exc)) from exc
 
 
 @router.post("/{project_id}/facecam/recording")
@@ -222,14 +239,46 @@ async def upload_recording(project_id: str, file: UploadFile = File(...)):
         raise
 
 
-@router.post("/{project_id}/facecam/recording/review")
-async def review_recording(project_id: str, request: ActionRequest):
-    from ...services.facecam_media_service import FacecamMediaService
-    _require_idle(project_id)
+@router.get("/{project_id}/facecam/recording/review")
+async def get_recording_review(project_id: str):
+    from ...services.facecam_recording_review import FacecamRecordingReview
     try:
-        return FacecamMediaService.review(project_id, request.revision)
+        return FacecamRecordingReview.ensure(project_id)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@router.put("/{project_id}/facecam/recording/review")
+async def save_recording_review(project_id: str, request: RecordingReviewDraftRequest):
+    from ...services.facecam_recording_review import FacecamRecordingReview
+    _require_idle(project_id)
+    try:
+        return FacecamRecordingReview.save(project_id, request.revision, request.review_id, request.version,
+                                           request.blocks, request.resolved_ids)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/{project_id}/facecam/recording/review")
+async def review_recording(project_id: str, request: RecordingReviewRequest):
+    from ...services.facecam_recording_review import FacecamRecordingReview
+    from ...services.facecam_placement_service import FacecamPlacementService
+    state = _state(project_id)
+    review = state.recording_review
+    same_validation = (review and review.id == request.review_id and review.version == request.version
+                       and review.validated_revision == state.revision and state.placement and state.recording
+                       and state.recording.get("reviewed_revision") == state.revision
+                       and state.placement.fingerprint == state.recording["fingerprint"])
+    if same_validation and state.placement.status in {"complete", "pending", "running"}:
+        job = _jobs.get(project_id)
+        if state.placement.status == "complete" or (job and not job.done()):
+            return state
+    _require_idle(project_id)
+    try:
+        state = FacecamRecordingReview.validate(project_id, request.revision, request.review_id, request.version)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return await _job(project_id, "Placement des scènes", FacecamPlacementService.run, state.placement.key, heavy=True)
 
 
 @router.get("/{project_id}/facecam/recording")
@@ -296,6 +345,8 @@ async def preview(project_id: str, request: PreviewRequest | None = None):
             raise HTTPException(409, "Attendez la fin de l'opération Facecam.")
         if state.recording_edit and not state.recording_edit.applied:
             raise HTTPException(409, "Validez d'abord les coupes de l'enregistrement.")
+        if not state.placement or state.placement.status != "complete":
+            raise HTTPException(409, "Validez la relecture et attendez le placement des scènes.")
         if request:
             if request.revision != state.revision:
                 raise HTTPException(409, "Le script a changé. Rechargez la version actuelle.")

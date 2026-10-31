@@ -207,6 +207,8 @@ def test_preview_saves_tuning_and_rejects_stale_or_busy_requests(monkeypatch):
     from app.services.facecam_service import FacecamService
     from app.services.facecam_media_service import FacecamMediaService
     state = current_state()
+    from app.models.facecam import FacecamPlacement
+    state.placement = FacecamPlacement(key="test", revision=3, fingerprint="original", status="complete")
     invalidations = []
     jobs = []
     monkeypatch.setattr(FacecamService, 'load', lambda pid: state)

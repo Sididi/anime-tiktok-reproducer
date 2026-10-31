@@ -151,7 +151,7 @@ def test_final_comparison_uses_edited_audio_and_stale_or_unvalidated_edits_canno
     assert not calls
     result = FacecamCutService.apply(project.id, state.revision, edit.id, 0, [cut(.5, 1.5)])
     assert result.recording_edit.applied and result.recording_edit.version == 1
-    assert result.recording['reviewed_revision'] == state.revision
+    assert result.recording['reviewed_revision'] is None  # Even identical speech requires explicit review.
     assert result.recording['differences'] == []
     assert result.recording['duration'] == 2
     assert result.recording['source_directory'] == str(root)

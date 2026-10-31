@@ -110,6 +110,10 @@ class FacecamTargetedSearch:
         with FacecamVisualIndex.locked("selection:" + project_id):
             check()
             state = FacecamService.load(project_id)
+            if (not state.recording or state.recording.get("reviewed_revision") != state.revision
+                    or state.approved_revision != state.revision
+                    or (state.recording_edit and not state.recording_edit.applied)):
+                raise ValueError("Validez la relecture du texte enregistré avant de rechercher des plans V4.")
             context, excluded = cls.targets(state)
             if not context["scenes"]:
                 return []

@@ -20,7 +20,7 @@ export function useFacecamPreview({id, state, musicKey, settingsLoaded, approved
   const enabled = manualVersion > 0 || !!state?.preview_enabled || !!state?.prepared?.preview_version;
   const jobBusy = state?.job?.status === 'processing';
   const controlsDisabled = working || (jobBusy && state?.job?.step !== PREVIEW_JOB);
-  const ready = approved && !!state?.recording && state.recording.reviewed_revision === state.revision
+  const ready = approved && state?.placement?.status === 'complete' && !!state?.recording && state.recording.reviewed_revision === state.revision
     && (!state.recording_edit || state.recording_edit.applied);
   const prepared = state?.prepared;
   const previewReady = ready && !!prepared?.preview_version && !!prepared.auto_editor_signature
