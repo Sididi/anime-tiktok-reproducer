@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.models import SceneTranscription, Transcription, Word
 from app.models.facecam import FacecamAutoEditorSettings, FacecamState
 from app.services.facecam_auto_editor import (
-    UNCERTAIN_SILENCE_DB, audible_spans, keep_intervals, prepared_is_current, protected_spans, settings_signature,
+    ALGORITHM_VERSION, UNCERTAIN_SILENCE_DB, audible_spans, audible_words, keep_intervals, prepared_is_current, protected_spans, settings_signature,
     verify_speech_retained,
 )
 
@@ -30,10 +30,11 @@ def test_quiet_words_and_consonants_survive_aggressive_silence_detection():
 
 
 def test_small_pause_is_cut_but_no_orphan_silence_at_file_edges():
-    keep = keep_intervals(3, [(0, .5), (1, 1.2), (2.5, 3)])
+    settings = FacecamAutoEditorSettings(margin_before_ms=30, margin_after_ms=50)
+    keep = keep_intervals(3, [(0, .5), (1, 1.2), (2.5, 3)], settings)
     assert keep == [(28, 63), (70, 153)]
-    assert keep_intervals(3, [(1, 1.1)]) == [(0, 180)]
-    assert keep_intervals(3, [(0, 3)]) == []
+    assert keep_intervals(3, [(1, 1.1)], settings) == [(0, 180)]
+    assert keep_intervals(3, [(0, 3)], settings) == []
 
 
 def test_overlapping_silences_are_merged_and_uncertain_speech_is_protected():
@@ -71,6 +72,37 @@ def test_silent_part_of_an_uncertain_span_is_cut_but_audible_part_stays_protecte
     assert sum(b - a for a, b in keep) / 60 < 3
     assert any(a <= 3.2 * 60 and b >= 3.5 * 60 for a, b in keep)
     assert audible_spans([(1, 4)], []) == [(1, 4)]
+
+
+def test_pause_absorbed_into_word_edge_is_cut_but_closure_and_breath_stay(tmp_path):
+    import array
+    import wave
+    from app.services.facecam_media_service import detect_silences
+    # 03cdc1a13bcf: "plan B," spanned the 550 ms digital silence before
+    # "récupérer", while "bannir … à" only holds a -30 dB breath.
+    path = tmp_path / 'voice.wav'
+    level = {(0, .6): 8000, (.6, 1.18): 0, (1.18, 1.25): 600, (1.25, 2.4): 8000, (2.4, 2.55): 0,
+             (2.55, 3): 8000, (3, 3.25): 1000, (3.25, 4): 8000}
+    samples = array.array('h')
+    for (a, b), value in level.items():
+        samples.extend(value if i % 2 else -value for i in range(round((b - a) * 48000)))
+    with wave.open(str(path), 'wb') as stream:
+        stream.setparams((1, 2, 48000, 0, 'NONE', 'not compressed'))
+        stream.writeframes(samples.tobytes())
+    words = [{'start': .1, 'end': 1.25}, {'start': 1.27, 'end': 2}, {'start': 2.02, 'end': 3},
+             {'start': 3.02, 'end': 3.9}]
+    settings = FacecamAutoEditorSettings(noise_threshold_db=-23, min_silence_ms=80, margin_before_ms=30, margin_after_ms=50)
+    silences = detect_silences(path, -23, .08, 4)
+    quiet = detect_silences(path, min(-23, UNCERTAIN_SILENCE_DB), .08, 4)
+    speech = protected_spans(audible_words(words, quiet))
+    keep = keep_intervals(4, silences, settings, speech)
+    verify_speech_retained(keep, speech, 4)
+    assert not any(a <= .8 * 60 and b >= 1 * 60 for a, b in keep)
+    assert any(a <= .6 * 60 and b >= .65 * 60 for a, b in keep)
+    assert any(a <= 1.15 * 60 and b >= 1.25 * 60 for a, b in keep)
+    assert any(a <= 2.4 * 60 and b >= 2.55 * 60 for a, b in keep)
+    assert any(a <= 3 * 60 and b >= 3.25 * 60 for a, b in keep)
+    assert audible_words([{'start': 1, 'end': 1.5}], [(.9, 1.6)]) == [{'start': 1, 'end': 1.5}]
 
 
 def test_last_partial_frame_retains_speech_instead_of_truncating_it():
@@ -145,8 +177,8 @@ def test_adding_speed_at_one_keeps_existing_preview_signature():
     import json
     settings = FacecamAutoEditorSettings()
     assert settings.speed == 1.0
-    legacy_payload = {'version': 2, 'noise_threshold_db': -26.0, 'min_silence_ms': 120,
-                      'margin_before_ms': 30, 'margin_after_ms': 50}
+    legacy_payload = {'version': ALGORITHM_VERSION, 'noise_threshold_db': -26.0, 'min_silence_ms': 120,
+                      'margin_before_ms': 50, 'margin_after_ms': 60}
     legacy_signature = hashlib.sha256(json.dumps(legacy_payload, sort_keys=True).encode()).hexdigest()[:16]
     assert settings_signature(settings) == legacy_signature
     assert settings_signature(FacecamAutoEditorSettings.model_validate_json(settings.model_dump_json())) == legacy_signature

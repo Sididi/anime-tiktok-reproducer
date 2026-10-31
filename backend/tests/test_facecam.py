@@ -655,7 +655,8 @@ def test_comparison_ignores_case_and_punctuation_but_exposes_meaningful_changes(
 
 
 def test_camera_cut_map_composes_raw_gap_without_drift():
-    keep=keep_intervals(4,[(1,2)])
+    from app.models.facecam import FacecamAutoEditorSettings
+    keep=keep_intervals(4,[(1,2)],FacecamAutoEditorSettings(margin_before_ms=30,margin_after_ms=50))
     assert keep==[(0,63),(118,240)]
     clean=sum(b-a for a,b in keep)/60
     playback=[SimpleNamespace(kind='audio',source_start=0,source_end=1,duration=1),

@@ -18,7 +18,7 @@ from ..models import Transcription
 from .facecam_service import FacecamService
 from .atomic_files import write_text_atomic
 from .facecam_auto_editor import (
-    UNCERTAIN_SILENCE_DB, audible_spans, keep_intervals, prepared_is_current, protected_spans, settings_signature,
+    UNCERTAIN_SILENCE_DB, audible_spans, audible_words, keep_intervals, prepared_is_current, protected_spans, settings_signature,
     verify_speech_retained,
 )
 
@@ -324,7 +324,7 @@ class FacecamMediaService:
         quiet = detect_silences(wav, min(tuning.noise_threshold_db, UNCERTAIN_SILENCE_DB),
                                 tuning.min_silence_ms / 1000, duration)
         uncertain = audible_spans(timing.get("uncertain_spans", []), quiet)
-        speech = protected_spans(timing["words"], uncertain)
+        speech = protected_spans(audible_words(timing["words"], quiet), uncertain)
         keep = keep_intervals(duration, silences, tuning, speech)
         verify_speech_retained(keep, speech, duration)
         if not keep:

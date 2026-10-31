@@ -38,7 +38,7 @@ export interface FacecamPlacement {
   assignment_complete: boolean; error: string | null;
 }
 export const DEFAULT_FACECAM_AUTO_EDITOR: FacecamAutoEditorSettings = {
-  noise_threshold_db: -26, min_silence_ms: 120, margin_before_ms: 30, margin_after_ms: 50, speed: 1.0,
+  noise_threshold_db: -26, min_silence_ms: 120, margin_before_ms: 50, margin_after_ms: 60, speed: 1.0,
 };
 export function sameAutoEditorSettings(a?: FacecamAutoEditorSettings, b?: FacecamAutoEditorSettings): boolean {
   return !!a && !!b && (Object.keys(DEFAULT_FACECAM_AUTO_EDITOR) as (keyof FacecamAutoEditorSettings)[])

@@ -8,12 +8,16 @@ import math
 from ..models.facecam import FacecamAutoEditorSettings, FacecamState
 
 FPS = 60
-ALGORITHM_VERSION = 2
+ALGORITHM_VERSION = 3
 WORD_LEAD_SECONDS = 0.03
 WORD_TAIL_SECONDS = 0.05
 # Uncertain ASR spans are released only where the take is silent at this
 # level, so a whispered word the ASR missed survives a loose user threshold.
 UNCERTAIN_SILENCE_DB = -45.0
+# The aligner stretches a word over the adjacent pause ("rêve," then 400 ms of
+# silence before "pas"). A silent run reaching this close to a word edge is
+# that pause; the next word's attack may sit in between.
+WORD_EDGE_TOLERANCE_SECONDS = 0.1
 
 
 def settings_signature(settings: FacecamAutoEditorSettings) -> str:
@@ -71,6 +75,21 @@ def audible_spans(uncertain_spans, silences) -> list[tuple[float, float]]:
     sentences comes back from the ASR as "speech without words". Only its
     audible parts can hide a missed word."""
     return subtract_intervals([(float(a), float(b)) for a, b in uncertain_spans], silences)
+
+
+def audible_words(words: list[dict], silences) -> list[dict]:
+    """Release the silent runs at a word's edges, measured at the strict
+    `UNCERTAIN_SILENCE_DB` level. Quiet inside a word (stop-consonant closures)
+    and everything audible around the run stay protected; a word that is
+    silent end to end keeps its full span."""
+    result = []
+    for word in words:
+        start, end = float(word["start"]), float(word["end"])
+        edges = [(a, b) for a, b in silences if a < end and b > start
+                 and (a <= start + WORD_EDGE_TOLERANCE_SECONDS or b >= end - WORD_EDGE_TOLERANCE_SECONDS)]
+        parts = subtract_intervals([(start, end)], edges)
+        result.extend({**word, "start": a, "end": b} for a, b in parts or [(start, end)])
+    return result
 
 
 def keep_intervals(duration: float, silences: list[tuple[float, float]],
