@@ -61,7 +61,7 @@ export interface FacecamState {
   prepared: {revision: number; fingerprint: string; preview_music_key?: string | null; preview_version?: string; duration_seconds?: number;
     auto_editor?: FacecamAutoEditorSettings; auto_editor_signature?: string;
     cut_report?: {removed_seconds: number; cut_count: number; protected_word_count: number; clipped_word_count: number};
-  } | null; cover: {anilist_id?: number; manual?: boolean} | null;
+  } | null; cover: {anilist_id?: number; manual?: boolean; frame?: boolean; title?: string} | null;
   job: {status: string; step?: string; message?: string; error?: string} | null;
 }
 export async function facecamRequest<T = FacecamState>(projectId: string, path = '', method = 'GET', data?: unknown): Promise<T> {

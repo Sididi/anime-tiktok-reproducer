@@ -22,6 +22,7 @@ from app.services.facecam_media_service import compare_words, keep_intervals, ca
 @pytest.fixture
 def source(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, 'projects_dir', tmp_path)
+    monkeypatch.setattr(settings, 'data_dir', tmp_path.parent / f'{tmp_path.name}-data')
     monkeypatch.setattr(ProjectService, 'sync_project_pin', lambda *a: None)
     project = Project(id='original', anime_name='Naruto', phase=ProjectPhase.SCRIPT_RESTRUCTURE,
         drive_folder_id='private-folder', scheduled_account_id='old-account', mother_project_id='family')
@@ -609,7 +610,7 @@ def test_fact_checker_passes_episode_evidence_to_both_stages_and_serves_citation
     with pytest.raises(HTTPException): asyncio.run(fact_evidence(project.id,'unknown'))
 
 
-def test_cover_alias_lookup_deduplicates_and_refuses_ambiguity(source, monkeypatch):
+def test_cover_alias_lookup_deduplicates_and_ranks_ambiguity(source, monkeypatch):
     from app.services.facecam_cover_service import FacecamCoverService
     import app.services.facecam_cover_service as covers
     project,_=draft(source)
@@ -631,12 +632,13 @@ def test_cover_alias_lookup_deduplicates_and_refuses_ambiguity(source, monkeypat
     assert queries==['Kill Ao (Kill Blue)','Kill Ao','Kill Blue']
     assert results==[media,season2]
     assert FacecamCoverService.exact_matches(project.anime_name,results)==[media]
-    monkeypatch.setattr(FacecamCoverService,'search',lambda *a:[media,{**media,'id':2}])
-    with pytest.raises(ValueError,match='Choisissez'): FacecamCoverService.ensure(project.id)
     selected=[]
-    monkeypatch.setattr(FacecamCoverService,'search',lambda *a:results)
     monkeypatch.setattr(FacecamCoverService,'select',lambda pid,mid:selected.append(mid))
     monkeypatch.setattr(FacecamCoverService,'render',lambda pid:'cached-cover')
+    monkeypatch.setattr(FacecamCoverService,'search',lambda *a:[{**media,'id':2,'popularity':5},{**media,'popularity':9}])
+    assert FacecamCoverService.ensure(project.id)=='cached-cover' and selected==[198113]
+    selected.clear()
+    monkeypatch.setattr(FacecamCoverService,'search',lambda *a:results)
     assert FacecamCoverService.ensure(project.id)=='cached-cover' and selected==[198113]
     cached=FacecamService.directory(project.id)/'cover.jpg'
     cached.write_bytes(b'cached')
