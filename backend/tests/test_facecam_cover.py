@@ -305,3 +305,33 @@ def test_invalid_or_partial_catalog_response_is_not_treated_as_no_match(source, 
     Covers.ensure(project.id)
     assert len(calls) == 1
     assert FacecamService.load(project.id).cover["frame"] is True
+
+
+def test_small_covers_are_upscaled_once_to_fill_the_card(source, monkeypatch):
+    import app.services.facecam_cover_upscale as cover_upscale
+    project, _ = draft(source)
+    calls = []
+    monkeypatch.setattr(cover_upscale, "upscale",
+                        lambda image: calls.append(image.size) or image.resize((image.width * 4, image.height * 4)))
+    Covers.store(project.id, png(size=(460, 690)), {"anilist_id": 1})
+    Covers.render(project.id)
+    assert calls == [(460, 690)]  # Cached after the first render.
+    card = Image.open(FacecamService.directory(project.id) / "anime_reveal.png")
+    assert card.getpixel((70, 800)) != (14, 17, 24) and card.getpixel((1005, 800)) != (14, 17, 24)
+
+    Covers.store(project.id, png(size=(1920, 1080)), {"frame": True})
+    assert calls == [(460, 690)]  # Large frames are only reduced.
+    assert len(list(FacecamService.directory(project.id).glob("cover_hd-*.jpg"))) == 1
+
+    monkeypatch.setattr(cover_upscale, "upscale", lambda image: (_ for _ in ()).throw(RuntimeError("no torch")))
+    Covers.store(project.id, png(size=(200, 300)), {"manual": True})
+    assert Image.open(Covers.render(project.id)).getpixel((70, 800)) != (14, 17, 24)
+
+
+def test_real_anime_upscaler_runs_on_cpu(monkeypatch):
+    import app.services.facecam_cover_upscale as cover_upscale
+    real = Path(__file__).resolve().parents[1] / "data/models/realesrgan/RealESRGAN_x4plus_anime_6B.pth"
+    if not real.is_file():
+        pytest.skip("Real-ESRGAN weights are downloaded on first use")
+    monkeypatch.setattr(cover_upscale, "weights_path", lambda: real)
+    assert cover_upscale.upscale(Image.new("RGB", (24, 36), (200, 40, 40))).size == (96, 144)

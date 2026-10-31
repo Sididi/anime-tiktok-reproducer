@@ -23,6 +23,8 @@ from app.services.facecam_media_service import compare_words, keep_intervals, ca
 def source(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, 'projects_dir', tmp_path)
     monkeypatch.setattr(settings, 'data_dir', tmp_path.parent / f'{tmp_path.name}-data')
+    import app.services.facecam_cover_upscale as cover_upscale
+    monkeypatch.setattr(cover_upscale, 'upscale', lambda image: image.resize((image.width * 4, image.height * 4)))
     monkeypatch.setattr(ProjectService, 'sync_project_pin', lambda *a: None)
     project = Project(id='original', anime_name='Naruto', phase=ProjectPhase.SCRIPT_RESTRUCTURE,
         drive_folder_id='private-folder', scheduled_account_id='old-account', mother_project_id='family')

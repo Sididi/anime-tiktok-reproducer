@@ -35,6 +35,7 @@ RELEASE_TAGS = re.compile(
 class FacecamCoverService:
     MAX_DISCOVERY_QUERIES = 4
     MAX_ATTEMPTS = 4
+    COVER_BOX = (940, 1420)
     _identity_lock = threading.Lock()
 
     @staticmethod
@@ -366,13 +367,36 @@ class FacecamCoverService:
         return cls.render(project_id)
 
     @classmethod
+    def card_cover(cls, project_id, cover: dict) -> Image.Image:
+        """Catalog covers (~460 px wide) must fill the card: upscale once per cover, then reuse."""
+        from .facecam_cover_upscale import upscale
+        image = Image.open(cover["path"]).convert("RGB")
+        if image.width >= cls.COVER_BOX[0] or image.height >= cls.COVER_BOX[1]:
+            return image
+        fingerprint = cover.get("fingerprint") or hashlib.sha256(Path(cover["path"]).read_bytes()).hexdigest()
+        cached = FacecamService.directory(project_id) / f"cover_hd-{fingerprint[:16]}.jpg"
+        if cached.is_file():
+            return Image.open(cached).convert("RGB")
+        try:
+            # Half the box in, 4x out: bounded memory and still above the card resolution.
+            upscaled = upscale(ImageOps.contain(image, (cls.COVER_BOX[0] // 2, cls.COVER_BOX[1] // 2),
+                                                Image.Resampling.LANCZOS) if image.width > cls.COVER_BOX[0] // 2
+                               or image.height > cls.COVER_BOX[1] // 2 else image)
+        except Exception:
+            logger.exception("Facecam cover upscale failed project=%s; using a plain resize", project_id)
+            return image
+        for old in cached.parent.glob("cover_hd-*.jpg"):
+            old.unlink(missing_ok=True)
+        upscaled.save(cached, quality=95)
+        return upscaled
+
+    @classmethod
     def render(cls, project_id):
         state = FacecamService.load(project_id)
         if not state.cover:
             raise ValueError("Couverture manquante.")
         canvas = Image.new("RGB", (1080, 1920), (14, 17, 24))
-        cover = Image.open(state.cover["path"]).convert("RGB")
-        cover.thumbnail((940, 1420), Image.Resampling.LANCZOS)
+        cover = ImageOps.contain(cls.card_cover(project_id, state.cover), cls.COVER_BOX, Image.Resampling.LANCZOS)
         canvas.paste(cover, ((1080 - cover.width) // 2, 80 + (1420 - cover.height) // 2))
         title = state.cover.get("title") or cls.display_title(FacecamService.project(project_id).anime_name or "") or "Anime"
         font_path = Path(__file__).parents[3] / "assets/fonts/Inter-Black.ttf"

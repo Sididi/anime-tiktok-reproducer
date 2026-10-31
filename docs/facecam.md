@@ -191,6 +191,8 @@ Identity is resolved in this order, and processing never fails on it:
 
 When the selected AniList entry spells the same title differently (`Tatsuki Fujimoto 17-26` for the library's `17_26`), the card shows the catalog spelling; otherwise it shows the cleaned library name. Existing selected or uploaded covers remain cached.
 
+Catalog covers are small (AniList and Kitsu both top out around 460×690), so a cover smaller than the 940×1420 card box is upscaled 4x once with Real-ESRGAN `x4plus_anime_6B` and cached as `facecam/cover_hd-<fingerprint>.jpg`; the card then fills the box. Inference runs on CPU in 128 px padded tiles (≈13 s, ≈1.1 GB peak RSS for a 460×690 cover; whole-image inference peaked at 4.6 GB) so it never takes VRAM from matching or encoding. The weights are downloaded on first use to `data/models/realesrgan/` and checked against a pinned SHA-256. If upscaling fails, a plain Lanczos resize is used.
+
 ## Original anime introduction
 
 **Présentation originale** can also be selected immediately under **Choisir l’histoire à raconter**,
