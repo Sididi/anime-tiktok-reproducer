@@ -29,15 +29,15 @@ templates:
   zoomed:
     label: "Minimal (no panel, zoomed)"
     foreground:
-      prfpset: "SPM Anime Foreground.prfpset"
-      zoom: 0.5
+      prfpset: "SPM Anime full Foreground.prfpset"
+      zoom: 1.30
     background:
-      prfpset: "SPM Anime Background.prfpset"
+      prfpset: "SPM Anime full Background.prfpset"
     subtitles:
       mogrt: "SPM_Anime_Subtitle.mogrt"
       raw_mogrt: "SPM_Anime_Subtitle_Raw.mogrt"
     white_border:
-      enabled: true
+      enabled: false
       top_px: 8.4
       bottom_px: 6.0
     overlay:
@@ -58,10 +58,10 @@ templates:
   squared:
     label: "Squared (Zen)"
     foreground:
-      prfpset: "SPM Anime Foreground.prfpset"
+      prfpset: "SPM Anime Zen Foreground.prfpset"
       zoom: 0.76
     background:
-      prfpset: "SPM Anime Background.prfpset"
+      prfpset: "SPM Anime Zen Background.prfpset"
     subtitles:
       mogrt: "SPM_Anime_Subtitle.mogrt"
       raw_mogrt: "SPM_Anime_Subtitle_Raw.mogrt"
