@@ -221,7 +221,7 @@ Facecam uses FFmpeg silence detection rather than the TTS auto-editor profile. S
 
 Prepared audio stores its settings and an algorithm-version signature; old previews cannot be reused for different settings, a different recording, or an older algorithm. Rebuilds use separate directories to preserve prior files. `cut_report.json` records retained words, removed time, and cut count. On October 8, 2026, project `ba1a7c09ed83` was checked with four thresholds (−30/−28/−26/−24 dB): the chosen −26 dB version retains all 221 source word intervals and their guards, removes 13.48 s from the 76.928 s recording in 26 cuts, and produces 63.45 s of voice (64.45 s including the final card, versus approximately 71.13 s previously). Retranscription finds no deleted words; differences are spelling/homophone variants. The source-word analysis and comparison variants are under ignored `backend/data/research/facecam-autoeditor-ba1a7c09ed83/`.
 
-The AniList identity and cover remain under `facecam/`, outside `output/`. Processing never stops for a missing cover (see below). The final card is 1080×1920 with a readable title, occupies V5 for 60 frames at 60 fps, and follows all camera/narration clips.
+The AniList identity and cover remain under `facecam/`, outside `output/`. Processing never stops for a missing cover (see below). The final card is 1080×1920 with a readable title, occupies V3 for 60 frames at 60 fps, and follows all camera/narration clips.
 
 Cover lookup searches parenthesized aliases as well as the full library title (for example `Kill Ao (Kill Blue)`), after removing release tags (`S01 1080p WEBRip x265-GROUP`, `[...]`) and splitting `A | B` aliases. If those searches yield no exact identity, up to four longer words from the main title are searched to discover candidates despite differences in word spacing. Results are deduplicated by AniList ID; a partial GraphQL response cannot trigger a selection, and HTTP 429/5xx responses are retried following `Retry-After`.
 
@@ -286,8 +286,8 @@ links every publication; creator transcripts remain local research artifacts and
 
 Facecam exports `SPM_facecam_<anime>_<project_id>.zip` with ZIP64, streamed files, complete episodes, original recording, silent normalized camera, real narration, music, cover/title card, presets, expanded subtitle MOGRTs/timings, JSX, Windows launcher, script, and French instructions. Media references are checked before delivery. It bypasses shared-source prewarming, folder synchronization and Premiere Link. Only the ZIP is uploaded or updated; editor files are preserved.
 
-Premiere exports provide **V4 · Illustrations 100 %**, above the automatic montage on V3.
-V4 now presents **the current shot plus up to two alternatives per narration scene**. It deliberately
+Premiere exports provide **V1 · Illustrations 100 %** (formerly V4).
+V1 presents **the current shot plus up to two alternatives per narration scene**. It deliberately
 shortens the first shot and divides that scene's available timeline interval between the proposals.
 Every proposal plays at 100%; a short source leaves a gap. Slots never cross the scene's end, the
 next scene's start or the final card. Scenes too short for 0.5-second previews receive fewer choices.
@@ -339,12 +339,12 @@ The next request is blocked if its reservation would exceed the shared ceiling. 
 spending guard, not a provider-side hard billing guarantee. Completed stages survive failures so that
 retries do not repeat successful requests. No fallback to the writing model is used.
 
-V3 remains hidden by default with a nonfatal manual-eye fallback. V4 receives the foreground effects;
-V5 holds the camera and final card, V6 the subtitles, V7–V8 optional overlays. V1 still follows the
-automatic montage and may differ from V4. New candidates preserve their episode's own frame rate,
+V1 receives the foreground effects; V2 and V4 stay empty. V3 holds the camera and final card,
+V5 the subtitles, V6–V7 optional overlays. The blurred background, white border and automatic
+retimed montage are no longer created. New candidates preserve their episode's own frame rate,
 including true 24 fps versus 23.976 fps. Export packages the exact selection embedded in the JSX,
 without another LLM call, and rejects media outside the project's allowed episodes. Existing exports
-need processing/JSX regeneration to receive the new V4 proposals.
+need processing/JSX regeneration to receive this track layout.
 
 Visual descriptions are sampled evidence, not an exhaustive understanding of every motion between
 frames. Automated tests cover placement, cache invalidation, malformed selections, budget accounting,

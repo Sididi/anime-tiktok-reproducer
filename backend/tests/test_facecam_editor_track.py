@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -185,7 +186,8 @@ def render(facecam=None):
 
 
 def run_js(script):
-    result = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True,
+                            env={k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"})
     assert result.returncode == 0, result.stderr
 
 
@@ -197,26 +199,30 @@ def test_non_facecam_exports_never_call_the_specialization(monkeypatch):
     assert "FACECAM ? 7 : 6" in jsx
 
 
-def test_facecam_track_topology_presets_and_card_are_shifted_together():
+@pytest.mark.parametrize("overlays", [False, True])
+def test_facecam_track_topology_presets_and_card_are_shifted_together(overlays):
     jsx = render({"editor_track": {"clips": []}})
     layout = jsx[jsx.index("    ensureVideoTracks(sequence,"):jsx.index('    log(\n      "Reserved raw audio zone:')]
-    preset = jsx[jsx.index("    placeFacecamEditorTrack(sequence, qeSeq);"):jsx.index('    perfEnd("presets", "Presets");')]
+    preset = jsx[jsx.index("    // --- APPLY VIDEO PRESETS ---"):jsx.index('    perfEnd("presets", "Presets");')]
     camera = "function placeFacecam(sequence)" + jsx.split("  function placeFacecam(sequence)", 1)[1].split("\n  function ", 1)[0]
-    run_js('''
+    run_js("var OVERLAY_ENABLED=" + json.dumps(overlays) + ";\n" + '''
 const assert = require('node:assert/strict');
-var sequence = {videoTracks: Array.from({length:8}, (_,i)=>({index:i})), audioTracks:Array.from({length:4},()=>({}))};
-sequence.videoTracks.numTracks=8; sequence.audioTracks.numTracks=4;
+var trackCount=OVERLAY_ENABLED?7:5;
+var sequence = {videoTracks: Array.from({length:trackCount}, (_,i)=>({index:i})), audioTracks:Array.from({length:4},()=>({}))};
+sequence.videoTracks.numTracks=trackCount; sequence.audioTracks.numTracks=4;
 var rawAudioTrackDesiredCount=4, RAW_AUDIO_TRACK_START_INDEX=3, qe={project:{getActiveSequence(){return {}}}};
 var desiredTracks=0; function ensureVideoTracks(s,n){desiredTracks=n} function ensureAudioTracks(){}
 ''' + layout + '''
-assert.equal(desiredTracks,8); assert.equal(v3.index,2); assert.equal(v5.index,6); assert.equal(v6.index,7);
-var applied=[], OVERLAY_ENABLED=true, CATEGORY_OVERLAY_ENABLED=true, TITLE_OVERLAY_ENABLED=true;
+assert.equal(desiredTracks,trackCount);
+assert.equal(categoryOverlayTrack,OVERLAY_ENABLED?sequence.videoTracks[5]:null);
+assert.equal(titleOverlayTrack,OVERLAY_ENABLED?sequence.videoTracks[6]:null);
+var applied=[], CATEGORY_OVERLAY_ENABLED=true, TITLE_OVERLAY_ENABLED=true;
 var FOREGROUND_PRESET_NAME='foreground', FOREGROUND_PRESET_FILE_PATH='fg', BACKGROUND_PRESET_NAME='background', BACKGROUND_PRESET_FILE_PATH='bg';
 var CATEGORY_TITLE_PRESET_NAME='overlay', CATEGORY_TITLE_PRESET_FILE_PATH='overlay', QE_TRACK_RESOLVE_CACHE={};
 function placeFacecamEditorTrack(){} function verifyFacecamEditorTrack(){} function perfStart(){} function perfEnd(){} function log(){}
 function applyVideoPresetToTrackItems(index,name){applied.push([index,name])}
 ''' + preset + '''
-assert.deepEqual(applied,[[0,'background'],[2,'foreground'],[3,'foreground'],[6,'overlay'],[7,'overlay']]);
+assert.deepEqual(applied,OVERLAY_ENABLED?[[0,'foreground'],[5,'overlay'],[6,'overlay']]:[[0,'foreground']]);
 var FACECAM={filename:'facecam.mp4',cover:'anime_reveal.png',scale:100,cover_start:5,camera_segments:[{start_frame:0,end_frame:300,source_frame:30}]};
 var TRACK_ITEM_WAIT_MAX_MS=1, placed=[];
 function getOrImportClip(name){return {name,setInPoint(s){this.in=s},setOutPoint(s){this.out=s},clearInPoint(){},clearOutPoint(){}}}
@@ -225,13 +231,91 @@ function resolvePlacedItemFast(){return placed.at(-1)} function stripKnownExtens
 function setTrackItemEndSeconds(item,end){item.end=end;return true} function getTrackItemEndSeconds(item){return item.end}
 function setScaleOnItem(item,scale){item.scale=scale;return true}
 ''' + camera + '''
-placeFacecam(sequence); assert.deepEqual(placed.map(p=>[p.index,p.start,p.end]),[[4,0,5],[4,5,6]]);
+placeFacecam(sequence); assert.deepEqual(placed.map(p=>[p.index,p.start,p.end]),[[2,0,5],[2,5,6]]);
 ''')
-    assert "      5,\n      SUBTITLE_MOGRT_DIR," in jsx
-    assert "overlayFadeTrackIndexes[overlayFadeIdx] + 2" in jsx
+    assert "      4,\n      SUBTITLE_MOGRT_DIR," in jsx
+    assert "overlayFadeTrackIndexes[overlayFadeIdx] + 1" in jsx
 
 
-def test_executable_video_only_placement_preserves_gaps_speed_and_mute_failure_is_nonfatal():
+@pytest.mark.parametrize("overlays", [False, True])
+def test_facecam_main_omits_legacy_video_layers_but_keeps_audio_and_subtitles(overlays):
+    jsx = render({"editor_track": {"clips": []}})
+    begin = jsx.index("  function main() {")
+    main = jsx[begin:jsx.index("\n  // ========================================================================", begin)]
+    run_js("var OVERLAY_ENABLED=" + json.dumps(overlays) + ";\n" + '''
+const assert=require('node:assert/strict');
+var FACECAM={cover_start:5,editor_track:{clips:[{clipName:'extra'}]}};
+// Non-native speeds and raw scenes must not recreate either removed video layer.
+var scenes=[{scene_index:0,clipName:'episode',start:0,end:2,effective_speed:2},
+            {scene_index:1,clipName:'episode',start:2,end:5,is_raw:true}];
+var BATCH_SEQUENCE_NAME='test', SEQUENCE_PRESET_PATH='preset', PROJECT_BIN_NAME='project';
+var AUDIO_FILENAME='narration.wav', MUSIC_FILENAME='music.wav', MUSIC_GAIN_DB=-24, VOICE_GAIN_DB=0;
+var CATEGORY_OVERLAY_FILENAME='category.png', TITLE_OVERLAY_FILENAME='title.png';
+var CATEGORY_OVERLAY_ENABLED=true, TITLE_OVERLAY_ENABLED=true, OVERLAY_FADE_DURATION_SEC=0.5;
+var FOREGROUND_PRESET_NAME='foreground', FOREGROUND_PRESET_FILE_PATH='fg';
+var CATEGORY_TITLE_PRESET_NAME='overlay', CATEGORY_TITLE_PRESET_FILE_PATH='overlay';
+var SUBTITLE_MOGRT_DIR='subs', SUBTITLE_SRT_PATH='timings', RAW_SCENE_TEXT_SUBTITLE_MOGRT_DIR='raw';
+var RAW_SCENE_TEXT_SUBTITLE_SRT_PATH='raw-timings', RAW_SCENE_SUBTITLE_MANIFEST_PATH='manifest';
+var RAW_AUDIO_TRACK_START_INDEX=3, PERF_PROFILE_ENABLED=false, TRACK_ITEM_WAIT_MAX_MS=1;
+function track(){return {clips:[],setMute(){},overwriteClip(item,start){this.clips.push({name:item.name,start,end:5})}}}
+var sequence={videoTracks:[],audioTracks:[],markers:{createMarker(){return {}}}};
+var app={enableQE(){},project:{activeSequence:sequence}};
+var qe={project:{newSequence(){},getActiveSequence(){return {}}}};
+function File(){this.exists=true;this.fsName='preset'}
+function ensureProjectBin(){return {}}
+function ensureVideoTracks(seq,n){seq.videoTracks=Array.from({length:n},track);seq.videoTracks.numTracks=n}
+function ensureAudioTracks(seq,n){seq.audioTracks=Array.from({length:n},track);seq.audioTracks.numTracks=n}
+function getRequiredRawAudioZoneWidthForScenes(){return 2}
+function snapSecondsToFrame(s){return s} function trimSpaces(s){return s.trim()}
+function stripKnownExtension(s){return s.split('.')[0]}
+var preloaded,applied=[],fades=[],rawPresets=false,verified=false;
+function preloadProjectItemsBatch(names){preloaded=Object.keys(names);return {}}
+function hasProjectItemForName(){return true}
+function getOrImportClip(name){return {name}}
+function resolvePlacedItemFast(track){return track.clips[0]}
+function getTrackItemEndSeconds(item){return item.end}
+function applyTrackItemGainDb(item,gain){item.gain=gain;return true}
+function cleanupAudioTracks(index,name){assert.equal(index,1);assert.equal(name,AUDIO_FILENAME)}
+function placeFacecamEditorTrack(seq){seq.videoTracks[0].overwriteClip({name:'native-illustrations'},0)}
+function verifyFacecamEditorTrack(seq){assert.equal(seq.videoTracks[0].clips.length,1);verified=true}
+function clearRawAudioZone(seq,index,width){assert.equal(index,3);assert.equal(width,2)}
+function duplicateRawSceneAudioToTrack(track,items,width){
+  assert.equal(track,sequence.audioTracks[3]);assert.equal(items,scenes);assert.equal(width,2);
+  track.overwriteClip({name:'raw-dialogue'},items[1].start);
+}
+function placeOverlayOnTrack(track,name,end){track.overwriteClip({name},0);track.clips[0].end=end;return track.clips[0]}
+function applyOverlayFadeOut(index){fades.push(index)}
+function buildLoopedMusicBed(track,item,end){track.overwriteClip(item,0);track.clips[0].end=end;return true}
+function applyVideoPresetToTrackItems(index,name){applied.push([index,name])}
+function importUnifiedSubtitles(seq,index){seq.videoTracks[index].overwriteClip({name:'subtitles'},0)}
+function placeFacecam(seq){seq.videoTracks[2].overwriteClip({name:'camera'},0)}
+function applyRawSceneAudioPreset(){rawPresets=true}
+function finishFacecamEditorTrack(){} function refreshSequenceUI(){} function deleteSequenceByName(){}
+function warmFullProjectMediaIndex(){} function warmProjectItemCache(){}
+function perfStart(){} function perfEnd(){} function perfLogSummary(){} function log(){}
+function ensureWhiteBorderImage(){assert.fail('Removed border must never be placed')}
+function safeApplySpeedQE(){assert.fail('Removed montage must never be retimed')}
+function validateAndRepairRawSceneVideoPlacement(){assert.fail('Removed montage must never be repaired')}
+''' + main + '''
+main();
+assert.equal(sequence.videoTracks.length,OVERLAY_ENABLED?7:5);
+assert.deepEqual(sequence.videoTracks.slice(0,5).map(t=>t.clips.map(c=>c.name)),
+                 [['native-illustrations'],[],['camera'],[],['subtitles']]);
+assert.deepEqual(applied,OVERLAY_ENABLED?[[0,'foreground'],[5,'overlay'],[6,'overlay']]:[[0,'foreground']]);
+assert.deepEqual(fades,OVERLAY_ENABLED?[5,6]:[]);
+if(OVERLAY_ENABLED){
+  assert.equal(sequence.videoTracks[5].clips[0].name,CATEGORY_OVERLAY_FILENAME);
+  assert.equal(sequence.videoTracks[6].clips[0].name,TITLE_OVERLAY_FILENAME);
+}
+assert.deepEqual(sequence.audioTracks.map(t=>t.clips.map(c=>c.name)),
+                 [[],['narration.wav'],['music.wav'],['raw-dialogue'],[]]);
+assert.equal(sequence.audioTracks[2].clips[0].end,6);
+assert(preloaded.includes('extra'));assert(rawPresets);assert(verified);
+''')
+
+
+@pytest.mark.parametrize("mode", ["anime", "pure"])
+def test_executable_video_only_placement_preserves_gaps_speed_and_empty_tracks(mode):
     code = (ProcessingService.PREMIERE_JSX_TEMPLATE_PATH.parent / "premiere_facecam_editor_track.jsx").read_text()
     scenes = [scene(0, 0, 4, 11, 13), scene(1, 4, 8, 20, 27), scene(2, 8, 9, 20, 27)]
     plan = Editor.place(scenes, mapping(), references(), selection(2, 4),
@@ -240,7 +324,7 @@ def test_executable_video_only_placement_preserves_gaps_speed_and_mute_failure_i
 const assert=require('node:assert/strict');
 var PROJECT_ID='test', PROJECT_EXECUTION_ID='run', SEQ_FPS=60, DEFAULT_FG_SCALE=76, TRACK_ITEM_WAIT_MAX_MS=1, QE_TRACK_RESOLVE_CACHE={};
 var FACECAM={editor_track:''' + json.dumps(plan) + '''};
-var $={global:{}}, cache={}, created=[], activeSpeed=1;
+var $={global:{}}, cache={}, created=[], crops=[], activeSpeed=1;
 function log(){} function getCachedProjectItem(n){return cache[n]} function findProjectItem(n){return cache[n]}
 function buildRawTimeFromSourceFrame(frame){return {ticks:String(frame*1000)}}
 function getOrImportClip(name){return {createSubClip(n,a,b,hard,v,audio){
@@ -248,7 +332,9 @@ function getOrImportClip(name){return {createSubClip(n,a,b,hard,v,audio){
  const result={name:n,duration:(Number(b)-Number(a))/24000};created.push(result);return result;
 }}}
 function moveItemToProjectBin(){} function cacheProjectItem(){} function cacheProjectItemByName(n,v){cache[n]=v}
-function stripKnownExtension(n){return n} function getSourceGeometry(){return {fg_scale:50,mode:'anime'}}
+function stripKnownExtension(n){return n}
+function getSourceGeometry(){return {fg_scale:50,mode:''' + json.dumps(mode) + '''}}
+function ensureCropOnSceneItem(item,geo,start,name,qe,cache,index,label){crops.push([index,label])}
 function setScaleOnItem(item,s){item.scale=s;return true}
 function getTrackItemStartSeconds(item){return item.start} function getTrackItemEndSeconds(item){return item.end}
 function setTrackItemEndSeconds(item,end){item.end=end;return true}
@@ -265,16 +351,20 @@ function makeTrack(){return {clips:[],muted:false,setMute(v){this.muted=!!v},isM
  next.push({name:source.name,start,end,getSpeed(){return activeSpeed},isSpeedReversed(){return false}});
  this.clips=next.sort((a,b)=>a.start-b.start);this.clips.numItems=this.clips.length;
 }}}
-var sequence={videoTracks:Array.from({length:8},makeTrack),audioTracks:[{sentinel:'narration'}]};
+var sequence={videoTracks:Array.from({length:5},makeTrack),audioTracks:[{sentinel:'narration'}]};
 ''' + code + '''
 placeFacecamEditorTrack(sequence,{}); verifyFacecamEditorTrack(sequence);
-assert.deepEqual(sequence.videoTracks[3].clips.map(c=>[c.start,c.end]),[[0,1],[1,2],[3,4],[4,8],[8,9]]);
-assert(sequence.videoTracks[3].clips.every(c=>c.scale===50));
+assert.deepEqual(sequence.videoTracks[0].clips.map(c=>[c.start,c.end]),[[0,1],[1,2],[3,4],[4,8],[8,9]]);
+assert(sequence.videoTracks[0].clips.every(c=>c.scale===50));
+assert.deepEqual(crops,getSourceGeometry().mode==='pure'?Array.from({length:5},()=>[0,'V1']):[]);
 assert.deepEqual(sequence.audioTracks,[{sentinel:'narration'}]);
 assert.equal(created.length,5);
-finishFacecamEditorTrack(sequence); assert(sequence.videoTracks[2].muted);assert(!sequence.videoTracks[3].muted);
-sequence.videoTracks[2].setMute=()=>{throw new Error('unsupported')};
-finishFacecamEditorTrack(sequence);assert($.global.__ATR_IMPORT_WARNINGS__.includes('oeil'));
+finishFacecamEditorTrack(sequence);
+assert(sequence.videoTracks.every(t=>!t.muted));
+assert.equal(sequence.videoTracks[1].clips.length,0);assert.equal(sequence.videoTracks[3].clips.length,0);
+assert.equal(sequence.videoTracks[0].name,'Illustrations 100 %');
+assert.equal(sequence.videoTracks[2].name,'Facecam');assert.equal(sequence.videoTracks[4].name,'Sous-titres');
+assert.equal($.global.__ATR_IMPORT_WARNINGS__,undefined);
 activeSpeed=0.5;assert.throws(()=>verifyFacecamEditorTrack(sequence),/100/);
 ''')
 
@@ -315,9 +405,9 @@ function getProjectItemMediaPath(item){return item.path}
 function cacheProjectItem(item){cacheProjectItemByMediaPath(item.path,item)}
 ''' + function("isFacecamDerivedSubclip") + function("cacheProjectItemByMediaPath") +
            function("findProjectItemByMediaPathInContainer") + '''
-var master={name:'episode',path:'episode.mp4'}, raw={name:'__ATR_RAW_AUDIO__old',path:'episode.mp4'}, video={name:'V4_100__old',path:'episode.mp4'};
-[master,raw,video].forEach(cacheProjectItem);
+var master={name:'episode',path:'episode.mp4'}, raw={name:'__ATR_RAW_AUDIO__old',path:'episode.mp4'}, video={name:'V1_100__new',path:'episode.mp4'}, legacy={name:'V4_100__old',path:'episode.mp4'};
+[master,raw,video,legacy].forEach(cacheProjectItem);
 assert.equal(PROJECT_ITEM_CACHE['episode.mp4'],master);
-assert.equal(findProjectItemByMediaPathInContainer([video,raw,master],'episode.mp4'),master);
-assert.equal(findProjectItemByMediaPathInContainer([video,raw],'episode.mp4'),null);
+assert.equal(findProjectItemByMediaPathInContainer([legacy,video,raw,master],'episode.mp4'),master);
+assert.equal(findProjectItemByMediaPathInContainer([legacy,video,raw],'episode.mp4'),null);
 ''')
