@@ -9,6 +9,7 @@ from .facecam_service import FacecamService, StaleFacecamRevision
 from .facecam_visual_index import fingerprint
 from .llm_service import LLMService
 from .metadata import MetadataService
+from .facecam_metadata_service import FacecamMetadataService
 from .project_service import ProjectService
 
 
@@ -24,7 +25,7 @@ class FacecamPublicationService:
     @classmethod
     def signature(cls, project_id):
         project = FacecamService.project(project_id)
-        return fingerprint([project.anime_name, cls.script(project_id)])
+        return fingerprint([FacecamMetadataService.VERSION, project.anime_name, cls.script(project_id)])
 
     @staticmethod
     def digest(project_id):
@@ -55,12 +56,11 @@ class FacecamPublicationService:
         if project.library_type != LibraryType.ANIME or not (project.anime_name or "").strip():
             raise ValueError("Un Facecam nécessite le nom de l'anime.")
         signature = cls.signature(project_id)
-        prompt = MetadataService.build_prompt_from_script_payload(
+        prompt = FacecamMetadataService.build_prompt_from_script_payload(
             project.anime_name, cls.script(project_id), "fr", LibraryType.ANIME)
-        # Exactly the faceless metadata prompt, schema, model preset and light tier.
-        candidates = MetadataService.validate_candidate_payload(LLMService.generate_json(
+        candidates = FacecamMetadataService.validate_candidate_payload(LLMService.generate_json(
             prompt, preset_key=project.resolved_llm_preset_key(), tier="light",
-            response_schema=MetadataService.candidate_response_schema(), schema_name="metadata"))
+            response_schema=FacecamMetadataService.candidate_response_schema(), schema_name="metadata"))
         with FacecamService.lock(project_id):
             if cls.signature(project_id) != signature:
                 raise StaleFacecamRevision("Le script a changé ; régénérez les métadonnées.")
@@ -84,9 +84,8 @@ class FacecamPublicationService:
     def select_title(cls, project_id, revision, generation_id, title):
         with FacecamService.lock(project_id):
             generation = cls.require_generation(project_id, revision, generation_id)
-            if title not in generation["candidates"]["title_candidates"]:
-                raise ValueError("Choisissez l'un des huit titres proposés.")
-            payload = MetadataService.resolve_candidate_payload(generation["candidates"], selected_title=title)
+            title = title.strip()
+            payload = FacecamMetadataService.resolve_candidate_payload(generation["candidates"], selected_title=title)
             MetadataService.save(project_id, payload)
             FacecamService.update(project_id, {"metadata_generation": {
                 **generation, "selected_title": title, "digest": cls.digest(project_id)}}, revision)
@@ -99,9 +98,10 @@ class FacecamPublicationService:
             generation = cls.require_generation(project_id, revision, generation_id)
             if not generation.get("selected_title"):
                 raise ValueError("Choisissez d'abord un titre parmi les propositions.")
-            MetadataService.save(project_id, MetadataService.validate_payload(payload))
+            metadata = FacecamMetadataService.normalize_metadata(payload)
+            MetadataService.save(project_id, metadata)
             FacecamService.update(project_id, {"metadata_generation": {
-                **generation, "digest": cls.digest(project_id)}}, revision)
+                **generation, "selected_title": metadata.youtube.title, "digest": cls.digest(project_id)}}, revision)
             cls.invalidate_bundle(project_id)
             return cls.status(project_id)
 

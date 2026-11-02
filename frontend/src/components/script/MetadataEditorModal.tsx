@@ -7,6 +7,7 @@ interface MetadataEditorModalProps {
   isOpen: boolean;
   onClose: () => void;
   metadata: PlatformMetadata;
+  facecam?: boolean;
   onSave: (metadata: PlatformMetadata) => void | Promise<void>;
 }
 
@@ -25,6 +26,7 @@ function MetadataEditorContent({
   onClose,
   metadata,
   onSave,
+  facecam = false,
 }: MetadataEditorModalProps) {
   const [draft, setDraft] = useState<PlatformMetadata>(metadata);
   const [facebookTagsInput, setFacebookTagsInput] = useState(metadata.facebook.tags.join("\n"));
@@ -79,7 +81,7 @@ function MetadataEditorContent({
       }}
     >
       <div role="dialog" aria-modal="true" aria-label="Edit metadata" className="bg-[hsl(var(--card))] rounded-lg w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
-        <div className="flex items-center justify-between p-4 border-b border-[hsl(var(--border))]">
+        <div className="shrink-0 flex items-center justify-between p-4 border-b border-[hsl(var(--border))]">
           <h2 className="text-lg font-semibold">Edit metadata</h2>
           <button
             onClick={onClose}
@@ -91,11 +93,29 @@ function MetadataEditorContent({
           </button>
         </div>
 
-        <fieldset disabled={saving} className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain" data-testid="metadata-scroll">
+        <fieldset disabled={saving} className="min-w-0 p-4 space-y-4">
           <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            Edit platform metadata content with a structured form. Tags can be
-            entered one per line (or comma separated).
+            {facecam ? 'Modifiez le titre et la description communs ci-dessous. Les hashtags fixes sont ajoutés automatiquement. Le suffixe TikTok configuré sera ajouté lors de l’envoi.' : 'Edit platform metadata content with a structured form. Tags can be entered one per line (or comma separated).'}
           </p>
+
+          {facecam && <section className="space-y-3 rounded-lg border border-[hsl(var(--border))] p-4">
+            <label className="block space-y-1 text-sm">Titre commun
+              <Input aria-label="Titre commun" maxLength={62} value={draft.youtube.title} onChange={e => setDraft(prev => ({
+                ...prev, youtube: {...prev.youtube, title:e.target.value}, facebook: {...prev.facebook, title:e.target.value},
+              }))}/>
+            </label>
+            <label className="block space-y-1 text-sm">Description commune sans CTA
+              <textarea aria-label="Description commune" value={draft.youtube.description}
+                ref={node => {textareaRefs.current.shared_description = node;}}
+                className="w-full min-h-[96px] p-2 rounded-md border border-[hsl(var(--input))] bg-transparent text-sm resize-none"
+                onChange={e => setDraft(prev => ({...prev,
+                  youtube: {...prev.youtube, description:e.target.value},
+                  facebook: {...prev.facebook, description:`${e.target.value.trim()}\n\n#anime #animerecommendations #manga #animefr #otaku`},
+                  instagram: {caption:`${e.target.value.trim()}\n\n#anime #animefr #animerecommendations`},
+                }))}/>
+            </label>
+          </section>}
 
           <div className="grid gap-4 md:grid-cols-2">
             <section className="rounded-lg border border-[hsl(var(--border))] p-4 space-y-3">
@@ -105,6 +125,7 @@ function MetadataEditorContent({
                   Title
                 </label>
                 <Input
+                  readOnly={facecam}
                   value={draft.facebook.title}
                   onChange={(e) =>
                     setDraft((prev) => ({
@@ -120,6 +141,7 @@ function MetadataEditorContent({
                   Description
                 </label>
                 <textarea
+                  readOnly={facecam}
                   ref={node => {textareaRefs.current["facebook_description"] = node;}}
                   value={draft.facebook.description}
                   onChange={(e) =>
@@ -143,6 +165,7 @@ function MetadataEditorContent({
                   Tags
                 </label>
                 <textarea
+                  readOnly={facecam}
                   ref={node => {textareaRefs.current["facebook_tags"] = node;}}
                   value={facebookTagsInput}
                   onChange={(e) => setFacebookTagsInput(e.target.value)}
@@ -162,6 +185,7 @@ function MetadataEditorContent({
                   Caption
                 </label>
                 <textarea
+                  readOnly={facecam}
                   ref={node => {textareaRefs.current["instagram_caption"] = node;}}
                   value={draft.instagram.caption}
                   onChange={(e) =>
@@ -189,6 +213,7 @@ function MetadataEditorContent({
                   Title
                 </label>
                 <Input
+                  readOnly={facecam}
                   value={draft.youtube.title}
                   onChange={(e) =>
                     setDraft((prev) => ({
@@ -204,6 +229,7 @@ function MetadataEditorContent({
                   Description
                 </label>
                 <textarea
+                  readOnly={facecam}
                   ref={node => {textareaRefs.current["youtube_description"] = node;}}
                   value={draft.youtube.description}
                   onChange={(e) =>
@@ -246,6 +272,7 @@ function MetadataEditorContent({
                   Description
                 </label>
                 <textarea
+                  readOnly={facecam}
                   ref={node => {textareaRefs.current["tiktok_description"] = node;}}
                   value={draft.tiktok.description}
                   onChange={(e) =>
@@ -267,8 +294,9 @@ function MetadataEditorContent({
             </section>
           </div>
         </fieldset>
+        </div>
 
-        <div className="flex items-center justify-end gap-2 p-4 border-t border-[hsl(var(--border))]">
+        <div className="shrink-0 flex items-center justify-end gap-2 p-4 border-t border-[hsl(var(--border))]">
           {error && <p role="alert" className="mr-auto text-sm text-red-400">{error}</p>}
           <Button variant="outline" disabled={saving} onClick={onClose}>
             Cancel

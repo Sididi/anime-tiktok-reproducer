@@ -102,6 +102,20 @@ class PfmStatusSyncService:
                     exc.detail,
                 )
                 continue
+            if state.is_draft:
+                # The fetch can overlap a cancellation or a Discord acknowledgement.
+                latest = ProjectService.load(project.id)
+                if (latest is None or latest.tiktok_pfm is None
+                        or latest.tiktok_pfm.post_id != state.post_id
+                        or latest.tiktok_pfm.stage not in ("post_created", "post_scheduled")):
+                    continue
+                project, state = latest, latest.tiktok_pfm
+                entry = next((e for e in (project.upload_last_result or {}).get("platforms", [])
+                              if e.get("platform") == "tiktok"), {})
+                if entry.get("status") in ("uploaded", "skipped"):
+                    state.stage = "published" if entry["status"] == "uploaded" else "draft_cancelled"
+                    cls._save_quiet(project)
+                    continue
             state.last_polled_at = now
             if outcome is None:
                 # Still pending on PFM's side. Once past the publish instant
@@ -117,6 +131,18 @@ class PfmStatusSyncService:
                 cls._save_quiet(project)
                 continue
             if outcome.success:
+                if state.is_draft:
+                    state.stage = "draft_uploaded"
+                    state.url = None
+                    state.last_error = None
+                    # PFM confirms inbox delivery, not public posting.
+                    if (project.upload_last_result or {}).get("tiktok_reminder_registered") is False:
+                        cls._save_quiet(project)  # Keep the visible reminder-registration failure.
+                        continue
+                    detail = "Brouillon envoyé dans TikTok — publication manuelle, puis ✅ Discord"
+                    cls._persist_result(project, status="pending", url=None, detail=detail)
+                    cls._update_embed(project, status="pending", url=None, detail=detail)
+                    continue
                 state.stage = "published"
                 state.url = outcome.url
                 state.last_error = None

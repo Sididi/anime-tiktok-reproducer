@@ -313,8 +313,9 @@ async def test_container_creation_fails_http_400():
     assert "create_container:" in result.detail
 
 
+@pytest.mark.parametrize("trial_reel", [False, True])
 @respx.mock
-async def test_container_creation_includes_cover_url_when_set():
+async def test_container_creation_includes_cover_url_when_set(trial_reel):
     """cover_url, when passed, reaches the container-creation POST body."""
     _mock_video_download()
     create_route = _mock_resumable_create()
@@ -330,15 +331,23 @@ async def test_container_creation_includes_cover_url_when_set():
 
     result = await publish_to_instagram(
         **_COMMON, poll_interval=0.01, poll_timeout=1.0,
-        cover_url="https://cdn.example.com/cover.jpg",
+        cover_url="https://cdn.example.com/cover.jpg", trial_reel=trial_reel,
     )
 
     assert result.success is True
+    for call in create_route.calls:
+        body = parse_qs(call.request.content.decode())
+        if trial_reel:
+            assert json.loads(body['trial_params'][0]) == {'graduation_strategy': 'MANUAL'}
+            assert body['share_to_feed'] == ['false']
+        else:
+            assert 'trial_params' not in body
     assert _form_call(create_route)["cover_url"] == ["https://cdn.example.com/cover.jpg"]
 
 
+@pytest.mark.parametrize("trial_reel", [False, True])
 @respx.mock
-async def test_container_creation_retries_without_cover_url_on_failure():
+async def test_container_creation_retries_without_cover_url_on_failure(trial_reel):
     """A bad cover_url must never kill the publish: one retry without it."""
     _mock_video_download()
     create_route = respx.post(f"{BASE}/{IG_USER_ID}/media").mock(
@@ -359,18 +368,26 @@ async def test_container_creation_retries_without_cover_url_on_failure():
 
     result = await publish_to_instagram(
         **_COMMON, poll_interval=0.01, poll_timeout=1.0,
-        cover_url="https://cdn.example.com/bad-cover.jpg",
+        cover_url="https://cdn.example.com/bad-cover.jpg", trial_reel=trial_reel,
     )
 
     assert result.success is True
+    for call in create_route.calls:
+        body = parse_qs(call.request.content.decode())
+        if trial_reel:
+            assert json.loads(body['trial_params'][0]) == {'graduation_strategy': 'MANUAL'}
+            assert body['share_to_feed'] == ['false']
+        else:
+            assert 'trial_params' not in body
     assert create_route.call_count == 2
     assert "cover_url" in _form_call(create_route, 0)
     assert "cover_url" not in _form_call(create_route, 1)
 
 
+@pytest.mark.parametrize("trial_reel", [False, True])
 @respx.mock
 async def test_container_creation_cover_retry_failure_still_reaches_rupload_fallback(
-    tmp_path,
+    tmp_path, trial_reel,
 ):
     """cover retry failing must not swallow the existing video_url→rupload
     fallback, and the operator-facing detail must still mention the original
@@ -401,10 +418,17 @@ async def test_container_creation_cover_retry_failure_still_reaches_rupload_fall
         project_id="ig-job",
         prepared_media_dir=prepared_dir,
         public_base_url="https://tiktok.sididi.tv",
-        cover_url="https://cdn.example.com/bad-cover.jpg",
+        cover_url="https://cdn.example.com/bad-cover.jpg", trial_reel=trial_reel,
     )
 
     assert result.success is True
+    for call in create_route.calls:
+        body = parse_qs(call.request.content.decode())
+        if trial_reel:
+            assert json.loads(body['trial_params'][0]) == {'graduation_strategy': 'MANUAL'}
+            assert body['share_to_feed'] == ['false']
+        else:
+            assert 'trial_params' not in body
     assert create_route.call_count == 3
     # 1: primary video_url attempt, with cover_url
     assert "cover_url" in _form_call(create_route, 0)

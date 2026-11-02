@@ -157,8 +157,9 @@ def build_post_body(
     allow_duet: bool = True,
     allow_stitch: bool = True,
     scheduled_at: datetime | None = None,
+    is_draft: bool = False,
 ) -> dict[str, Any]:
-    """CreateSocialPostDto body. scheduled_at omitted ⇒ instant publish."""
+    """CreateSocialPostDto. A native TikTok draft is delivered immediately."""
     if post_for_me_platform not in _POST_FOR_ME_TIKTOK_PLATFORMS:
         supported = ", ".join(sorted(_POST_FOR_ME_TIKTOK_PLATFORMS))
         raise ValueError(
@@ -180,7 +181,10 @@ def build_post_body(
             }
         },
     }
-    if scheduled_at is not None:
+    if is_draft:
+        # Platform draft: send to the TikTok inbox now, never a PFM system draft.
+        body["platform_configurations"][post_for_me_platform]["is_draft"] = True
+    elif scheduled_at is not None:
         body["scheduled_at"] = scheduled_at.astimezone(UTC).isoformat()
     return body
 

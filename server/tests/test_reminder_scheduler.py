@@ -455,9 +455,10 @@ async def test_dispatch_tiktok_resumes_uploading_after_crash(
 # Instagram dispatch tests
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("trial_reel", [False, True])
 @pytest.mark.parametrize("facecam_cover", [False, True])
 async def test_dispatch_instagram_happy_path(
-    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, facecam_cover: bool
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, facecam_cover: bool, trial_reel: bool
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
@@ -476,6 +477,7 @@ async def test_dispatch_instagram_happy_path(
         "thumb_offset": 250,
         "cover_url": "https://drive.example/cover.jpg",
         "use_custom_cover": facecam_cover,
+        "trial_reel": trial_reel,
     }
     job.platform_statuses = {"instagram": PlatformStatus(status="pending")}
     await store.create(job)
@@ -512,6 +514,7 @@ async def test_dispatch_instagram_happy_path(
     assert publish_mock.await_args.kwargs["poll_timeout"] == 600
     assert publish_mock.await_args.kwargs["share_to_feed"] is False
     assert "thumb_offset" not in publish_mock.await_args.kwargs
+    assert publish_mock.await_args.kwargs.get("trial_reel", False) is trial_reel
     if facecam_cover:
         assert publish_mock.await_args.kwargs["cover_url"] == "https://drive.example/cover.jpg"
     else:

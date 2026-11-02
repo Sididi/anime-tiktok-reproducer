@@ -213,9 +213,10 @@ def test_platform_status_rejects_invalid_status(
     assert r.status_code == 422  # Pydantic validation error
 
 
+@pytest.mark.parametrize("trial_reel", [None, False, True])
 @pytest.mark.parametrize("custom_cover", [False, True])
 def test_create_job_persists_instagram_payload(
-    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path, custom_cover
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path, custom_cover, trial_reel
 ):
     app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
     discord.post_message.return_value = "msg_embed"
@@ -237,6 +238,8 @@ def test_create_job_persists_instagram_payload(
             }
         },
     }
+    if trial_reel is not None:
+        payload["instagram"]["trial_reel"] = trial_reel
     if custom_cover:
         payload["instagram"].update(cover_url="https://example.org/facecam.jpg", use_custom_cover=True)
     with TestClient(app) as client:
@@ -1009,3 +1012,18 @@ def test_pending_tiktok_platform_status_keeps_reminder(
     assert job.reminder_cancelled is False
     assert job.reminder_message_id == "m_rem"
     discord.delete_message.assert_not_called()
+
+
+@pytest.mark.parametrize('terminal', ['uploaded', 'skipped'])
+@pytest.mark.parametrize('late', ['pending', 'uploading', 'failed'])
+def test_late_draft_status_cannot_undo_manual_ack_or_cancel(monkeypatch, example_yaml, example_env, tmp_server_dir, terminal, late):
+    app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
+    with TestClient(app) as client:
+        response = client.post('/api/internal/jobs', json={**JOB_PAYLOAD, 'tiktok_manual':True}, headers=INTERNAL_AUTH)
+        assert response.status_code == 200
+        endpoint = '/api/internal/jobs/p1/platform-status'
+        assert client.post(endpoint, json={'platform':'tiktok','status':terminal}, headers=INTERNAL_AUTH).status_code == 200
+        response = client.post(endpoint, json={'platform':'tiktok','status':late}, headers=INTERNAL_AUTH)
+        assert response.json()['noop'] is True
+        job = asyncio.run(app.state.job_store.get('p1'))
+        assert job.platform_statuses['tiktok'].status == terminal

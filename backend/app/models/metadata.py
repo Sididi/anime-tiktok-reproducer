@@ -175,3 +175,26 @@ class MetadataTitleCandidatesPayload(_StrictModel):
                 title = cut.rstrip()
             truncated.append(title)
         return truncated
+
+
+class FacecamMetadataCandidates(_StrictModel):
+    title_candidates: list[str]
+    description: str
+    youtube_tags: list[str]
+
+    @field_validator("title_candidates")
+    @classmethod
+    def validate_titles(cls, value: list[str]) -> list[str]:
+        return MetadataTitleCandidatesPayload.validate_title_candidates(value)
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Description cannot be empty")
+        return value.strip()
+
+    @field_validator("youtube_tags")
+    @classmethod
+    def validate_tags(cls, value: list[str]) -> list[str]:
+        return _validate_non_empty_strings(value, "youtube_tags")

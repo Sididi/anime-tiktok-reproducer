@@ -1,12 +1,11 @@
 export const publicationCandidates = {
   title_candidates: Array.from({length: 8}, (_, i) => `Ce ninja cache un secret ${i + 1}`),
-  facebook: {description: 'Une histoire inattendue.', tags: ['anime']},
-  instagram: {hashtags: ['#Anime']}, youtube: {description: 'Une découverte.', tags: ['anime']},
+  description: 'Une histoire inattendue.', youtube_tags: ['anime'],
 };
 export const publicationMetadata = (title = publicationCandidates.title_candidates[0]) => ({
-  facebook: {title, ...publicationCandidates.facebook},
-  youtube: {title, ...publicationCandidates.youtube},
-  instagram: {caption: `${title} #Anime`}, tiktok: {description: `${title} #Anime`},
+  facebook: {title, description: `${publicationCandidates.description}\n\n#anime #animerecommendations #manga #animefr #otaku`, tags: ['Anime TV & Movies']},
+  youtube: {title, description: publicationCandidates.description, tags: publicationCandidates.youtube_tags},
+  instagram: {caption: `${publicationCandidates.description}\n\n#anime #animefr #animerecommendations`}, tiktok: {description: 'Recommendation anime #animerecommendations'},
 });
 export const readyMetadata = (revision: number) => ({revision, generation_id: 'generation-1', candidates: publicationCandidates,
   metadata: publicationMetadata(), ready: true});

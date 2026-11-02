@@ -117,6 +117,9 @@ class Settings(BaseSettings):
     # Empty or unset ATR_TIKTOK_DESCRIPTION_SUFFIX disables it.
     tiktok_description_suffix: str = ""
 
+    # Facecam Instagram uploads only; snapshot into the scheduled VPS payload.
+    instagram_trial_reels: bool = False
+
     cep_trigger_url_template: str = "http://localhost:48653/p/{project_id}"
     # Premiere Link: after a /processing Drive export, ask the VPS to auto-launch
     # the project in the Premiere Pro panel (VPS-brokered WebSocket). Uses the

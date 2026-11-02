@@ -19,6 +19,7 @@ going through the VPS job (Instagram has no native scheduling API).
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -65,6 +66,7 @@ class InstagramImmediateService:
         poll_timeout: float = _DEFAULT_POLL_TIMEOUT_SECONDS,
         share_to_feed: bool = True,
         cover_url: str | None = None,
+        trial_reel: bool = False,
     ) -> InstagramImmediateResult:
         if len(caption) > _MAX_CAPTION_CHARS:
             return InstagramImmediateResult(
@@ -87,6 +89,7 @@ class InstagramImmediateService:
                 video_path=video_path,
                 video_url=video_url,
                 cover_url=cover_url,
+                trial_reel=trial_reel,
             )
             if container_id is None:
                 return InstagramImmediateResult(success=False, detail=detail)
@@ -151,6 +154,7 @@ class InstagramImmediateService:
         upload_method: str,
         video_url: str | None = None,
         cover_url: str | None = None,
+        trial_reel: bool = False,
     ) -> tuple[str, str | None]:
         create_data = {
             "media_type": "REELS",
@@ -158,6 +162,9 @@ class InstagramImmediateService:
             "share_to_feed": "true" if share_to_feed else "false",
             "access_token": ig_access_token,
         }
+        if trial_reel:
+            create_data["trial_params"] = json.dumps({"graduation_strategy": "MANUAL"})
+            create_data["share_to_feed"] = "false"
         if upload_method == "rupload":
             create_data["upload_type"] = "resumable"
         else:
@@ -191,6 +198,7 @@ class InstagramImmediateService:
         video_path: Path | None,
         video_url: str | None,
         cover_url: str | None = None,
+        trial_reel: bool = False,
     ) -> tuple[str | None, str | None]:
         """Returns (container_id, error_detail).
 
@@ -213,6 +221,7 @@ class InstagramImmediateService:
                     upload_method="video_url",
                     video_url=video_url,
                     cover_url=cover_url,
+                    trial_reel=trial_reel,
                 )
                 return container_id, None
             except httpx.HTTPStatusError as e:
@@ -236,6 +245,7 @@ class InstagramImmediateService:
                     share_to_feed=share_to_feed,
                     upload_method="rupload",
                     cover_url=cover_url,
+                    trial_reel=trial_reel,
                 )
                 file_size = video_path.stat().st_size
                 with video_path.open("rb") as f:

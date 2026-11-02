@@ -158,3 +158,36 @@ def test_sync_failure_persists_and_pings(projects_dir, monkeypatch):
     )
     assert entry["status"] == "failed"
     assert pings and "reached_active_user_cap" in pings[0]
+
+
+@pytest.mark.parametrize('acknowledged', [False, True])
+def test_draft_delivery_is_pending_until_manual_ack(projects_dir, monkeypatch, acknowledged):
+    project = _save('draft', TikTokPfmState(post_id='post', stage='post_created', is_draft=True))
+    project.upload_last_result = {'platforms': [{'platform':'tiktok', 'status':'uploaded' if acknowledged else 'pending', 'source':'vps'}]}
+    ProjectService.save(project)
+    monkeypatch.setattr(PostForMeClient, 'fetch_outcome', lambda *a: PfmPublishOutcome(success=True, url='https://tiktok.com/@profile'))
+    updates = []
+    monkeypatch.setattr(PfmStatusSyncService, '_update_embed', lambda *a, **kw: updates.append(kw))
+    PfmStatusSyncService.sync_once()
+    saved = ProjectService.load(project.id)
+    assert saved.tiktok_pfm.stage == ('published' if acknowledged else 'draft_uploaded')
+    assert saved.tiktok_pfm.url is None
+    assert saved.upload_last_result['platforms'][0]['status'] == ('uploaded' if acknowledged else 'pending')
+    if acknowledged:
+        assert not updates
+    else:
+        assert updates[0]['status'] == 'pending' and updates[0]['url'] is None
+    PfmStatusSyncService.sync_once()
+    assert len(updates) == (0 if acknowledged else 1)
+
+
+def test_draft_sync_preserves_cancellation_during_fetch(projects_dir, monkeypatch):
+    project = _save('draft', TikTokPfmState(post_id='post', stage='post_created', is_draft=True))
+    def outcome(*args):
+        project.tiktok_pfm.stage = 'draft_cancelled'
+        ProjectService.save(project)
+        return PfmPublishOutcome(success=True)
+    monkeypatch.setattr(PostForMeClient, 'fetch_outcome', outcome)
+    monkeypatch.setattr(PfmStatusSyncService, '_update_embed', lambda *a, **kw: pytest.fail('Revived cancelled draft'))
+    PfmStatusSyncService.sync_once()
+    assert ProjectService.load(project.id).tiktok_pfm.stage == 'draft_cancelled'

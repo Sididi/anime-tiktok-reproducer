@@ -193,12 +193,14 @@ def _execute(flow, **kwargs):
     )
 
 
+@pytest.mark.parametrize("trial_reels", [False, True])
 @pytest.mark.parametrize("facecam", [False, True])
 @pytest.mark.parametrize("immediate", [False, True])
-def test_facecam_thumbnail_reaches_publishers_without_enabling_standard_covers(flow, monkeypatch, tmp_path, facecam, immediate):
+def test_facecam_thumbnail_reaches_publishers_without_enabling_standard_covers(flow, monkeypatch, tmp_path, facecam, immediate, trial_reels):
     from app.services.facecam_publication_service import FacecamPublicationService
     from app.services.account_service import AccountYouTubeConfig, AccountMetaConfig, AccountFacebookConfig, AccountInstagramConfig
     from app.services.social_upload_service import PlatformUploadResult
+    monkeypatch.setattr('app.services.upload_phase.settings.instagram_trial_reels', trial_reels)
     flow.project.project_mode = 'facecam' if facecam else 'standard'
     flow.account.supported_types = [flow.project.publishing_type]
     flow.account.youtube = AccountYouTubeConfig(refresh_token='fixture', slots=['14:00'])
@@ -233,6 +235,7 @@ def test_facecam_thumbnail_reaches_publishers_without_enabling_standard_covers(f
         payload = ig_now.call_args.kwargs['payload']
     else:
         payload = flow.create_job.call_args.kwargs['instagram']
+    assert payload['trial_reel'] is (facecam and trial_reels)
     if facecam:
         assert payload['cover_url'] == 'https://drive.example/download/cover-1' and payload['use_custom_cover']
         assert uploaded.call_args.kwargs['filename'] == 'facecam_thumbnail_saved-choice.jpg'

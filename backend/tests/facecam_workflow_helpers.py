@@ -21,9 +21,7 @@ def approve_and_assign(project_id, revision):
 
 def publication_candidates():
     return {"title_candidates": [f"Ce ninja cache un secret {i}" for i in range(8)],
-            "facebook": {"description": "Une découverte inattendue.", "tags": ["anime"]},
-            "instagram": {"hashtags": ["#Anime"]},
-            "youtube": {"description": "Une histoire de ninja.", "tags": ["anime", "Naruto"]}}
+            "description": "Une histoire de ninja.", "youtube_tags": ["anime", "Naruto"]}
 
 
 def complete_publication(project_id, monkeypatch, episode):

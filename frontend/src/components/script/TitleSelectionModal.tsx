@@ -10,7 +10,9 @@ import type {
 interface TitleSelectionModalProps {
   isOpen: boolean;
   projectId?: string;
-  metadataCandidates?: MetadataTitleCandidatesPayload | null;
+  metadataCandidates?: Pick<MetadataTitleCandidatesPayload, 'title_candidates'> | null;
+  allowCustomMetadataTitle?: boolean;
+  initialMetadataTitle?: string;
   metadataError?: string | null;
   overlay?: VideoOverlay | null;
   overlayError?: string | null;
@@ -62,6 +64,8 @@ export function TitleSelectionModal({
   isOpen,
   projectId,
   metadataCandidates,
+  allowCustomMetadataTitle = false,
+  initialMetadataTitle = '',
   metadataError,
   overlay,
   overlayError,
@@ -79,7 +83,10 @@ export function TitleSelectionModal({
       : [];
   }, [overlay]);
 
-  const [selectedMetadataTitle, setSelectedMetadataTitle] = useState("");
+  const initialIsCustom = allowCustomMetadataTitle && Boolean(initialMetadataTitle) && !metadataOptions.includes(initialMetadataTitle);
+  const [selectedMetadataTitle, setSelectedMetadataTitle] = useState(initialMetadataTitle);
+  const [customMetadataTitle, setCustomMetadataTitle] = useState(initialIsCustom ? initialMetadataTitle : '');
+  const [useCustomMetadataTitle, setUseCustomMetadataTitle] = useState(initialIsCustom);
   const [selectedOverlayTitle, setSelectedOverlayTitle] = useState("");
 
   if (!isOpen) return null;
@@ -90,9 +97,9 @@ export function TitleSelectionModal({
   const hasOverlayPane = overlayOptions.length > 1 || Boolean(overlayError);
   const twoPaneLayout = hasMetadataPane && hasOverlayPane;
   const effectiveMetadataTitle =
-    metadataOptions.includes(selectedMetadataTitle)
-      ? selectedMetadataTitle
-      : metadataOptions[0] || "";
+    allowCustomMetadataTitle && useCustomMetadataTitle
+      ? customMetadataTitle.trim()
+      : metadataOptions.includes(selectedMetadataTitle) ? selectedMetadataTitle : metadataOptions[0] || "";
   const effectiveOverlayTitle =
     overlayOptions.includes(selectedOverlayTitle)
       ? selectedOverlayTitle
@@ -138,7 +145,7 @@ export function TitleSelectionModal({
                 <div className="mb-4">
                   <h3 className="font-medium">Metadata Title</h3>
                   <p className="mt-1 text-sm text-[hsl(var(--muted-foreground))]">
-                    This title will be reused across YouTube, Facebook, Instagram, and TikTok.
+                    {allowCustomMetadataTitle ? 'Un titre commun pour les plateformes qui acceptent un titre. Les descriptions Facecam gardent leur format dédié.' : 'This title will be reused across YouTube, Facebook, Instagram, and TikTok.'}
                   </p>
                 </div>
 
@@ -147,11 +154,20 @@ export function TitleSelectionModal({
                     {metadataError}
                   </div>
                 ) : (
-                  <SelectionList
-                    options={metadataOptions}
-                    selected={effectiveMetadataTitle}
-                    onSelect={setSelectedMetadataTitle}
-                  />
+                  <>
+                    <SelectionList
+                      options={metadataOptions}
+                      selected={useCustomMetadataTitle ? '' : effectiveMetadataTitle}
+                      onSelect={value => {setSelectedMetadataTitle(value); setUseCustomMetadataTitle(false);}}
+                    />
+                    {allowCustomMetadataTitle && <label className={`mt-2 flex items-center gap-3 rounded-md border p-3 ${useCustomMetadataTitle ? 'border-[hsl(var(--primary))] ring-2 ring-[hsl(var(--primary))]' : 'border-[hsl(var(--border))]'}`}>
+                      <span className="font-mono text-xs text-[hsl(var(--muted-foreground))]">9.</span>
+                      <input aria-label="Titre personnalisé" placeholder="Saisir mon propre titre" maxLength={62}
+                        className="min-w-0 flex-1 bg-transparent text-sm outline-none" value={customMetadataTitle} disabled={isSaving}
+                        onFocus={() => setUseCustomMetadataTitle(true)}
+                        onChange={event => {setUseCustomMetadataTitle(true); setCustomMetadataTitle(event.target.value);}}/>
+                    </label>}
+                  </>
                 )}
               </section>
             )}

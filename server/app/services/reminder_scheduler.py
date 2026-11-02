@@ -569,6 +569,7 @@ async def _dispatch_instagram_publish(
         ),
         # Standard covers remain disabled; Facecam explicitly enables its saved image.
         **({"cover_url": payload["cover_url"]} if payload.get("use_custom_cover") and payload.get("cover_url") else {}),
+        **({"trial_reel": True} if payload.get("trial_reel") else {}),
         publish_state=job.instagram_publish_state,
         progress_callback=persist_instagram_state,
         project_id=job.project_id,

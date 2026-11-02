@@ -42,6 +42,8 @@ class TikTokPfmState(BaseModel):
 
     Stages mirror server/app/models/job.py::TikTokPublishState:
     media_uploaded | post_scheduled | post_created | published | failed.
+    Facecam: is_draft=True; post_created → draft_uploaded (manual ✅ still pending),
+    or draft_cancelled (reminder cancelled; the inbox draft remains).
     post_scheduled posts can be rescheduled (PUT) or cancelled (DELETE);
     post_created/published posts are immutable.
     """
@@ -51,6 +53,7 @@ class TikTokPfmState(BaseModel):
     stage: str | None = None
     social_account_id: str | None = None
     post_for_me_platform: str = "tiktok"
+    is_draft: bool = False
     scheduled_at: datetime | None = None
     url: str | None = None
     last_error: str | None = None

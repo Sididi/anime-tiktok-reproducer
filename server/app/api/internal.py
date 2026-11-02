@@ -44,6 +44,7 @@ class InstagramPayload(BaseModel):
     max_duration_seconds: float | None = None
     cover_url: str | None = None
     use_custom_cover: bool | None = None  # Explicit Facecam opt-in; standard covers stay disabled.
+    trial_reel: bool | None = None
 
 
 class TikTokPayload(BaseModel):
@@ -461,6 +462,10 @@ async def platform_status(project_id: str, req: PlatformStatusRequest, request: 
 
     new_status = PlatformStatus(status=req.status, url=req.url, detail=req.detail)
     existing = job.platform_statuses.get(req.platform)
+    if (req.platform == "tiktok" and job.tiktok_manual and existing
+            and existing.status in ("uploaded", "skipped") and req.status in ("pending", "uploading", "failed")):
+        # A late draft-delivery result must never undo the user's ✅ / cancellation.
+        return {"ok": True, "noop": True}
     if existing == new_status:
         return {"ok": True, "noop": True}
 

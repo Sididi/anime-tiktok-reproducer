@@ -414,6 +414,7 @@ async def _create_instagram_container(
     upload_method: str,
     video_url: str | None = None,
     cover_url: str | None = None,
+    trial_reel: bool = False,
 ) -> tuple[str, str | None]:
     create_data = {
         "media_type": "REELS",
@@ -421,6 +422,9 @@ async def _create_instagram_container(
         "share_to_feed": "true" if share_to_feed else "false",
         "access_token": ig_access_token,
     }
+    if trial_reel:
+        create_data["trial_params"] = json.dumps({"graduation_strategy": "MANUAL"})
+        create_data["share_to_feed"] = "false"
     if thumb_offset is not None:
         create_data["thumb_offset"] = str(thumb_offset)
     if cover_url is not None:
@@ -458,6 +462,7 @@ async def _create_rupload_fallback_container(
     force_video_url_reason: str | None,
     prepared_metadata: dict[str, Any],
     progress_callback: InstagramProgressCallback | None,
+    trial_reel: bool = False,
 ) -> tuple[str, str | None, InstagramPublishState]:
     container_id, upload_uri = await _create_instagram_container(
         client,
@@ -468,6 +473,7 @@ async def _create_rupload_fallback_container(
         share_to_feed=share_to_feed,
         thumb_offset=thumb_offset,
         upload_method="rupload",
+        trial_reel=trial_reel,
     )
     created_at = _utc_now()
     expires_at = created_at + timedelta(seconds=_INSTAGRAM_CONTAINER_TTL_SECONDS)
@@ -1228,6 +1234,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
     share_to_feed: bool = True,
     thumb_offset: int | None = None,
     cover_url: str | None = None,
+    trial_reel: bool = False,
     publish_state: InstagramPublishState | dict[str, Any] | None = None,
     progress_callback: InstagramProgressCallback | None = None,
     project_id: str | None = None,
@@ -1433,6 +1440,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     upload_method=upload_method,
                     video_url=prepared_video_url if upload_method == "video_url" else None,
                     cover_url=cover_url,
+                    trial_reel=trial_reel,
                 )
                 created_at = _utc_now()
                 expires_at = created_at + timedelta(
@@ -1495,6 +1503,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                                 prepared_video_url if upload_method == "video_url" else None
                             ),
                             cover_url=None,
+                            trial_reel=trial_reel,
                         )
                     except (
                         httpx.HTTPStatusError, httpx.HTTPError, KeyError, ValueError,
@@ -1569,6 +1578,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                                     force_video_url_reason=force_video_url_reason,
                                     prepared_metadata=prepared_metadata,
                                     progress_callback=progress_callback,
+                                    trial_reel=trial_reel,
                                 )
                             )
                             needs_upload = True
@@ -1858,6 +1868,7 @@ async def publish_to_instagram(  # noqa: PLR0911, PLR0912, PLR0915
                     share_to_feed=share_to_feed,
                     thumb_offset=thumb_offset,
                     cover_url=cover_url,
+                    trial_reel=trial_reel,
                     publish_state=state,
                     progress_callback=progress_callback,
                     project_id=project_id,

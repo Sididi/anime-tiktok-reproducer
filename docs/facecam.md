@@ -18,14 +18,53 @@ ZIP export/download and social upload requests. Existing Facecams must complete 
 
 After publication preparation, **Passer au traitement** asks for confirmation when the current audio preview’s final duration is **strictly below 61 seconds**. This measurement includes silence cuts, voice speed and retained original dialogue. Cancel keeps the user on the Facecam page to adjust the recording/settings; confirm proceeds. Exactly 61 seconds needs no warning. Pending audio changes keep the button disabled until the new preview is ready.
 
-Metadata uses the standard anime `MetadataService` prompt, the anime name and current script
+Metadata uses `backend/prompts/facecam/metadata.md`, the anime name and current script
 (including retained original dialogue), French output, the project's model preset and its **light**
-tier, with the same structured eight-title schema as faceless automation. Generation never silently
-chooses the first title. The shared title picker and metadata editor support selecting and editing
-the platform fields. Choices persist on disk; a changed script/anime or an outdated generation ID
-cannot validate or overwrite current metadata. A failed generation preserves the previous choices;
-a failed form save preserves the user's edits for retry. Metadata and thumbnail changes invalidate
-the ZIP without rerunning audio or scene selection.
+tier. The model returns eight titles, one simple shared description without a CTA, and YouTube tags.
+Facebook, Instagram and YouTube use that same description. Platform additions are deterministic:
+
+- Facebook: only the metadata tag `Anime TV & Movies`; description ends with
+  `#anime #animerecommendations #manga #animefr #otaku`.
+- Instagram: description ends with `#anime #animefr #animerecommendations`.
+- TikTok: `Recommendation anime #animerecommendations`; the current
+  `ATR_TIKTOK_DESCRIPTION_SUFFIX` is appended at upload time and in the Discord reminder.
+- YouTube: the shared description and generated search tags.
+
+`Anime TV & Movies` was confirmed by the owner in Meta Business Suite on November 2, 2026.
+The Graph `search?type=adinterest` catalogue returns `Anime movies` instead; these are not treated as
+interchangeable tags. The label is stored in the Facebook metadata for the native selector; no
+unverified Graph content-tag ID is sent by the Reels publisher.
+
+Generation never silently chooses a title. The ninth row accepts a custom title (1–62 characters),
+applied to the metadata title fields. Instagram and TikTok retain their description formats above.
+The editor offers one shared title/description and scrollable previews of every platform's metadata.
+Choices persist on disk; a changed script/anime or an outdated generation ID cannot overwrite current
+metadata. The November 2 format revision invalidates older generated metadata: regenerate and choose
+a title once to adopt the new format. A failed generation preserves previous choices; a failed form
+save preserves edits for retry. Metadata edits invalidate the ZIP without rerunning audio or scene selection.
+
+Publication requires an account explicitly allowing `supported_types: [facecam]`; no global-credential
+fallback is allowed for Facecam. Configure its platform slots and credentials like other accounts,
+including the same account ID in the VPS account configuration for Discord reminders.
+
+With a Post for Me connection, Facecam TikTok sends a native inbox draft immediately using
+[`platform_configurations.tiktok.is_draft`](https://www.postforme.dev/resources/working-with-tiktok-drafts)
+(or `tiktok_business.is_draft`), without `scheduled_at` on the PFM post. The reserved/manual TikTok time
+controls the existing Discord reminder five minutes before posting. Delivery to the inbox leaves the
+platform pending until the Discord ✅ acknowledgement. Rescheduling moves the reminder; cancelling
+cancels the reminder and leaves the existing draft in TikTok. Retrying delivery reuses an existing draft.
+An account without a PFM connection keeps the existing manual upload/reminder path; configure
+`post_for_me_account_id` to enable draft delivery.
+
+Facebook, Instagram and YouTube retain automatic slots and manually chosen publication times.
+`ATR_INSTAGRAM_TRIAL_REELS=false` is the default. Set it to `true` in the backend environment to send
+Facecam Instagram Reels as trials, for both immediate and scheduled publishing. The value is snapshotted
+into the VPS job. The publisher sends `trial_params={"graduation_strategy":"MANUAL"}` and keeps the trial
+setting through upload/cover retries; an API rejection does not fall back to a regular Reel.
+Graduation to followers happens manually in Instagram, per
+[Meta's media reference](https://developers.facebook.com/documentation/instagram-platform/instagram-graph-api/reference/ig-user/media).
+Deploy the VPS changes together with the backend before enabling this option.
+The YouTube three-minute duration adaptation and copyright music replacement paths are unchanged.
 
 Thumbnail proposals use **zero paid API calls**. A bounded local pass samples at most 80 frames,
 prioritizing retained montage shots and committed V4 alternatives, then spreading samples across

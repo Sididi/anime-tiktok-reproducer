@@ -881,9 +881,25 @@ class UploadPhaseService:
         social_account_id = str(payload["social_account_id"])
         pfm_platform = str(payload.get("post_for_me_platform") or "tiktok")
         caption = str(payload.get("caption") or "")
+        is_draft = project.project_mode == "facecam"
+        if is_draft:
+            scheduled_at = None  # The reserved TikTok slot belongs to the manual reminder.
+            previous = project.tiktok_pfm
+            if (previous and previous.is_draft and previous.post_id
+                    and previous.social_account_id == social_account_id
+                    and previous.stage in ("post_created", "draft_uploaded", "published")):
+                previous_result = next((entry for entry in (project.upload_last_result or {}).get("platforms", [])
+                                        if entry.get("platform") == "tiktok"), {})
+                if previous.stage == "published" or previous_result.get("status") == "uploaded":
+                    return PlatformUploadResult(platform="tiktok", status="uploaded",
+                        url=previous_result.get("url") or previous.url,
+                        detail="Publication manuelle TikTok déjà confirmée")
+                return PlatformUploadResult(platform="tiktok", status="pending",
+                    detail="Brouillon TikTok déjà envoyé — publication manuelle, puis ✅ Discord")
         state = TikTokPfmState(
             social_account_id=social_account_id,
             post_for_me_platform=pfm_platform,
+            is_draft=is_draft,
             scheduled_at=scheduled_at,
             caption=caption,
             privacy_status=str(payload.get("privacy_status") or "public"),
@@ -926,6 +942,7 @@ class UploadPhaseService:
             allow_duet=state.allow_duet,
             allow_stitch=state.allow_stitch,
             scheduled_at=scheduled_at,
+            is_draft=is_draft,
         )
         try:
             state.post_id = PostForMeClient.create_post(body)
@@ -938,9 +955,12 @@ class UploadPhaseService:
             outcome = PostForMeClient.poll_outcome(state.post_id, social_account_id)
             state.last_polled_at = datetime.now(timezone.utc)
             if outcome.success:
-                state.stage = "published"
-                state.url = outcome.url
+                state.stage = "draft_uploaded" if is_draft else "published"
+                state.url = None if is_draft else outcome.url
                 persist_state()
+                if is_draft:
+                    return PlatformUploadResult(platform="tiktok", status="pending",
+                        detail="Brouillon envoyé dans TikTok — publication manuelle, puis ✅ Discord")
                 return PlatformUploadResult(
                     platform="tiktok", status="uploaded", url=outcome.url
                 )
@@ -950,11 +970,14 @@ class UploadPhaseService:
                 persist_state()
                 return PlatformUploadResult(
                     platform="tiktok",
-                    status="uploaded",
-                    detail="Publishing via Post for Me (result pending)",
+                    status="pending" if is_draft else "uploaded",
+                    detail="Envoi du brouillon TikTok en cours — publication manuelle" if is_draft else "Publishing via Post for Me (result pending)",
                 )
             return failed(f"TikTok publish failed: {outcome.detail}")
 
+        if is_draft:
+            return PlatformUploadResult(platform="tiktok", status="pending",
+                detail="Envoi du brouillon TikTok en cours — publication manuelle, puis ✅ Discord")
         if scheduled_at is not None:
             detail = (
                 f"Scheduled via Post for Me at {scheduled_at.isoformat()} "
@@ -985,6 +1008,7 @@ class UploadPhaseService:
                 payload.get("graph_api_version") or settings.meta_graph_api_version
             ),
             **({"cover_url": payload["cover_url"]} if payload.get("use_custom_cover") and payload.get("cover_url") else {}),
+            **({"trial_reel": True} if payload.get("trial_reel") else {}),
         )
         if result.success:
             return PlatformUploadResult(
@@ -1342,6 +1366,8 @@ class UploadPhaseService:
                     f"Project type '{project.publishing_type}' does not match "
                     f"account supported types {[item.value for item in account.supported_types]}"
                 )
+        elif project.project_mode == "facecam":
+            raise ValueError("account_id is required for Facecam publication")
         elif configured_accounts:
             raise ValueError("account_id is required when accounts are configured")
 
@@ -1443,6 +1469,8 @@ class UploadPhaseService:
         tiktok_payload = cls._build_tiktok_payload(
             account, tiktok_description, thumbnail_timestamp_ms
         )
+        if project.project_mode == "facecam" and cls._tiktok_enrolled(account, tiktok_payload) and not DiscordService.is_configured():
+            raise ValueError("Le serveur Discord doit être configuré pour rappeler la publication manuelle des Facecams TikTok.")
 
         # Public share the drive video before upload phase.
         emit_progress(0.15, "prepare", "Preparing Drive upload assets...")
@@ -1470,7 +1498,7 @@ class UploadPhaseService:
                     else "Queued for publishing by the VPS"
                 ),
             )
-        tiktok_manual = tiktok_enrolled and tiktok_payload is None
+        tiktok_manual = tiktok_enrolled and (tiktok_payload is None or project.project_mode == "facecam")
         if tiktok_manual:
             # Manual mode: the row stays pending on the VPS job; the server
             # posts the reminder and the ✅ reaction marks it uploaded.
@@ -1554,6 +1582,7 @@ class UploadPhaseService:
                     "poll_interval_seconds": settings.instagram_publish_poll_interval_seconds,
                     "poll_timeout_seconds": settings.instagram_publish_timeout_seconds,
                     "max_duration_seconds": instagram_max_duration,
+                    "trial_reel": project.project_mode == "facecam" and settings.instagram_trial_reels,
                 }
 
         with tempfile.TemporaryDirectory(prefix=f"atr-upload-{project_id}-") as tmp_dir:
@@ -2076,6 +2105,13 @@ class UploadPhaseService:
                             )
                         emit_platform_result(results_by_platform[platform])
 
+                if job_response is None and tiktok_manual and project.project_mode == "facecam":
+                    results_by_platform["tiktok"] = PlatformUploadResult(
+                        platform="tiktok", status="failed",
+                        detail="Rappel Discord non enregistré. Vérifiez le brouillon TikTok et publiez manuellement.",
+                    )
+                    emit_platform_result(results_by_platform["tiktok"], update_discord=False)
+
                 if pending:
                     timed_out_platforms = True
                     timeout_seconds = max(
@@ -2162,6 +2198,8 @@ class UploadPhaseService:
             "direct_drive_download": direct_drive_download,
             "drive_video_id": drive_video_id,
             "drive_video_name": drive_video_name,
+            **({"tiktok_reminder_registered": job_response is not None}
+               if tiktok_manual and project.project_mode == "facecam" else {}),
             **instagram_drive_metadata,
             **facebook_drive_metadata,
         }

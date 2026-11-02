@@ -317,8 +317,9 @@ class PlatformRescheduleService:
         from .project_service import ProjectService  # noqa: PLC0415
 
         state = project.tiktok_pfm
-        if state is None:
+        if state is None or state.is_draft:
             # Legacy pre-migration project: the VPS job still owns TikTok.
+            # Facecam drafts are already in the inbox: only move the reminder.
             return cls._patch_server_slot(project, "tiktok", new_scheduled_at)
 
         if state.stage in ("post_created", "published"):
@@ -480,18 +481,21 @@ class PlatformRescheduleService:
         from .project_service import ProjectService  # noqa: PLC0415
 
         state = project.tiktok_pfm
-        if state is None:
+        if state is None or state.is_draft:
             # No backend-owned PFM post: either a manual-mode job (2026-08 —
             # the VPS row is pending until the Discord ✅) or a legacy
             # pre-migration project. Flip the server row to "skipped": the
             # server cancels/deletes its reminder on any terminal TikTok
             # status. Deleting the whole VPS job would also cancel Instagram.
-            if project.final_upload_discord_message_id:
+            if project.final_upload_discord_message_id or state is not None:
                 from .discord_service import DiscordService  # noqa: PLC0415
 
                 DiscordService.update_job_platform(
                     project.id, "tiktok", status="skipped", detail="Annulé"
                 )
+                if state is not None:
+                    state.stage = "draft_cancelled"
+                    ProjectService.save(project)
                 return NotificationResult(status="ok")
             return NotificationResult(status="skipped")
 

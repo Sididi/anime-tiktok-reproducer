@@ -137,7 +137,7 @@ class UrgentUploadService:
         reason: str | None = None
         best_effort = False
 
-        if platform == "tiktok" and project.tiktok_pfm is not None:
+        if platform == "tiktok" and project.tiktok_pfm is not None and not project.tiktok_pfm.is_draft:
             stage = project.tiktok_pfm.stage
             if stage == "published":
                 reason = "unmovable_published"

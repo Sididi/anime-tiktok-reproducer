@@ -15,6 +15,7 @@ from app.services.facecam_service import FacecamService, StaleFacecamRevision
 from app.services.facecam_publication_service import FacecamPublicationService as Publication
 from app.services.facecam_thumbnail_service import FacecamThumbnailService as Thumbnails, portrait, quality
 from app.services.metadata import MetadataService
+from app.services.facecam_metadata_service import FacecamMetadataService
 from app.services.llm_service import LLMService
 from app.services.project_service import ProjectService
 from app.services.anime_library import AnimeLibraryService
@@ -44,11 +45,11 @@ def generate(project, monkeypatch):
     return Publication.status(project.id)
 
 
-def test_same_prompt_schema_tier_and_explicit_title_choice(project, monkeypatch):
+def test_facecam_prompt_schema_tier_and_explicit_title_choice(project, monkeypatch):
     def llm(prompt, **kwargs):
-        assert prompt == MetadataService.build_prompt_from_script_payload('Naruto', Publication.script(project.id), 'fr')
+        assert prompt == FacecamMetadataService.build_prompt_from_script_payload('Naruto', Publication.script(project.id), 'fr')
         assert 'Dialogue original.' in prompt and 'Naruto poursuit son rêve.' in prompt
-        assert kwargs == {'preset_key': 'gpt', 'tier': 'light', 'response_schema': MetadataService.candidate_response_schema(), 'schema_name': 'metadata'}
+        assert kwargs == {'preset_key': 'gpt', 'tier': 'light', 'response_schema': FacecamMetadataService.candidate_response_schema(), 'schema_name': 'metadata'}
         return publication_candidates()
     monkeypatch.setattr(LLMService, 'generate_json', llm)
     Publication.generate(project.id, 1)
@@ -61,12 +62,18 @@ def test_same_prompt_schema_tier_and_explicit_title_choice(project, monkeypatch)
     assert chosen['ready']
     metadata = chosen['metadata']
     assert metadata['youtube']['title'] == metadata['facebook']['title'] == title
-    assert metadata['instagram']['caption'].startswith(title)
-    assert metadata['tiktok']['description'].startswith(title)
+    assert metadata['instagram']['caption'] == 'Une histoire de ninja.\n\n#anime #animefr #animerecommendations'
+    assert metadata['facebook']['description'] == 'Une histoire de ninja.\n\n#anime #animerecommendations #manga #animefr #otaku'
+    assert metadata['facebook']['tags'] == ['Anime TV & Movies']
+    assert metadata['tiktok']['description'] == 'Recommendation anime #animerecommendations'
     assert Publication.status(project.id) == chosen  # Disk reload retains choice.
     metadata['youtube']['description'] = 'Ma description manuelle.'
     Publication.save_metadata(project.id, 1, status['generation_id'], metadata)
-    assert Publication.status(project.id)['metadata']['youtube']['description'] == 'Ma description manuelle.'
+    saved = Publication.status(project.id)['metadata']
+    assert saved['youtube']['description'] == 'Ma description manuelle.'
+    assert saved['facebook']['description'].startswith('Ma description manuelle.\n\n')
+    assert saved['instagram']['caption'].startswith('Ma description manuelle.\n\n')
+    assert saved['tiktok']['description'] == 'Recommendation anime #animerecommendations'
 
 
 def test_failed_generation_and_stale_tabs_do_not_overwrite_choices(project, monkeypatch):
@@ -80,8 +87,12 @@ def test_failed_generation_and_stale_tabs_do_not_overwrite_choices(project, monk
     with pytest.raises(StaleFacecamRevision):
         Publication.select_title(project.id, 1, old['generation_id'], old['candidates']['title_candidates'][0])
     assert not new['ready']
-    with pytest.raises(ValueError, match='huit'):
-        Publication.select_title(project.id, 1, new['generation_id'], 'Un titre inconnu')
+    for invalid in ('   ', 'x' * 63):
+        with pytest.raises(ValueError, match='titre'):
+            Publication.select_title(project.id, 1, new['generation_id'], invalid)
+    custom = Publication.select_title(project.id, 1, new['generation_id'], '  Mon propre titre  ')
+    assert custom['metadata']['youtube']['title'] == 'Mon propre titre'
+    assert custom['metadata']['facebook']['title'] == 'Mon propre titre'
 
 
 def test_script_change_invalidates_metadata_even_after_reapproval(project, monkeypatch):

@@ -8,7 +8,7 @@ import { MetadataEditorModal } from './MetadataEditorModal';
 import './FacecamPublication.css';
 
 interface MetadataStatus {
-  revision: number; generation_id: string | null; candidates: MetadataTitleCandidatesPayload | null;
+  revision: number; generation_id: string | null; candidates: Pick<MetadataTitleCandidatesPayload, 'title_candidates'> | null;
   metadata: PlatformMetadata | null; ready: boolean;
 }
 interface Thumbnail {
@@ -156,7 +156,7 @@ export function FacecamPublication({id, state, disabled, approved, onState, onRe
     <header><div><h2 id="facecam-publication-title">5. Préparer la publication</h2><p>Choisissez votre titre et votre miniature pour débloquer le traitement.</p></div>
       <span className={ready ? 'facecam-publication-done' : ''}>{ready ? <><Check size={16}/> Prêt pour le traitement</> : 'Étape obligatoire'}</span></header>
     <div className="facecam-publication-metadata"><h3>Titre et métadonnées</h3>
-      <p>Huit titres à partir du nom de l’anime et du script, avec les mêmes descriptions et hashtags que les projets classiques.</p>
+      <p>Huit propositions ou votre propre titre. Une description commune sans CTA, des hashtags fixes et un texte TikTok dédié.</p>
       {metadata?.ready && <blockquote>{metadata.metadata?.youtube.title}</blockquote>}
       <div className="flex flex-wrap gap-3">
         <Button variant="outline" disabled={busy || !approved} onClick={() => void generate('metadata')}>{metadata?.candidates ? 'Régénérer les métadonnées' : 'Générer les métadonnées'}</Button>
@@ -193,9 +193,10 @@ export function FacecamPublication({id, state, disabled, approved, onState, onRe
       {thumbnails?.warning && <p role="status">{thumbnails.warning}</p>}
       {thumbnailError && <p role="alert" className="text-red-400">{thumbnailError} <button onClick={() => setRefresh(n => n + 1)}>Recharger</button></p>}
     </div>
-    {titlesOpen && metadata?.candidates && <TitleSelectionModal isOpen metadataCandidates={metadata.candidates} isSaving={busy}
+    {titlesOpen && metadata?.candidates && <TitleSelectionModal isOpen allowCustomMetadataTitle metadataCandidates={metadata.candidates} isSaving={busy}
+      initialMetadataTitle={metadata.metadata?.youtube.title}
       error={metadataError} onClose={() => setTitlesOpen(false)} onConfirm={({metadataTitle}) => {if (metadataTitle) void chooseTitle(metadataTitle);}}/>}
-    {editorOpen && metadata?.metadata && <MetadataEditorModal isOpen metadata={metadata.metadata} onClose={() => setEditorOpen(false)} onSave={saveMetadata}/>}
+    {editorOpen && metadata?.metadata && <MetadataEditorModal isOpen facecam metadata={metadata.metadata} onClose={() => setEditorOpen(false)} onSave={saveMetadata}/>}
     {manual && thumbnails?.episodes.length && <ManualThumbnail key={thumbnails.version} id={id} status={thumbnails} initial={manual.initial} busy={busy}
       onClose={() => setManual(null)} onSave={selectThumbnail}/>}
   </section>;

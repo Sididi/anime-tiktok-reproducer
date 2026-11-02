@@ -98,6 +98,7 @@ def test_preflight_reuses_recent_manager_drive_result(tmp_path, monkeypatch):
         drive_folder_id="folder-1",
         drive_folder_url="https://drive.example/folder-1",
         upload_last_result=None,
+        archived_at=None,
     )
     monkeypatch.setattr(UploadPhaseService, "_drive_video_cache", {})
     UploadPhaseService._cache_drive_video(

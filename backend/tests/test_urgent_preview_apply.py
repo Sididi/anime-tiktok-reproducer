@@ -318,3 +318,17 @@ def test_record_immediate_schedules_writes_manual_now(acc):
         SchedulingService._resolve_pool_key(acc, "tiktok"), "tiktok"
     )
     assert not slots
+
+
+@pytest.mark.parametrize('stage', ['post_created', 'draft_uploaded'])
+@pytest.mark.parametrize('acknowledged', [False, True])
+def test_facecam_draft_reminder_can_move_until_manual_publication(acc, monkeypatch, stage, acknowledged):
+    from app.services.vps_status_sync_service import VpsStatusSyncService
+    monkeypatch.setattr(VpsStatusSyncService, 'cached_status', lambda *a: {'status':'uploaded' if acknowledged else 'pending'})
+    t = _in(30)
+    project = _save_project('facecam-draft', acc, {'tiktok':(t,False)},
+        project_mode='facecam', tiktok_pfm=TikTokPfmState(post_id='post', stage=stage, is_draft=True))
+    item = UrgentUploadService._classify(project, 'tiktok', t, datetime.now(timezone.utc))
+    assert item['movable'] is (not acknowledged)
+    if acknowledged:
+        assert item['reason'] == 'unmovable_published'

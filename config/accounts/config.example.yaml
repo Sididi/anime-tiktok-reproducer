@@ -1,5 +1,10 @@
-# Facecam is a separate publishing type. Opt in per account with supported_types: [anime, facecam].
+# Facecam is a separate publishing type. For a dedicated account use supported_types: [facecam].
 # Existing anime-only accounts do not accept Facecam projects.
+# Facecam + post_for_me_account_id sends a TikTok inbox draft immediately; the
+# TikTok slot is the manual-post Discord reminder time. Other platforms keep
+# their normal schedules. Also declare the account ID in the VPS config.
+# ATR_INSTAGRAM_TRIAL_REELS=true enables Instagram trials for Facecam only
+# (backend .env, default false). See docs/facecam.md.
 # Account configuration for multi-channel upload scheduling.
 # Copy this file to config.yaml and fill in your credentials.
 # Only Dailymotion, Snapchat, and Bilibili require explicit account blocks.
