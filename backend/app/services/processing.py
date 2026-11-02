@@ -2372,36 +2372,54 @@ class ProcessingService:
         transcription: Transcription,
         language: str = "fr",
     ) -> list[SrtEntry]:
-        """Generate aggressive single-line subtitle entries from aligned TTS words."""
+        """Generate captions from final playback timings without retiming speech.
+
+        The first caption of a continuous narration run covers its short audio
+        lead-in. Raw/empty scenes and timeline gaps delimit runs; ordinary shot
+        changes do not. Longer initial silences keep the aligned word start.
+        """
         entries: list[SrtEntry] = []
 
-        raw_break_scene_indices: set[int] = set()
-        next_non_raw_index: int | None = None
-        saw_raw_since_last_non_raw = False
-        for idx in range(len(transcription.scenes) - 1, -1, -1):
-            scene_trans = transcription.scenes[idx]
-            if scene_trans.is_raw:
-                saw_raw_since_last_non_raw = True
-                continue
-            if scene_trans.words and next_non_raw_index is not None and saw_raw_since_last_non_raw:
-                raw_break_scene_indices.add(scene_trans.scene_index)
-            if scene_trans.words:
-                next_non_raw_index = idx
-                saw_raw_since_last_non_raw = False
-
         all_words: list[dict[str, object]] = []
+        previous_scene_end = 0.0
+        narration_continues = False
         for scene_trans in transcription.scenes:
-            if scene_trans.is_raw or not scene_trans.words:
+            # Filter before assigning boundaries so punctuation-only tokens
+            # cannot swallow a break or the first caption's presentation start.
+            words = [] if scene_trans.is_raw else [
+                word for word in scene_trans.words if strip_punctuation(word.text)
+            ]
+            if not words:
+                if all_words:
+                    all_words[-1]["force_break_after"] = True
+                narration_continues = False
+                previous_scene_end = max(previous_scene_end, scene_trans.end_time)
                 continue
-            force_break_after_scene = scene_trans.scene_index in raw_break_scene_indices
-            last_word_index = len(scene_trans.words) - 1
-            for idx, word in enumerate(scene_trans.words):
+
+            starts_run = (
+                not narration_continues
+                or scene_trans.start_time > previous_scene_end + 1e-6
+            )
+            first_display_start = words[0].start
+            if starts_run:
+                if all_words:
+                    all_words[-1]["force_break_after"] = True
+                run_start = max(0.0, scene_trans.start_time, previous_scene_end)
+                # Reuse the caption silence policy, rather than filling an
+                # arbitrarily long pause or assuming the run begins at zero.
+                if 0 <= first_display_start - run_start <= SRT_OBVIOUS_SILENCE_GAP_SEC:
+                    first_display_start = run_start
+
+            for idx, word in enumerate(words):
                 all_words.append(
                     {
                         "word": word,
-                        "force_break_after": force_break_after_scene and idx == last_word_index,
+                        "display_start": first_display_start if idx == 0 else word.start,
+                        "force_break_after": False,
                     }
                 )
+            narration_continues = True
+            previous_scene_end = max(previous_scene_end, scene_trans.end_time)
 
         if not all_words:
             return entries
@@ -2421,9 +2439,6 @@ class ProcessingService:
                 word_entry = all_words[i]
                 word = word_entry["word"]
                 word_text = strip_punctuation(word.text)
-                if not word_text:
-                    i += 1
-                    continue
 
                 new_len = current_len + len(word_text) + (1 if current_block else 0)
                 word_count = len(current_block) + 1
@@ -2494,7 +2509,7 @@ class ProcessingService:
 
                 entries.append(
                     SrtEntry(
-                        start=current_block[0].start,
+                        start=all_words[current_block_indices[0]]["display_start"],
                         end=end_time,
                         text=" ".join(w.text for w in current_block),
                     )
