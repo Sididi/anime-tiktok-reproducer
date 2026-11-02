@@ -7,7 +7,7 @@ interface MetadataEditorModalProps {
   isOpen: boolean;
   onClose: () => void;
   metadata: PlatformMetadata;
-  onSave: (metadata: PlatformMetadata) => void;
+  onSave: (metadata: PlatformMetadata) => void | Promise<void>;
 }
 
 function parseTags(raw: string): string[] {
@@ -17,21 +17,21 @@ function parseTags(raw: string): string[] {
     .filter(Boolean);
 }
 
-export function MetadataEditorModal({
-  isOpen,
+export function MetadataEditorModal(props: MetadataEditorModalProps) {
+  return props.isOpen ? <MetadataEditorContent {...props}/> : null;
+}
+
+function MetadataEditorContent({
   onClose,
   metadata,
   onSave,
 }: MetadataEditorModalProps) {
   const [draft, setDraft] = useState<PlatformMetadata>(metadata);
-  const [facebookTagsInput, setFacebookTagsInput] = useState("");
-  const [youtubeTagsInput, setYoutubeTagsInput] = useState("");
+  const [facebookTagsInput, setFacebookTagsInput] = useState(metadata.facebook.tags.join("\n"));
+  const [youtubeTagsInput, setYoutubeTagsInput] = useState(metadata.youtube.tags.join("\n"));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
   const textareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
-
-  const registerTextarea =
-    (key: string) => (node: HTMLTextAreaElement | null) => {
-      textareaRefs.current[key] = node;
-    };
 
   const autoResizeTextarea = (el: HTMLTextAreaElement | null) => {
     if (!el) return;
@@ -44,18 +44,11 @@ export function MetadataEditorModal({
   }, []);
 
   useEffect(() => {
-    if (!isOpen) return;
-    setDraft(metadata);
-    setFacebookTagsInput(metadata.facebook.tags.join("\n"));
-    setYoutubeTagsInput(metadata.youtube.tags.join("\n"));
-  }, [isOpen, metadata]);
+    const frame = requestAnimationFrame(() => autoResizeAllTextareas());
+    return () => cancelAnimationFrame(frame);
+  }, [draft, facebookTagsInput, youtubeTagsInput, autoResizeAllTextareas]);
 
-  useEffect(() => {
-    if (!isOpen) return;
-    requestAnimationFrame(() => autoResizeAllTextareas());
-  }, [isOpen, draft, facebookTagsInput, youtubeTagsInput, autoResizeAllTextareas]);
-
-  const handleSave = useCallback(() => {
+  const handleSave = useCallback(async () => {
     const updated: PlatformMetadata = {
       facebook: {
         ...draft.facebook,
@@ -69,31 +62,36 @@ export function MetadataEditorModal({
       tiktok: { ...draft.tiktok },
     };
 
-    onSave(updated);
-    onClose();
+    setSaving(true); setError("");
+    try {
+      await onSave(updated);
+      onClose();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Enregistrement impossible.");
+    } finally { setSaving(false); }
   }, [draft, facebookTagsInput, youtubeTagsInput, onSave, onClose]);
-
-  if (!isOpen) return null;
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget && !saving) onClose();
       }}
     >
-      <div className="bg-[hsl(var(--card))] rounded-lg w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
+      <div role="dialog" aria-modal="true" aria-label="Edit metadata" className="bg-[hsl(var(--card))] rounded-lg w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col">
         <div className="flex items-center justify-between p-4 border-b border-[hsl(var(--border))]">
-          <h2 className="text-lg font-semibold">Edit Script</h2>
+          <h2 className="text-lg font-semibold">Edit metadata</h2>
           <button
             onClick={onClose}
+            disabled={saving}
+            aria-label="Fermer les métadonnées"
             className="p-1 hover:bg-[hsl(var(--muted))] rounded"
           >
             <X className="h-5 w-5" />
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <fieldset disabled={saving} className="flex-1 overflow-y-auto p-4 space-y-4">
           <p className="text-sm text-[hsl(var(--muted-foreground))]">
             Edit platform metadata content with a structured form. Tags can be
             entered one per line (or comma separated).
@@ -122,7 +120,7 @@ export function MetadataEditorModal({
                   Description
                 </label>
                 <textarea
-                  ref={registerTextarea("facebook_description")}
+                  ref={node => {textareaRefs.current["facebook_description"] = node;}}
                   value={draft.facebook.description}
                   onChange={(e) =>
                     setDraft((prev) => ({
@@ -145,7 +143,7 @@ export function MetadataEditorModal({
                   Tags
                 </label>
                 <textarea
-                  ref={registerTextarea("facebook_tags")}
+                  ref={node => {textareaRefs.current["facebook_tags"] = node;}}
                   value={facebookTagsInput}
                   onChange={(e) => setFacebookTagsInput(e.target.value)}
                   onInput={(e) =>
@@ -164,7 +162,7 @@ export function MetadataEditorModal({
                   Caption
                 </label>
                 <textarea
-                  ref={registerTextarea("instagram_caption")}
+                  ref={node => {textareaRefs.current["instagram_caption"] = node;}}
                   value={draft.instagram.caption}
                   onChange={(e) =>
                     setDraft((prev) => ({
@@ -206,7 +204,7 @@ export function MetadataEditorModal({
                   Description
                 </label>
                 <textarea
-                  ref={registerTextarea("youtube_description")}
+                  ref={node => {textareaRefs.current["youtube_description"] = node;}}
                   value={draft.youtube.description}
                   onChange={(e) =>
                     setDraft((prev) => ({
@@ -229,7 +227,7 @@ export function MetadataEditorModal({
                   Tags
                 </label>
                 <textarea
-                  ref={registerTextarea("youtube_tags")}
+                  ref={node => {textareaRefs.current["youtube_tags"] = node;}}
                   value={youtubeTagsInput}
                   onChange={(e) => setYoutubeTagsInput(e.target.value)}
                   onInput={(e) =>
@@ -248,7 +246,7 @@ export function MetadataEditorModal({
                   Description
                 </label>
                 <textarea
-                  ref={registerTextarea("tiktok_description")}
+                  ref={node => {textareaRefs.current["tiktok_description"] = node;}}
                   value={draft.tiktok.description}
                   onChange={(e) =>
                     setDraft((prev) => ({
@@ -268,13 +266,14 @@ export function MetadataEditorModal({
               </div>
             </section>
           </div>
-        </div>
+        </fieldset>
 
         <div className="flex items-center justify-end gap-2 p-4 border-t border-[hsl(var(--border))]">
-          <Button variant="outline" onClick={onClose}>
+          {error && <p role="alert" className="mr-auto text-sm text-red-400">{error}</p>}
+          <Button variant="outline" disabled={saving} onClick={onClose}>
             Cancel
           </Button>
-          <Button onClick={handleSave}>Save Changes</Button>
+          <Button disabled={saving} onClick={() => void handleSave()}>{saving ? 'Enregistrement…' : 'Save Changes'}</Button>
         </div>
       </div>
     </div>

@@ -213,8 +213,9 @@ def test_platform_status_rejects_invalid_status(
     assert r.status_code == 422  # Pydantic validation error
 
 
+@pytest.mark.parametrize("custom_cover", [False, True])
 def test_create_job_persists_instagram_payload(
-    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path
+    monkeypatch, example_yaml: Path, example_env, tmp_server_dir: Path, custom_cover
 ):
     app, discord = _make_app(monkeypatch, example_yaml, example_env, tmp_server_dir)
     discord.post_message.return_value = "msg_embed"
@@ -236,6 +237,8 @@ def test_create_job_persists_instagram_payload(
             }
         },
     }
+    if custom_cover:
+        payload["instagram"].update(cover_url="https://example.org/facecam.jpg", use_custom_cover=True)
     with TestClient(app) as client:
         r = client.post("/api/internal/jobs", json=payload, headers=INTERNAL_AUTH)
     assert r.status_code == 200
@@ -243,13 +246,7 @@ def test_create_job_persists_instagram_payload(
     # Verify the IG payload is persisted on the job.
     job = asyncio.run(app.state.job_store.get("p1"))
     assert job is not None
-    assert job.instagram_payload == {
-        "ig_user_id": "ig_user_42",
-        "ig_access_token": "ig_token_secret",
-        "caption": "Hello from IG",
-        "prepared_video_url": "https://drive.usercontent.google.com/download?id=ig_prepared",
-        "graph_api_version": "v25.0",
-    }
+    assert job.instagram_payload == payload["instagram"]
     assert job.platform_statuses["instagram"].status == "failed"
     assert job.platform_statuses["instagram"].detail == "Instagram video preparation failed"
 

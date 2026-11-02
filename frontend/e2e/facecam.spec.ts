@@ -1,5 +1,6 @@
 import {test,expect,type Page} from '@playwright/test';
 import {DEFAULT_FACECAM_AUTO_EDITOR, type FacecamState, type FacecamStory} from '../src/api/facecam';
+import {readyMetadata, readyThumbnails, publicationCandidates, publicationMetadata, thumbnailImage} from './helpers/facecamPublication';
 
 async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; fullDuration?: number; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean; failOriginal?: boolean; delayedOriginal?: boolean}) {
   const id='facecam-browser';
@@ -38,6 +39,9 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
     const json=(body:unknown)=>route.fulfill({json:body});
     if(path==='')return json({id,anime_name:'Naruto',project_mode:'facecam',library_type:'anime',phase:'script_restructure',source_paths:[]});
     if(path==='/facecam')return json(state);
+    if(path==='/facecam/metadata')return json(readyMetadata(state.revision));
+    if(path==='/facecam/thumbnails')return json(readyThumbnails());
+    if(path==='/facecam/thumbnail'||path.startsWith('/facecam/thumbnails/'))return route.fulfill({contentType:'image/svg+xml',body:thumbnailImage});
     if(path==='/facecam/recording/review' && state.recording) {
       if (!state.recording_review || state.recording_review.revision !== state.revision || state.recording_review.fingerprint !== state.recording.fingerprint) {
         state = {...state, recording_review:{id:`review-${state.revision}`, revision:state.revision,
@@ -180,6 +184,7 @@ test('original generation saves manual edits first, keeps the angle and survives
 test('original generation is unavailable before a script and preserves it on failure',async({page})=>{
   await fixture(page,{empty:true});
   await expect(page.getByRole('button',{name:'Recréer de zéro',exact:true})).toHaveCount(0);
+  await page.goto('about:blank');
   await page.unrouteAll({behavior:'wait'});
   const f=await fixture(page,{failOriginal:true});
   await page.getByRole('button',{name:'Recréer de zéro',exact:true}).click();
@@ -517,7 +522,12 @@ test('correcting one finding preserves the other through typing save and reload'
   const second=page.locator('.facecam-fact-item').filter({hasText:'Il devient plus fort.'});
   await second.click();
   const body=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] p');
-  await body.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');
+  await body.evaluate(node => {
+    (node.closest('[contenteditable]') as HTMLElement).focus();
+    const text = document.createTreeWalker(node, NodeFilter.SHOW_TEXT).nextNode()!;
+    const range = document.createRange(); range.setStart(text, 1); range.collapse(true);
+    window.getSelection()!.removeAllRanges(); window.getSelection()!.addRange(range);
+  });
   await page.keyboard.type('X');
   await expect(page.locator('.facecam-finding')).toHaveCount(1);
   await expect(second).toBeVisible();
@@ -555,10 +565,20 @@ test('a delayed autosave cannot resurrect a finding corrected while it was pendi
     await route.fallback();
   });
   const first=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-0"] p');
-  await first.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');await page.keyboard.type('X');
+  await first.evaluate(node => {
+    (node.closest('[contenteditable]') as HTMLElement).focus();
+    const text = document.createTreeWalker(node, NodeFilter.SHOW_TEXT).nextNode()!;
+    const range = document.createRange(); range.setStart(text, 1); range.collapse(true);
+    window.getSelection()!.removeAllRanges(); window.getSelection()!.addRange(range);
+  });await page.keyboard.type('X');
   await expect.poll(()=>requests).toBe(1);
   const second=page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="body-2"] p');
-  await second.click();await page.keyboard.press('Home');await page.keyboard.press('ArrowRight');await page.keyboard.type('X');
+  await second.evaluate(node => {
+    (node.closest('[contenteditable]') as HTMLElement).focus();
+    const text = document.createTreeWalker(node, NodeFilter.SHOW_TEXT).nextNode()!;
+    const range = document.createRange(); range.setStart(text, 1); range.collapse(true);
+    window.getSelection()!.removeAllRanges(); window.getSelection()!.addRange(range);
+  });await page.keyboard.type('X');
   await expect(page.locator('.facecam-finding')).toHaveCount(0);
   release();
   await expect.poll(()=>f.saves).toBe(2);
@@ -674,4 +694,99 @@ test('ordinary anime creation needs only confirmation and opens an independent t
   expect(creations).toBe(1);
   await expect(page).toHaveURL(/\/project\/source\/script$/);
   await tab.close();
+});
+
+test('publication requires an explicit title and thumbnail; choices and manual edits survive reload', async ({page}) => {
+  const f = await fixture(page, {recording:true});
+  let metadata: ReturnType<typeof readyMetadata> | {revision:number; generation_id:string|null; candidates: typeof publicationCandidates|null; metadata:ReturnType<typeof publicationMetadata>|null; ready:boolean} = {
+    revision:1, generation_id:null, candidates:null, metadata:null, ready:false};
+  let thumbnails: Omit<ReturnType<typeof readyThumbnails>, 'selected'> & {selected: ReturnType<typeof readyThumbnails>['selected'] | null} = {
+    ...readyThumbnails(), candidates:[], selected:null, ready:false, generated:false};
+  let generations=0, failedSave=true;
+  await page.route('**/facecam/metadata**', async route => {
+    const path = new URL(route.request().url()).pathname;
+    if(path.endsWith('/generate')) {
+      generations++; metadata={...metadata,generation_id:'generation-1',candidates:publicationCandidates};
+      return route.fulfill({json:{...f.state,job:{status:'complete'}}});
+    }
+    if(path.endsWith('/title')) {
+      const request=route.request().postDataJSON();
+      expect(request.generation_id).toBe('generation-1');
+      metadata={...metadata,metadata:publicationMetadata(request.title),ready:true};
+    } else if(route.request().method()==='PUT') {
+      if(failedSave) {failedSave=false;return route.fulfill({status:503,json:{detail:'Enregistrement indisponible, réessayez.'}});}
+      metadata={...metadata,metadata:route.request().postDataJSON().metadata};
+    }
+    return route.fulfill({json:metadata});
+  });
+  await page.route('**/facecam/thumbnails', route => route.fulfill({json:thumbnails}));
+  await page.route('**/facecam/thumbnails/generate', route => {
+    thumbnails={...thumbnails,candidates:readyThumbnails().candidates,generated:true};
+    return route.fulfill({json:{...f.state,job:{status:'complete'}}});
+  });
+  await page.route('**/facecam/thumbnail', route => {
+    if(route.request().method()!=='PUT')return route.fulfill({contentType:'image/svg+xml',body:thumbnailImage});
+    const request=route.request().postDataJSON();
+    expect(request.version).toBe('sources-1');
+    thumbnails={...thumbnails,selected:{id:'selected-1',label:'Episode 1',...request},ready:true};
+    return route.fulfill({json:thumbnails});
+  });
+  await page.reload();
+  const process=page.getByRole('button',{name:'Passer au traitement'});
+  await expect(process).toBeDisabled();
+  await page.getByRole('button',{name:'Générer les métadonnées',exact:true}).click();
+  const titles=page.getByRole('dialog',{name:'Select Titles'});
+  await expect(titles.getByRole('button',{name:/Ce ninja cache un secret/})).toHaveCount(8);
+  await expect(process).toBeDisabled();
+  await titles.getByRole('button',{name:/Ce ninja cache un secret 6/}).click();
+  await titles.getByRole('button',{name:'Apply Selection'}).click();
+  await expect(page.locator('.facecam-publication-metadata blockquote')).toHaveText('Ce ninja cache un secret 6');
+  await expect(process).toBeDisabled();
+  await page.reload();
+  await expect(page.locator('.facecam-publication-metadata blockquote')).toHaveText('Ce ninja cache un secret 6');
+  await page.getByRole('button',{name:'Modifier les métadonnées'}).click();
+  const editor=page.getByRole('dialog',{name:'Edit metadata'});
+  await editor.getByPlaceholder('YouTube description').fill('Description corrigée à la main.');
+  await editor.getByRole('button',{name:'Save Changes'}).click();
+  await expect(editor.getByRole('alert')).toContainText('Enregistrement indisponible');
+  await expect(editor.getByPlaceholder('YouTube description')).toHaveValue('Description corrigée à la main.');
+  await editor.getByRole('button',{name:'Save Changes'}).click();
+  await expect(editor).toBeHidden();
+  await page.getByRole('button',{name:'Proposer 10 miniatures'}).click();
+  await expect(page.getByRole('button',{name:/Choisir la miniature \d+/})).toHaveCount(10);
+  await page.getByRole('button',{name:'Choisir la miniature 4',exact:true}).click();
+  await expect(process).toBeEnabled();
+  await page.reload();
+  await expect(process).toBeEnabled();
+  expect(generations).toBe(1);
+  expect(metadata.metadata?.youtube.description).toBe('Description corrigée à la main.');
+  await page.getByRole('button',{name:'Sélecteur manuel'}).click();
+  const manual=page.getByRole('dialog',{name:'Choisir une image dans un épisode'});
+  await expect(manual.getByAltText('Aperçu de la miniature verticale')).toBeVisible();
+  await manual.getByLabel('Instant (secondes)').fill('123.5');
+  await manual.getByRole('slider',{name:'Cadrage horizontal'}).fill('0.25');
+  await manual.getByRole('button',{name:'Utiliser cette image'}).click();
+  await expect(manual).toBeHidden();
+  expect(thumbnails.selected?.timestamp).toBe(123.5);
+  expect(thumbnails.selected?.crop_x).toBe(.25);
+  await expect(process).toBeEnabled();
+  await page.setViewportSize({width:390,height:844});
+  await page.locator('#facecam-publication-title').scrollIntoViewIfNeeded();
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBeTruthy();
+});
+
+test('metadata generation failure remains retryable and never unlocks processing', async ({page}) => {
+  const f=await fixture(page,{recording:true});
+  let attempted=false;
+  await page.route('**/facecam/metadata', route => route.fulfill({json:{revision:1,generation_id:null,candidates:null,metadata:null,ready:false}}));
+  await page.route('**/facecam/metadata/generate', route => {
+    attempted=true;
+    return route.fulfill({json:{...f.state,job:{status:'error',message:'Génération indisponible, réessayez.'}}});
+  });
+  await page.reload();
+  await page.getByRole('button',{name:'Générer les métadonnées',exact:true}).click();
+  await expect(page.locator('.facecam-status')).toContainText('Génération indisponible, réessayez.');
+  await expect(page.getByRole('button',{name:'Passer au traitement'})).toBeDisabled();
+  await expect(page.getByRole('button',{name:'Générer les métadonnées',exact:true})).toBeEnabled();
+  expect(attempted).toBe(true);
 });

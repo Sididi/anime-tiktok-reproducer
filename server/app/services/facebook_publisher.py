@@ -138,12 +138,14 @@ async def create_facebook_scheduled_post(
     prepared_video_url: str,
     scheduled_at: datetime,
     graph_api_version: str | None = None,
+    cover_url: str | None = None,
 ) -> FacebookHoldResult:
     """3-phase Reels upload with video_state=SCHEDULED at the target instant.
 
     The video was fully prepared (strategy applied + validated) by the backend
     at upload time; this only moves bytes and finishes the session."""
     base = _graph_base(graph_api_version)
+    cover_warning = None
     epoch = str(int(scheduled_at.astimezone(UTC).timestamp()))
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None)) as client:
         try:
@@ -214,6 +216,26 @@ async def create_facebook_scheduled_post(
                 )
         finally:
             video_path.unlink(missing_ok=True)
+        if cover_url:
+            # Same best-effort edge as the local Facebook publisher. Rejection
+            # does not duplicate or cancel the successfully scheduled Reel.
+            try:
+                content = bytearray()
+                async with client.stream("GET", cover_url, follow_redirects=True, timeout=30) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        content.extend(chunk)
+                        if len(content) > 2_000_000:
+                            raise ValueError("Miniature trop volumineuse")
+                if not content.startswith(b"\xff\xd8"):
+                    raise ValueError("La miniature n'est pas un JPEG")
+                response = await client.post(f"{base}/{video_id}/thumbnails",
+                    data={"access_token": page_access_token, "is_preferred": "true"},
+                    files={"source": ("thumbnail.jpg", bytes(content), "image/jpeg")}, timeout=30)
+                response.raise_for_status()
+            except Exception as exc:
+                cover_warning = f"Miniature Facebook non appliquée : {type(exc).__name__}"
+                logger.warning("Facebook scheduled cover failed for video %s: %s", video_id, type(exc).__name__)
     logger.info(
         "Facebook hold converted to native scheduled post page=%s video_id=%s at=%s",
         page_id,
@@ -221,5 +243,5 @@ async def create_facebook_scheduled_post(
         scheduled_at.isoformat(),
     )
     return FacebookHoldResult(
-        success=True, video_id=video_id, url=_page_video_url(page_id, video_id)
+        success=True, video_id=video_id, url=_page_video_url(page_id, video_id), detail=cover_warning
     )

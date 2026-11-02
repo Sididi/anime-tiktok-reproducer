@@ -14,6 +14,9 @@ interface TitleSelectionModalProps {
   metadataError?: string | null;
   overlay?: VideoOverlay | null;
   overlayError?: string | null;
+  isSaving?: boolean;
+  error?: string;
+  onClose?: () => void;
   onConfirm: (selection: {
     metadataTitle?: string;
     overlayTitle?: string;
@@ -63,6 +66,9 @@ export function TitleSelectionModal({
   overlay,
   overlayError,
   onConfirm,
+  isSaving = false,
+  error,
+  onClose,
 }: TitleSelectionModalProps) {
   const metadataOptions = metadataCandidates?.title_candidates ?? [];
   const overlayOptions = useMemo(() => {
@@ -98,8 +104,8 @@ export function TitleSelectionModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div
-        className={`flex w-full rounded-lg bg-[hsl(var(--card))] shadow-xl ${
+      <div role="dialog" aria-modal="true" aria-label="Select Titles"
+        className={`flex w-full max-h-[90vh] overflow-y-auto rounded-lg bg-[hsl(var(--card))] shadow-xl ${
           twoPaneLayout ? "max-w-7xl" : "max-w-4xl"
         }`}
       >
@@ -179,7 +185,9 @@ export function TitleSelectionModal({
             )}
           </div>
 
-          <div className="mt-4 flex justify-end">
+          {error && <p role="alert" className="mt-3 text-red-400">{error}</p>}
+          <div className="mt-4 flex justify-end gap-3">
+            {onClose && <Button variant="outline" disabled={isSaving} onClick={onClose}>Fermer</Button>}
             <Button
               onClick={() =>
               onConfirm({
@@ -189,7 +197,7 @@ export function TitleSelectionModal({
                     overlayOptions.length > 0 ? effectiveOverlayTitle : undefined,
                 })
               }
-              disabled={!canConfirmMetadata || !canConfirmOverlay}
+              disabled={isSaving || !canConfirmMetadata || !canConfirmOverlay}
             >
               Apply Selection
             </Button>

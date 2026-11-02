@@ -984,6 +984,7 @@ class UploadPhaseService:
             graph_api_version=str(
                 payload.get("graph_api_version") or settings.meta_graph_api_version
             ),
+            **({"cover_url": payload["cover_url"]} if payload.get("use_custom_cover") and payload.get("cover_url") else {}),
         )
         if result.success:
             return PlatformUploadResult(
@@ -1285,11 +1286,8 @@ class UploadPhaseService:
         progress_callback: Callable[[float, str, str], None] | None = None,
         platform_result_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
-        # THUMBNAIL FEATURE DISABLED (2026-08-16, owner request): force-clear
-        # both request fields so every downstream cover path (frame extraction,
-        # Drive hosting, YouTube thumbnails.set, Facebook thumb, Instagram
-        # cover_url/thumb_offset, TikTok thumbnail fields) stays inert.
-        # To re-enable, delete these two lines.
+        # The old rendered-frame selector remains disabled for standard projects.
+        # Facecam publishes its separately validated episode image below.
         thumbnail_timestamp_ms = None
         thumbnail_candidate_index = None
 
@@ -1312,6 +1310,10 @@ class UploadPhaseService:
             raise ValueError("Project not found")
         if project.archived_at:
             raise ArchivedProjectError()
+        facecam_thumbnail_path = None
+        if project.project_mode == "facecam":
+            from .facecam_publication_service import FacecamPublicationService
+            facecam_thumbnail_path = FacecamPublicationService.require_ready(project_id)
         requested_platforms = cls._normalize_platforms(platforms)
         # Urgent-immediate mode: these platforms publish right now (no
         # scheduled_at). "tiktok" is a valid member here even though it is
@@ -1620,6 +1622,9 @@ class UploadPhaseService:
             # (YouTube, Facebook). Extracted from the ORIGINAL output video, so
             # platform-side cut/sped_up retiming cannot shift the image.
             thumbnail_image_path: Path | None = None
+            if facecam_thumbnail_path is not None:
+                thumbnail_image_path = Path(tmp_dir) / "thumbnail.jpg"
+                shutil.copy2(facecam_thumbnail_path, thumbnail_image_path)
             if thumbnail_candidate_index is not None:
                 thumbnail_image_path = ThumbnailService.cover_image_for(
                     project_id,
@@ -1648,7 +1653,10 @@ class UploadPhaseService:
             cover_drive_url: str | None = None
             wants_hosted_cover = thumbnail_image_path is not None and (
                 ig_payload_base is not None
+                or (facecam_thumbnail_path is not None and fb_deferred)
                 or (
+                    project.project_mode != "facecam"
+                    and
                     account is not None
                     and account.tiktok is not None
                     and account.tiktok.post_for_me_platform == "tiktok_business"
@@ -1658,7 +1666,7 @@ class UploadPhaseService:
                 try:
                     uploaded_cover = GoogleDriveService.upsert_local_file(
                         parent_id=readiness.drive_folder_id,
-                        filename="thumbnail_cover.jpg",
+                        filename=f"facecam_thumbnail_{facecam_thumbnail_path.stem}.jpg" if facecam_thumbnail_path else "thumbnail_cover.jpg",
                         local_path=thumbnail_image_path,
                         chunksize=settings.drive_upload_chunk_mb * 1024 * 1024,
                     )
@@ -1673,6 +1681,8 @@ class UploadPhaseService:
                     )
 
             ig_payload = dict(ig_payload_base) if ig_payload_base is not None else None
+            if ig_payload is not None and facecam_thumbnail_path is not None and cover_drive_url:
+                ig_payload.update(cover_url=cover_drive_url, use_custom_cover=True)
             ig_prep_needed = False
             if (
                 "instagram" in requested_platforms
@@ -1693,7 +1703,8 @@ class UploadPhaseService:
 
             # Hosted-cover attach must precede the TikTok job closure below
             # (the PFM body is built from the payload inside the worker).
-            cls._attach_tiktok_cover(tiktok_payload, cover_drive_url)
+            if project.project_mode != "facecam":
+                cls._attach_tiktok_cover(tiktok_payload, cover_drive_url)
 
             jobs: dict[str, Any] = {}
 
@@ -1941,6 +1952,8 @@ class UploadPhaseService:
                             ],
                             "graph_api_version": settings.meta_graph_api_version,
                         }
+                        if facecam_thumbnail_path is not None and cover_drive_url:
+                            fb_payload["cover_url"] = cover_drive_url
                         results_by_platform["facebook"] = PlatformUploadResult(
                             platform="facebook",
                             status="skipped",

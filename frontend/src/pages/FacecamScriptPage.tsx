@@ -9,10 +9,10 @@ import { FacecamStories } from '@/components/script/FacecamStories';
 import { FacecamPrompter } from '@/components/script/FacecamPrompter';
 import { FacecamAutoEditor } from '@/components/script/FacecamAutoEditor';
 import { FacecamRecordingReview } from '@/components/script/FacecamRecordingReview';
-import { MetadataEditorModal } from '@/components/script/MetadataEditorModal';
+import { FacecamPublication } from '@/components/script/FacecamPublication';
 import { DEFAULT_FACECAM_AUTO_EDITOR, FULL_STORY_ID, facecamRequest, uploadFacecam, type FacecamAutoEditorSettings, type FacecamBlock, type FacecamState, type Finding, type RecordingCut } from '@/api/facecam';
 import { useFacecamPreview } from '@/hooks/useFacecamPreview';
-import type { PlatformMetadata, Project } from '@/types';
+import type { Project } from '@/types';
 import './facecam.css';
 
 const FacecamCuts = lazy(() => import('@/components/script/FacecamCuts').then(module => ({default: module.FacecamCuts})));
@@ -27,7 +27,8 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const [hook, setHook] = useState(''), [opinion, setOpinion] = useState(''), [stage, setStage] = useState<'hooks' | 'opinions'>('hooks');
   const [finding, setFinding] = useState<Finding | null>(null), [covers, setCovers] = useState<Cover[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null), [upload, setUpload] = useState<number | null>(null);
-  const [metadata, setMetadata] = useState<PlatformMetadata | null>(null), [metadataOpen, setMetadataOpen] = useState(false);
+  const [publication, setPublication] = useState<{revision: number; ready: boolean} | null>(null);
+  const [publicationBusy, setPublicationBusy] = useState(false);
   const [delivery, setDelivery] = useState<{status: string} | null>(project.facecam_delivery ?? null);
   const [sourceOpen, setSourceOpen] = useState(false), [sourceLoaded, setSourceLoaded] = useState(false);
   const [cutsOpen, setCutsOpen] = useState(false);
@@ -65,24 +66,20 @@ export function FacecamScriptPage({project}: {project: Project}) {
   }, []);
   const saveMusic = useCallback((music_key: string | null) => setSettings(previous => previous ? {...previous, music_key} : previous), []);
   const preview = useFacecamPreview({id, state, musicKey: settings?.music_key ?? null, settingsLoaded: !!settings,
-    approved, working: working || cutsOpen || reviewDirty, apply, saveMusic, onError: setError});
-  const busy = working || preview.requestBusy || state?.job?.status === 'processing';
-  const loadMetadata = useCallback(() => fetch(`/api/projects/${id}/metadata`).then(async response => {
-    if (response.ok) {const result = await response.json(); setMetadata(result.metadata);}
-  }), [id]);
+    approved, working: working || publicationBusy || cutsOpen || reviewDirty, apply, saveMusic, onError: setError});
+  const busy = working || publicationBusy || preview.requestBusy || state?.job?.status === 'processing';
   useEffect(() => {let cancelled = false;
     facecamRequest(id).then(next => {if (!cancelled) {apply(next); setHook(next.selected_hook); setOpinion(next.selected_opinion);}}).catch(e => setError(e.message));
     facecamRequest<Settings>(id, '/settings').then(setSettings).catch(e => setError(e.message));
-    void loadMetadata();
     return () => {cancelled = true;};
-  }, [id, apply, loadMetadata]);
+  }, [id, apply]);
   useEffect(() => {
     if (state?.job?.status !== 'processing') return;
     let source: EventSource | undefined, retry: ReturnType<typeof setTimeout> | undefined, stopped = false;
     function connect() {
       if (stopped) return;
       source = new EventSource(`/api/projects/${id}/facecam/events`);
-      source.onmessage = event => {if (stopped) return; const next = JSON.parse(event.data) as FacecamState; apply(next); if (next.job?.status !== 'processing') {source?.close(); void loadMetadata();}};
+      source.onmessage = event => {if (stopped) return; const next = JSON.parse(event.data) as FacecamState; apply(next); if (next.job?.status !== 'processing') {source?.close();}};
       source.onerror = () => {
         source?.close();
         facecamRequest(id).then(next => {
@@ -94,7 +91,7 @@ export function FacecamScriptPage({project}: {project: Project}) {
     }
     connect();
     return () => {stopped = true; source?.close(); clearTimeout(retry);};
-  }, [id, state?.job?.status, apply, loadMetadata]);
+  }, [id, state?.job?.status, apply]);
   useEffect(() => {const warn = (e: BeforeUnloadEvent) => {if (editVersion.current !== savedVersion.current) {e.preventDefault(); e.returnValue = '';}}; window.addEventListener('beforeunload', warn); return () => window.removeEventListener('beforeunload', warn);}, []);
   useEffect(() => {if (cutsOpen) {recordingPlayer.current?.pause(); sourcePlayer.current?.pause();}}, [cutsOpen]);
 
@@ -173,15 +170,16 @@ export function FacecamScriptPage({project}: {project: Project}) {
   const selection = stage === 'hooks' ? hook : opinion;
   const select = stage === 'hooks' ? setHook : setOpinion;
   const previewReady = preview.previewReady && !reviewDirty;
+  const publicationReady = publication?.revision === state.revision && publication.ready && approved;
   const cutsPending = !!state.recording_edit && !state.recording_edit.applied;
   const storyReady = originalMode || !!state.selected_story_id || (!state.stories?.length && state.blocks.length > 0);
   const wordCount = state.blocks.filter(b => b.kind !== 'raw').reduce((n, b) => n + (b.text.trim() ? b.text.trim().split(/\s+/).length : 0), 0);
   return <main className="facecam-page">
     <header className="flex flex-wrap items-start justify-between gap-4">
       <div><div className="facecam-eyebrow"><Video size={15}/> FACECAM · FRANÇAIS · MINIMAL</div><h1 className="text-3xl font-semibold mt-2">{project.anime_name}</h1><p className="text-sm opacity-60 mt-2">Votre texte, votre voix, votre regard.</p></div>
-      <div className="flex flex-wrap gap-2"><Button variant="outline" aria-expanded={sourceOpen} aria-controls="facecam-source-video" onClick={e => toggleSource(e.currentTarget)}><Play size={16} className="mr-2"/>Vidéo originale</Button><Button disabled={busy || !previewReady} onClick={() => navigate(`/project/${id}/processing`)}>Passer au traitement<ChevronRight size={16} className="ml-2"/></Button></div>
+      <div className="flex flex-wrap gap-2"><Button variant="outline" aria-expanded={sourceOpen} aria-controls="facecam-source-video" onClick={e => toggleSource(e.currentTarget)}><Play size={16} className="mr-2"/>Vidéo originale</Button><Button disabled={busy || !previewReady || !publicationReady} onClick={() => navigate(`/project/${id}/processing`)}>Passer au traitement<ChevronRight size={16} className="ml-2"/></Button></div>
     </header>
-    <ol className="facecam-steps">{['Histoire', 'Angle', 'Script', 'Enregistrement', 'Traitement'].map((label, i) => <li key={label} className={i < (previewReady ? 4 : approved ? 3 : state.blocks.length ? 2 : storyReady ? 1 : 0) ? 'done' : ''}><span>{i + 1}</span>{label}</li>)}</ol>
+    <ol className="facecam-steps">{['Histoire', 'Angle', 'Script', 'Enregistrement', 'Publication', 'Traitement'].map((label, i) => <li key={label} className={i < (previewReady && publicationReady ? 5 : previewReady ? 4 : approved ? 3 : state.blocks.length ? 2 : storyReady ? 1 : 0) ? 'done' : ''}><span>{i + 1}</span>{label}</li>)}</ol>
     {error && <div role="alert" className="facecam-error">{error}<button onClick={() => setError('')} aria-label="Fermer l’erreur">×</button></div>}
     {state.job && <div className={`facecam-status ${state.job.status === 'error' ? 'facecam-error' : ''}`} role="status">{state.job.status === 'processing' ? <Loader2 size={17} className="animate-spin"/> : state.job.status === 'complete' ? <Check size={17}/> : null}{state.job.message || state.job.step}</div>}
     <div className={`facecam-workspace ${sourceOpen ? 'facecam-workspace-with-video' : ''}`}>
@@ -250,9 +248,11 @@ export function FacecamScriptPage({project}: {project: Project}) {
       {state.cover && <img className="facecam-cover-preview" src={`/api/projects/${id}/facecam/cover?v=${JSON.stringify(state.cover)}`} alt="Couverture et titre de l’anime"/>}</div>
     </div>
     {!!covers.length && <div className="facecam-covers">{covers.map(c => <button key={c.id} disabled={busy} onClick={() => {setCovers([]); void action(`/covers/${c.id}`);}}><img src={c.coverImage.extraLarge} alt=""/><span>{c.title.english || c.title.romaji}</span></button>)}</div>}
-    <div className="flex flex-wrap gap-3 mt-5"><Button variant="outline" disabled={busy || !approved} onClick={() => void action('/metadata/generate')}>{metadata ? 'Régénérer les métadonnées' : 'Générer les métadonnées'}</Button>{metadata && <Button variant="outline" onClick={() => setMetadataOpen(true)}>Modifier les métadonnées</Button>}
+    <div className="flex flex-wrap gap-3 mt-5">
     {project.drive_folder_id && <><Button variant="outline" onClick={() => facecamRequest<{status:string}>(id, '/delivery').then(setDelivery).catch(e=>setError(e.message))}><RefreshCw size={14} className="mr-2"/>Actualiser la livraison</Button><span>{delivery?.status === 'complete' ? 'Montage terminé' : 'Montage en attente'}</span>{delivery?.status === 'complete' && <Button variant="outline" onClick={() => {if(window.confirm('Archiver le montage livré et demander une nouvelle version ?')) facecamRequest<{status:string}>(id,'/delivery/reopen','POST').then(setDelivery).catch(e=>setError(e.message));}}>Demander un nouveau montage</Button>}</>}
     </div></section>
+    <FacecamPublication id={id} state={state} disabled={!!busy || !saved || reviewDirty || cutsPending} approved={approved}
+      onState={apply} onReady={setPublication} onBusyChange={setPublicationBusy}/>
       </div>
     </div>
     <dialog ref={dialog} className="facecam-dialog facecam-candidates" onCancel={e => {e.preventDefault(); if(!busy) void closeChoices();}}><header className="flex justify-between items-center"><div><small>{stage === 'hooks' ? 'ÉTAPE 1 / 2' : 'ÉTAPE 2 / 2'}</small><h2>{stage === 'hooks' ? 'Choisissez votre accroche' : 'Quel est votre point de vue ?'}</h2></div><button aria-label="Fermer" disabled={busy} onClick={() => void closeChoices()}>×</button></header>
@@ -266,6 +266,6 @@ export function FacecamScriptPage({project}: {project: Project}) {
     </dialog>
     {cutsOpen && state.recording_edit && <Suspense fallback={<p role="status">Ouverture du montage…</p>}><FacecamCuts key={state.recording_edit.id} projectId={id} edit={state.recording_edit} busy={!!busy}
       job={state.job} onClose={closeCuts} onApply={applyCuts} onAnalyze={analyzeCuts}/></Suspense>}
-    {metadata && <MetadataEditorModal isOpen={metadataOpen} onClose={() => setMetadataOpen(false)} metadata={metadata} onSave={value => {facecamRequest(id, '/metadata', 'PUT', value).then(() => {setMetadata(value); setMetadataOpen(false);}).catch(e => setError(e.message));}}/>}
+
   </main>;
 }

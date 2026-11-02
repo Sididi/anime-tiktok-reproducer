@@ -779,6 +779,8 @@ def test_package_expands_subtitles_and_contains_original_media(source,monkeypatc
     monkeypatch.setattr(ExportService,'_collect_baked_subtitle_files',lambda *a:[mogrt])
     monkeypatch.setattr(ExportService,'_collect_subtitle_timing_files',lambda *a:[timing])
     monkeypatch.setattr(ExportService,'_build_subtitles_archive_entry',lambda *a,**k:pytest.fail('No nested ZIP for Facecam'))
+    from facecam_workflow_helpers import complete_publication
+    complete_publication(project.id, monkeypatch, episode)
     FacecamService.update(project.id,{'processed_signature':FacecamService.processing_signature(project.id)})
     bundle=ExportService.build_bundle(project,[])
     assert bundle.name==ExportService.output_folder_name(project)+'.zip'
@@ -790,6 +792,10 @@ def test_package_expands_subtitles_and_contains_original_media(source,monkeypatc
         assert archive.read(folder+'script.txt').decode()==state.spoken_text()
         assert archive.read(folder+'sources/facecam.mp4')==(b'retimed camera' if retimed else b'edited camera' if edited else b'media')
         assert archive.read(folder+'recording/original.mov') == b'media'
+        with Image.open(io.BytesIO(archive.read(folder+'metadata/thumbnail.jpg'))) as thumbnail:
+            assert thumbnail.size == (1080, 1920) and thumbnail.format == 'JPEG'
+        assert json.loads(archive.read(folder+'metadata/metadata.json'))['youtube']['title'] == 'Ce ninja cache un secret 2'
+        assert folder+'metadata/metadata.html' in names
         if extra_illustrations:
             assert archive.read(folder+'sources/extra.mp4') == b'extra illustration episode'
     FacecamService.save_draft(project.id,state.revision,state.blocks,'','')
@@ -814,6 +820,7 @@ def test_facecam_acl_changes_only_project_folder_and_is_idempotent(monkeypatch):
 
 
 def test_premiere_camera_clips_and_cover_have_frame_exact_ends():
+    import os
     import subprocess
     from app.services.processing import ProcessingService
     template=ProcessingService.PREMIERE_JSX_TEMPLATE_PATH.read_text()
@@ -838,7 +845,9 @@ assert.equal((placed[2].end-placed[2].start)*60,60);
 setTrackItemEndSeconds=()=>false;
 assert.throws(()=>placeFacecam(sequence),/duration/);
 '''
-    subprocess.run(['node','-e',harness],check=True,capture_output=True,text=True)
+    # OpenCV can inject conda's libffi into LD_LIBRARY_PATH; Node uses host libraries.
+    subprocess.run(['node','-e',harness],check=True,capture_output=True,text=True,
+                   env={k:v for k,v in os.environ.items() if k != 'LD_LIBRARY_PATH'})
 
 
 def test_responses_preserves_provider_citations_and_omits_sampling(monkeypatch):

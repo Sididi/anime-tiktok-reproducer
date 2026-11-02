@@ -455,8 +455,9 @@ async def test_dispatch_tiktok_resumes_uploading_after_crash(
 # Instagram dispatch tests
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("facecam_cover", [False, True])
 async def test_dispatch_instagram_happy_path(
-    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path
+    tmp_path: Path, example_yaml: Path, example_env, tmp_server_dir: Path, facecam_cover: bool
 ):
     settings = _settings_for(example_yaml, tmp_server_dir / "avatars")
     store = JobStore(tmp_path / "jobs.json")
@@ -474,6 +475,7 @@ async def test_dispatch_instagram_happy_path(
         "share_to_feed": False,
         "thumb_offset": 250,
         "cover_url": "https://drive.example/cover.jpg",
+        "use_custom_cover": facecam_cover,
     }
     job.platform_statuses = {"instagram": PlatformStatus(status="pending")}
     await store.create(job)
@@ -509,12 +511,11 @@ async def test_dispatch_instagram_happy_path(
     assert publish_mock.await_args.kwargs["poll_interval"] == 7
     assert publish_mock.await_args.kwargs["poll_timeout"] == 600
     assert publish_mock.await_args.kwargs["share_to_feed"] is False
-    # THUMBNAIL FEATURE DISABLED (2026-08-16, owner request): covers are not
-    # forwarded. Restore the equality assertions when re-enabling.
     assert "thumb_offset" not in publish_mock.await_args.kwargs
-    assert "cover_url" not in publish_mock.await_args.kwargs
-    # assert publish_mock.await_args.kwargs["thumb_offset"] == 250
-    # assert publish_mock.await_args.kwargs["cover_url"] == "https://drive.example/cover.jpg"
+    if facecam_cover:
+        assert publish_mock.await_args.kwargs["cover_url"] == "https://drive.example/cover.jpg"
+    else:
+        assert "cover_url" not in publish_mock.await_args.kwargs
     assert publish_mock.await_args.kwargs["project_id"] == "ig-job"
     assert "prepared_media_dir" not in publish_mock.await_args.kwargs
     assert "public_base_url" not in publish_mock.await_args.kwargs

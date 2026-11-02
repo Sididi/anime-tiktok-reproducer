@@ -1164,6 +1164,11 @@ async def process_project(project_id: str):
             raise HTTPException(400, "Les réglages de coupe ont changé. Préparez à nouveau l'aperçu audio.")
         if state.prepared.get("preview_music_key") != project.resolved_music_key():
             raise HTTPException(400, "La musique a changé. Préparez à nouveau l'aperçu audio.")
+        from ...services.facecam_publication_service import FacecamPublicationService
+        try:
+            await asyncio.to_thread(FacecamPublicationService.require_ready, project_id)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
         audio_path = Path(state.prepared["directory"]) / "narration.wav"
         try:
             await asyncio.to_thread(FacecamCoverService.ensure, project_id)
@@ -1193,6 +1198,11 @@ async def process_project(project_id: str):
                 job = _jobs.get(project_id)
                 if project_id in FacecamService._processing or (job and not job.done()):
                     yield 'data: ' + json.dumps({"status": "error", "error": "Une opération Facecam est déjà en cours."}) + "\n\n"
+                    return
+                try:
+                    FacecamPublicationService.require_ready(project_id)
+                except (ValueError, OSError) as exc:
+                    yield 'data: ' + json.dumps({"status": "error", "error": str(exc)}) + "\n\n"
                     return
                 FacecamService._processing.add(project_id)
         try:
@@ -1245,6 +1255,11 @@ async def download_bundle(project_id: str):
         from ...services.facecam_service import FacecamService
         if FacecamService.load(project_id).processed_signature != FacecamService.processing_signature(project_id):
             raise HTTPException(409, "Le projet a changé. Relancez le traitement et recréez le ZIP.")
+        from ...services.facecam_publication_service import FacecamPublicationService
+        try:
+            await asyncio.to_thread(FacecamPublicationService.require_ready, project_id)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     bundle_path = ProjectService.get_project_dir(project_id) / (ExportService.output_folder_name(project) + ".zip" if project.project_mode == "facecam" else "project_bundle.zip")
 

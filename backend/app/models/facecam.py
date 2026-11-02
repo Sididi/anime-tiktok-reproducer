@@ -166,6 +166,8 @@ class FacecamState(BaseModel):
     processed_signature: str | None = None
     delivery: dict[str, Any] | None = None
     cover: dict[str, Any] | None = None
+    metadata_generation: dict[str, Any] | None = None
+    thumbnail: dict[str, Any] | None = None
     job: dict[str, Any] | None = None
 
     def spoken_text(self) -> str:

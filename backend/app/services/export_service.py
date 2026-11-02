@@ -573,6 +573,8 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             state = FacecamService.load(project.id)
             if state.approved_revision != state.revision or state.processed_signature != FacecamService.processing_signature(project.id):
                 raise ValueError("Le projet Facecam a changé. Relancez le traitement avant l'export.")
+            from .facecam_publication_service import FacecamPublicationService
+            thumbnail_path = FacecamPublicationService.require_ready(project.id)
         output_dir = cls.get_output_dir(project.id)
         if not output_dir.exists():
             raise FileNotFoundError("Processing output directory not found")
@@ -600,6 +602,10 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
             ManifestEntry(relative_path=f"{folder}/tts_edited.wav", source_path=tts_path),
             ManifestEntry(relative_path=f"{folder}/{subtitle_name}", source_path=subtitle_path),
         ]
+
+        if project.project_mode == "facecam":
+            entries.append(ManifestEntry(relative_path=f"{folder}/metadata/thumbnail.jpg",
+                                         source_path=thumbnail_path, mime_type="image/jpeg"))
 
         # Optional metadata files
         metadata_json = ProjectService.get_metadata_file(project.id)
@@ -769,6 +775,9 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
 
     @classmethod
     def build_bundle(cls, project: Project, matches: list[SceneMatch]) -> Path:
+        if project.project_mode == "facecam":
+            from .facecam_publication_service import FacecamPublicationService
+            publication_signature = FacecamPublicationService.bundle_signature(project.id)
         folder, entries = cls.build_manifest(project, matches)
         bundle_path = ProjectService.get_project_dir(project.id) / (f"{folder}.zip" if project.project_mode == "facecam" else "project_bundle.zip")
         temporary_path = bundle_path.with_suffix(".zip.partial")
@@ -780,9 +789,13 @@ subtitles/              - CEP subtitle archive (extracts baked MOGRT files local
                     zf.writestr(entry.relative_path, entry.inline_content or b"")
         if project.project_mode == "facecam":
             from .facecam_service import FacecamService
-            if FacecamService.load(project.id).processed_signature != FacecamService.processing_signature(project.id):
-                temporary_path.unlink(missing_ok=True)
-                raise ValueError("Le projet a changé pendant l'export. Relancez le traitement.")
+            with FacecamService.lock(project.id):
+                if (FacecamService.load(project.id).processed_signature != FacecamService.processing_signature(project.id)
+                        or FacecamPublicationService.bundle_signature(project.id) != publication_signature):
+                    temporary_path.unlink(missing_ok=True)
+                    raise ValueError("Le projet a changé pendant l'export. Recréez le ZIP.")
+                temporary_path.replace(bundle_path)
+            return bundle_path
         temporary_path.replace(bundle_path)
         return bundle_path
 

@@ -43,6 +43,7 @@ class InstagramPayload(BaseModel):
     thumb_offset: int | None = None
     max_duration_seconds: float | None = None
     cover_url: str | None = None
+    use_custom_cover: bool | None = None  # Explicit Facecam opt-in; standard covers stay disabled.
 
 
 class TikTokPayload(BaseModel):
@@ -72,6 +73,7 @@ class FacebookPayload(BaseModel):
     prepared_video_url: str | None = None
     video_id: str | None = None
     graph_api_version: str = "v25.0"
+    cover_url: str | None = None
 
 
 class InitialPlatformStatus(BaseModel):

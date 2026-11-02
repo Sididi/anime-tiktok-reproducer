@@ -567,10 +567,8 @@ async def _dispatch_instagram_publish(
         share_to_feed=(
             True if payload.get("share_to_feed") is None else bool(payload["share_to_feed"])
         ),
-        # THUMBNAIL FEATURE DISABLED (2026-08-16, owner request):
-        # covers are not forwarded to the Graph container. Uncomment to re-enable.
-        # thumb_offset=payload.get("thumb_offset"),
-        # cover_url=payload.get("cover_url"),
+        # Standard covers remain disabled; Facecam explicitly enables its saved image.
+        **({"cover_url": payload["cover_url"]} if payload.get("use_custom_cover") and payload.get("cover_url") else {}),
         publish_state=job.instagram_publish_state,
         progress_callback=persist_instagram_state,
         project_id=job.project_id,
@@ -678,6 +676,7 @@ async def _dispatch_facebook_hold(
             title=str(payload.get("title") or ""),
             description=str(payload.get("description") or ""),
             prepared_video_url=str(payload.get("prepared_video_url") or ""),
+            **({"cover_url": payload["cover_url"]} if payload.get("cover_url") else {}),
             scheduled_at=sched,
             graph_api_version=payload.get("graph_api_version"),
         )
@@ -695,7 +694,7 @@ async def _dispatch_facebook_hold(
             PlatformStatus(
                 status="uploaded",
                 url=result.url,
-                detail=f"Scheduled natively at {sched.isoformat()} ({stage_on_success})",
+                detail=f"Scheduled natively at {sched.isoformat()} ({stage_on_success})" + (f"; {result.detail}" if result.detail else ""),
                 attempts=next_attempts,
                 completed_at=datetime.now(tz=UTC),
             ),

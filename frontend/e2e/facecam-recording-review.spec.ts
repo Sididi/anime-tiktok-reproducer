@@ -1,5 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 import { DEFAULT_FACECAM_AUTO_EDITOR, type FacecamState, type RecordingWordChange } from '../src/api/facecam';
+import {readyMetadata, readyThumbnails, thumbnailImage} from './helpers/facecamPublication';
 
 async function fixture(page: Page, options: {failSave?: boolean; noChanges?: boolean} = {}) {
   const id = 'recording-review';
@@ -35,6 +36,9 @@ async function fixture(page: Page, options: {failSave?: boolean; noChanges?: boo
     const path = new URL(route.request().url()).pathname.replace(`/api/projects/${id}`, '');
     const method = route.request().method();
     const json = (data: unknown) => route.fulfill({json: data});
+    if(path==='/facecam/metadata')return json(readyMetadata(state.revision));
+    if(path==='/facecam/thumbnails')return json(readyThumbnails());
+    if(path==='/facecam/thumbnail'||path.startsWith('/facecam/thumbnails/'))return route.fulfill({contentType:'image/svg+xml',body:thumbnailImage});
     if (path === '') return json({id, anime_name: 'Naruto', project_mode: 'facecam', library_type: 'anime', phase: 'script_restructure', source_paths: []});
     if (path === '/facecam') return json(state);
     if (path === '/metadata') return json({metadata: null});

@@ -193,6 +193,54 @@ def _execute(flow, **kwargs):
     )
 
 
+@pytest.mark.parametrize("facecam", [False, True])
+@pytest.mark.parametrize("immediate", [False, True])
+def test_facecam_thumbnail_reaches_publishers_without_enabling_standard_covers(flow, monkeypatch, tmp_path, facecam, immediate):
+    from app.services.facecam_publication_service import FacecamPublicationService
+    from app.services.account_service import AccountYouTubeConfig, AccountMetaConfig, AccountFacebookConfig, AccountInstagramConfig
+    from app.services.social_upload_service import PlatformUploadResult
+    flow.project.project_mode = 'facecam' if facecam else 'standard'
+    flow.account.supported_types = [flow.project.publishing_type]
+    flow.account.youtube = AccountYouTubeConfig(refresh_token='fixture', slots=['14:00'])
+    flow.account.facebook = AccountFacebookConfig(slots=['14:00'])
+    flow.account.instagram = AccountInstagramConfig(slots=['14:00'])
+    flow.account.meta = AccountMetaConfig(facebook_page_id='page', facebook_page_access_token='token',
+        instagram_business_account_id='ig', instagram_access_token='token')
+    cover = tmp_path / 'saved-choice.jpg'; cover.write_bytes(b'validated facecam image')
+    guard = MagicMock(return_value=cover)
+    monkeypatch.setattr(FacecamPublicationService, 'require_ready', guard)
+    monkeypatch.setattr(AccountService, 'get_youtube_credentials', lambda _: None)
+    monkeypatch.setattr(AccountService, 'get_meta_credentials', lambda _: SimpleNamespace(page_id='page', facebook_page_access_token='token'))
+    monkeypatch.setattr(UploadPhaseService, '_youtube_prep_dir', lambda _: tmp_path / 'yt')
+    monkeypatch.setattr(UploadPhaseService, '_facebook_prep_dir', lambda _: tmp_path / 'fb')
+    monkeypatch.setattr(UploadPhaseService, '_prepare_instagram_drive_video', lambda **kw: (None, {'instagram_drive_video_url':DIRECT_URL}))
+    uploaded = MagicMock(return_value={'id':'cover-1'})
+    monkeypatch.setattr(GoogleDriveService, 'upsert_local_file', uploaded)
+    calls = {}
+    def publish(platform, **kwargs):
+        image = kwargs.get('thumbnail_image_path')
+        calls[platform] = image.read_bytes() if image else None
+        return PlatformUploadResult(platform=platform, status='uploaded', url=f'https://example.org/{platform}')
+    monkeypatch.setattr(SocialUploadService, 'upload_youtube', lambda **kw: publish('youtube', **kw))
+    monkeypatch.setattr(SocialUploadService, 'upload_facebook', lambda **kw: publish('facebook', **kw))
+    ig_now = MagicMock(return_value=PlatformUploadResult(platform='instagram',status='uploaded',url='https://example.org/ig'))
+    monkeypatch.setattr(UploadPhaseService, '_publish_instagram_immediate', ig_now)
+    _execute(flow, platforms=['youtube','facebook','instagram'], immediate_platforms=['instagram'] if immediate else [],
+             thumbnail_candidate_index=1, thumbnail_timestamp_ms=1000)
+    assert calls == {'youtube':b'validated facecam image' if facecam else None, 'facebook':b'validated facecam image' if facecam else None}
+    assert guard.call_count == int(facecam)
+    if immediate:
+        payload = ig_now.call_args.kwargs['payload']
+    else:
+        payload = flow.create_job.call_args.kwargs['instagram']
+    if facecam:
+        assert payload['cover_url'] == 'https://drive.example/download/cover-1' and payload['use_custom_cover']
+        assert uploaded.call_args.kwargs['filename'] == 'facecam_thumbnail_saved-choice.jpg'
+    else:
+        assert 'cover_url' not in payload
+        uploaded.assert_not_called()
+
+
 @pytest.mark.parametrize("immediate", [False, True])
 @pytest.mark.parametrize("suffix", ["#WhatToWatch", "#NewCampaign", ""])
 def test_tiktok_campaign_suffix_reaches_publish_and_reminder(

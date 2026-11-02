@@ -16,8 +16,6 @@ from pydub import AudioSegment
 from ..config import settings
 from ..library_types import LibraryType, resolve_static_overlay_title
 from ..models import (
-    METADATA_TITLE_CANDIDATE_COUNT,
-    METADATA_TITLE_MAX_CHARS,
     Project,
     Transcription,
 )
@@ -376,52 +374,7 @@ class ScriptAutomationService:
 
     @classmethod
     def _metadata_response_schema(cls) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "title_candidates": {
-                    "type": "array",
-                    "minItems": METADATA_TITLE_CANDIDATE_COUNT,
-                    "maxItems": METADATA_TITLE_CANDIDATE_COUNT,
-                    "items": {
-                        "type": "string",
-                        "maxLength": METADATA_TITLE_MAX_CHARS,
-                    },
-                },
-                "facebook": {
-                    "type": "object",
-                    "properties": {
-                        "description": {"type": "string"},
-                        "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                    },
-                    "required": ["description", "tags"],
-                    "additionalProperties": False,
-                },
-                "instagram": {
-                    "type": "object",
-                    "properties": {
-                        "hashtags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "minItems": 1,
-                        },
-                    },
-                    "required": ["hashtags"],
-                    "additionalProperties": False,
-                },
-                "youtube": {
-                    "type": "object",
-                    "properties": {
-                        "description": {"type": "string"},
-                        "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                    },
-                    "required": ["description", "tags"],
-                    "additionalProperties": False,
-                },
-            },
-            "required": ["title_candidates", "facebook", "instagram", "youtube"],
-            "additionalProperties": False,
-        }
+        return MetadataService.candidate_response_schema()
 
     @classmethod
     def _ensure_sentence_end(cls, text: str) -> str:

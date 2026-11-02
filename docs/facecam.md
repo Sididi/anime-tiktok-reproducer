@@ -6,7 +6,50 @@ Facecam is a separate project mode for anime sources. Create it beside Duplicate
 
 Opening a Facecam does not start generation. Choose the writing model above the story section, then click “Analyser les histoires” to detect the stories present in its source. Model changes are saved before analysis can start. A single story is selected automatically; when several distinct arcs exist, choose one before the hook. Cards show the premise, progression, endpoint and omitted material. Alternative hooks on the same arc are not separate stories. Existing drafts are preserved: detection is explicitly started, and choosing a story resets the draft and its dependent results. Choices persist across reloads; failed detection is retryable.
 
-Then choose/edit one of eight hooks and, optionally, one of eight opinions, generate, edit the full script, approve it for recording, record, clean up failed takes, review the complete recorded script, validate it to place scenes and prepare the audio preview, then process. Writing approval makes no scene-assignment or illustration calls. “Sans point de vue” clears the selected opinion; an empty opinion omits that block when generating and takes the story directly to the fixed title-reveal phrase. This choice survives reloads and can be changed before regenerating. Retained original-dialogue markers cannot be removed in the text editor. The fixed closing phrase introduces a visual title reveal; do not speak the anime title.
+Then choose/edit one of eight hooks and, optionally, one of eight opinions, generate, edit the full script, approve it for recording, record, clean up failed takes, review the complete recorded script, validate it to place scenes and prepare the audio preview, prepare publication, then process. Writing approval makes no scene-assignment or illustration calls. “Sans point de vue” clears the selected opinion; an empty opinion omits that block when generating and takes the story directly to the fixed title-reveal phrase. This choice survives reloads and can be changed before regenerating. Retained original-dialogue markers cannot be removed in the text editor. The fixed closing phrase introduces a visual title reveal; do not speak the anime title.
+
+## Mandatory publication preparation
+
+**Préparer la publication** requires generated metadata, an explicitly selected title, and a selected
+episode thumbnail before processing. The API enforces the same checks, including for direct process,
+ZIP export/download and social upload requests. Existing Facecams must complete this step too.
+
+Metadata uses the standard anime `MetadataService` prompt, the anime name and current script
+(including retained original dialogue), French output, the project's model preset and its **light**
+tier, with the same structured eight-title schema as faceless automation. Generation never silently
+chooses the first title. The shared title picker and metadata editor support selecting and editing
+the platform fields. Choices persist on disk; a changed script/anime or an outdated generation ID
+cannot validate or overwrite current metadata. A failed generation preserves the previous choices;
+a failed form save preserves the user's edits for retry. Metadata and thumbnail changes invalidate
+the ZIP without rerunning audio or scene selection.
+
+Thumbnail proposals use **zero paid API calls**. A bounded local pass samples at most 80 frames,
+prioritizing retained montage shots and committed V4 alternatives, then spreading samples across
+their associated episodes. It skips the usual episode opening/ending regions for the extra samples,
+rejects fades/flat images, evaluates vertical crops for detail and exposure, and removes near-duplicates.
+It proposes up to ten distinct images; scarce or unreadable sources can produce fewer. The pass stops
+sampling after approximately one minute plus an in-flight decode. Successful proposals are cached.
+This is an image-quality heuristic, not a semantic character/face recognition model.
+
+**Sélecteur manuel** browses the same episodes by timestamp, timeline slider and native-frame steps.
+It shows the complete image and vertical crop together; horizontal/vertical sliders adjust framing.
+Selection extracts the original source frame and exports an RGB/sRGB JPEG at **1080 × 1920 (9:16),
+under 2 MB**, without stretching. The ZIP includes `metadata/thumbnail.jpg`, `metadata.json` and
+`metadata.html`. Source changes invalidate thumbnails; an app-verified audio-only remux preserves
+them. The publication thumbnail is separate from the final anime-reveal card.
+
+Facecam uploads reuse this image for YouTube and Facebook's existing thumbnail endpoints and host
+an immutable copy for Instagram (immediate or scheduled) and long-range Facebook scheduling.
+Scheduled Instagram explicitly opts in with `use_custom_cover`; standard-project covers and TikTok's
+old thumbnail selector stay disabled. Facebook's optional thumbnail attempt is best effort: a refusal
+is reported without failing or duplicating the successfully published/scheduled video. The VPS changes
+must be deployed with the backend for scheduled Instagram and long-range Facebook covers.
+
+Format reference: [YouTube's current Shorts thumbnail guidance](https://support.google.com/youtube/answer/72431?hl=en-GB-)
+recommends 9:16 and supports custom uploads from desktop Studio on verified accounts.
+The implementation uses JPEG for Instagram's `cover_url` path; see the
+[Meta media reference](https://developers.facebook.com/docs/instagram-platform/instagram-graph-api/reference/ig-user/media/).
+No live platform upload is necessary for the regression tests.
 
 ## Full-script recording review and deferred scene placement
 

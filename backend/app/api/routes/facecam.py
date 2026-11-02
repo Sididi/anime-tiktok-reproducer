@@ -7,8 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ...models.facecam import FacecamAutoEditorSettings, FindingRange, RecordingCut, ScriptBlock
@@ -408,33 +408,107 @@ async def cover(project_id: str):
     return FileResponse(FacecamService.directory(project_id) / "anime_reveal.png")
 
 
+class MetadataSelectionRequest(BaseModel):
+    revision: int
+    generation_id: str
+    title: str
+
+
+class MetadataSaveRequest(BaseModel):
+    revision: int
+    generation_id: str
+    metadata: dict[str, Any]
+
+
+class ThumbnailSelectionRequest(BaseModel):
+    version: str
+    episode: str
+    timestamp: float = Field(ge=0, allow_inf_nan=False)
+    crop_x: float = Field(default=.5, ge=0, le=1, allow_inf_nan=False)
+    crop_y: float = Field(default=.5, ge=0, le=1, allow_inf_nan=False)
+
+
+async def _publication_call(project_id, function, *args):
+    _state(project_id)
+    try:
+        return await asyncio.to_thread(function, project_id, *args)
+    except ValueError as exc:
+        raise HTTPException(409 if isinstance(exc, StaleFacecamRevision) else 400, str(exc)) from exc
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@router.get("/{project_id}/facecam/metadata")
+async def metadata_status(project_id: str):
+    from ...services.facecam_publication_service import FacecamPublicationService
+    return await _publication_call(project_id, FacecamPublicationService.status)
+
+
 @router.post("/{project_id}/facecam/metadata/generate")
-async def generate_metadata(project_id: str):
-    def build(pid):
-        from ...services.metadata import MetadataService
-        state, project = _state(pid), FacecamService.project(pid)
-        prompt = MetadataService.build_prompt(project.anime_name or "Anime", state.spoken_text(), "fr")
-        result = FacecamService.llm(pid, prompt)
-        if "title_candidates" in result:
-            payload = MetadataService.resolve_candidate_payload(result, selected_title=result["title_candidates"][0])
-        else:
-            payload = MetadataService.validate_payload(result)
-        with FacecamService.lock(pid):
-            if FacecamService.load(pid).revision != state.revision:
-                raise StaleFacecamRevision("Le script a changé; régénérez les métadonnées.")
-            MetadataService.save(pid, payload)
-    return await _job(project_id, "Métadonnées de publication", build)
+async def generate_metadata(project_id: str, request: ActionRequest):
+    from ...services.facecam_publication_service import FacecamPublicationService
+    return await _job(project_id, "Métadonnées de publication", FacecamPublicationService.generate, request.revision)
+
+
+@router.put("/{project_id}/facecam/metadata/title")
+async def select_metadata_title(project_id: str, request: MetadataSelectionRequest):
+    from ...services.facecam_publication_service import FacecamPublicationService
+    _require_idle(project_id)
+    return await _publication_call(project_id, FacecamPublicationService.select_title,
+                                   request.revision, request.generation_id, request.title)
 
 
 @router.put("/{project_id}/facecam/metadata")
-async def save_metadata(project_id: str, payload: dict[str, Any]):
-    from ...services.metadata import MetadataService
-    _state(project_id)
-    try:
-        MetadataService.save(project_id, MetadataService.validate_payload(payload))
-        return {"saved": True}
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+async def save_metadata(project_id: str, request: MetadataSaveRequest):
+    from ...services.facecam_publication_service import FacecamPublicationService
+    _require_idle(project_id)
+    return await _publication_call(project_id, FacecamPublicationService.save_metadata,
+                                   request.revision, request.generation_id, request.metadata)
+
+
+@router.get("/{project_id}/facecam/thumbnails")
+async def thumbnails(project_id: str):
+    from ...services.facecam_thumbnail_service import FacecamThumbnailService
+    return await _publication_call(project_id, FacecamThumbnailService.status)
+
+
+@router.post("/{project_id}/facecam/thumbnails/generate")
+async def generate_thumbnails(project_id: str):
+    from ...services.facecam_thumbnail_service import FacecamThumbnailService
+    return await _job(project_id, "Sélection de miniatures", FacecamThumbnailService.generate)
+
+
+@router.put("/{project_id}/facecam/thumbnail")
+async def select_thumbnail(project_id: str, request: ThumbnailSelectionRequest):
+    from ...services.facecam_thumbnail_service import FacecamThumbnailService
+    _require_idle(project_id)
+    return await _publication_call(project_id, FacecamThumbnailService.select, request.version,
+                                   request.episode, request.timestamp, request.crop_x, request.crop_y)
+
+
+@router.get("/{project_id}/facecam/thumbnail")
+async def selected_thumbnail(project_id: str):
+    from ...services.facecam_thumbnail_service import FacecamThumbnailService
+    path = await _publication_call(project_id, FacecamThumbnailService.require_selected)
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "no-cache"})
+
+
+@router.get("/{project_id}/facecam/thumbnails/frame")
+async def thumbnail_frame(project_id: str, version: str, episode: str,
+                          timestamp: float = Query(ge=0, allow_inf_nan=False)):
+    from ...services.facecam_thumbnail_service import FacecamThumbnailService
+    content = await _publication_call(project_id, FacecamThumbnailService.frame, version, episode, timestamp)
+    return Response(content, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.get("/{project_id}/facecam/thumbnails/{candidate_id}")
+async def thumbnail_candidate(project_id: str, candidate_id: str, version: str):
+    from ...services.facecam_thumbnail_service import FacecamThumbnailService
+    status = await _publication_call(project_id, FacecamThumbnailService.status)
+    if status["version"] != version or not any(c["id"] == candidate_id for c in status["candidates"]):
+        raise HTTPException(404, "Miniature indisponible. Rechargez les propositions.")
+    path = FacecamThumbnailService.directory(project_id) / version / f"{candidate_id}.jpg"
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
 
 @router.get("/{project_id}/facecam/delivery")
