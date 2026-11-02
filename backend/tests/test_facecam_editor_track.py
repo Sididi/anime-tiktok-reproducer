@@ -223,7 +223,7 @@ function placeFacecamEditorTrack(){} function verifyFacecamEditorTrack(){} funct
 function applyVideoPresetToTrackItems(index,name){applied.push([index,name])}
 ''' + preset + '''
 assert.deepEqual(applied,OVERLAY_ENABLED?[[0,'foreground'],[5,'overlay'],[6,'overlay']]:[[0,'foreground']]);
-var FACECAM={filename:'facecam.mp4',cover:'anime_reveal.png',scale:100,cover_start:5,camera_segments:[{start_frame:0,end_frame:300,source_frame:30}]};
+var FACECAM={filename:'facecam.mp4',cover:'anime_reveal.png',scale:100,cover_start:5,cover_end:6,camera_segments:[{start_frame:0,end_frame:300,source_frame:30}]};
 var TRACK_ITEM_WAIT_MAX_MS=1, placed=[];
 function getOrImportClip(name){return {name,setInPoint(s){this.in=s},setOutPoint(s){this.out=s},clearInPoint(){},clearOutPoint(){}}}
 sequence.videoTracks.forEach(t=>t.overwriteClip=(clip,start)=>placed.push({index:t.index,start,name:clip.name}));
@@ -244,7 +244,7 @@ def test_facecam_main_omits_legacy_video_layers_but_keeps_audio_and_subtitles(ov
     main = jsx[begin:jsx.index("\n  // ========================================================================", begin)]
     run_js("var OVERLAY_ENABLED=" + json.dumps(overlays) + ";\n" + '''
 const assert=require('node:assert/strict');
-var FACECAM={cover_start:5,editor_track:{clips:[{clipName:'extra'}]}};
+var FACECAM={cover_start:5,cover_end:6,editor_track:{clips:[{clipName:'extra'}]}};
 // Non-native speeds and raw scenes must not recreate either removed video layer.
 var scenes=[{scene_index:0,clipName:'episode',start:0,end:2,effective_speed:2},
             {scene_index:1,clipName:'episode',start:2,end:5,is_raw:true}];

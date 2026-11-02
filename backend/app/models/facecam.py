@@ -7,6 +7,10 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 ENDING = "Le nom de l’anime c’est :"
 
 
+def default_ending(anime_title: str | None) -> str:
+    return f"{ENDING} {(anime_title or '').strip()}".rstrip()
+
+
 class FacecamCandidate(BaseModel):
     id: str
     text: str = Field(min_length=1)

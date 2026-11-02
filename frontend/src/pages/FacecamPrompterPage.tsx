@@ -70,7 +70,7 @@ function PrompterReader({ projectId }: { projectId: string }) {
       lastFrame = now;
       el.scrollTop = position;
       if (position >= maximum) {
-        finished = true; pause(); setNotice('Fin de la narration · le titre sera ajouté au montage'); return;
+        finished = true; pause(); setNotice('Fin de la narration'); return;
       }
       if (now - lastReport > 250) { report(); lastReport = now; }
       frame = requestAnimationFrame(tick);
@@ -169,7 +169,7 @@ function PrompterReader({ projectId }: { projectId: string }) {
         {script?.blocks.map(block => block.kind === 'raw'
           ? <div key={block.id} data-prompter-block={block.id} className="prompter-raw">Extrait original · ne pas lire</div>
           : block.text.trim() && <p key={block.id} data-prompter-block={block.id}>{block.text}</p>)}
-        {readable && <div className="prompter-end">Fin · titre ajouté au montage</div>}
+        {readable && <div className="prompter-end">Fin de la narration</div>}
       </div>
     </div>
     <div className="prompter-guide" aria-hidden="true">›</div>

@@ -11,7 +11,7 @@ function coordinates(doc: ProseMirrorNode) {
     if (block.attrs.kind === 'raw') return;
     if (spoken) chars.push({text: '\n', from: null, to: null}, {text: '\n', from: null, to: null});
     spoken = true;
-    if (block.attrs.kind === 'ending') {
+    if (block.type.name === 'facecamMarker') {
       for (const text of Array.from(String(block.attrs.text))) chars.push({text, from: null, to: null});
       return;
     }

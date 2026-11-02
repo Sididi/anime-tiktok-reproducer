@@ -69,6 +69,12 @@ def test_short_scenes_reduce_choices_and_raw_dialogue_and_cover_are_protected():
     assert len(plan["skipped"]) == 2
 
 
+def test_illustrations_stop_at_reveal_even_when_later_scenes_have_no_slot():
+    scenes = [scene(0, 0, 6, 0, 10), scene(1, 6, 8, 10, 12), scene(2, 8, 10, 12, 14)]
+    plan = Editor.place_alternatives(scenes, [], {}, 5, FrameRateInfo(24, False))
+    assert [(c['start_frame'], c['end_frame']) for c in plan['clips']] == [(0, 300)]
+
+
 def test_candidates_use_their_own_native_clock_in_ntsc_project():
     c = alternative(0)
     plan = Editor.place_alternatives([scene(0, 0, 8, 0, 10)], [c], {-1: resolved(c)}, 8, FrameRateInfo(24, True))

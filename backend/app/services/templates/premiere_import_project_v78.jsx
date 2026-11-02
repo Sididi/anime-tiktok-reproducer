@@ -3069,7 +3069,7 @@
     log("Narration gain verified on A2: " + VOICE_GAIN_DB + " dB.");
 
     var sequenceEndSec = ttsEndSec;
-    if (FACECAM) sequenceEndSec = FACECAM.cover_start + 1;
+    if (FACECAM) sequenceEndSec = FACECAM.cover_end;
 
     // Give Premiere an early chance to materialize the border image before
     // the heavier preset and subtitle graphics work. The final call after
@@ -3261,8 +3261,8 @@
     main.overwriteClip(cover, FACECAM.cover_start);
     var card = resolvePlacedItemFast(main, FACECAM.cover_start, stripKnownExtension(FACECAM.cover), TRACK_ITEM_WAIT_MAX_MS);
     if (!card) throw new Error("Anime cover placement failed");
-    if (!setTrackItemEndSeconds(card, FACECAM.cover_start + 1)) throw new Error("The cover must last exactly 60 frames");
-    if (Math.round((getTrackItemEndSeconds(card) - FACECAM.cover_start) * 60) !== 60) throw new Error("Incorrect anime reveal duration");
+    if (!setTrackItemEndSeconds(card, FACECAM.cover_end)) throw new Error("The cover must last until the end of the narration");
+    if (Math.round(getTrackItemEndSeconds(card) * 60) !== Math.round(FACECAM.cover_end * 60)) throw new Error("Incorrect anime reveal duration");
     setScaleOnItem(card, 100);
   }
 

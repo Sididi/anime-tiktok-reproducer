@@ -11,7 +11,7 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from ..models import MatchList, Transcription
-from ..models.facecam import ENDING, StoryArc, StoryClip
+from ..models.facecam import StoryArc, StoryClip, default_ending
 
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class FacecamStoryService:
     WORDS_PER_SECOND = 3.35  # Initial estimate, not a measurement of the user's voice.
     TARGET_MIN = 65
     TARGET_MAX = 70
-    COVER_SECONDS = 1
+    COVER_SECONDS = 0  # The reveal now overlaps the spoken ending.
     MAX_ATTEMPTS = 3
 
     @staticmethod
@@ -102,11 +102,11 @@ class FacecamStoryService:
         raise AssertionError("Unreachable story analysis attempt")
 
     @classmethod
-    def full_story(cls, reference, matches) -> StoryArc:
+    def full_story(cls, reference, matches, anime_title: str | None = None) -> StoryArc:
         """An application-owned option, available independently of model analysis."""
         raw_indices = {s.scene_index for s in reference.scenes if s.is_raw}
         raw_duration = sum(m.end_time - m.start_time for m in matches.matches if m.scene_index in raw_indices)
-        words = sum(len(s.text.split()) for s in reference.scenes if not s.is_raw) + len(ENDING.split())
+        words = sum(len(s.text.split()) for s in reference.scenes if not s.is_raw) + len(default_ending(anime_title).split())
         return StoryArc(
             id=cls.FULL_STORY_ID, title="Garder toute l’histoire",
             premise="Conserver toutes les étapes du récit source et les extraits audio originaux.",

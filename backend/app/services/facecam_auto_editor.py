@@ -32,6 +32,7 @@ def settings_signature(settings: FacecamAutoEditorSettings) -> str:
 def prepared_is_current(state: FacecamState) -> bool:
     prepared = state.prepared or {}
     return bool(state.recording and prepared
+                and "cover_end" in prepared  # Rebuild old fixed-duration reveals using cached alignment.
                 and (not state.recording_edit or state.recording_edit.applied)
                 and state.approved_revision == state.revision
                 and prepared.get("revision") == state.revision

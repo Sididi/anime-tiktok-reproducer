@@ -9,7 +9,7 @@ async function fixture(context: BrowserContext, options: { failSave?: boolean; e
       { id: 'hook', kind: 'hook', text: 'Imagine ce héros.', scene_indices: [] },
       { id: 'body', kind: 'body', text: 'Il revient dans sa ville après un long voyage. '.repeat(8), scene_indices: [0] },
       { id: 'raw', kind: 'raw', text: 'Cette réplique originale ne doit jamais être affichée.', scene_indices: [1] },
-      { id: 'ending', kind: 'ending', text: 'Le nom de l’anime c’est :', scene_indices: [] },
+      { id: 'ending', kind: 'ending', text: 'Le nom de l’anime c’est : Naruto', scene_indices: [] },
     ],
     findings: [], fact_revision: null, fact_status: 'unchecked', fact_error: null,
     recording: null, prepared: null, cover: null, job: null,
@@ -61,7 +61,7 @@ test('reads narration and cues at 1024×600, remotely controls playback, and rec
   await expect(reader.locator('.prompter-script')).toContainText('Extrait original · ne pas lire');
   await expect(reader.locator('.prompter-script')).not.toContainText('Cette réplique originale');
   await expect(reader.locator('.prompter-script')).toContainText('Le nom de l’anime c’est :');
-  await expect(reader.locator('.prompter-script')).not.toContainText('Naruto');
+  await expect(reader.locator('[data-prompter-block="ending"]')).toHaveText('Le nom de l’anime c’est : Naruto');
   expect(await reader.locator('body').evaluate(el => el.scrollWidth)).toBe(1024);
 
   await panel.getByRole('button', { name: 'Lire', exact: true }).click();
@@ -115,6 +115,18 @@ test('saves before opening and pauses at the start when a newer draft arrives', 
   await expect.poll(() => position(reader)).toBe(0);
   await expect(reader.getByRole('status')).toContainText('Texte actualisé');
   expect(f.saves).toBe(2);
+});
+
+test('the prompter follows shortened and omitted spoken titles', async ({ page, context }) => {
+  await fixture(context);
+  const reader = await open(page);
+  const ending = page.getByLabel('Script Facecam complet', {exact:true}).locator('section[data-facecam="ending"] p');
+  for (const text of ['Le nom de l’anime c’est : Naru', 'Le nom de l’anime c’est :']) {
+    await ending.fill(text);
+    await expect(reader.locator('[data-prompter-block="ending"]')).toHaveText(text);
+    await reader.reload();
+    await expect(reader.locator('[data-prompter-block="ending"]')).toHaveText(text);
+  }
 });
 
 test('standalone reader supports keyboard, stops at the end and reloads the saved text', async ({ page, context }) => {

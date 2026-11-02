@@ -24,6 +24,7 @@ export function useFacecamPreview({id, state, musicKey, settingsLoaded, approved
     && (!state.recording_edit || state.recording_edit.applied);
   const prepared = state?.prepared;
   const previewReady = ready && !!prepared?.preview_version && !!prepared.auto_editor_signature
+    && Number.isFinite(prepared.cover_end) && Number.isFinite(prepared.duration_seconds)
     && prepared.revision === state?.revision && prepared.fingerprint === state?.recording?.fingerprint
     && prepared.preview_music_key === selectedMusic && sameAutoEditorSettings(tuning, prepared.auto_editor);
   const musicChanged = settingsLoaded && selectedMusic !== musicKey;

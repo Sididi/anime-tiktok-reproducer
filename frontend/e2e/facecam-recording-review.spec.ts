@@ -77,7 +77,7 @@ async function fixture(page: Page, options: {failSave?: boolean; noChanges?: boo
   return {saves, validations, errors, get state() {return state;}, get previews() {return previews;},
     complete() {
       state = {...state, placement: {...state.placement!, status: 'complete', assignment_complete: true}, job: {status: 'complete'},
-        prepared: {revision: state.revision, fingerprint: 'take', preview_version: 'done', preview_music_key: 'music',
+        prepared: {duration_seconds: 70, cover_end: 70, revision: state.revision, fingerprint: 'take', preview_version: 'done', preview_music_key: 'music',
           auto_editor: {...DEFAULT_FACECAM_AUTO_EDITOR}, auto_editor_signature: 'settings'}};
       release?.();
     }};

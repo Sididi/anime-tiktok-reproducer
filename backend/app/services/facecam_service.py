@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import Project, ProjectPhase
-from ..models.facecam import ENDING, FacecamCandidate, FacecamFinding, FacecamState, FindingRange, ScriptBlock
+from ..models.facecam import FacecamCandidate, FacecamFinding, FacecamState, FindingRange, ScriptBlock, default_ending
 from .atomic_files import write_text_atomic
 from .llm_service import LLMService
 from .project_service import ProjectService
@@ -75,7 +75,8 @@ class FacecamService:
         # Also expose the integral option on projects analyzed before it was introduced.
         # References are installed after the first state write during creation.
         if (cls.directory(project_id) / "reference_matches.json").exists():
-            state.full_story = FacecamStoryService.full_story(cls.reference(project_id), cls.source_matches(project_id))
+            state.full_story = FacecamStoryService.full_story(cls.reference(project_id), cls.source_matches(project_id),
+                                                            cls.project(project_id).anime_name)
         return state
 
     @classmethod
@@ -266,7 +267,7 @@ class FacecamService:
             if not original and not full_story and state.stories_fingerprint != fingerprint:
                 raise ValueError("La source a changé. Relancez l'analyse des histoires.")
             if full_story:
-                story = FacecamStoryService.full_story(reference, matches)
+                story = FacecamStoryService.full_story(reference, matches, cls.project(project_id).anime_name)
                 FacecamStoryService.validate({"stories": [story.model_dump()]}, reference, matches, enforce_budget=False)
             if state.selected_story_id == story_id and state.stories_fingerprint == fingerprint:
                 return state
@@ -309,7 +310,7 @@ class FacecamService:
                                           kind="body", scene_indices=[scene.scene_index]))
         if include_opinion:
             blocks.append(ScriptBlock(id="opinion", kind="opinion"))
-        blocks.append(ScriptBlock(id="ending", kind="ending", text=ENDING))
+        blocks.append(ScriptBlock(id="ending", kind="ending", text=default_ending(cls.project(project_id).anime_name)))
         return blocks
 
     @classmethod
@@ -386,8 +387,6 @@ class FacecamService:
         for block in blocks:
             if block.kind == "raw":
                 block.text = ""
-            elif block.kind == "ending":
-                block.text = ENDING
         with cls.lock(project_id):
             old = cls.load(project_id)
             if old.revision != revision:
@@ -451,7 +450,7 @@ class FacecamService:
         context = cls.narrative_context(project_id)
         budget = context.get("budget")
         if budget:
-            fixed_words = len((hook + " " + opinion + " " + ENDING).split())
+            fixed_words = len((hook + " " + opinion + " " + blocks[-1].text).split())
             context["body_budget"] = {"min_words": max(0, budget["min_words"] - fixed_words),
                                       "max_words": max(0, budget["max_words"] - fixed_words),
                                       "advisory": True}

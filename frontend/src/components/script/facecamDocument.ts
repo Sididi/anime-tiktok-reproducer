@@ -12,6 +12,6 @@ export const Marker = Node.create({name: 'facecamMarker', group: 'block', atom: 
   renderHTML({node}) {return ['div', {'data-facecam-marker': node.attrs.id, contenteditable: 'false', class: 'facecam-marker'}, node.attrs.kind === 'raw' ? 'Extrait audio original' : node.attrs.text];},
 });
 export function signature(doc: {content?: JSONContent[]}) {return JSON.stringify(doc.content?.map(n => [n.type, n.attrs?.id, n.attrs?.kind, n.attrs?.scene_indices, n.type === 'facecamMarker' ? n.attrs?.text : undefined]));}
-export function document(blocks: FacecamBlock[], editEnding = false): JSONContent {return {type: 'doc', content: blocks.map(b => b.kind === 'raw' || (b.kind === 'ending' && !editEnding) ? {type: 'facecamMarker', attrs: b} : {type: 'facecamSection', attrs: b, content: b.text.split('\n').map(t => ({type: 'paragraph', content: t ? [{type: 'text', text: t}] : []}))})};}
+export function document(blocks: FacecamBlock[], editEnding = true): JSONContent {return {type: 'doc', content: blocks.map(b => b.kind === 'raw' || (b.kind === 'ending' && !editEnding) ? {type: 'facecamMarker', attrs: b} : {type: 'facecamSection', attrs: b, content: b.text.split('\n').map(t => ({type: 'paragraph', content: t ? [{type: 'text', text: t}] : []}))})};}
 export function blocksFrom(doc: JSONContent): FacecamBlock[] {return (doc.content || []).map(n => ({...n.attrs, text: n.type === 'facecamMarker' ? n.attrs?.text || '' : (n.content || []).map(p => (p.content || []).map(t => t.type === 'hardBreak' ? '\n' : t.text || '').join('')).join('\n')} as FacecamBlock));}
 

@@ -4,7 +4,7 @@ import json
 import pytest
 
 from test_facecam import source, draft, range_model  # noqa: F401 -- shared project fixture
-from app.models.facecam import ENDING, FacecamState
+from app.models.facecam import default_ending, FacecamState
 from app.services.facecam_service import FacecamService, StaleFacecamRevision
 from facecam_workflow_helpers import approve_and_assign, validate_recording
 from app.services.facecam_original_service import FacecamOriginalService
@@ -61,7 +61,7 @@ def test_original_research_and_writing_never_receive_source_story_or_old_body(so
     assert result.blocks[0].text == '  Mon accroche retouchée.  '
     assert [b.text for b in result.blocks if b.kind == 'opinion'] == ([opinion] if opinion else [])
     assert [b.kind for b in result.blocks] == ['hook', 'body', *(['opinion'] if opinion else []), 'ending']
-    assert result.blocks[1].scene_indices == [0, 2] and result.blocks[-1].text == ENDING
+    assert result.blocks[1].scene_indices == [0, 2] and result.blocks[-1].text == default_ending(project.anime_name)
     assert result.estimated_duration_seconds is not None
     assert result.fact_status == 'unchecked' and result.fact_revision is None and not result.findings
     assert result.original_brief['sources'] == EVIDENCE['sources']

@@ -12,7 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.config import settings
 from app.models import Project, ProjectPhase, Scene, SceneList, MatchList, SceneMatch, Transcription, SceneTranscription
-from app.models.facecam import ENDING
+from app.models.facecam import ENDING, default_ending
 from app.services.project_service import ProjectService
 from app.services.facecam_service import FacecamService, StaleFacecamRevision
 from facecam_workflow_helpers import approve_and_assign, validate_recording
@@ -90,7 +90,7 @@ def test_narrative_brief_is_shared_but_source_prose_never_reaches_writer(source,
     state = FacecamService.generate(project.id, 'Une accroche choisie.', 'Un avis précis.', initial.revision)
     assert len(prompts) == 5  # Shared extraction, hooks, opinions, draft, oral edit.
     assert [b.id for b in state.blocks] == ['hook', 'body-0', 'raw-1', 'body-2', 'opinion', 'ending']
-    assert state.blocks[2].text == '' and state.blocks[-1].text == ENDING
+    assert state.blocks[2].text == '' and state.blocks[-1].text == default_ending(project.anime_name)
     assert state.blocks[0].text == 'Une accroche choisie.'
 
 
@@ -117,8 +117,8 @@ def test_optional_opinion_can_be_generated_edited_approved_and_restored(source, 
     monkeypatch.setattr(FacecamService, 'llm', range_model)
     state = approve_and_assign(project.id, state.revision)
     assert state.approved_revision == state.revision
-    assert state.assignment[-1]['text'] == ENDING
-    assert ProjectService.load_transcription(project.id).scenes[-1].text == ENDING
+    assert state.assignment[-1]['text'] == default_ending(project.anime_name)
+    assert ProjectService.load_transcription(project.id).scenes[-1].text == default_ending(project.anime_name)
     monkeypatch.setattr(FacecamService, 'llm', write_body)
     state = FacecamService.generate(project.id, state.selected_hook, 'Un avis précis.', state.revision)
     assert state.blocks[-2].kind == 'opinion' and state.blocks[-2].text == 'Un avis précis.'
@@ -200,7 +200,7 @@ def test_oral_edit_uses_facts_and_draft_but_only_replaces_body(source, monkeypat
     assert len(calls) == 2 and state.revision == old.revision + 1
     assert [b.text for b in state.blocks if b.kind == 'body'] == ['Naruto arrive.', 'Il devient ninja.']
     assert [(b.id, b.scene_indices, b.text) for b in state.blocks if b.kind == 'raw'] == [('raw-1', [1], '')]
-    assert state.blocks[0].text == 'Une accroche choisie.' and state.blocks[-1].text == ENDING
+    assert state.blocks[0].text == 'Une accroche choisie.' and state.blocks[-1].text == default_ending(project.anime_name)
     assert [b.text for b in state.blocks if b.kind == 'opinion'] == ([opinion] if opinion else [])
     archive, = (FacecamService.directory(project.id) / 'generations').glob('*.json')
     saved = json.loads(archive.read_text())
@@ -297,6 +297,20 @@ def test_stale_generation_is_rejected_before_calling_model(source, monkeypatch):
         FacecamService.generate(project.id, 'Accroche.', 'Opinion.', state.revision - 1)
 
 
+@pytest.mark.parametrize('ending', [f'{ENDING} Naruto Shippuden', f'{ENDING} Naruto', ENDING])
+def test_edited_reveal_survives_save_reload_approval_and_assignment(source, monkeypatch, ending):
+    project, state = draft(source)
+    state.blocks[-1].text = ending
+    saved = FacecamService.save_draft(project.id, state.revision, state.blocks,
+                                     state.selected_hook, state.selected_opinion)
+    assert FacecamService.load(project.id).blocks[-1].text == ending
+    monkeypatch.setattr(FacecamService, 'llm', range_model)
+    assigned = approve_and_assign(project.id, saved.revision)
+    assert assigned.blocks[-1].text == ending
+    assert assigned.assignment[-1]['text'].endswith(ending)
+    assert ProjectService.load_transcription(project.id).scenes[-1].text.endswith(ending)
+
+
 def test_copy_is_independent_french_minimal_and_resets_integrations(source):
     project = FacecamService.create(source.id)
     assert (project.project_mode, project.publishing_type, project.library_type.value) == ('facecam','facecam','anime')
@@ -322,7 +336,7 @@ def test_approval_preserves_every_word_order_and_raw_boundaries(source,monkeypat
     assert ' '.join(r['text'] for r in result.assignment).split() == state.spoken_text().split()
     current = ProjectService.load_transcription(project.id)
     assert [r['text'] for r,s in zip(result.assignment,current.scenes) if s.is_raw] == [''] * sum(s.is_raw for s in reference.scenes)
-    assert current.scenes[-1].text.endswith(ENDING)
+    assert current.scenes[-1].text.endswith(default_ending(project.anime_name))
     assert not current.scenes[-1].is_raw
     ProjectService.validate_transcription_scene_alignment(project.id,current)
     assert len(ProjectService.load_matches(project.id).matches) == len(current.scenes)
@@ -827,7 +841,7 @@ def test_premiere_camera_clips_and_cover_have_frame_exact_ends():
     place='function placeFacecam'+template.split('  function placeFacecam',1)[1].split('\n  function ',1)[0]
     harness='''
 const assert=require('node:assert/strict');
-var FACECAM={filename:'facecam.mp4',cover:'anime_reveal.png',scale:100,cover_start:5,camera_segments:[{start_frame:0,end_frame:60,source_frame:30},{start_frame:180,end_frame:300,source_frame:90}]};
+var FACECAM={filename:'facecam.mp4',cover:'anime_reveal.png',scale:100,cover_start:5,cover_end:8.5,camera_segments:[{start_frame:0,end_frame:60,source_frame:30},{start_frame:180,end_frame:300,source_frame:90}]};
 var TRACK_ITEM_WAIT_MAX_MS=1,placed=[];
 function getOrImportClip(name){return {name,setInPoint(s){this.in=s},setOutPoint(s){this.out=s},clearInPoint(){},clearOutPoint(){}};}
 var sequence={videoTracks:Array.from({length:5},(_,index)=>({overwriteClip(clip,start){placed.push({index,start,sourceIn:clip.in,sourceOut:clip.out,name:clip.name})}}))};
@@ -839,9 +853,9 @@ function setScaleOnItem(item,scale){item.scale=scale;}
 '''+place+'''
 placeFacecam(sequence);
 assert.deepEqual(placed.map(p=>p.index),[3,3,2]);
-assert.deepEqual(placed.map(p=>[p.start,p.end]),[[0,1],[3,5],[5,6]]);
+assert.deepEqual(placed.map(p=>[p.start,p.end]),[[0,1],[3,5],[5,8.5]]);
 assert.deepEqual(placed.slice(0,2).map(p=>[p.sourceIn,p.sourceOut]),[[0.5,1.5],[1.5,3.5]]);
-assert.equal((placed[2].end-placed[2].start)*60,60);
+assert.equal((placed[2].end-placed[2].start)*60,210);
 setTrackItemEndSeconds=()=>false;
 assert.throws(()=>placeFacecam(sequence),/duration/);
 '''
@@ -870,7 +884,8 @@ def test_responses_preserves_provider_citations_and_omits_sampling(monkeypatch):
 
 
 @pytest.mark.parametrize('speed', [1.0, 1.25])
-def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,monkeypatch,speed):
+@pytest.mark.parametrize('ending', [ENDING, f'{ENDING} Naruto', f'{ENDING} Naruto Shippuden'])
+def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,monkeypatch,speed,ending):
     import array, contextlib, math, wave
     from app.models import Word
     from app.services.processing import ProcessingService
@@ -879,6 +894,8 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     from app.services import facecam_media_service as media
     from app.models.facecam import FacecamAutoEditorSettings
     project,state=draft(source)
+    state.blocks[-1].text=ending
+    state=FacecamService.save_draft(project.id,state.revision,state.blocks,state.selected_hook,state.selected_opinion)
     monkeypatch.setattr(FacecamService,'llm',range_model)
     state=approve_and_assign(project.id,state.revision)
     root=FacecamService.directory(project.id)/'recordings'/'test';root.mkdir(parents=True)
@@ -924,13 +941,19 @@ def test_preview_reuses_one_voice_camera_timeline_with_original_dialogue(source,
     assert abs((raw.end_time-raw.start_time)-2)<1/60
     clips=result.prepared['camera_segments']
     assert all(c['end_frame']/60<=raw.start_time+1/60 or c['start_frame']/60>=raw.end_time-1/60 for c in clips)
-    assert sum(c['end_frame']-c['start_frame'] for c in clips)==round(clean_duration*60)
+    assert sum(c['end_frame']-c['start_frame'] for c in clips)<round(clean_duration*60)
     assert result.prepared['camera_time_scale']==1/speed
     assert Path(result.prepared['camera_path'])==(work/'facecam.mp4' if speed!=1.0 else root/'facecam.mp4')
     voice_duration=ProcessingService._probe_wav_duration(work/'narration.wav')
     assert abs(voice_duration-(clean_duration+2))<1/60
-    assert 0<=result.prepared['cover_start']-voice_duration<1/60
-    assert result.prepared['scenes'][-1]['duration_frames']==60
+    outro=transcription.scenes[-1]
+    first_reveal_word=outro.words[len(state.selected_opinion.split())]
+    assert 0<=first_reveal_word.start-result.prepared['cover_start']<1/60
+    assert 0<=result.prepared['cover_end']-voice_duration<1/60
+    assert result.prepared['duration_seconds']==result.prepared['cover_end']
+    assert result.prepared['scenes'][-1]['duration_frames']==round((result.prepared['cover_end']-result.prepared['cover_start'])*60)
+    assert clips[-1]['end_frame']==round(result.prepared['cover_start']*60)
+    assert all(c['end_frame']<=round(result.prepared['cover_start']*60) for c in clips)
     assert FacecamMediaService.prepare(project.id).prepared==result.prepared
     assert len(align_calls)==1
     # Changing only the tuning must rebuild audio using cached alignment without a new

@@ -149,7 +149,7 @@ def test_invalid_tuning_is_rejected(field, value):
 def current_state():
     settings = FacecamAutoEditorSettings()
     return FacecamState(revision=3, approved_revision=3, recording={'fingerprint': 'original'},
-        prepared={'revision': 3, 'fingerprint': 'original', 'auto_editor_signature': settings_signature(settings)})
+        prepared={'cover_end': 60, 'revision': 3, 'fingerprint': 'original', 'auto_editor_signature': settings_signature(settings)})
 
 
 @pytest.mark.parametrize('field,value', [('noise_threshold_db', -32), ('min_silence_ms', 200), ('margin_before_ms', 80), ('margin_after_ms', 140), ('speed', 1.15)])
@@ -161,6 +161,9 @@ def test_every_setting_invalidates_prepared_audio(field, value):
 
 
 def test_legacy_preview_recording_changes_and_revision_changes_are_stale():
+    state = current_state()
+    del state.prepared['cover_end']
+    assert not prepared_is_current(state)
     state = current_state()
     del state.prepared['auto_editor_signature']
     assert not prepared_is_current(state)

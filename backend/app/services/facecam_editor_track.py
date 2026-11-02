@@ -128,6 +128,8 @@ class FacecamEditorTrackService:
         minimum = max(1, math.ceil(settings.facecam_illustration_min_preview_seconds * 60))
         for index, scene in enumerate(scenes):
             start = round(scene["start"] * 60)
+            if start >= cover_frame:
+                continue  # The spoken reveal is already covered by the title image.
             next_start = round(scenes[index + 1]["start"] * 60) if index + 1 < len(scenes) else cover_frame
             end = min(round(scene["end"] * 60), next_start, cover_frame)
             if start < 0 or end <= start:

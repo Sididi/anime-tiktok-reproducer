@@ -1334,6 +1334,7 @@ class ProcessingService:
             from .facecam_editor_track import FacecamEditorTrackService
             state = FacecamService.load(project.id)
             facecam = {"camera_segments": state.prepared["camera_segments"], "cover_start": state.prepared["cover_start"], "filename": "facecam.mp4", "cover": "anime_reveal.png",
+                "cover_end": state.prepared["cover_end"],
                 "scale": (state.recording or {}).get("scale", 100),
                 "editor_track": FacecamEditorTrackService.build(project, scenes, source_rate)}
         voice_key = project.resolved_voice_key()

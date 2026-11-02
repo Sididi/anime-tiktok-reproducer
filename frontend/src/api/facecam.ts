@@ -58,7 +58,7 @@ export interface FacecamState {
   placement?: FacecamPlacement | null;
   auto_editor?: FacecamAutoEditorSettings;
   preview_enabled?: boolean;
-  prepared: {revision: number; fingerprint: string; preview_music_key?: string | null; preview_version?: string; duration_seconds?: number;
+  prepared: {revision: number; fingerprint: string; preview_music_key?: string | null; preview_version?: string; duration_seconds?: number; cover_end?: number;
     auto_editor?: FacecamAutoEditorSettings; auto_editor_signature?: string;
     cut_report?: {removed_seconds: number; cut_count: number; protected_word_count: number; clipped_word_count: number};
   } | null; cover: {anilist_id?: number; manual?: boolean; frame?: boolean; title?: string} | null;

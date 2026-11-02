@@ -87,6 +87,25 @@ def camera_segments(keep: list[tuple[int, int]], playback: list, time_scale: flo
     return result
 
 
+def reveal_timing(blocks, transcription: Transcription, voice_duration: float) -> tuple[int, int]:
+    """Locate the editable ending on the final clock, after cuts, speed and raw inserts."""
+    end_frame = math.ceil(voice_duration * FPS - 1e-7)
+    tokens = lambda text: re.findall(r"[^\W_]+", text.casefold(), re.UNICODE)
+    ending = tokens(" ".join(b.text for b in blocks if b.kind == "ending"))
+    if not ending:
+        # Recording review can omit the entire reveal. Retain the silent card in
+        # that case; a spoken reveal (even without the title) never adds a tail.
+        return end_frame, end_frame + FPS
+    words = [(token, word.start) for scene in transcription.scenes if not scene.is_raw
+             for word in scene.words for token in tokens(word.text)]
+    if len(words) < len(ending) or [token for token, _ in words[-len(ending):]] != ending:
+        raise ValueError("Impossible de synchroniser la révélation du titre. Vérifiez la fin du texte enregistré.")
+    start = words[-len(ending)][1]
+    if not math.isfinite(start) or not 0 <= start < voice_duration:
+        raise ValueError("Horodatage de la révélation du titre invalide. Préparez à nouveau l’aperçu.")
+    return math.floor(start * FPS + 1e-7), end_frame
+
+
 class FacecamMediaService:
     @staticmethod
     def apply_speed(clean: Path, camera: Path, work: Path, speed: float) -> tuple[Path, Path, float]:
@@ -362,8 +381,12 @@ class FacecamMediaService:
         output_voice = work / "narration.wav"
         ProcessingService.rebuild_tts_audio_with_playback_segments(voice, output_voice, playback,
             apply_tail_fade=False, exact_sample_boundaries=True)
-        clips = camera_segments(keep, playback, time_scale)
-        end = math.ceil(ProcessingService._probe_wav_duration(output_voice) * FPS - 1e-7) / FPS
+        cover_start, cover_end = reveal_timing(state.blocks, transcription,
+                                              ProcessingService._probe_wav_duration(output_voice))
+        # Camera and title share a Premiere track. Do not insert any camera
+        # pieces underneath/after the reveal, including cuts inside a long title.
+        clips = [{**clip, "end_frame": min(clip["end_frame"], cover_start)}
+                 for clip in camera_segments(keep, playback, time_scale) if clip["start_frame"] < cover_start]
         write_text_atomic(work / "transcription.json", transcription.model_dump_json())
         cut_report = {"source_duration_seconds": duration,
             "clean_duration_seconds": sum(b - a for a, b in keep) / FPS,
@@ -376,10 +399,11 @@ class FacecamMediaService:
         prepared = {"revision": state.revision, "fingerprint": state.recording["fingerprint"], "directory": str(work),
             "auto_editor": tuning.model_dump(), "auto_editor_signature": signature, "cut_report": cut_report,
             "camera_path": str(camera), "camera_time_scale": time_scale,
-            "keep_frames": [list(interval) for interval in keep], "camera_segments": clips, "cover_start": end,
-            "duration_seconds": end + 1,
+            "keep_frames": [list(interval) for interval in keep], "camera_segments": clips,
+            "cover_start": cover_start / FPS, "cover_end": cover_end / FPS,
+            "duration_seconds": cover_end / FPS,
             "alignment_path": str(report_path),
-            "scenes": [{"kind": "cover", "start_frame": round(end * FPS), "duration_frames": FPS}]}
+            "scenes": [{"kind": "cover", "start_frame": cover_start, "duration_frames": cover_end - cover_start}]}
         with FacecamService.lock(project_id):
             current = FacecamService.load(project_id)
             if current.auto_editor != tuning or not current.recording or current.recording["fingerprint"] != state.recording["fingerprint"]:

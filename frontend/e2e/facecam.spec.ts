@@ -2,7 +2,7 @@ import {test,expect,type Page} from '@playwright/test';
 import {DEFAULT_FACECAM_AUTO_EDITOR, type FacecamState, type FacecamStory} from '../src/api/facecam';
 import {readyMetadata, readyThumbnails, publicationCandidates, publicationMetadata, thumbnailImage} from './helpers/facecamPublication';
 
-async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; fullDuration?: number; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean; failOriginal?: boolean; delayedOriginal?: boolean}) {
+async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; fullDuration?: number; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean; failOriginal?: boolean; delayedOriginal?: boolean; duration?: number; legacyReveal?: boolean}) {
   const id='facecam-browser';
   let checks=0,saves=0,analyses=0;
   let preset='gpt',music='music';
@@ -18,14 +18,15 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
     hooks:Array.from({length:8},(_,i)=>({id:`hook-${i}`,text:`Accroche ${i+1}`,original:i===0})),opinions:Array.from({length:8},(_,i)=>({id:`opinion-${i}`,text:`Avis ${i+1}`,original:false})),
     blocks:[{id:'hook',kind:'hook',text:'Imagine ce ninja.',scene_indices:[]},{id:'body-0',kind:'body',text:'Naruto poursuit son rêve.',scene_indices:[0]},
       {id:'raw-1',kind:'raw',text:'',scene_indices:[1]},{id:'body-2',kind:'body',text:'Il devient plus fort.',scene_indices:[2]},
-      {id:'opinion',kind:'opinion',text:'Ce choix est intéressant.',scene_indices:[]},{id:'ending',kind:'ending',text:'Le nom de l’anime c’est :',scene_indices:[]}],
+      {id:'opinion',kind:'opinion',text:'Ce choix est intéressant.',scene_indices:[]},{id:'ending',kind:'ending',text:'Le nom de l’anime c’est : Naruto',scene_indices:[]}],
     fact_revision:1,fact_status:'complete',fact_error:null,findings:[{id:'finding-1',quote:'Naruto',start:19,end:25,kind:'uncertain',explanation:'Identité à vérifier.',correction:'Vérifiez le prénom.',sources:[{url:'https://example.org/official',title:'Site officiel'}]}],recording:null,prepared:null,cover:null,job:null};
   if(options?.empty) state={...state,revision:0,blocks:[],selected_hook:'',selected_opinion:'',hooks:[],opinions:[],findings:[],fact_revision:null};
   state={...state,full_story:{id:'full-story',title:'Garder toute l’histoire',premise:'Le récit complet.',ending:'La fin de la source.',steps:['Toutes les étapes.'],omitted:[],
     clips:[0,1,2].map(scene_index=>({scene_index,start_word:null,end_word:null})),raw_duration_seconds:10,estimated_duration_seconds:options?.fullDuration??142}};
   if(options?.recording) state={...state,approved_revision:state.revision,auto_editor:{...DEFAULT_FACECAM_AUTO_EDITOR},
     recording:{fingerprint:'take-1',duration:77,transcript:'Imagine ce ninja.',differences:[],reviewed_revision:state.revision},
-    prepared:{revision:state.revision,fingerprint:'take-1',preview_music_key:'music',preview_version:'original',
+    prepared:{revision:state.revision,fingerprint:'take-1',duration_seconds:options.duration??70,
+      ...(options.legacyReveal?{}:{cover_end:options.duration??70}),preview_music_key:'music',preview_version:'original',
       ...(options.legacyPreview?{}:{auto_editor:{...DEFAULT_FACECAM_AUTO_EDITOR},auto_editor_signature:'signature-0'})}};
   if(options?.noPreview) state={...state,prepared:null};
   if(options?.unreviewed && state.recording) state={...state,preview_enabled:true,prepared:null,recording:{...state.recording,reviewed_revision:null}};
@@ -67,7 +68,7 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
       const snapshotMusic=music,version=previews.length;
       state={...state,auto_editor:data.auto_editor,preview_enabled:true};
       finishPreview=()=>{
-        state={...state,job:{status:'complete'},prepared:{revision:state.revision,fingerprint:'take-1',
+        state={...state,job:{status:'complete'},prepared:{revision:state.revision,fingerprint:'take-1',duration_seconds:(options?.duration??70)/data.auto_editor.speed,cover_end:(options?.duration??70)/data.auto_editor.speed,
           auto_editor:data.auto_editor,auto_editor_signature:`signature-${version}`,preview_music_key:snapshotMusic,preview_version:`preview-${version}`,
           cut_report:{removed_seconds:13.4,cut_count:26,protected_word_count:221,clipped_word_count:0}}};
         releaseJob?.();
@@ -114,7 +115,7 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
           {id:'hook',kind:'hook',text:data.hook,scene_indices:[]},
           {id:'body-original',kind:'body',text:'Une présentation entièrement nouvelle.',scene_indices:[0,2]},
           ...(data.opinion.trim()?[{id:'opinion',kind:'opinion' as const,text:data.opinion,scene_indices:[]}]:[]),
-          {id:'ending',kind:'ending',text:'Le nom de l’anime c’est :',scene_indices:[]},
+          {id:'ending',kind:'ending',text:'Le nom de l’anime c’est : Naruto',scene_indices:[]},
         ] : state.blocks.filter(b=>b.kind!=='opinion'||data.opinion.trim())};return json(state);
     }
     if(path==='/facecam/generate-original'){
@@ -140,6 +141,65 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
   await expect(page.getByRole('heading',{name:'Naruto',exact:true})).toBeVisible();
   return {analysisPresets,previews,originalRequests,scriptRequests,completeOriginal:()=>finishOriginal?.(),completePreview:()=>finishPreview?.(),get conflictingRequests(){return conflictingRequests;},get state(){return state;},get saves(){return saves;},get checks(){return checks;},get analyses(){return analyses;}};
 }
+
+test('editable reveal keeps a shortened title or just the introduction after reload',async({page})=>{
+  const f=await fixture(page);
+  const ending=page.getByLabel('Script Facecam complet',{exact:true}).locator('section[data-facecam="ending"] p');
+  await expect(ending).toHaveText('Le nom de l’anime c’est : Naruto');
+  for(const text of ['Le nom de l’anime c’est : Naruto Shippuden', 'Le nom de l’anime c’est : Naruto', 'Le nom de l’anime c’est :']) {
+    await ending.fill(text);
+    await expect.poll(()=>f.state.blocks.at(-1)?.text).toBe(text);
+    await page.reload();
+    await expect(ending).toHaveText(text);
+    await expect(page.getByText('Extrait audio original',{exact:true})).toBeVisible();
+  }
+});
+
+for(const duration of [59, 60, 60.5, 60 + 59/60]) {
+  test(`processing asks for confirmation at ${duration} seconds and cancellation stays on the script`,async({page})=>{
+    const f=await fixture(page,{recording:true,duration});
+    const process=page.getByRole('button',{name:'Passer au traitement'});
+    await expect(process).toBeEnabled();
+    expect(f.previews).toHaveLength(0);
+    const messages:string[]=[];
+    page.once('dialog',async dialog=>{messages.push(dialog.message());await dialog.dismiss();});
+    await process.click();
+    await expect(page).toHaveURL(/\/script$/);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toContain('moins de 1 min 01 s');
+    expect(messages[0]).toContain(duration.toLocaleString('fr-FR',{maximumFractionDigits:2}));
+    page.once('dialog',async dialog=>{await dialog.accept();});
+    await process.click();
+    await expect(page).toHaveURL(/\/processing$/);
+  });
+}
+
+for(const duration of [61, 70]) {
+  test(`processing needs no duration confirmation at ${duration} seconds`,async({page})=>{
+    await fixture(page,{recording:true,duration});
+    const dialogs:string[]=[];
+    page.on('dialog',async dialog=>{dialogs.push(dialog.message());await dialog.dismiss();});
+    await page.getByRole('button',{name:'Passer au traitement'}).click();
+    await expect(page).toHaveURL(/\/processing$/);
+    expect(dialogs).toEqual([]);
+  });
+}
+
+test('duration confirmation follows the new speed preview and old reveals are rebuilt',async({page})=>{
+  const f=await fixture(page,{recording:true,duration:70,legacyReveal:true});
+  const process=page.getByRole('button',{name:'Passer au traitement'});
+  await expect.poll(()=>f.previews.length).toBe(1);
+  await expect(process).toBeEnabled();
+  await page.getByRole('slider',{name:'Vitesse de la voix',exact:true}).fill('1.25');
+  await expect(process).toBeDisabled();
+  await expect(process).toBeEnabled();
+  expect(f.state.prepared?.duration_seconds).toBe(56);
+  const messages:string[]=[];
+  page.once('dialog',async dialog=>{messages.push(dialog.message());await dialog.dismiss();});
+  await process.click();
+  expect(messages[0]).toContain('56 s');
+  await expect(page).toHaveURL(/\/script$/);
+});
 
 test('original presentation is selectable immediately and needs only one script generation',async({page})=>{
   const f=await fixture(page,{empty:true});
@@ -473,7 +533,7 @@ test('whole-script editing autosaves, keeps raw markers, and only rechecks on re
   await page.getByRole('button',{name:'Vérifier les faits',exact:true}).click();
   expect(f.checks).toBe(1);
   await expect(page.locator('.facecam-finding')).toHaveCount(1);
-  expect(f.state.blocks.at(-1)?.text).toBe('Le nom de l’anime c’est :');
+  expect(f.state.blocks.at(-1)?.text).toBe('Le nom de l’anime c’est : Naruto');
 });
 
 async function reviewedFixture(page:Page) {

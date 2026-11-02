@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.config import settings
 from app.models import Project, ProjectPhase, SceneList, Scene, Transcription, SceneTranscription, MatchList, SceneMatch
 from app.models.transcription import Word
-from app.models.facecam import ENDING
+from app.models.facecam import default_ending
 from app.services.project_service import ProjectService
 from app.services.facecam_service import FacecamService, StaleFacecamRevision
 from facecam_workflow_helpers import approve_and_assign, validate_recording
@@ -74,8 +74,8 @@ def test_full_story_is_always_available_and_keeps_all_source_bounds(project, mon
     assert [c.scene_index for c in full.clips] == [5, 9, 42, 60]
     assert all(c.start_word is None and c.end_word is None for c in full.clips)
     assert full.raw_duration_seconds == 20  # Native episode duration, not the 10 s source clip.
-    words = sum(len(s.text.split()) for s in reference.scenes if not s.is_raw) + len(ENDING.split())
-    assert full.estimated_duration_seconds == round(words / 3.35 + 20 + 1, 2)
+    words = sum(len(s.text.split()) for s in reference.scenes if not s.is_raw) + len(default_ending(project.anime_name).split())
+    assert full.estimated_duration_seconds == round(words / 3.35 + 20, 2)
     state = FacecamService.select_story(project.id, original.revision, full.id)
     assert state.selected_story_id == full.id and state.revision == 1
     assert FacecamService.load(project.id) == state
@@ -375,7 +375,7 @@ def test_selected_story_bounds_reach_writer_and_editor_without_duration_retry(pr
         if len(prompts) in {2, 3}:
             payload = json.loads(prompt.splitlines()[-1])
             assert payload['selected_story']['title'] == 'Le retour'
-            assert payload['budget']['max_words'] == 231
+            assert payload['budget']['max_words'] == 234
             assert payload['body_budget']['advisory'] is True
             if len(prompts) == 3:
                 assert payload['draft_blocks'][0]['text'] == 'récit ' * 300
@@ -387,7 +387,7 @@ def test_selected_story_bounds_reach_writer_and_editor_without_duration_retry(pr
     assert state.estimated_duration_seconds > 70
     assert [b.scene_indices for b in state.blocks if b.kind == 'body'] == [[5, 42]]
     assert state.blocks[1].text == ('récit ' * 300).strip()
-    assert state.blocks[-1].text == ENDING
+    assert state.blocks[-1].text == default_ending(project.anime_name)
     assert FacecamService.load(project.id) == state
     archive, = (FacecamService.directory(project.id) / 'generations').glob('*.json')
     saved = json.loads(archive.read_text())
@@ -467,7 +467,7 @@ async def test_processing_keeps_editorial_cuts_instead_of_extending_them(project
     FacecamService.update(project.id, {'selected_story_id': state.selected_story_id if selected else None,
         'recording': {'fingerprint': 'test'},
         'prepared': {'revision': state.revision, 'directory': str(work), 'fingerprint': 'test',
-                     'auto_editor_signature': settings_signature(state.auto_editor)}})
+                     'cover_end': 60, 'auto_editor_signature': settings_signature(state.auto_editor)}})
     async def fps(*a, **k):
         return 24.0
     monkeypatch.setattr(ProcessingService, 'detect_first_source_fps', fps)
