@@ -4,6 +4,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from ..models import SceneMatch
+from ..config import settings
 from .anime_library import AnimeLibraryService
 
 
@@ -36,7 +37,7 @@ class FacecamVisualCandidates:
                 continue
             path = AnimeLibraryService.resolve_episode_path(match.episode, library_type=project.media_library)
             if path is None:
-                raise ValueError(f"Épisode local V4 introuvable : {match.episode}.")
+                raise ValueError(f"Épisode local introuvable : {match.episode}.")
             episodes.setdefault(str(path.resolve()), path.resolve())
         return list(episodes.values())
 
@@ -55,24 +56,38 @@ class FacecamVisualCandidates:
     def validate(value, targets, catalogue, originals):
         result = VisualSelection.model_validate(value)
         if [s.scene_index for s in result.scenes] != [s["scene_index"] for s in targets]:
-            raise ValueError("La sélection V4 doit couvrir chaque scène une seule fois, dans l'ordre.")
+            raise ValueError("La sélection doit couvrir chaque scène une seule fois, dans l'ordre.")
         for scene in result.scenes:
             seen = set()
             for candidate in scene.alternatives:
                 shot = catalogue.get(candidate.shot_id)
                 if not shot or candidate.shot_id in seen:
-                    raise ValueError("La sélection V4 contient un plan inconnu ou dupliqué.")
+                    raise ValueError("La sélection contient un plan inconnu ou dupliqué.")
                 seen.add(candidate.shot_id)
                 original = originals.get(scene.scene_index)
                 if original and shot["episode"] == original["episode"] and (
                     shot["start"] < original["end"] and shot["end"] > original["start"]):
-                    raise ValueError("Une alternative V4 recouvre le plan déjà proposé pour cette scène.")
+                    raise ValueError("Une alternative recouvre le plan déjà proposé pour cette scène.")
         return result
 
     @classmethod
-    def select(cls, project_id, *, cancel_event=None):
+    def select(cls, project_id, *, cancel_event=None, progress=None):
+        options = {"cancel_event": cancel_event}
+        if settings.facecam_illustration_provider == "antigravity":
+            options["progress"] = progress
+        return cls.search().select(project_id, **options)
+
+    @staticmethod
+    def search():
+        if settings.facecam_illustration_provider == "antigravity":
+            from .facecam_antigravity_search import FacecamAntigravitySearch
+            return FacecamAntigravitySearch
         from .facecam_targeted_search import FacecamTargetedSearch
-        return FacecamTargetedSearch.select(project_id, cancel_event=cancel_event)
+        return FacecamTargetedSearch
+
+    @classmethod
+    def targets(cls, state):
+        return cls.search().targets(state)
 
     @staticmethod
     def matches(candidates):

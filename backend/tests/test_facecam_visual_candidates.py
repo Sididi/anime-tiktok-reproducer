@@ -87,6 +87,7 @@ def test_candidates_use_their_own_native_clock_in_ntsc_project():
 
 @pytest.fixture
 def context(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "facecam_illustration_provider", "openrouter")
     monkeypatch.setattr(settings, "cache_dir", tmp_path / "cache")
     path = tmp_path / "episode.mp4"
     path.write_bytes(b"local video")

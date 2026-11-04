@@ -181,7 +181,7 @@ def placement_project(review_project, monkeypatch, tmp_path):
         calls['preview'] += 1
         return F.load(pid)
 
-    def search(pid):
+    def search(pid, **kwargs):
         calls['search'] += 1
         return selected
 
@@ -241,7 +241,7 @@ async def test_audio_normalization_preserves_selection_but_other_source_changes_
 
 def test_failed_search_resumes_after_assignment_without_reassigning(placement_project, monkeypatch):
     project, state, calls, selected = placement_project
-    def fail_once(pid):
+    def fail_once(pid, **kwargs):
         calls['search'] += 1
         if calls['search'] == 1:
             raise ValueError('provider unavailable')

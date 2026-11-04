@@ -4,6 +4,7 @@ from fractions import Fraction
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
+from typing import Literal
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -51,9 +52,17 @@ class Settings(BaseSettings):
     startup_max_concurrent: int = Field(default=4, ge=1, le=8)
     download_max_concurrent: int = Field(default=3, ge=1, le=6)
     scene_detection_max_concurrent: int = Field(default=2, ge=1, le=4)
-    # All stages of the targeted V4 search share this project budget, including retries.
+    # All stages of the optional OpenRouter search share this budget, including retries.
     facecam_illustration_budget_usd: float = Field(default=0.15, gt=0, le=0.15)
     facecam_illustration_timeout_seconds: int = Field(default=180, ge=30, le=300)
+    # Clip discovery only. Writing, assignment and fact checking keep their presets.
+    facecam_illustration_provider: Literal["antigravity", "openrouter"] = "antigravity"
+    antigravity_cli_binary: str = "agy"
+    facecam_antigravity_model: str = "gemini-4-argon-low"
+    facecam_antigravity_overview_model: str = "gemini-3.8-flash-low"
+    # One deadline for the whole project, including all its episodes and cache locks.
+    facecam_antigravity_timeout_seconds: int = Field(default=540, ge=60, le=590)
+    facecam_antigravity_request_timeout_seconds: int = Field(default=150, ge=10, le=180)
     # Legacy full-episode indexing is no longer called by Facecam processing.
     facecam_illustration_episode_budget_usd: float = Field(default=0.50, gt=0, le=10)
     facecam_illustration_selection_budget_usd: float = Field(default=0.15, gt=0, le=10)

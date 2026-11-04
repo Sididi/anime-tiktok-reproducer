@@ -339,50 +339,66 @@ next scene's start or the final card. Scenes too short for 0.5-second previews r
 Original-dialogue picture spans remain protected. Keep the desired clip, remove the others and extend
 it in Premiere: video-only subclips retain access to the complete source episode.
 
-The search covers **only local episodes already present in the project's immutable matches**. It
-first reads the prepared narration's final timing and skips raw dialogue, outro and scenes with no
-room for another 0.5-second preview. One text request uses the complete script, neighboring narration
-and local subtitles to locate a promising 12-second window for each eligible scene. Existing matches
-provide fallback locations, including when subtitles are absent. This can find shots outside the
-project's original matches, without indexing entire episodes.
+Clip discovery now defaults to **Antigravity CLI**, using the signed-in Google AI subscription.
+This change is limited to clip research and selection: writing, word assignment, fact checking,
+alignment, recording review and delivery retain their existing services. The installed CLI is normally
+`agy` (`ATR_ANTIGRAVITY_CLI_BINARY` can point to another executable). Each invocation passes session-only
+`useG1Credits: false`, disables API-key model routing, and denies commands, file writes, web and MCP tools.
+The complete request travels over stdin; image sheets and the schema use a temporary workspace. The application checks the
+CLI's completed image-read events before accepting a visual answer. Neither quota exhaustion nor a
+CLI failure falls back to OpenRouter or another model. The CLI's own account login remains authoritative;
+the backend never copies its credentials.
 
-Only the selected windows are decoded, by seeking into the original local videos. Local cuts delimit
-frame-indexed candidates. At most two subsequent vision requests inspect contact sheets containing
-two actual frames per candidate and choose up to two alternatives per scene. The model cannot supply
-timestamps: selected IDs resolve to measured native source frames. Overlapping original shots are
-removed before vision; unknown IDs and incorrect scene assignments are rejected. Images must match
-the narration's characters, appearance and action; subtitles alone are not visual evidence.
+The search covers **only local episodes already present in the project's immutable matches**. It first
+reads the final narration timing, excluding raw dialogue, the reveal/outro, and scenes with no room for
+another 0.5-second preview. The new `FacecamAntigravitySearch` follows three stages:
 
-Work is bounded to **three model requests, 24 windows of 12 seconds, 96 proposed shots and 32 eligible
-scenes** per selection. If there are more eligible scenes, those with room for more alternatives take
-priority, then narration order. CPU decoding uses two workers. The default active-work deadline is
-180 seconds (`ATR_FACECAM_ILLUSTRATION_TIMEOUT_SECONDS`), with at most 60 seconds for each model request.
-Failures stop explicitly; there are no automatic paid retries. This targeted approach may miss suitable
-shots elsewhere in an episode and does not claim an exhaustive visual understanding of it.
+1. **Shared episode overview.** Up to 96 measured frames across the whole project, at most 48 per episode,
+   cover the episodes' full time range. Gemini 3.8 Flash (Low) describes appearance, locations and visible
+   situations in batches of 48, with local subtitles as context. Observations and images are reused across
+   projects. An observation is bound to the local source identity, exact frame, subtitle content, model and
+   prompt. This sampled overview is deliberately lighter than an exhaustive shot index.
+2. **Wider localization.** Gemini 4 Argon (Low) uses the complete reviewed script, neighboring narration,
+   subtitles and visual overview to propose up to two 12-second windows per eligible scene. Existing
+   matches and neighboring windows provide additional locations. Subtitles can locate events between
+   sampled images; an absent overview image is not evidence that a scene is absent from the episode.
+3. **Detailed visual verification.** At most 48 windows are decoded locally. Actual cuts provide candidate
+   IDs and exact native frame boundaries. Up to 160 candidates are offered across at most 64 eligible
+   scenes, with three chronological frames per shot. Batches contain at most eight narration scenes.
+   Gemini 4 Argon selects zero, one or two alternatives
+   that match the narrated people, appearance and action. A candidate must have been offered for that
+   specific scene, fit its available slots, and avoid overlapping its existing shot. Unknown IDs, duplicate
+   scene rows, invented locations and invalid source clocks are rejected. Each request's JSON schema
+   also restricts shot IDs separately for each scene, preventing confusion with other rows on the sheets.
 
-`facecam_illustrations` in `config/llm/config.yaml` independently selects **Gemini 3.8 Flash**, with
-minimal reasoning. Request output limits are 1,536 tokens for localization and 3,072 for visual
-selection. Local window images are shared between projects in `backend/data/cache/facecam_windows/`.
-Selections, raw model responses and reports live under `facecam/targeted_selection/<fingerprint>/`.
-Source identity, subtitle, narration, eligible-slot, prompt or model changes invalidate the relevant
-cache. Repeating processing with unchanged inputs reuses completed results without model calls.
-Original source matches are not modified. The reviewed script supplies the authoritative narration
-assignment. Legacy projects must explicitly validate the recording review before new processing;
-existing assignments can be reused when their words are unchanged.
+All episodes share **one global deadline**, default 540 seconds and configurable only up to 590 seconds
+with `ATR_FACECAM_ANTIGRAVITY_TIMEOUT_SECONDS`. Waiting for cache locks, extracting frames and model calls
+consume that same deadline. Individual CLI requests default to 150 seconds, bounded by the remaining
+project time (`ATR_FACECAM_ANTIGRAVITY_REQUEST_TIMEOUT_SECONDS`). Decoding and independent model batches
+use at most two workers each. CLI process groups are terminated on cancellation or timeout. Provider
+availability can still prevent completion; errors preserve completed observations, localization and vision
+batches for an explicit retry instead of silently extending the run or buying additional credits.
 
-**The entire targeted search shares a $0.15 spending ceiling**, including localization, vision and
-manual retries for the same narration/source context. It can be lowered with
-`ATR_FACECAM_ILLUSTRATION_BUDGET_USD` but cannot be configured above $0.15. Prompt, model and search-limit
-changes do not reset its ledger, stored separately in `facecam/targeted_budgets/<context>/usage.json`.
-The older per-episode and selection budget settings apply only to the retired exhaustive index path;
-normal Facecam processing no longer invokes that path.
+The final model can be pinned with `ATR_FACECAM_ANTIGRAVITY_MODEL` (default `gemini-4-argon-low`); the shared
+overview model uses `ATR_FACECAM_ANTIGRAVITY_OVERVIEW_MODEL` (default `gemini-3.8-flash-low`). Pinning avoids a
+silent model substitution. Models must be available to the signed-in account (`agy models`). Google AI Pro
+provides subscription quotas, not unlimited requests; quota limits and optional credit overages are described
+in [Google's plans documentation](https://antigravity.google/docs/plans). The integration uses
+[headless JSON output](https://antigravity.google/docs/cli/headless) and explicitly turns off the
+[credit-overage setting](https://antigravity.google/docs/cli/credits) for every request.
 
-Before each request the application checks current OpenRouter rates, caps provider prices and reserves
-conservative spending using UTF-8 byte counts, bounded image allowances and maximum output tokens.
-Reported actual costs replace reservations afterward; unknown costs and timeouts keep their reservation.
-The next request is blocked if its reservation would exceed the shared ceiling. This is an application
-spending guard, not a provider-side hard billing guarantee. Completed stages survive failures so that
-retries do not repeat successful requests. No fallback to the writing model is used.
+Shared overviews live in `backend/data/cache/facecam_episode_overviews/`. Project responses, validated
+stage results, usage metadata and reports live in `facecam/antigravity_selection/<fingerprint>/`. Successful
+repeated processing and JSX exports read the committed placement without another model call. Changing a
+recording or review still requires explicit validation, and switching the configured provider does not
+invalidate an already committed placement. Source matches and the current Premiere V1/V3 layout are preserved.
+
+The older targeted OpenRouter strategy remains available **only by explicit configuration**:
+`ATR_FACECAM_ILLUSTRATION_PROVIDER=openrouter`. It still uses the independent `facecam_illustrations` model
+entry and its shared **$0.15 maximum** for localization, vision and retries. Its limits remain three model
+requests, 24 windows, 96 offered shots, 32 eligible scenes and a default 180-second active-work deadline.
+The usage ledger remains in `facecam/targeted_budgets/<context>/usage.json`, so model/prompt edits do not reset
+its spending guard. The old exhaustive per-shot index is not called by either normal strategy.
 
 V1 receives the foreground effects; V2 and V4 stay empty. V3 holds the camera and final card,
 V5 the subtitles, V6–V7 optional overlays. The blurred background, white border and automatic

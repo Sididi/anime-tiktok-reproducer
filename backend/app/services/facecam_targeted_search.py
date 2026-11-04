@@ -83,7 +83,7 @@ class FacecamTargetedSearch:
         # Retain coverage of every supplied episode; shorten each row uniformly if needed.
         while len(json.dumps(rows, ensure_ascii=False).encode()) > cls.MAX_SUBTITLE_BYTES:
             if max((len(row[1]) for row in rows), default=0) <= 40:
-                raise ValueError("Trop d'épisodes pour la recherche V4 à 0,15 $. Réduisez les épisodes utilisés.")
+                raise ValueError("Les sous-titres dépassent la limite de recherche par projet. Réduisez les épisodes utilisés.")
             rows = [[identity, text[:max(40, len(text) * 3 // 4)]] for identity, text in rows]
         return rows
 

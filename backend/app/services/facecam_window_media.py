@@ -33,7 +33,7 @@ class FacecamWindowMedia:
                 "duration": duration, "frame_count": round(duration * rate.rate_float)}
 
     @classmethod
-    def window(cls, info, start: float, end: float, check):
+    def window(cls, info, start: float, end: float, check, *, sample_count=2):
         import av
         import cv2
         from PIL import Image
@@ -45,9 +45,11 @@ class FacecamWindowMedia:
         last = min(info["frame_count"], math.floor(end * fps + 1e-5))
         if last <= first or last - first > math.ceil(16 * fps):
             raise ValueError("Une fenêtre V4 doit durer au maximum 16 secondes.")
+        if sample_count not in {2, 3}:
+            raise ValueError("Deux ou trois images sont nécessaires pour vérifier un plan.")
         directory = settings.cache_dir / "facecam_windows" / info["fingerprint"]
-        cache = directory / f"{first}-{last}.json"
-        with FacecamVisualIndex.locked(cache):
+        cache = directory / f"{first}-{last}{'-3frames' if sample_count == 3 else ''}.json"
+        with FacecamVisualIndex.locked(cache, check=check):
             check()
             if file_identity(source) != info["identity"]:
                 raise ValueError("L'épisode V4 a changé pendant la recherche.")
@@ -90,7 +92,7 @@ class FacecamWindowMedia:
             for a, b in zip(bounds, bounds[1:]):
                 if (b - a) / fps < settings.facecam_illustration_min_preview_seconds:
                     continue
-                samples = [a + (b - a) // 3, a + 2 * (b - a) // 3]
+                samples = [a + i * (b - a) // (sample_count + 1) for i in range(1, sample_count + 1)]
                 for sample in samples:
                     path = directory / f"{sample}.png"
                     temporary = path.with_suffix(".png.tmp")
@@ -106,14 +108,16 @@ class FacecamWindowMedia:
             return shots
 
     @staticmethod
-    def contact_sheets(shots):
+    def contact_sheets(shots, *, shots_per_sheet=4):
         from PIL import Image, ImageDraw
 
         sheets = []
-        for offset in range(0, len(shots), 4):
-            sheet = Image.new("RGB", (704, 888), "#111111")
+        for offset in range(0, len(shots), shots_per_sheet):
+            batch = shots[offset:offset + shots_per_sheet]
+            columns = max(len(s["samples"]) for s in batch)
+            sheet = Image.new("RGB", (352 * columns, 222 * len(batch)), "#111111")
             draw = ImageDraw.Draw(sheet)
-            for row, shot in enumerate(shots[offset:offset + 4]):
+            for row, shot in enumerate(batch):
                 for col, frame in enumerate(shot["samples"]):
                     with Image.open(Path(shot["frames_dir"]) / f"{frame}.png") as source:
                         thumbnail = source.convert("RGB")

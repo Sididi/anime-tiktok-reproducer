@@ -7,6 +7,7 @@ import io
 import json
 import math
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -57,17 +58,30 @@ class FacecamVisualIndex:
 
     @classmethod
     @contextmanager
-    def locked(cls, key):
+    def locked(cls, key, *, check=None):
         import fcntl
-        with cls.lock(key):
+        lock = cls.lock(key)
+        while not lock.acquire(timeout=.1):
+            if check:
+                check()
+        try:
             path = settings.cache_dir / "facecam_visual" / "locks" / fingerprint(str(key))
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a") as handle:
-                fcntl.flock(handle, fcntl.LOCK_EX)
+                while True:
+                    if check:
+                        check()
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(.1)
                 try:
                     yield
                 finally:
                     fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            lock.release()
 
     @staticmethod
     def subtitles(source: Path):

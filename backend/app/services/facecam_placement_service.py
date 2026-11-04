@@ -76,7 +76,6 @@ class FacecamPlacementService:
     @classmethod
     def run(cls, project_id, key):
         from .facecam_media_service import FacecamMediaService
-        from .facecam_targeted_search import FacecamTargetedSearch
         from .facecam_visual_candidates import FacecamVisualCandidates
         from .facecam_window_media import FacecamWindowMedia
 
@@ -98,11 +97,11 @@ class FacecamPlacementService:
                 FacecamService.assign_scenes(project_id, state.revision)
                 progress("Synchronisation des scènes avec votre voix", .3)
                 FacecamMediaService.prepare(project_id)
-                progress("Recherche des illustrations supplémentaires pour V4", .6)
-                candidates = FacecamVisualCandidates.select(project_id)
+                progress("Recherche des illustrations supplémentaires", .6)
+                candidates = FacecamVisualCandidates.select(project_id, progress=lambda message, fraction: progress(message, .6 + .3 * fraction))
                 current = FacecamService.load(project_id)
                 cls.require_review(current, key)
-                targets, _ = FacecamTargetedSearch.targets(current)
+                targets, _ = FacecamVisualCandidates.targets(current)
                 sources = [FacecamWindowMedia.probe(path) for path in FacecamVisualCandidates.episodes(project_id)]
                 with FacecamService.lock(project_id):
                     current = FacecamService.load(project_id)
