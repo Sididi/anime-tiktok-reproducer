@@ -2,7 +2,7 @@ import {test,expect,type Page} from '@playwright/test';
 import {DEFAULT_FACECAM_AUTO_EDITOR, type FacecamState, type FacecamStory} from '../src/api/facecam';
 import {readyMetadata, readyThumbnails, publicationCandidates, publicationMetadata, thumbnailImage} from './helpers/facecamPublication';
 
-async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; fullDuration?: number; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean; failOriginal?: boolean; delayedOriginal?: boolean; duration?: number; legacyReveal?: boolean}) {
+async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamStory[]; fullDuration?: number; failAnalysis?: boolean; recording?: boolean; failPreview?: boolean; legacyPreview?: boolean; noPreview?: boolean; delayedPreview?: boolean; unreviewed?: boolean; failOriginal?: boolean; delayedOriginal?: boolean; duration?: number; legacyReveal?: boolean; placementError?: boolean}) {
   const id='facecam-browser';
   let checks=0,saves=0,analyses=0;
   let preset='gpt',music='music';
@@ -35,6 +35,9 @@ async function fixture(page:Page, options?: {empty?: boolean; stories?: FacecamS
       blocks:structuredClone(state.blocks), changes:[], validated_revision:options?.unreviewed?null:state.revision},
     placement: options?.unreviewed ? null : {key:'placement-1', revision:state.revision, fingerprint:state.recording.fingerprint,
       status:'complete', assignment_complete:true, error:null}};
+  if (options?.placementError && state.placement) state = {...state,
+    placement: {...state.placement, status:'error', error:'Délai Antigravity atteint'},
+    job: {status:'error', message:'Délai Antigravity atteint'}};
   await page.route(url=>url.pathname.startsWith('/api/'),async route=>{
     const path=new URL(route.request().url()).pathname.replace(`/api/projects/${id}`,'');
     const json=(body:unknown)=>route.fulfill({json:body});
@@ -848,6 +851,45 @@ test('publication requires an explicit title and thumbnail; choices and manual e
   await page.setViewportSize({width:390,height:844});
   await page.locator('#facecam-publication-title').scrollIntoViewIfNeeded();
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBeTruthy();
+});
+
+test('thumbnail proposals and manual selection work after placement timeout without resuming it', async ({page}) => {
+  const f = await fixture(page, {recording:true, placementError:true});
+  let thumbnails: Omit<ReturnType<typeof readyThumbnails>, 'selected'> & {selected: ReturnType<typeof readyThumbnails>['selected'] | null} = {
+    ...readyThumbnails(), candidates:[], selected:null, ready:false, generated:false};
+  const placementRequests: string[] = [];
+  page.on('request', request => {
+    if (request.method() === 'POST' && request.url().includes('/facecam/recording/review')) placementRequests.push(request.url());
+  });
+  await page.route('**/facecam/thumbnails', route => route.fulfill({json:thumbnails}));
+  await page.route('**/facecam/thumbnails/generate', route => {
+    thumbnails = {...thumbnails, candidates:readyThumbnails().candidates, generated:true};
+    return route.fulfill({json:{...f.state, job:{status:'complete'}}});
+  });
+  await page.route('**/facecam/thumbnail', route => {
+    if (route.request().method() !== 'PUT') return route.fulfill({contentType:'image/svg+xml', body:thumbnailImage});
+    const request = route.request().postDataJSON();
+    thumbnails = {...thumbnails, selected:{id:'selected-1', label:'Episode 1', ...request}, ready:true};
+    return route.fulfill({json:thumbnails});
+  });
+  await page.reload();
+  await expect(page.getByRole('button', {name:'Sélecteur manuel'})).toBeEnabled();
+  await page.getByRole('button', {name:'Proposer 10 miniatures'}).click();
+  await expect(page.getByRole('button', {name:/Choisir la miniature \d+/})).toHaveCount(10);
+  await page.getByRole('button', {name:'Choisir la miniature 4', exact:true}).click();
+  await expect(page.getByText('Miniature enregistrée', {exact:true})).toBeVisible();
+  await expect(page.getByRole('button', {name:'Passer au traitement'})).toBeDisabled();
+  await page.reload();
+  await expect(page.getByText('Miniature enregistrée', {exact:true})).toBeVisible();
+  await page.getByRole('button', {name:'Sélecteur manuel'}).click();
+  const manual = page.getByRole('dialog', {name:'Choisir une image dans un épisode'});
+  await manual.getByLabel('Instant (secondes)').fill('123.5');
+  await expect(manual.getByAltText('Aperçu de la miniature verticale')).toBeVisible();
+  await manual.getByRole('button', {name:'Utiliser cette image'}).click();
+  await expect(manual).toBeHidden();
+  expect(thumbnails.selected?.timestamp).toBe(123.5);
+  expect(placementRequests).toEqual([]);
+  expect(f.state.placement?.status).toBe('error');
 });
 
 test('metadata generation failure remains retryable and never unlocks processing', async ({page}) => {

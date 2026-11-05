@@ -74,6 +74,11 @@ It proposes up to ten distinct images; scarce or unreadable sources can produce 
 sampling after approximately one minute plus an in-flight decode. Successful proposals are cached.
 This is an image-quality heuristic, not a semantic character/face recognition model.
 
+Thumbnail proposals and the manual selector are available independently of scene-placement
+completion, including after an illustration-search timeout. They do not start or resume an AI
+clip search. A selected thumbnail survives newly added illustration alternatives while its episode
+remains in the montage and its visual source is unchanged.
+
 **Sélecteur manuel** browses the same episodes by timestamp, timeline slider and native-frame steps.
 It shows the complete image and vertical crop together; horizontal/vertical sliders adjust framing.
 Selection extracts the original source frame and exports an RGB/sRGB JPEG at **1080 × 1920 (9:16),
@@ -378,6 +383,12 @@ project time (`ATR_FACECAM_ANTIGRAVITY_REQUEST_TIMEOUT_SECONDS`). Decoding and i
 use at most two workers each. CLI process groups are terminated on cancellation or timeout. Provider
 availability can still prevent completion; errors preserve completed observations, localization and vision
 batches for an explicit retry instead of silently extending the run or buying additional credits.
+
+The complete NDJSON request is supplied through a temporary file connected to CLI stdin. This keeps
+large subtitle/overview requests intact even when CLI startup exceeds the 250 ms cancellation-poll
+interval: a timed-out pipe write followed by `communicate(input=None)` could previously leave the
+request incomplete and the CLI waiting until the request deadline. Output polling, cancellation and
+the existing deadlines are unchanged.
 
 The final model can be pinned with `ATR_FACECAM_ANTIGRAVITY_MODEL` (default `gemini-4-argon-low`); the shared
 overview model uses `ATR_FACECAM_ANTIGRAVITY_OVERVIEW_MODEL` (default `gemini-3.8-flash-low`). Pinning avoids a

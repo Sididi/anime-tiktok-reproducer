@@ -115,8 +115,8 @@ export function FacecamPublication({id, state, disabled, approved, onState, onRe
         if (cancelled) return;
         setMetadataError(''); setMetadata(next); setTitlesOpen(!!next.candidates && !next.metadata);
       }).catch(e => {if (!cancelled) {setMetadata(null); setMetadataError(e.message);}}),
-      placementReady ? facecamRequest<ThumbnailsStatus>(id, '/thumbnails').then(next => {if (!cancelled) {setThumbnailError(''); setThumbnails(next);}})
-        .catch(e => {if (!cancelled) {setThumbnails(null); setThumbnailError(e.message);}}) : Promise.resolve().then(() => {if (!cancelled) setThumbnails(null);}),
+      facecamRequest<ThumbnailsStatus>(id, '/thumbnails').then(next => {if (!cancelled) {setThumbnailError(''); setThumbnails(next);}})
+        .catch(e => {if (!cancelled) {setThumbnails(null); setThumbnailError(e.message);}}),
     ];
     void Promise.all(requests).finally(() => {if (!cancelled) setLoadedKey(requestKey);});
     return () => {cancelled = true;};
@@ -169,10 +169,10 @@ export function FacecamPublication({id, state, disabled, approved, onState, onRe
     <div className="facecam-publication-thumbnails"><h3><ImageIcon size={17}/> Miniature de publication</h3>
       <p>Jusqu’à 10 images extraites des épisodes du montage, triées par netteté, exposition et diversité. Sélection locale gratuite, sans appel IA payant.</p>
       <div className="flex flex-wrap gap-3">
-        <Button variant="outline" disabled={busy || !approved || !placementReady} onClick={() => void generate('thumbnails')}>{thumbnails?.generated ? 'Recharger les propositions' : 'Proposer 10 miniatures'}</Button>
+        <Button variant="outline" disabled={busy || !approved} onClick={() => void generate('thumbnails')}>{thumbnails?.generated ? 'Recharger les propositions' : 'Proposer 10 miniatures'}</Button>
         <Button variant="outline" disabled={busy || !approved || !thumbnails?.episodes.length} onClick={() => setManual({initial: thumbnails?.selected ?? null})}><SlidersHorizontal size={16} className="mr-2"/>Sélecteur manuel</Button>
       </div>
-      {!placementReady && <p>Les miniatures seront disponibles après le placement des scènes.</p>}
+      {!placementReady && <p>Vous pouvez choisir la miniature avant la fin du placement des scènes.</p>}
       {!!thumbnails?.candidates.length && <div className="facecam-thumbnail-grid" aria-label="Miniatures proposées">
         {thumbnails.candidates.map((candidate, index) => {
           const selected = thumbnails.selected?.episode === candidate.episode && thumbnails.selected?.timestamp === candidate.timestamp;

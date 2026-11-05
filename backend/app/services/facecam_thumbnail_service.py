@@ -128,8 +128,16 @@ class FacecamThumbnailService:
         manifest = cls._read(cache / "candidates.json") or {}
         candidates = [c for c in manifest.get("candidates", []) if (cache / (c["id"] + ".jpg")).is_file()]
         selected = FacecamService.load(project_id).thumbnail
-        if not selected or selected["version"] != version or not cls.selected_path(project_id, selected).is_file():
-            selected = None
+        if selected:
+            source = next((s for s in context["sources"] if s["id"] == selected["episode"]), None)
+            # Completing placement can add sampling spans without changing the
+            # selected image. Keep that choice while its episode remains allowed
+            # and its visual source is unchanged; old selections retain their
+            # original full-context validation until selected again.
+            current = source is not None and (selected["version"] == version
+                or selected.get("source_fingerprint") == fingerprint(source["identity"]))
+            if not current or not cls.selected_path(project_id, selected).is_file():
+                selected = None
         return {"version": version, "candidates": candidates,
                 "episodes": [{k: s[k] for k in ("id", "label", "duration", "fps")} for s in context["sources"]],
                 "selected": selected, "ready": selected is not None,
@@ -282,6 +290,7 @@ class FacecamThumbnailService:
             raise ValueError("Recadrage invalide.")
         image = portrait(cls.extract(source, timestamp), crop_x, crop_y)
         selection = {"id": uuid.uuid4().hex, "version": version, "episode": episode,
+                     "source_fingerprint": fingerprint(source["identity"]),
                      "label": source["label"], "timestamp": timestamp, "crop_x": crop_x, "crop_y": crop_y}
         with FacecamService.lock(project_id):
             if project_id in FacecamService._processing:

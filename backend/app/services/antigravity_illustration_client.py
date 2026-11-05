@@ -74,7 +74,8 @@ class AntigravityIllustrationClient:
         ledger["calls"].append(record)
         write_json(audit_path, ledger)
         try:
-            with tempfile.TemporaryDirectory(prefix="atr-illustrations-") as temporary:
+            with (tempfile.TemporaryDirectory(prefix="atr-illustrations-") as temporary,
+                  tempfile.TemporaryFile() as request_input):
                 workspace = Path(temporary)
                 assets = []
                 for i, data in enumerate(images or []):
@@ -101,11 +102,17 @@ class AntigravityIllustrationClient:
                 # argv-size limit, or truncation by the agent's text-file reader.
                 payload = (json.dumps({"event": "user", "message": {"content": instruction + "\n\n" + prompt}},
                                       ensure_ascii=False) + "\n").encode()
+                # A short communicate(input=...) timeout can leave a pipe only
+                # partly written. Retrying with input=None does not resume that
+                # write. A rewound file supplies the complete request and EOF
+                # even when CLI startup is slower than our cancellation polling.
+                request_input.write(payload)
+                request_input.seek(0)
                 args = [executable, "--input-format", "stream-json", "--model", model, "--output-format", "stream-json",
                         "--json-schema", str(workspace / "schema.json"), "--settings", json.dumps(options),
                         "--disable-slash-commands", "--print-timeout", f"{max(1, int(deadline - started))}s",
                         "--log-file", str(workspace / "cli.log")]
-                process = subprocess.Popen(args, cwd=workspace, env=self.environment(), stdin=subprocess.PIPE,
+                process = subprocess.Popen(args, cwd=workspace, env=self.environment(), stdin=request_input,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
                 try:
                     while True:
@@ -114,10 +121,9 @@ class AntigravityIllustrationClient:
                         if remaining <= 0:
                             raise TimeoutError("Délai Antigravity atteint ; les analyses terminées restent en cache.")
                         try:
-                            stdout, stderr = process.communicate(input=payload, timeout=min(.25, remaining))
+                            stdout, stderr = process.communicate(timeout=min(.25, remaining))
                             break
                         except subprocess.TimeoutExpired:
-                            payload = None
                             continue
                 finally:
                     self.stop(process)

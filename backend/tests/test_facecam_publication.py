@@ -207,6 +207,40 @@ def test_verified_audio_remux_preserves_thumbnail(project, episode, monkeypatch)
     assert Thumbnails.status(project.id)['selected'] == selected
 
 
+def test_thumbnail_remains_usable_after_search_timeout_and_later_placement(project, episode, monkeypatch):
+    from app.services.facecam_placement_service import FacecamPlacementService
+    from app.services.facecam_visual_candidates import FacecamVisualCandidates
+
+    placement = {'key': 'pending-visuals', 'revision': 1, 'fingerprint': 'take',
+                 'status': 'error', 'assignment_complete': True, 'error': 'Délai Antigravity atteint'}
+    FacecamService.update(project.id, {'placement': placement})
+    monkeypatch.setattr(FacecamVisualCandidates, 'select', lambda *a, **kw: pytest.fail('Thumbnail started clip search'))
+    monkeypatch.setattr(FacecamPlacementService, 'candidates', lambda *a: pytest.fail('Incomplete placement read'))
+    monkeypatch.setattr(LLMService, 'generate_json', lambda *a, **kw: pytest.fail('Thumbnail called a model'))
+
+    def extract(source, timestamp, **kwargs):
+        pixels = np.random.default_rng(round(timestamp * 24)).integers(20, 235, (18, 32, 3), dtype=np.uint8)
+        return Image.fromarray(pixels).resize((640, 360))
+
+    monkeypatch.setattr(Thumbnails, 'extract', extract)
+    Thumbnails.generate(project.id)
+    status = Thumbnails.status(project.id)
+    assert status['candidates'] and not status['ready']
+    choice = status['candidates'][0]
+    selected = Thumbnails.select(project.id, status['version'], choice['episode'], choice['timestamp'])['selected']
+    assert selected is not None
+    assert FacecamService.load(project.id).placement.model_dump() == placement
+
+    monkeypatch.setattr(FacecamPlacementService, 'candidates', lambda *a: [
+        {'episode': str(episode), 'start': 100, 'end': 105}])
+    FacecamService.update(project.id, {'placement': {**placement, 'status': 'complete', 'error': None}})
+    completed = Thumbnails.status(project.id)
+    assert completed['version'] != status['version']
+    assert completed['ready'] and completed['selected'] == selected
+    episode.write_bytes(b'different video after placement')
+    assert not Thumbnails.status(project.id)['ready']
+
+
 def test_real_ffmpeg_frame_extraction_and_vertical_export(tmp_path):
     from app.services.facecam_media_service import ffmpeg
     video = tmp_path / 'synthetic.mp4'
